@@ -1170,8 +1170,9 @@ end
 --   dpichange   scale           the window moved to a display with another
 --                               scale factor
 -- Without a timeout it returns at once; with one (in seconds) it waits up
--- to that long for the first event. A `close` event only reports the
--- request: call `window:close()` to honour it.
+-- to that long for the first event; inside a task that wait suspends only
+-- the task (the scheduler pumps the event loop meanwhile). A `close` event
+-- only reports the request: call `window:close()` to honour it.
 function ui.poll(timeout: number?): {Event}
     checkOptionalNumber(timeout, "timeout")
     if (timeout != nil and timeout < 0) then error("timeout must be non-negative") end
@@ -1221,6 +1222,10 @@ local loopState = { tweens = 0 }
 -- With `fps = "auto"` the loop runs at 60 fps only while a tween is running,
 -- events arrived or the handler returned `true` (it is animating); otherwise
 -- it sleeps in the event loop for up to a second between calls.
+-- Inside a task (`task.spawn(function() ui.run(...) end)`) each wait for
+-- events suspends the task instead of blocking the program, so `spawn`
+-- returns at once and the scheduler drives the window. A `task.wait` in the
+-- handler still blocks the loop: the handler runs under `try`.
 function ui.run(handler: ({Event}, number) -> any, options: RunOptions?): ()
     checkFunction(handler, "handler")
     checkOptionalTable(options, "options")

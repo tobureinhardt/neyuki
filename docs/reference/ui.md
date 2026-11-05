@@ -68,9 +68,11 @@ Calls `handler(events, dt)` about 60 times a second (`options.fps`, or `"auto"`)
 
 With `fps = "auto"` the loop runs at 60 fps only while a `ui.animate` tween is running, events arrived in the last step or the handler returned `true` (return it while an animated image is visible). Otherwise it waits in the event loop for up to a second, so an idle window uses almost no CPU.
 
+Inside a task (`task.spawn(function() ui.run(...) end)`) the loop does not block the program: `spawn` returns at once with the task suspended, and the window runs while the main program is in `task.wait` and after it finishes, until every window is closed. See [Windows in a task](task.md#windows-in-a-task) for the limits (one event loop at a time, cooperative scheduling, and `task.wait` inside the handler blocking the loop).
+
 ## ui.poll(timeout: number?): {table}
 
-Pumps the event loop and returns the events since the last call. Without a timeout it returns at once; with one it waits up to that many seconds for the first event. Each event has `kind` and `window` plus:
+Pumps the event loop and returns the events since the last call. Without a timeout it returns at once; with one it waits up to that many seconds for the first event. Inside a task, a poll with a timeout suspends that task instead of blocking the program, and the scheduler wakes it with the events or, when the time is up, an empty list. Each event has `kind` and `window` plus:
 
 - `close`: the close button or shortcut was used (call `window:close()` to honour it)
 - `resize`: `width`, `height`

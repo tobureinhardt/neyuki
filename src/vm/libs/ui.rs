@@ -3331,11 +3331,34 @@ fn builtin_size(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// so one task that runs long without yielding still delays the frame.
 const TASK_BUDGET: Duration = Duration::from_millis(4);
 
+/// Pumps the event loop, waiting up to `timeout` for something to happen,
+/// and takes the events that arrived.
+fn pump_events(timeout: Duration) -> Result<Vec<Value>, String> {
+    pump(timeout)?;
+    webview::pump_toolkit();
+    drain_media_commands();
+    let mut events = EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()));
+    events.extend(webview::take_events());
+    Ok(events)
+}
+
+/// The hook the task scheduler pumps the event loop through for the tasks
+/// parked in `__ui_poll`.
+fn scheduler_pump(_vm: &mut VM, timeout: Duration) -> Result<Value, String> {
+    pump_events(timeout).map(new_table)
+}
+
 /// `__ui_poll(timeout?)` pumps the event loop, waiting up to `timeout`
 /// seconds for something to happen, then runs the tasks that are due
 /// (within `TASK_BUDGET`) and returns the events as an array. Background
 /// work that finishes during the wait wakes it early through an event loop
 /// proxy, so an idle app can wait long without missing a completion.
+///
+/// A task that polls with a timeout does not block: it is parked and
+/// yields, and the scheduler pumps the event loop for it (see
+/// `task::service_pollers`), so the rest of the program keeps running. The
+/// main chunk, a plain coroutine, a call under `try` and a zero timeout
+/// cannot or need not yield and block as described above.
 fn builtin_poll(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let timeout = timeout_arg(args, 0, "timeout")?;
     if !task::has_waker(vm) {
@@ -3349,17 +3372,19 @@ fn builtin_poll(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             }),
         );
     }
+    if !timeout.is_zero()
+        && let Some(thread) = task::current_task(vm)
+    {
+        let deadline = task::deadline_after(Instant::now(), timeout);
+        return task::park_poller(vm, thread, deadline, scheduler_pump);
+    }
     // A sleeping task's deadline also ends the wait, so `task.wait` keeps
     // its timing while `fps = "auto"` idles for up to a second.
     let timeout = match task::next_due(vm) {
         Some(due) => timeout.min(due.saturating_duration_since(Instant::now())),
         None => timeout,
     };
-    pump(timeout)?;
-    webview::pump_toolkit();
-    drain_media_commands();
-    let mut events = EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()));
-    events.extend(webview::take_events());
+    let events = pump_events(timeout)?;
     task::run_for(vm, TASK_BUDGET);
     Ok(vec![new_table(events)])
 }

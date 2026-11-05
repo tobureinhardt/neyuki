@@ -594,4 +594,28 @@ local third = ui.open({ width = 100, height = 100, visible = false })
 expectError(ui.run, "boom", "run re-raises handler errors", function() error("boom") end)
 assert(not third:isOpen(), "run closes windows when the handler fails")
 
+-- `run` inside a task does not block the program: `task.spawn` returns at
+-- once with the task suspended, and the scheduler drives the window while
+-- the main program waits.
+local hosted = ui.open({ width = 100, height = 100, visible = false })
+local order = { "before" }
+local hostedFrames = 0
+local game = task.spawn(function()
+    ui.run(function(frameEvents: {Event}, dt: number)
+        hostedFrames += 1
+        if (hostedFrames >= 3) then hosted:close() end
+    end, { fps = 120 })
+    order[#order + 1] = "run returned"
+end)
+order[#order + 1] = "main"
+assert(coroutine.status(game) == "suspended", "run in a task parks the task: " .. coroutine.status(game))
+assert(hostedFrames == 0, "the handler must not run before main waits")
+assert(hosted:isOpen(), "the window is still open right after spawn")
+local patience = os.clock() + 10
+while (coroutine.status(game) ~= "dead" and os.clock() < patience) do task.wait(0.01) end
+assert(coroutine.status(game) == "dead", "the task finished once the window closed")
+assert(hostedFrames == 3, "the handler ran until it closed the window: " .. tostring(hostedFrames))
+assert(not hosted:isOpen())
+assert(table.concat(order, ",") == "before,main,run returned", "main ran first: " .. table.concat(order, ","))
+
 print("ui: live window checks passed")
