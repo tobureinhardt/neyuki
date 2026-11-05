@@ -229,7 +229,16 @@ local geometry = require("geometry")
 print(geometry.area(2, 3))
 ```
 
-The standard libraries (`math`, `string`, `table`, `bit`, `buffer`, `coroutine`, `task`, `utf8`, `debug`, `json`, `os`) are always available as globals. The bundled modules are loaded with `require("@neyuki/name")`: `fs`, `io`, `http`, `net`, `sql`, `crypto`, `ui`, `hid` and `profile`.
+The standard libraries (`math`, `string`, `table`, `bit`, `buffer`, `coroutine`, `task`, `utf8`, `debug`, `json`, `os`) are always available as globals. The bundled modules are loaded with `require("@neyuki/name")`: `fs`, `io`, `http`, `net`, `sql`, `crypto`, `ui`, `hid`, `profile` and `webview`.
+
+A `--!importall` line before the first line of code makes every bundled module available under its own name, without a `require` for each:
+
+```lua
+--!importall
+fs.write("hello.txt", crypto.randomBytes(8))
+```
+
+Only the modules the file names are loaded, and a name the file declares itself keeps its own meaning. The directive applies to the file it is in, not to the modules that file requires.
 
 ## Limits
 

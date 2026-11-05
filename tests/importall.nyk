@@ -1,0 +1,15 @@
+-- `--!importall` makes the bundled modules available without a `require`.
+--!importall
+
+assert(fs == require("@neyuki/fs"), "fs is the bundled module")
+assert(type(crypto.randomBytes) == "function", "crypto is usable")
+
+local function usesModuleInFunction()
+    return json.encode({ hash = crypto.encode("hi", "base64") })
+end
+assert(usesModuleInFunction() != nil, "modules are visible inside functions")
+
+-- A name the file declares itself is not replaced.
+local ui = "mine"
+assert(ui == "mine", "own locals win")
+print(ui, "importall ok")

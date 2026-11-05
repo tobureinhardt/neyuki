@@ -11,7 +11,7 @@ use crate::ast::node_id::NodeId;
 use crate::bytecode::proto::Proto;
 use crate::bytecode::serialize::serialize;
 use crate::parser::{Parser, Stmt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::rc::Rc;
 
@@ -78,11 +78,38 @@ pub fn parse(source: &str) -> Result<Parsed, String> {
 
     crate::ast::visitor::check_ast_sanity(&stmts)?;
     crate::ast::visitor_mut::normalize_ast(&mut stmts);
+    if has_import_all(source) {
+        let undeclared = crate::sema::undeclared_names(&stmts, source, &pool);
+        stmts.splice(0..0, bundled_imports(&undeclared)?);
+    }
     Ok(Parsed {
         stmts,
         lines: Rc::new(pool.start_lines()),
         spans: pool,
     })
+}
+
+/// Whether a `--!importall` line comes before the first line of code.
+fn has_import_all(source: &str) -> bool {
+    source
+        .lines()
+        .map(str::trim)
+        .take_while(|line| line.is_empty() || line.starts_with("--"))
+        .any(|line| line == "--!importall")
+}
+
+/// One `local name = require("@neyuki/name")` per bundled module in `names`.
+/// Modules the program never names are not loaded, so the directive costs a
+/// script nothing for the ones it doesn't use.
+fn bundled_imports(names: &HashSet<String>) -> Result<Vec<Stmt>, String> {
+    let imports: String = crate::vm::libs::BUNDLED_LIBRARIES
+        .iter()
+        .map(|(path, _)| path)
+        .filter_map(|path| Some((path, path.strip_prefix("@neyuki/")?)))
+        .filter(|(_, name)| names.contains(*name))
+        .map(|(path, name)| format!("local {} = require({:?})\n", name, path))
+        .collect();
+    Ok(parse(&imports)?.stmts)
 }
 
 /// Parses Neyuki source into statements.
@@ -227,6 +254,36 @@ mod tests {
         let code = "local a = 10\nlocal b = 20\nreturn a + b";
         let bc = compile_source_to_bytecode(code, "test").expect("compilation failed");
         assert!(bc.starts_with(MAGIC));
+    }
+
+    #[test]
+    fn import_all_binds_only_the_undeclared_modules_used() {
+        let parsed = parse("--!importall\nprint(fs, http)\nlocal ui = 1\nprint(ui, x.sql)\n");
+        let names: Vec<_> = parsed
+            .unwrap()
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Local { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["fs", "http", "ui"]);
+    }
+
+    #[test]
+    fn import_all_must_come_before_code() {
+        let run = |code: &str| compile_program(code, "test", Options::RUN);
+        assert!(run("return fs").is_err());
+        assert!(run("print(1)\n--!importall\nreturn fs").is_err());
+        assert!(run("--!importall now\nreturn fs").is_err());
+        assert!(run("-- about\n\n--!importall\nreturn fs").is_ok());
+    }
+
+    #[test]
+    fn import_all_lints_clean_and_keeps_undefined_name_errors() {
+        assert!(crate::lint::lint_source("--!importall\nprint(fs, net)\n").is_empty());
+        assert!(compile_program("--!importall\nreturn nope", "test", Options::RUN).is_err());
     }
 
     #[test]

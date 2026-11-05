@@ -20,6 +20,7 @@ pub struct SemanticAnalyzer<'a> {
     pub scope_mgr: ScopeManager,
     pub diagnostics: Vec<Diagnostic>,
     pub known_globals: HashSet<String>,
+    pub undeclared: HashSet<String>,
     current_return_type: Option<NeyukiType>,
     current_line: u32,
     spans: Option<&'a SpanPool>,
@@ -84,6 +85,7 @@ impl<'a> SemanticAnalyzer<'a> {
             scope_mgr: ScopeManager::new(),
             diagnostics: Vec::new(),
             known_globals,
+            undeclared: HashSet::new(),
             current_return_type: None,
             current_line: 1,
             spans: None,
@@ -480,6 +482,7 @@ impl<'a> SemanticAnalyzer<'a> {
                             };
                     }
                 } else if !self.is_known_global(name) {
+                    self.undeclared.insert(name.to_string());
                     let diag = Diagnostic::error(format!(
                         "variable '{}' is used before declaration",
                         name
@@ -504,6 +507,7 @@ impl<'a> SemanticAnalyzer<'a> {
     fn read_variable(&mut self, name: &str) {
         let span = self.find_ident_span(name);
         if !self.scope_mgr.mark_used(name) && !self.is_known_global(name) {
+            self.undeclared.insert(name.to_string());
             let diag = Diagnostic::error(format!("cannot find variable '{}' in this scope", name))
                 .with_code(ErrorCode::E0001)
                 .with_label(span, "not found in this scope")
@@ -946,6 +950,7 @@ impl<'a> SemanticAnalyzer<'a> {
                         self.diagnostics.push(diag);
                     }
                 } else if !self.is_known_global(name) {
+                    self.undeclared.insert(name.to_string());
                     let diag = Diagnostic::error(format!("variable '{}' is not declared", name))
                         .with_code(ErrorCode::E0001)
                         .with_label(span, "cannot increment undeclared variable");

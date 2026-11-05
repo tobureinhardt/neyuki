@@ -1700,12 +1700,9 @@ fn collect_symbols_from_stmts(
                 initializer,
                 ..
             } => {
-                let span = spans.get(*id);
-                let (line_1, col_1) = if let Some(s) = span {
-                    (s.start.line, s.start.column)
-                } else {
-                    (1, 1)
-                };
+                // No span: a binding `--!importall` added, not one in the file.
+                let Some(s) = spans.get(*id) else { continue };
+                let (line_1, col_1) = (s.start.line, s.start.column);
                 let ty = type_name.as_deref().unwrap_or("any");
                 out.push(FoundSymbol {
                     name: name.clone(),

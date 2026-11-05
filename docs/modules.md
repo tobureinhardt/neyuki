@@ -63,6 +63,11 @@ Path traversal attempts trigger an immediate security exception:
 runtime error[E0200]: security error: path traversal forbidden in require: '../sensitive'
 ```
 
+### 2.3 Importing Every Bundled Module (`--!importall`)
+A `--!importall` comment on its own line, before the first line of code (only blank lines and other comments may precede it), binds each bundled `lib/*.nyk` module to a local of the same name at the top of the file, as if the file began with `local fs = require("@neyuki/fs")` and so on.
+
+Only names the file uses without declaring are bound, so unused modules are never loaded, and a file's own `local ui = ...` is left alone. The directive applies per file; other undeclared names remain errors.
+
 ---
 
 ## 3. Caching and Lifecycle

@@ -30,6 +30,17 @@ pub fn analyze_with_spans(
     analyzer.diagnostics
 }
 
+/// The names the program uses without anything declaring them.
+pub fn undeclared_names(
+    statements: &[Stmt],
+    source: &str,
+    spans: &crate::ast::span::SpanPool,
+) -> std::collections::HashSet<String> {
+    let mut analyzer = SemanticAnalyzer::new(source).with_spans(spans);
+    analyzer.analyze_program(statements);
+    analyzer.undeclared
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
