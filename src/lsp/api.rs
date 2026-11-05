@@ -580,7 +580,10 @@ mod tests {
         // instead of silently dropping out of completion and hover.
         assert_eq!(
             api.skipped_headings,
-            vec![("task".to_string(), "Blocking calls".to_string())]
+            vec![
+                ("task".to_string(), "Blocking calls".to_string()),
+                ("task".to_string(), "Windows in a task".to_string()),
+            ]
         );
         for lib in &api.libraries {
             assert!(!lib.doc.is_empty(), "page {} has no overview", lib.page);
