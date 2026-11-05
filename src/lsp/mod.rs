@@ -1772,6 +1772,26 @@ fn collect_symbols_from_stmts(
                     collect_symbols_from_expr(v, spans, out);
                 }
             }
+            crate::ast::Stmt::TypeAlias {
+                name,
+                exported,
+                ty,
+                name_span,
+                ..
+            } => {
+                out.push(FoundSymbol {
+                    name: name.clone(),
+                    detail: format!(
+                        "{}type {} = {}",
+                        if *exported { "export " } else { "" },
+                        name,
+                        ty
+                    ),
+                    kind: 26, // TypeParameter, the closest kind to a type alias
+                    line_1_based: name_span.start.line,
+                    col_1_based: name_span.start.column,
+                });
+            }
             _ => {}
         }
     }

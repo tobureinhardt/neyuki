@@ -58,7 +58,13 @@ Statement       ::= BindingStmt
                   | ContinueStmt
                   | GotoStmt
                   | LabelStmt
+                  | TypeAliasStmt
                   | ExprStmt
+
+TypeAliasStmt   ::= [ "export" ] "type" IDENTIFIER "=" TypeExpr
+                    (* contextual: only when "type" (or "export" "type") is followed by
+                       IDENTIFIER and "=". "export" is only allowed at the top level.
+                       "type" IDENTIFIER "<" ... is rejected: generics are not supported. *)
 
 BindingStmt     ::= ( "local" | "const" | "global" ) BindingDecl { "," BindingDecl }
 BindingDecl     ::= IDENTIFIER [ ":" TypeExpr ] [ "=" Expr ]
@@ -191,6 +197,7 @@ PrimitiveType   ::= "any" | "nil" | "void" | "never"
                   | "buffer"
                   | "thread"
                   | IDENTIFIER
+                  | IDENTIFIER "." IDENTIFIER   (* qualified: not checked *)
 
 ArrayType       ::= "[" TypeExpr "]"
                   | "{" TypeExpr "}"
@@ -206,6 +213,8 @@ FunctionType    ::= "(" [ ParamTypeList ] ")" "->" TypeExpr
 ParamTypeList   ::= ParamType { "," ParamType }
 ParamType       ::= [ IDENTIFIER ":" ] TypeExpr
 ```
+
+A `TypeAliasStmt` names a type for its scope (blocks scope aliases like locals; forward and recursive references are allowed, a recursive reference is treated as `any`). It is erased before code generation. An `IDENTIFIER` that no alias declares, and any qualified name, is an unchecked named type.
 
 ### 4.2 Subtyping and Assignability Rules
 1. **Reflexivity**: For any type `T`, `T <: T`.

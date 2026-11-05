@@ -53,6 +53,29 @@ local function area(w: number, h: number?): number
 end
 ```
 
+### Type declarations
+
+`type Name = ...` gives a type a name. The name can then be used in any annotation in its scope, and it is checked like the type it stands for:
+
+```lua
+type Point = { x: number, y: number }
+type Id = number | string
+type Tree = { children: {Tree}, label: string }   -- may refer to itself
+
+local p: Point = { x = 1, y = 2 }
+local bad: Point = 5                               -- rejected
+```
+
+- An alias follows the same scoping as a `local`: one declared inside a block is visible only there and may shadow an outer one. Declaring the same name twice in one scope, or a built-in type name such as `string`, is an error.
+- Aliases may be used before their declaration in the same block, and may refer to each other. A reference back to an alias that is still being expanded (a recursive type) is not checked any further.
+- The right-hand side may continue on the following lines, either inside `{ }` or after a leading or trailing `|` or `->`.
+- Generic aliases (`type Box<T> = ...`) are not supported yet and are a compile error.
+- A declaration is erased when the program is compiled: it produces no code and no value.
+- A name that no `type` declares, such as `Window` in `self: Window`, is still accepted without being checked, as before.
+- A qualified name such as `ui.Event` may be used wherever a type is allowed (`local e: ui.Event`, `{ui.Event}`, `-> ui.Window`). Qualified names are not checked by the compiler, which never reads other files; see [Modules](modules.md#exporting-types).
+
+`type` and `export` are only keywords at the start of a declaration, `type <Name> =` or `export type <Name> =`. Everywhere else they are ordinary names: `type(x)` is still the builtin, and `local type = 1`, `export = 1` and `export.foo()` mean what they always did.
+
 ## Values
 
 - `nil`: the absence of a value. Reading a missing variable field gives `nil`.

@@ -5,6 +5,28 @@ local os = require("@neyuki/os")
 
 local ui = {}
 
+-- Types other files can name as `ui.Event`, `ui.Window`, ... They are erased
+-- at compile time. The handle types are deliberately loose (any table): this
+-- file is not type checked, and a precise shape would only start rejecting
+-- code the day it is.
+export type Event = {
+    kind: string,
+    window: any,
+    x: number?,
+    y: number?,
+    key: string?,
+    button: string?,
+    text: string?,
+    path: string?
+}
+export type WindowOptions = { [string]: any }
+export type RunOptions = { fps: (number | string)?, autoClose: boolean? }
+export type Window = { [string]: any }
+export type Canvas = { [string]: any }
+export type Image = { [string]: any }
+export type Font = { [string]: any }
+export type Path = { [string]: any }
+
 -- Windows, drawing and input on top of the `__ui_*` natives in
 -- src/vm/libs/ui.rs (winit, tiny-skia, fontdue and softbuffer: CPU
 -- rendered, one code path for X11, Wayland, macOS and Windows).

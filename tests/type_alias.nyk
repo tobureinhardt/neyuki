@@ -1,0 +1,109 @@
+-- Type declarations: `type Name = ...` and `export type Name = ...`.
+-- They are erased before the program runs; the checker resolves local ones.
+
+type Point = { x: number, y: number }
+type Id = number | string
+type Tree = { children: { Tree }, label: string }
+type Shape = {
+    kind: string,
+    origin: Point,
+}
+type Handler = (event: string, count: number) -> boolean
+export type Config = { name: string?, retries: number }
+
+-- 1. A local alias works wherever an annotation does
+local p: Point = { x = 1, y = 2 }
+assert(p.x == 1 and p.y == 2, "alias on a local")
+
+local id: Id = "abc"
+assert(id == "abc", "union alias")
+
+local shape: Shape = { kind = "dot", origin = p }
+assert(shape.origin.x == 1, "alias that names another alias")
+
+local function norm(pt: Point): number
+    return pt.x * pt.x + pt.y * pt.y
+end
+assert(norm(p) == 5, "alias on a parameter and a return type")
+
+local handler: Handler = function(event: string, count: number): boolean
+    return count > 0
+end
+assert(handler("tick", 1), "function type alias")
+
+-- 2. Forward references and recursive types
+local early: Later = { v = 1 }
+type Later = { v: number }
+assert(early.v == 1, "an alias may be used before its declaration")
+
+local leaf: Tree = { children = {}, label = "leaf" }
+local root: Tree = { children = { leaf }, label = "root" }
+assert(#root.children == 1, "recursive alias terminates")
+
+type A = { b: B, c: B }
+type B = { d: C, e: C }
+type C = { f: A, g: A }
+local deep: A = { b = {}, c = {} }
+assert(deep.b != nil, "mutually recursive aliases terminate")
+
+-- 3. Blocks scope aliases like locals
+do
+    type Point = { name: string }
+    local q: Point = { name = "inner" }
+    assert(q.name == "inner", "inner alias shadows the outer one")
+end
+local again: Point = { x = 3, y = 4 }
+assert(again.y == 4, "outer alias is back after the block")
+
+-- 4. Names no alias declares stay unchecked, as before
+local unknown: SomethingElse = 5
+assert(unknown == 5, "undeclared bare names are permissive")
+
+-- 5. `type` and `export` are only contextual keywords
+do
+    assert(type(1) == "number", "type() still calls the builtin")
+    assert(type("s") == "string", "type() on a string")
+    local type = 1
+    assert(type == 1, "type is a valid local name")
+end
+do
+    local type = 0
+    type = 1
+    assert(type == 1, "type can be assigned")
+end
+do
+    local export = 1
+    assert(export == 1, "export is a valid local name")
+    export = 2
+    assert(export == 2, "export can be assigned")
+end
+do
+    local export = { foo = function() return "foo" end }
+    assert(export.foo() == "foo", "export.foo() is a call")
+end
+
+-- 6. Qualified names in annotations, and exported types of a module
+local shapes = require("fixtures/modules/shapes")
+local v: shapes.Vec = { x = 3, y = 4 }
+local o: shapes.Options = { name = "x" }
+local missing: shapes.Missing = 5
+assert(shapes.lengthSquared(v) == 25, "module function with an exported type")
+assert(o.name == "x", "qualified annotation on a local")
+assert(missing == 5, "qualified names are not checked by the compiler")
+
+local function scale(a: shapes.Vec, k: number): shapes.Vec
+    return { x = a.x * k, y = a.y * k }
+end
+assert(scale(v, 2).x == 6, "qualified names in parameters and returns")
+
+-- 7. Declarations leave no trace in what `require` returns
+local members = 0
+for _ in pairs(shapes) do
+    members += 1
+end
+assert(members == 1, "only the module's own values are exported")
+assert(type(shapes) == "table", "require result is unchanged")
+
+local cfg: Config = { retries = 2 }
+assert(cfg.retries == 2, "exported alias is usable in its own file")
+print("type_alias ok")

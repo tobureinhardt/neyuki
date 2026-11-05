@@ -44,6 +44,9 @@ pub struct Parser {
     pub(crate) span_pool: SpanPool,
     pub(crate) statements_count: usize,
     pub(crate) case_colon_pos: Option<usize>,
+    /// Set while the next statement is one of the file's own, so `export type`
+    /// can tell it from one nested in a block.
+    pub(crate) top_level_stmt: bool,
 }
 
 impl Parser {
@@ -61,6 +64,7 @@ impl Parser {
             span_pool: SpanPool::new(),
             statements_count: 0,
             case_colon_pos: None,
+            top_level_stmt: false,
         }
     }
 
@@ -79,6 +83,7 @@ impl Parser {
                 span_pool: SpanPool::new(),
                 statements_count: 0,
                 case_colon_pos: None,
+                top_level_stmt: false,
             },
             comments,
         )
@@ -178,6 +183,7 @@ impl Parser {
                 continue;
             }
 
+            self.top_level_stmt = true;
             program.push(self.parse_statement()?);
             self.consume_semicolon_if_any();
         }

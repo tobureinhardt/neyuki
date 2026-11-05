@@ -104,7 +104,11 @@ pub fn walk_stmt<V: AstVisitor + ?Sized>(visitor: &mut V, stmt: &Stmt) {
         Stmt::Expr { expr, .. } => {
             visitor.visit_expr(expr);
         }
-        Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Goto { .. } | Stmt::Label { .. } => {}
+        Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Goto { .. }
+        | Stmt::Label { .. }
+        | Stmt::TypeAlias { .. } => {}
     }
 }
 

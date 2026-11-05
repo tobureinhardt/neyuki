@@ -861,6 +861,7 @@ fn fold_stmt_scoped(stmt: Stmt, shadowed: &mut HashSet<String>) -> Option<Stmt> 
         Stmt::Continue { id } => Some(Stmt::Continue { id }),
         Stmt::Goto { label, id } => Some(Stmt::Goto { label, id }),
         Stmt::Label { name, id } => Some(Stmt::Label { name, id }),
+        alias @ Stmt::TypeAlias { .. } => Some(alias),
         Stmt::AssignMany {
             targets,
             values,

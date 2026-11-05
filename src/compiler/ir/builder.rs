@@ -1368,6 +1368,8 @@ impl IrBuilder {
                 let target = self.get_or_alloc_label(lbl);
                 self.emit(IrInst::Label(target));
             }
+            // Type declarations are erased: they produce no code.
+            Stmt::TypeAlias { .. } => {}
         }
     }
 

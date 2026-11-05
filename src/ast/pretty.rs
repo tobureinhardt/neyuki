@@ -199,6 +199,15 @@ pub fn pretty_print_stmt(stmt: &Stmt, indent: usize) -> String {
         Stmt::Continue { .. } => format!("{}continue", pad),
         Stmt::Goto { label, .. } => format!("{}goto {}", pad, label),
         Stmt::Label { name, .. } => format!("{}::{}::", pad, name),
+        Stmt::TypeAlias {
+            name, exported, ty, ..
+        } => format!(
+            "{}{}type {} = {}",
+            pad,
+            if *exported { "export " } else { "" },
+            name,
+            ty
+        ),
         Stmt::Expr { expr, .. } => format!("{}{}", pad, pretty_print_expr(expr)),
     }
 }

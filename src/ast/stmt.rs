@@ -3,6 +3,7 @@
 use crate::ast::expr::{Expr, Param};
 use crate::ast::node_id::NodeId;
 use crate::ast::pattern::AssignTarget;
+use crate::ast::span::Span;
 
 #[derive(Clone, Debug, Eq)]
 pub enum Stmt {
@@ -89,6 +90,17 @@ pub enum Stmt {
     },
     Expr {
         expr: Expr,
+        id: NodeId,
+    },
+    /// `type Name = ...` or `export type Name = ...`. Erased before code
+    /// generation: it exists for the checker and for tooling.
+    TypeAlias {
+        name: String,
+        exported: bool,
+        /// The aliased type as source text, like every other annotation.
+        ty: String,
+        /// Where `name` is written, for go-to-definition and diagnostics.
+        name_span: Span,
         id: NodeId,
     },
 }
@@ -289,6 +301,20 @@ impl PartialEq for Stmt {
             (Stmt::Goto { label: la, .. }, Stmt::Goto { label: lb, .. }) => la == lb,
             (Stmt::Label { name: na, .. }, Stmt::Label { name: nb, .. }) => na == nb,
             (Stmt::Expr { expr: ea, .. }, Stmt::Expr { expr: eb, .. }) => ea == eb,
+            (
+                Stmt::TypeAlias {
+                    name: na,
+                    exported: xa,
+                    ty: ta,
+                    ..
+                },
+                Stmt::TypeAlias {
+                    name: nb,
+                    exported: xb,
+                    ty: tb,
+                    ..
+                },
+            ) => na == nb && xa == xb && ta == tb,
             _ => false,
         }
     }
@@ -313,6 +339,7 @@ impl Stmt {
             | Stmt::Continue { id }
             | Stmt::Goto { id, .. }
             | Stmt::Label { id, .. }
+            | Stmt::TypeAlias { id, .. }
             | Stmt::Expr { id, .. } => *id,
         }
     }

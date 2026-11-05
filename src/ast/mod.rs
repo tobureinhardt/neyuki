@@ -15,7 +15,7 @@ pub mod ty;
 pub mod visitor;
 pub mod visitor_mut;
 
-pub use decl::Decl;
+pub use decl::{Decl, ExportedType, exported_types};
 pub use expr::{Expr, InterpPart, Param, TableEntry};
 pub use fold::{AstFolder, walk_fold_expr, walk_fold_stmt};
 pub use literal::Literal;

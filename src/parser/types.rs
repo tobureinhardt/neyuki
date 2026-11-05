@@ -8,7 +8,23 @@ pub struct TypeParserEngine;
 impl TypeParserEngine {
     /// Reads raw string type annotation tokens until the next statement delimiter.
     pub fn read_type_annotation(parser: &mut Parser) -> String {
-        let mut parts = Vec::new();
+        join_type_tokens(&Self::read_type_tokens(parser, false))
+    }
+
+    /// Like `read_type_annotation`, for the right side of a `type` alias:
+    /// the type may continue on the next line after an operator or before
+    /// one, and the text is laid out as it is usually written.
+    pub fn read_alias_type(parser: &mut Parser) -> String {
+        let mut parts = Self::read_type_tokens(parser, true);
+        // `type T =` may put a `|` before the first variant.
+        if parts.first().is_some_and(|p| p == "|") {
+            parts.remove(0);
+        }
+        pretty_type_tokens(&parts)
+    }
+
+    fn read_type_tokens(parser: &mut Parser, continue_lines: bool) -> Vec<String> {
+        let mut parts: Vec<String> = Vec::new();
         let mut braces = 0usize;
         let mut brackets = 0usize;
         let mut parens = 0usize;
@@ -23,7 +39,14 @@ impl TypeParserEngine {
                 && parens == 0
                 && last_line.is_some_and(|line| line != token.line)
             {
-                break;
+                let joins = continue_lines
+                    && (parts
+                        .last()
+                        .is_some_and(|p| matches!(p.as_str(), "|" | "->"))
+                        || (token.kind == "symbol" && matches!(token.value.as_str(), "|" | "->")));
+                if !joins {
+                    break;
+                }
             }
             // Types never put two names side by side, so a name right after a
             // complete type starts the body: `function f(): () x = 1 end`.
@@ -86,7 +109,7 @@ impl TypeParserEngine {
             }
             parts.push(parser.advance_token().value);
         }
-        parts.join(" ")
+        parts
     }
 
     /// Parses a structured `TypeExpr` from the current token stream.
@@ -99,8 +122,44 @@ impl TypeParserEngine {
     }
 }
 
+/// Joins type tokens with spaces, keeping `m.Foo` together.
+fn join_type_tokens(parts: &[String]) -> String {
+    let mut out = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        let glued = part == "." || (i > 0 && parts[i - 1] == ".");
+        if i > 0 && !glued {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    out
+}
+
+/// Lays type tokens out the way a type is written: `{ x: number, y: number }`,
+/// `(a: number) -> string?`.
+fn pretty_type_tokens(parts: &[String]) -> String {
+    let mut out = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            let prev = parts[i - 1].as_str();
+            let tight = matches!(part.as_str(), "," | ":" | ")" | "]" | "?" | ".")
+                || matches!(prev, "(" | "[" | "." | "...")
+                || (prev == "{" && part == "}");
+            if !tight {
+                out.push(' ');
+            }
+        }
+        out.push_str(part);
+    }
+    out
+}
+
 pub fn read_type_annotation(parser: &mut Parser) -> String {
     TypeParserEngine::read_type_annotation(parser)
+}
+
+pub fn read_alias_type(parser: &mut Parser) -> String {
+    TypeParserEngine::read_alias_type(parser)
 }
 
 pub fn parse_type_expr(parser: &mut Parser) -> Result<TypeExpr, String> {

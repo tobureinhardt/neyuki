@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::ast::ty::TypeExpr;
 use crate::diagnostics::span::Span;
 use crate::sema::symbol::Symbol;
 
@@ -13,9 +14,18 @@ pub enum ScopeKind {
     Loop,
 }
 
+/// A `type Name = ...` declared in a scope.
+pub struct TypeAlias {
+    pub ty: TypeExpr,
+    pub span: Span,
+}
+
 pub struct Scope {
     pub kind: ScopeKind,
     pub symbols: HashMap<String, Symbol>,
+    /// Type names live apart from variables: `type Point` and `local Point`
+    /// may both exist.
+    pub types: HashMap<String, TypeAlias>,
 }
 
 impl Scope {
@@ -23,6 +33,7 @@ impl Scope {
         Self {
             kind,
             symbols: HashMap::new(),
+            types: HashMap::new(),
         }
     }
 }
@@ -83,6 +94,31 @@ impl ScopeManager {
         }
         global_scope.symbols.insert(symbol.name.clone(), symbol);
         Ok(())
+    }
+
+    /// Declares a type alias in the current scope. Fails with the span of the
+    /// existing declaration when the scope already has one of that name.
+    pub fn define_type(&mut self, name: &str, alias: TypeAlias) -> Result<(), Span> {
+        let current = self.scopes.last_mut().expect("scope stack cannot be empty");
+        if let Some(existing) = current.types.get(name) {
+            return Err(existing.span);
+        }
+        current.types.insert(name.to_string(), alias);
+        Ok(())
+    }
+
+    /// The innermost alias called `name`.
+    pub fn lookup_type(&self, name: &str) -> Option<&TypeAlias> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.types.get(name))
+    }
+
+    /// Whether any type alias is in scope, so the common case of a program
+    /// without any can skip alias resolution.
+    pub fn has_types(&self) -> bool {
+        self.scopes.iter().any(|scope| !scope.types.is_empty())
     }
 
     pub fn lookup(&self, name: &str) -> Option<&Symbol> {

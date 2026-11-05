@@ -158,6 +158,7 @@ pub fn walk_fold_stmt<F: AstFolder + ?Sized>(folder: &mut F, stmt: Stmt) -> Stmt
         Stmt::Continue { id } => Stmt::Continue { id },
         Stmt::Goto { label, id } => Stmt::Goto { label, id },
         Stmt::Label { name, id } => Stmt::Label { name, id },
+        alias @ Stmt::TypeAlias { .. } => alias,
     }
 }
 

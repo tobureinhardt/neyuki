@@ -847,4 +847,15 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_format_source_type_declarations() {
+        let src = "export type Options = { name: string?, frame: ((events: {any}, dt: number) -> ())? }\ntype Point = {\n        x: number,\n  y: number,\n    }\nlocal p: Point = { x = 1, y = 2 }\nif true then\ntype Inner = number\nend\n";
+        let formatted = format_source(src).unwrap();
+        assert_eq!(
+            formatted,
+            "export type Options = { name: string?, frame: ((events: {any}, dt: number) -> ())? }\ntype Point = {\n    x: number,\n    y: number,\n}\nlocal p: Point = { x = 1, y = 2 }\nif true then\n    type Inner = number\nend\n"
+        );
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
 }

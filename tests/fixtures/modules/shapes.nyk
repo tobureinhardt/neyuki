@@ -1,0 +1,13 @@
+-- A module that exports types. They are erased: requiring it returns only
+-- the table below.
+export type Vec = { x: number, y: number }
+export type Options = { name: string?, frame: ((events: { any }, dt: number) -> ())? }
+type Hidden = number
+
+local shapes = {}
+
+function shapes.lengthSquared(v: Vec): number
+    return v.x * v.x + v.y * v.y
+end
+
+return shapes

@@ -3,7 +3,7 @@
 use super::Parser;
 use super::action_helper::ActionHelper;
 use super::expr::parse_expr;
-use super::types::read_type_annotation;
+use super::types::{read_alias_type, read_type_annotation};
 use crate::ast::*;
 
 pub fn parse_statement(parser: &mut Parser) -> Result<Stmt, String> {
@@ -87,7 +87,74 @@ fn is_match_statement(parser: &Parser) -> bool {
     true
 }
 
+/// Where a `type Name =` or `export type Name =` declaration starts: whether
+/// it is exported and how many tokens come before `type`. `type` and `export`
+/// stay ordinary names everywhere else (`type(x)`, `export = 1`).
+fn type_decl_start(parser: &Parser) -> Option<(bool, usize)> {
+    let tok = |i: usize| parser.tokens.get(parser.pos + i);
+    let is_word = |t: Option<&crate::lexer::Token>, w: &str| {
+        t.is_some_and(|t| (t.kind == "keyword" || t.kind == "name") && t.value == w)
+    };
+    let (exported, at) = if is_word(tok(0), "export") && is_word(tok(1), "type") {
+        (true, 1)
+    } else if is_word(tok(0), "type") {
+        (false, 0)
+    } else {
+        return None;
+    };
+    let named = tok(at + 1).is_some_and(|t| t.kind == "name");
+    let opens =
+        tok(at + 2).is_some_and(|t| t.kind == "symbol" && matches!(t.value.as_str(), "=" | "<"));
+    (named && opens).then_some((exported, at))
+}
+
+fn parse_type_alias(parser: &mut Parser, exported: bool, at: usize) -> Result<Stmt, String> {
+    let line = parser.peek().line;
+    if exported && !parser.top_level_stmt {
+        return Err(format!(
+            "[line {}] 'export type' is only allowed at the top level of a file",
+            line
+        ));
+    }
+    parser.pos += at + 1;
+    let name_tok = parser.advance_token();
+    let name_span = Span::new(
+        SourceLocation::new(name_tok.line as u32, name_tok.col as u32),
+        SourceLocation::new(
+            name_tok.line as u32,
+            (name_tok.col + name_tok.value.chars().count()) as u32,
+        ),
+    );
+    if parser.check_symbol("<") {
+        return Err(format!(
+            "[line {}] generic type aliases are not supported: '{}' cannot take type parameters",
+            name_tok.line, name_tok.value
+        ));
+    }
+    parser.expect_symbol("=")?;
+    let ty = read_alias_type(parser);
+    if ty.is_empty() {
+        return Err(format!(
+            "[line {}] expected a type after '=' in the declaration of '{}'",
+            name_tok.line, name_tok.value
+        ));
+    }
+    Ok(Stmt::TypeAlias {
+        name: name_tok.value,
+        exported,
+        ty,
+        name_span,
+        id: NodeId::next(),
+    })
+}
+
 pub fn parse_statement_inner(parser: &mut Parser) -> Result<Stmt, String> {
+    // Only the statement the program loop just started is top level.
+    let top_level = std::mem::take(&mut parser.top_level_stmt);
+    if let Some((exported, at)) = type_decl_start(parser) {
+        parser.top_level_stmt = top_level;
+        return parse_type_alias(parser, exported, at);
+    }
     if is_enum_statement(parser) {
         return parse_enum(parser);
     }

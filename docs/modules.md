@@ -31,6 +31,27 @@ end
 return math_utils
 ```
 
+### 1.3 Exporting Types
+`export type Name = ...` makes a type usable by other files as `module.Name`. It is only allowed at the top level of a file (a nested one is a compile error); a plain `type` stays private to its file.
+
+```lua
+-- khione.nyk
+export type Options = { name: string?, frame: ((events: {any}, dt: number) -> ())? }
+type Internal = number        -- not exported
+
+local khione = {}
+function khione.open(options: Options?) end
+return khione
+
+-- main.nyk
+local khione = require("khione")
+local o: khione.Options = { name = "x" }
+```
+
+Type declarations are erased at compile time, so they do not change what a module returns and the module table gets no `Options` field. A qualified name such as `khione.Options` is accepted in any annotation but is not checked: the compiler never reads the required file. Editor tooling uses the file's `export type` declarations to resolve it.
+
+The bundled `@neyuki/ui` module exports `Event`, `Window`, `Canvas`, `Image`, `Font`, `Path`, `WindowOptions` and `RunOptions` this way (`ui.Event`, ...). The handle types are loose tables.
+
 ---
 
 ## 2. Module Resolution (`require`)
