@@ -1,6 +1,6 @@
 [package]
 name = "neyuki"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2024"
 description = "A small Lua-like scripting language implemented in Rust"
 readme = "README.md"
