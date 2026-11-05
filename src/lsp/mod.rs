@@ -6,6 +6,12 @@ use std::io::{self, BufReader, Write};
 use crate::dap_json::{self, Json};
 use crate::diagnostics::severity::Severity;
 
+pub mod analysis;
+pub mod api;
+
+use analysis::Context;
+use api::MemberSource;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoundSymbol {
     pub name: String,
@@ -21,6 +27,9 @@ pub struct LspServer {
     pub is_shutdown: bool,
     pub is_exit: bool,
     pub exit_code: Option<i32>,
+    /// Whether the client accepts snippet syntax in completion items,
+    /// read from the `initialize` request.
+    pub snippet_support: bool,
 }
 
 impl Default for LspServer {
@@ -59,6 +68,7 @@ impl LspServer {
             is_shutdown: false,
             is_exit: false,
             exit_code: None,
+            snippet_support: false,
         }
     }
 
@@ -92,28 +102,62 @@ impl LspServer {
             match method_name {
                 "initialize" => {
                     let req_id = id.cloned().unwrap_or(Json::Num(1.0));
+                    self.snippet_support = matches!(
+                        json.get("params")
+                            .and_then(|p| p.get("capabilities"))
+                            .and_then(|c| c.get("textDocument"))
+                            .and_then(|t| t.get("completion"))
+                            .and_then(|c| c.get("completionItem"))
+                            .and_then(|i| i.get("snippetSupport")),
+                        Some(Json::Bool(true))
+                    );
+                    let triggers = |chars: &[&str]| {
+                        Json::Arr(chars.iter().map(|c| Json::Str(c.to_string())).collect())
+                    };
                     let resp = json_response(
                         req_id,
-                        Json::Obj(vec![(
-                            "capabilities".to_string(),
-                            Json::Obj(vec![
-                                ("textDocumentSync".to_string(), Json::Num(1.0)),
-                                ("documentFormattingProvider".to_string(), Json::Bool(true)),
-                                ("hoverProvider".to_string(), Json::Bool(true)),
-                                (
-                                    "completionProvider".to_string(),
-                                    Json::Obj(vec![(
-                                        "triggerCharacters".to_string(),
-                                        Json::Arr(vec![
-                                            Json::Str(".".to_string()),
-                                            Json::Str(":".to_string()),
+                        Json::Obj(vec![
+                            (
+                                "capabilities".to_string(),
+                                Json::Obj(vec![
+                                    ("textDocumentSync".to_string(), Json::Num(1.0)),
+                                    ("documentFormattingProvider".to_string(), Json::Bool(true)),
+                                    ("hoverProvider".to_string(), Json::Bool(true)),
+                                    (
+                                        "completionProvider".to_string(),
+                                        // The quotes and the slash start module names
+                                        // inside `require("`.
+                                        Json::Obj(vec![(
+                                            "triggerCharacters".to_string(),
+                                            triggers(&[".", ":", "\"", "'", "/"]),
+                                        )]),
+                                    ),
+                                    (
+                                        "signatureHelpProvider".to_string(),
+                                        Json::Obj(vec![
+                                            (
+                                                "triggerCharacters".to_string(),
+                                                triggers(&["(", ","]),
+                                            ),
+                                            ("retriggerCharacters".to_string(), triggers(&[","])),
                                         ]),
-                                    )]),
-                                ),
-                                ("definitionProvider".to_string(), Json::Bool(true)),
-                                ("documentSymbolProvider".to_string(), Json::Bool(true)),
-                            ]),
-                        )]),
+                                    ),
+                                    ("definitionProvider".to_string(), Json::Bool(true)),
+                                    ("documentSymbolProvider".to_string(), Json::Bool(true)),
+                                ]),
+                            ),
+                            // Editors read the version to know which Neyuki they talk to.
+                            (
+                                "serverInfo".to_string(),
+                                Json::Obj(vec![
+                                    ("name".to_string(), Json::Str("neyuki".to_string())),
+                                    (
+                                        "version".to_string(),
+                                        Json::Str(env!("CARGO_PKG_VERSION").to_string()),
+                                    ),
+                                ]),
+                            ),
+                        ]),
                     );
                     return Some(dap_json::render_json(&resp).into_bytes());
                 }
@@ -268,7 +312,7 @@ impl LspServer {
                     let (uri, line, character) = parse_text_document_position(&json);
                     let cached = self.last_valid_symbols.get(uri).map(|s| s.as_slice());
                     let result = if let Some(content) = self.documents.get(uri) {
-                        handle_hover(content, line, character, cached)
+                        handle_hover(content, line, character, cached, api::api())
                     } else {
                         Json::Null
                     };
@@ -281,12 +325,31 @@ impl LspServer {
                     let (uri, line, character) = parse_text_document_position(&json);
                     let cached = self.last_valid_symbols.get(uri).map(|s| s.as_slice());
                     let items = if let Some(content) = self.documents.get(uri) {
-                        handle_completion(content, line, character, cached)
+                        handle_completion(
+                            content,
+                            line,
+                            character,
+                            cached,
+                            self.snippet_support,
+                            api::api(),
+                        )
                     } else {
                         Json::Arr(Vec::new())
                     };
 
                     let resp = json_response(req_id, items);
+                    return Some(dap_json::render_json(&resp).into_bytes());
+                }
+                "textDocument/signatureHelp" => {
+                    let req_id = id.cloned().unwrap_or(Json::Null);
+                    let (uri, line, character) = parse_text_document_position(&json);
+                    let result = if let Some(content) = self.documents.get(uri) {
+                        analysis::signature_help(content, line, character, api::api())
+                    } else {
+                        Json::Null
+                    };
+
+                    let resp = json_response(req_id, result);
                     return Some(dap_json::render_json(&resp).into_bytes());
                 }
                 "textDocument/definition" => {
@@ -594,32 +657,14 @@ fn handle_hover(
     line: usize,
     character: usize,
     cached_symbols: Option<&[FoundSymbol]>,
+    src: &dyn MemberSource,
 ) -> Json {
-    if let Some(word) = get_word_at_position(content, line, character)
-        && let Some((sig, desc)) = lookup_docs(&word)
-    {
-        let markdown = format!("```neyuki\n{}\n```\n{}", sig, desc);
-        return Json::Obj(vec![(
-            "contents".to_string(),
-            Json::Obj(vec![
-                ("kind".to_string(), Json::Str("markdown".to_string())),
-                ("value".to_string(), Json::Str(markdown)),
-            ]),
-        )]);
+    // The standard library first, then what the document declares.
+    if let Some(hover) = analysis::hover(content, line, character, src) {
+        return hover;
     }
 
     if let Some(ident) = get_ident_at_position(content, line, character) {
-        if let Some((sig, desc)) = lookup_docs(&ident) {
-            let markdown = format!("```neyuki\n{}\n```\n{}", sig, desc);
-            return Json::Obj(vec![(
-                "contents".to_string(),
-                Json::Obj(vec![
-                    ("kind".to_string(), Json::Str("markdown".to_string())),
-                    ("value".to_string(), Json::Str(markdown)),
-                ]),
-            )]);
-        }
-
         let parsed_symbols = extract_document_symbols(content);
         let symbols = if !parsed_symbols.is_empty() {
             parsed_symbols
@@ -772,878 +817,130 @@ fn handle_document_symbols(content: &str, cached_symbols: Option<&[FoundSymbol]>
     Json::Arr(symbol_objs)
 }
 
-pub(crate) const OS_METHODS: &[(&str, &str, &str)] = &[
-    (
-        "clock",
-        "os.clock(): float",
-        "Returns an approximation of the amount in seconds of CPU time used by the program.",
-    ),
-    (
-        "time",
-        "os.time(): int",
-        "Returns the current time in seconds since the UNIX epoch.",
-    ),
-    (
-        "date",
-        "os.date(format?: string, time?: int): string | table",
-        "Formats date and time string or returns date table.",
-    ),
-    (
-        "difftime",
-        "os.difftime(t2: int, t1: int): int",
-        "Returns difference in seconds between two timestamps.",
-    ),
-    (
-        "getenv",
-        "os.getenv(varname: string): string | nil",
-        "Returns the value of the environment variable, or nil if undefined.",
-    ),
-    (
-        "sleep",
-        "os.sleep(seconds: number): void",
-        "Suspends execution for specified duration in seconds.",
-    ),
-    (
-        "exit",
-        "os.exit(code?: int): void",
-        "Terminates the host process with an exit status code.",
-    ),
-    (
-        "args",
-        "os.args: {string}",
-        "Command-line arguments passed to the script.",
-    ),
-    (
-        "run",
-        "os.run(command: string, options?: { stdin?: string, timeout?: int }): { stdout: string, stderr: string, code: int, success: boolean }",
-        "Executes an external system command.",
-    ),
-    (
-        "app",
-        "os.app(): { bundled: boolean, name: string?, version: string?, identifier: string? }",
-        "Describes the app built with `neyuki build` that is running; `bundled` is false under `neyuki run`.",
-    ),
-    (
-        "dataDir",
-        "os.dataDir(appName: string): string",
-        "The per-user directory for an app's own files, created if missing.",
-    ),
-    (
-        "configDir",
-        "os.configDir(appName: string): string",
-        "The per-user directory for an app's settings, created if missing.",
-    ),
-    (
-        "cacheDir",
-        "os.cacheDir(appName: string): string",
-        "The per-user directory for files an app can rebuild, created if missing.",
-    ),
-    (
-        "protect",
-        "os.protect(data: string): string",
-        "Seals data so only the current user on this machine can read it back.",
-    ),
-    (
-        "unprotect",
-        "os.unprotect(blob: string): string",
-        "The string os.protect sealed into blob.",
-    ),
-];
-
-pub(crate) const STRING_METHODS: &[(&str, &str, &str)] = &[
-    (
-        "byte",
-        "string.byte(s: string, i?: int, j?: int): ...int",
-        "Returns internal numeric codes of characters.",
-    ),
-    (
-        "char",
-        "string.char(...codes: int): string",
-        "Returns string with characters of given numeric codes.",
-    ),
-    (
-        "count",
-        "string.count(s: string, pattern: string): int",
-        "Counts non-overlapping occurrences of pattern.",
-    ),
-    (
-        "endswith",
-        "string.endswith(s: string, suffix: string): boolean",
-        "Returns true if string ends with suffix.",
-    ),
-    (
-        "find",
-        "string.find(s: string, pattern: string, init?: int, plain?: boolean): (int, int) | nil",
-        "Searches for first match of pattern.",
-    ),
-    (
-        "format",
-        "string.format(fmt: string, ...args: any): string",
-        "Formats values according to format specifier.",
-    ),
-    (
-        "gmatch",
-        "string.gmatch(s: string, pattern: string): () -> ...string",
-        "Returns iterator over pattern matches.",
-    ),
-    (
-        "gsub",
-        "string.gsub(s: string, pattern: string, repl: any, n?: int): (string, int)",
-        "Replaces matches of pattern.",
-    ),
-    (
-        "len",
-        "string.len(s: string): int",
-        "Returns length of string in bytes.",
-    ),
-    (
-        "lower",
-        "string.lower(s: string): string",
-        "Converts string to lowercase.",
-    ),
-    (
-        "ltrim",
-        "string.ltrim(s: string): string",
-        "Trims leading whitespace.",
-    ),
-    (
-        "match",
-        "string.match(s: string, pattern: string, init?: int): any",
-        "Extracts pattern captures from string.",
-    ),
-    (
-        "pack",
-        "string.pack(fmt: string, ...values: any): string",
-        "Packs values into binary string according to format.",
-    ),
-    (
-        "packsize",
-        "string.packsize(fmt: string): int",
-        "Returns size of binary string for given format.",
-    ),
-    (
-        "rep",
-        "string.rep(s: string, n: int, sep?: string): string",
-        "Repeats string n times.",
-    ),
-    (
-        "reverse",
-        "string.reverse(s: string): string",
-        "Reverses characters in string.",
-    ),
-    (
-        "rtrim",
-        "string.rtrim(s: string): string",
-        "Trims trailing whitespace.",
-    ),
-    (
-        "split",
-        "string.split(s: string, sep?: string): {string}",
-        "Splits string by separator into a list of strings.",
-    ),
-    (
-        "startswith",
-        "string.startswith(s: string, prefix: string): boolean",
-        "Returns true if string starts with prefix.",
-    ),
-    (
-        "sub",
-        "string.sub(s: string, i: int, j?: int): string",
-        "Returns substring from index i to j.",
-    ),
-    (
-        "trim",
-        "string.trim(s: string): string",
-        "Trims leading and trailing whitespace.",
-    ),
-    (
-        "unpack",
-        "string.unpack(fmt: string, s: string, pos?: int): ...any",
-        "Unpacks values from binary string according to format.",
-    ),
-    (
-        "upper",
-        "string.upper(s: string): string",
-        "Converts string to uppercase.",
-    ),
-];
-
-pub(crate) const TABLE_METHODS: &[(&str, &str, &str)] = &[
-    (
-        "clear",
-        "table.clear(t: table): void",
-        "Clears all elements in table.",
-    ),
-    (
-        "clone",
-        "table.clone(t: table): table",
-        "Creates a shallow clone of table.",
-    ),
-    (
-        "concat",
-        "table.concat(list: table, sep?: string, i?: int, j?: int): string",
-        "Concatenates table elements into a string.",
-    ),
-    (
-        "create",
-        "table.create(count: int, val?: any): table",
-        "Creates table preallocated with count elements.",
-    ),
-    (
-        "find",
-        "table.find(t: table, val: any, init?: int): any",
-        "Finds first index of value in table.",
-    ),
-    (
-        "freeze",
-        "table.freeze(t: table): table",
-        "Freezes a table, making it read-only.",
-    ),
-    (
-        "insert",
-        "table.insert(list: table, [pos: int,] val: any): void",
-        "Inserts value into list at position.",
-    ),
-    (
-        "isfrozen",
-        "table.isfrozen(t: table): boolean",
-        "Returns true if table is frozen.",
-    ),
-    (
-        "keys",
-        "table.keys(t: table): {any}",
-        "Returns list of all keys in table.",
-    ),
-    (
-        "length",
-        "table.length(t: table): int",
-        "Returns number of elements in table.",
-    ),
-    (
-        "move",
-        "table.move(a1: table, f: int, e: int, t: int, a2?: table): table",
-        "Moves range of elements.",
-    ),
-    (
-        "pack",
-        "table.pack(...args: any): table",
-        "Packs arguments into a table with field n.",
-    ),
-    (
-        "remove",
-        "table.remove(list: table, pos?: int): any",
-        "Removes element at pos from list.",
-    ),
-    (
-        "sort",
-        "table.sort(list: table, comp?: function): void",
-        "Sorts table in place.",
-    ),
-    (
-        "unpack",
-        "table.unpack(list: table, i?: int, j?: int): ...any",
-        "Unpacks elements of table into multiple values.",
-    ),
-    (
-        "values",
-        "table.values(t: table): {any}",
-        "Returns list of all values in table.",
-    ),
-];
-
-pub(crate) const MATH_METHODS: &[(&str, &str, &str)] = &[
-    (
-        "abs",
-        "math.abs(x: number): number",
-        "Returns absolute value.",
-    ),
-    ("acos", "math.acos(x: number): float", "Returns arc cosine."),
-    ("asin", "math.asin(x: number): float", "Returns arc sine."),
-    (
-        "atan",
-        "math.atan(x: number): float",
-        "Returns arc tangent.",
-    ),
-    (
-        "atan2",
-        "math.atan2(y: number, x: number): float",
-        "Returns arc tangent of y/x.",
-    ),
-    ("cbrt", "math.cbrt(x: number): float", "Returns cube root."),
-    (
-        "ceil",
-        "math.ceil(x: number): int",
-        "Returns smallest integer greater than or equal to x.",
-    ),
-    (
-        "clamp",
-        "math.clamp(x: number, min: number, max: number): number",
-        "Clamps value between min and max.",
-    ),
-    ("cos", "math.cos(x: number): float", "Returns cosine."),
-    (
-        "cosh",
-        "math.cosh(x: number): float",
-        "Returns hyperbolic cosine.",
-    ),
-    (
-        "deg",
-        "math.deg(x: number): float",
-        "Converts radians to degrees.",
-    ),
-    (
-        "exp",
-        "math.exp(x: number): float",
-        "Returns e raised to power x.",
-    ),
-    (
-        "floor",
-        "math.floor(x: number): int",
-        "Returns largest integer less than or equal to x.",
-    ),
-    (
-        "fmod",
-        "math.fmod(x: number, y: number): number",
-        "Returns floating-point remainder of x/y.",
-    ),
-    (
-        "frexp",
-        "math.frexp(x: number): (float, int)",
-        "Decomposes number into mantissa and exponent.",
-    ),
-    (
-        "isfinite",
-        "math.isfinite(x: number): boolean",
-        "Returns true if value is finite.",
-    ),
-    (
-        "isinf",
-        "math.isinf(x: number): boolean",
-        "Returns true if value is infinite.",
-    ),
-    (
-        "isnan",
-        "math.isnan(x: number): boolean",
-        "Returns true if value is NaN.",
-    ),
-    (
-        "ldexp",
-        "math.ldexp(m: number, e: int): float",
-        "Returns m * 2^e.",
-    ),
-    (
-        "lerp",
-        "math.lerp(a: number, b: number, t: number): number",
-        "Linear interpolation between a and b.",
-    ),
-    (
-        "log",
-        "math.log(x: number, base?: number): float",
-        "Returns logarithm of x.",
-    ),
-    (
-        "log10",
-        "math.log10(x: number): float",
-        "Returns base-10 logarithm of x.",
-    ),
-    (
-        "log2",
-        "math.log2(x: number): float",
-        "Returns base-2 logarithm of x.",
-    ),
-    (
-        "map",
-        "math.map(x: number, in_min: number, in_max: number, out_min: number, out_max: number): number",
-        "Maps number from one range to another.",
-    ),
-    (
-        "max",
-        "math.max(...x: number): number",
-        "Returns maximum value.",
-    ),
-    (
-        "min",
-        "math.min(...x: number): number",
-        "Returns minimum value.",
-    ),
-    (
-        "modf",
-        "math.modf(x: number): (int, float)",
-        "Splits number into integral and fractional parts.",
-    ),
-    (
-        "noise",
-        "math.noise(x: number, y?: number, z?: number): float",
-        "Perlin noise generator.",
-    ),
-    (
-        "pow",
-        "math.pow(x: number, y: number): number",
-        "Returns x raised to power y.",
-    ),
-    (
-        "rad",
-        "math.rad(x: number): float",
-        "Converts degrees to radians.",
-    ),
-    (
-        "random",
-        "math.random(m?: int, n?: int): number",
-        "Generates pseudo-random number.",
-    ),
-    (
-        "randomseed",
-        "math.randomseed(x: int): void",
-        "Sets random generator seed.",
-    ),
-    (
-        "round",
-        "math.round(x: number): int",
-        "Rounds to nearest integer.",
-    ),
-    (
-        "sign",
-        "math.sign(x: number): int",
-        "Returns sign of x (-1, 0, or 1).",
-    ),
-    ("sin", "math.sin(x: number): float", "Returns sine."),
-    (
-        "sinh",
-        "math.sinh(x: number): float",
-        "Returns hyperbolic cosine.",
-    ),
-    (
-        "sqrt",
-        "math.sqrt(x: number): float",
-        "Returns square root.",
-    ),
-    ("tan", "math.tan(x: number): float", "Returns tangent."),
-    (
-        "tanh",
-        "math.tanh(x: number): float",
-        "Returns hyperbolic tangent.",
-    ),
-    (
-        "trunc",
-        "math.trunc(x: number): int",
-        "Truncates toward zero.",
-    ),
-    ("huge", "math.huge: float", "Positive infinity."),
-    ("pi", "math.pi: float", "Value of Pi."),
-    ("tau", "math.tau: float", "Value of Tau (2 * Pi)."),
-    ("e", "math.e: float", "Euler's number."),
-    ("phi", "math.phi: float", "Golden ratio."),
-    ("sqrt2", "math.sqrt2: float", "Square root of 2."),
-    ("nan", "math.nan: float", "NaN value."),
-];
-
-pub(crate) const TASK_METHODS: &[(&str, &str, &str)] = &[
-    (
-        "spawn",
-        "task.spawn(f: function | thread, ...args: any): thread",
-        "Runs f as a task right away, until it first waits or yields.",
-    ),
-    (
-        "defer",
-        "task.defer(f: function | thread, ...args: any): thread",
-        "Runs f as a task on the next scheduler pass.",
-    ),
-    (
-        "delay",
-        "task.delay(seconds: number, f: function | thread, ...args: any): thread",
-        "Runs f as a task once seconds have passed.",
-    ),
-    (
-        "wait",
-        "task.wait(seconds?: number): number",
-        "Suspends the current task for seconds and returns the time actually waited.",
-    ),
-    (
-        "cancel",
-        "task.cancel(thread: thread)",
-        "Unschedules a task and closes its coroutine.",
-    ),
-];
-
-pub(crate) const COROUTINE_METHODS: &[(&str, &str, &str)] = &[
-    (
-        "create",
-        "coroutine.create(f: function): thread",
-        "Creates a new coroutine.",
-    ),
-    (
-        "resume",
-        "coroutine.resume(co: thread, ...args: any): (boolean, ...any)",
-        "Resumes coroutine execution.",
-    ),
-    (
-        "yield",
-        "coroutine.yield(...values: any): ...any",
-        "Suspends coroutine execution.",
-    ),
-    (
-        "status",
-        "coroutine.status(co: thread): string",
-        "Returns coroutine status.",
-    ),
-    (
-        "running",
-        "coroutine.running(): thread | nil",
-        "Returns currently running coroutine.",
-    ),
-    (
-        "wrap",
-        "coroutine.wrap(f: function): function",
-        "Creates function that resumes coroutine on each call.",
-    ),
-    (
-        "isyieldable",
-        "coroutine.isyieldable(): boolean",
-        "Returns true if coroutine can yield.",
-    ),
-    (
-        "close",
-        "coroutine.close(co: thread): (boolean, string?)",
-        "Closes coroutine, releasing resources.",
-    ),
-];
-
-pub(crate) const JSON_METHODS: &[(&str, &str, &str)] = &[
-    (
-        "encode",
-        "json.encode(val: any): string",
-        "Encodes Neyuki value to JSON string.",
-    ),
-    (
-        "decode",
-        "json.decode(s: string): any",
-        "Decodes JSON string to Neyuki value.",
-    ),
-    (
-        "array",
-        "json.array(t: table): table",
-        "Marks table to serialize as JSON array.",
-    ),
-    ("null", "json.null: any", "JSON null sentinel value."),
-];
-
-pub(crate) const FS_METHODS: &[(&str, &str, &str)] = &[
-    (
-        "open",
-        "fs.open(path: string, mode?: string): File",
-        "Opens a file handle.",
-    ),
-    (
-        "read",
-        "fs.read(path: string): string",
-        "Reads file contents as a string.",
-    ),
-    (
-        "write",
-        "fs.write(path: string, text: string): void",
-        "Writes text to file.",
-    ),
-    (
-        "append",
-        "fs.append(path: string, text: string): void",
-        "Appends text to file.",
-    ),
-    (
-        "lines",
-        "fs.lines(path: string): () -> string?",
-        "Iterates over lines in file.",
-    ),
-    (
-        "exists",
-        "fs.exists(path: string): boolean",
-        "Returns true if file exists.",
-    ),
-    (
-        "isFile",
-        "fs.isFile(path: string): boolean",
-        "Returns true if path is a regular file.",
-    ),
-    (
-        "isDir",
-        "fs.isDir(path: string): boolean",
-        "Returns true if path is a directory.",
-    ),
-    (
-        "info",
-        "fs.info(path: string): FileInfo?",
-        "Returns file information.",
-    ),
-    (
-        "list",
-        "fs.list(path: string): {string}",
-        "Lists directory contents.",
-    ),
-    (
-        "walk",
-        "fs.walk(path: string): {string}",
-        "Recursively walks directory.",
-    ),
-    (
-        "mkdir",
-        "fs.mkdir(path: string, recursive?: boolean): void",
-        "Creates directory.",
-    ),
-    (
-        "remove",
-        "fs.remove(path: string, recursive?: boolean): void",
-        "Removes file or directory.",
-    ),
-    (
-        "rename",
-        "fs.rename(from: string, to: string): void",
-        "Renames file or directory.",
-    ),
-    (
-        "copy",
-        "fs.copy(from: string, to: string): number",
-        "Copies file to destination.",
-    ),
-    (
-        "join",
-        "fs.join(...parts: string): string",
-        "Joins path components.",
-    ),
-    (
-        "basename",
-        "fs.basename(path: string): string",
-        "Returns base name.",
-    ),
-    (
-        "dirname",
-        "fs.dirname(path: string): string",
-        "Returns directory name.",
-    ),
-    (
-        "extension",
-        "fs.extension(path: string): string",
-        "Returns file extension.",
-    ),
-    (
-        "absolute",
-        "fs.absolute(path: string): string",
-        "Returns absolute path.",
-    ),
-    (
-        "cwd",
-        "fs.cwd(): string",
-        "Returns current working directory.",
-    ),
-];
-
-pub(crate) const CRYPTO_METHODS: &[(&str, &str, &str)] = &[
-    (
-        "hash",
-        "crypto.hash(s: string, algorithm?: string, encoding?: string): string",
-        "Computes hash of string.",
-    ),
-    (
-        "hmac",
-        "crypto.hmac(s: string, key: string, algorithm?: string, encoding?: string): string",
-        "Computes HMAC.",
-    ),
-    (
-        "equals",
-        "crypto.equals(a: string, b: string): boolean",
-        "Constant-time string comparison.",
-    ),
-    (
-        "pbkdf2",
-        "crypto.pbkdf2(password: string, salt: string, options?: table): string",
-        "Derives key using PBKDF2.",
-    ),
-    (
-        "hkdf",
-        "crypto.hkdf(key: string, options?: table): string",
-        "Derives key using HKDF.",
-    ),
-    (
-        "hashPassword",
-        "crypto.hashPassword(password: string, options?: table): string",
-        "Hashes password securely.",
-    ),
-    (
-        "verifyPassword",
-        "crypto.verifyPassword(password: string, hash: string): boolean",
-        "Verifies hashed password.",
-    ),
-    (
-        "generateKey",
-        "crypto.generateKey(algorithm?: string, options?: table): string",
-        "Generates symmetric key.",
-    ),
-    (
-        "encrypt",
-        "crypto.encrypt(s: string, key: string, options?: table): string",
-        "Encrypts data.",
-    ),
-    (
-        "decrypt",
-        "crypto.decrypt(s: string, key: string, options?: table): string",
-        "Decrypts data.",
-    ),
-    (
-        "generateKeyPair",
-        "crypto.generateKeyPair(algorithm?: string, options?: table): KeyPair",
-        "Generates asymmetric keypair.",
-    ),
-    (
-        "publicKey",
-        "crypto.publicKey(privateKey: string): string",
-        "Extracts public key from private key.",
-    ),
-    (
-        "sign",
-        "crypto.sign(s: string, privateKey: string, options?: table): string",
-        "Signs data using private key.",
-    ),
-    (
-        "verify",
-        "crypto.verify(s: string, signature: string, publicKey: string, options?: table): boolean",
-        "Verifies signature with public key.",
-    ),
-    (
-        "publicEncrypt",
-        "crypto.publicEncrypt(s: string, publicKey: string, options?: table): string",
-        "Encrypts with public key.",
-    ),
-    (
-        "privateDecrypt",
-        "crypto.privateDecrypt(s: string, privateKey: string, options?: table): string",
-        "Decrypts with private key.",
-    ),
-    (
-        "sharedSecret",
-        "crypto.sharedSecret(privateKey: string, publicKey: string, options?: table): string",
-        "Derives Diffie-Hellman shared secret.",
-    ),
-    (
-        "randomBytes",
-        "crypto.randomBytes(n: number, encoding?: string): string",
-        "Generates CSPRNG random bytes.",
-    ),
-    (
-        "randomInt",
-        "crypto.randomInt(min: number, max?: number): number",
-        "Generates CSPRNG random integer.",
-    ),
-    ("uuid", "crypto.uuid(): string", "Generates UUID v4."),
-    (
-        "encode",
-        "crypto.encode(s: string, encoding: string): string",
-        "Encodes string (hex, base64).",
-    ),
-    (
-        "decode",
-        "crypto.decode(s: string, encoding: string): string",
-        "Decodes string (hex, base64).",
-    ),
-];
-
+/// Completion at a position. What the cursor follows decides the answer
+/// (see `analysis::Context`); the members of namespaces and types come from
+/// `src`, so another source of modules can be consulted next to the
+/// standard library.
 fn handle_completion(
     content: &str,
     line: usize,
     character: usize,
     cached_symbols: Option<&[FoundSymbol]>,
+    snippets: bool,
+    src: &dyn MemberSource,
 ) -> Json {
-    let doc_lines: Vec<&str> = content.lines().collect();
-    let line_str = doc_lines.get(line).unwrap_or(&"");
-    let byte_idx = utf16_col_to_byte_offset(line_str, character);
-    let prefix = &line_str[..byte_idx];
-    let trimmed_prefix = prefix.trim_end();
+    let offset = analysis::offset_at(content, line, character);
+    let context = analysis::completion_context(&content[..offset]);
+    let binds = analysis::bindings(content, src);
 
     let mut items = Vec::new();
-
-    if let Some(dot_idx) = trimmed_prefix.rfind('.') {
-        let before_dot = &trimmed_prefix[..dot_idx];
-        let filter = &trimmed_prefix[dot_idx + 1..];
-        let mod_name = before_dot
-            .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .next()
-            .unwrap_or("");
-
-        let method_list: Option<&[(&str, &str, &str)]> = match mod_name {
-            "os" => Some(OS_METHODS),
-            "string" => Some(STRING_METHODS),
-            "table" => Some(TABLE_METHODS),
-            "math" => Some(MATH_METHODS),
-            "coroutine" => Some(COROUTINE_METHODS),
-            "task" => Some(TASK_METHODS),
-            "json" => Some(JSON_METHODS),
-            "fs" => Some(FS_METHODS),
-            "crypto" => Some(CRYPTO_METHODS),
-            _ => None,
-        };
-
-        if let Some(methods) = method_list {
-            for (name, detail, _) in methods {
-                if filter.is_empty() || name.starts_with(filter) {
-                    items.push(make_completion_item(name, detail, 3));
+    match context {
+        Context::None => {}
+        Context::Module { prefix } => {
+            let start = character.saturating_sub(prefix.len());
+            for lib in src.modules() {
+                if let Some(name) = lib.module.as_deref()
+                    && name.starts_with(&prefix)
+                {
+                    items.push(analysis::library_item(
+                        &lib,
+                        name,
+                        Some((line, start, character)),
+                    ));
                 }
             }
-            return Json::Arr(items);
         }
-    }
-
-    let filter = prefix
-        .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .next()
-        .unwrap_or("");
-
-    for (name, detail) in &[
-        ("print", "print(...)"),
-        ("assert", "assert(cond, msg)"),
-        ("type", "type(val)"),
-        ("checktype", "checktype(val, ty)"),
-        ("asserttype", "asserttype(val, ty)"),
-        ("pcall", "pcall(fn, ...)"),
-        ("xpcall", "xpcall(fn, msgh, ...)"),
-        ("error", "error(msg)"),
-        ("require", "require(mod)"),
-        ("os", "module os"),
-        ("string", "module string"),
-        ("table", "module table"),
-        ("math", "module math"),
-        ("coroutine", "module coroutine"),
-        ("task", "module task"),
-        ("json", "module json"),
-        ("fs", "module fs"),
-        ("crypto", "module crypto"),
-    ] {
-        if filter.is_empty() || name.starts_with(filter) {
-            items.push(make_completion_item(name, detail, 3));
+        Context::Member { chain, prefix } => {
+            let namespace = analysis::canonical(&chain, &binds);
+            for entry in src.namespace_members(&namespace) {
+                if analysis::short_name(&entry.name).starts_with(&prefix) {
+                    items.push(analysis::entry_item(&entry, false, snippets));
+                }
+            }
         }
-    }
-
-    for kw in &[
-        "function", "local", "if", "then", "else", "elseif", "for", "while", "do", "repeat",
-        "until", "return", "break", "continue", "match", "case", "default", "enum", "end",
-    ] {
-        if filter.is_empty() || kw.starts_with(filter) {
-            items.push(make_completion_item(kw, "keyword", 14));
+        Context::Method { receiver, prefix } => {
+            for entry in analysis::methods_for(&receiver, &binds, src) {
+                if analysis::short_name(&entry.name).starts_with(&prefix) {
+                    items.push(analysis::entry_item(&entry, true, snippets));
+                }
+            }
         }
-    }
+        Context::Type { prefix } => {
+            for name in analysis::TYPES {
+                if name.starts_with(&prefix) {
+                    items.push(analysis::word_item(name, "type"));
+                }
+            }
+            for name in src.type_names() {
+                if name.starts_with(&prefix) {
+                    items.push(analysis::word_item(&name, "class"));
+                }
+            }
+        }
+        Context::Global { prefix } => {
+            // Declarations of the document come first, then what is always
+            // in scope: globals, standard libraries and keywords.
+            let parsed_symbols = extract_document_symbols(content);
+            let symbols = if !parsed_symbols.is_empty() {
+                parsed_symbols
+            } else if let Some(cached) = cached_symbols {
+                cached.to_vec()
+            } else {
+                Vec::new()
+            };
 
-    let parsed_symbols = extract_document_symbols(content);
-    let symbols = if !parsed_symbols.is_empty() {
-        parsed_symbols
-    } else if let Some(cached) = cached_symbols {
-        cached.to_vec()
-    } else {
-        Vec::new()
-    };
-
-    for sym in symbols {
-        if filter.is_empty() || sym.name.starts_with(filter) {
-            items.push(make_completion_item(&sym.name, &sym.detail, 6));
+            let mut declared = Vec::new();
+            for sym in symbols {
+                if sym.name.starts_with(&prefix) {
+                    items.push(with_sort_text(
+                        make_completion_item(&sym.name, &sym.detail, 6),
+                        format!("0{}", sym.name),
+                    ));
+                }
+                declared.push(sym.name);
+            }
+            for entry in src.globals() {
+                let name = analysis::short_name(&entry.name);
+                if name.starts_with(&prefix) && !declared.iter().any(|d| d == name) {
+                    items.push(with_sort_text(
+                        analysis::entry_item(&entry, false, snippets),
+                        format!("1{name}"),
+                    ));
+                }
+            }
+            for lib in src.standard_namespaces() {
+                if let Some(name) = lib.module.as_deref()
+                    && name.starts_with(&prefix)
+                {
+                    items.push(with_sort_text(
+                        analysis::library_item(&lib, name, None),
+                        format!("1{name}"),
+                    ));
+                }
+            }
+            for keyword in analysis::KEYWORDS {
+                if keyword.starts_with(&prefix) {
+                    items.push(with_sort_text(
+                        analysis::word_item(keyword, "keyword"),
+                        format!("2{keyword}"),
+                    ));
+                }
+            }
         }
     }
 
     Json::Arr(items)
+}
+
+/// Adds the key clients order completion items by.
+fn with_sort_text(item: Json, sort_text: String) -> Json {
+    match item {
+        Json::Obj(mut fields) => {
+            fields.push(("sortText".to_string(), Json::Str(sort_text)));
+            Json::Obj(fields)
+        }
+        other => other,
+    }
 }
 
 fn make_completion_item(label: &str, detail: &str, kind: usize) -> Json {
@@ -1815,203 +1112,6 @@ fn extract_document_symbols(content: &str) -> Vec<FoundSymbol> {
     symbols
 }
 
-fn lookup_docs(word: &str) -> Option<(&'static str, &'static str)> {
-    if let Some((mod_name, func_name)) = word.split_once('.') {
-        let list: Option<&[(&str, &str, &str)]> = match mod_name {
-            "os" => Some(OS_METHODS),
-            "string" => Some(STRING_METHODS),
-            "table" => Some(TABLE_METHODS),
-            "math" => Some(MATH_METHODS),
-            "coroutine" => Some(COROUTINE_METHODS),
-            "task" => Some(TASK_METHODS),
-            "json" => Some(JSON_METHODS),
-            "fs" => Some(FS_METHODS),
-            "crypto" => Some(CRYPTO_METHODS),
-            _ => None,
-        };
-        if let Some(methods) = list
-            && let Some((_, sig, desc)) = methods.iter().find(|(name, _, _)| *name == func_name)
-        {
-            return Some((*sig, *desc));
-        }
-    }
-
-    match word {
-        "print" => Some((
-            "print(...: any): void",
-            "Prints formatted values to standard output separated by tabs and followed by a newline.",
-        )),
-        "assert" => Some((
-            "assert(v: any, message?: string): any",
-            "Asserts that `v` is truthy (not `nil` or `false`). Raises an error if assertion fails.",
-        )),
-        "type" => Some((
-            "type(v: any): string",
-            "Returns the basic type name of `v` as a string (`\"nil\"`, `\"boolean\"`, `\"number\"`, `\"string\"`, `\"table\"`, `\"function\"`, `\"thread\"`, `\"buffer\"`).",
-        )),
-        "checktype" => Some((
-            "checktype(val: any, expected: string): boolean",
-            "Returns true if `val` conforms to the specified type expression, false otherwise.",
-        )),
-        "asserttype" | "assert_type" => Some((
-            "asserttype(val: any, expected: string): any",
-            "Asserts that `val` conforms to the specified type expression. Raises error `E0210` on mismatch.",
-        )),
-        "pcall" => Some((
-            "pcall(f: function, ...args: any): (boolean, ...any)",
-            "Calls function `f` in protected mode. Catches runtime errors and returns `true` plus results, or `false` plus error message.",
-        )),
-        "xpcall" => Some((
-            "xpcall(f: function, msgh: function, ...args: any): (boolean, ...any)",
-            "Calls function `f` in protected mode with a custom error handler `msgh`.",
-        )),
-        "error" => Some((
-            "error(message: string, level?: int): void",
-            "Terminates the last protected function called and returns `message` as the error object.",
-        )),
-        "setmetatable" => Some((
-            "setmetatable(table: table, metatable: table | nil): table",
-            "Sets the metatable for the given table. If `metatable` is `nil`, removes the metatable.",
-        )),
-        "getmetatable" => Some((
-            "getmetatable(table: table): table | nil",
-            "Returns the metatable of the given table, or `nil` if it has no metatable.",
-        )),
-        "rawget" => Some((
-            "rawget(table: table, index: any): any",
-            "Gets the real value of `table[index]` without invoking `__index` metamethods.",
-        )),
-        "rawset" => Some((
-            "rawset(table: table, index: any, value: any): table",
-            "Sets the real value of `table[index]` to `value` without invoking `__newindex` metamethods.",
-        )),
-        "rawequal" => Some((
-            "rawequal(v1: any, v2: any): boolean",
-            "Checks whether `v1` is primitive-equal to `v2` without invoking `__eq` metamethods.",
-        )),
-        "rawlen" => Some((
-            "rawlen(v: table | string): int",
-            "Returns the length of `v` without invoking `__len` metamethods.",
-        )),
-        "select" => Some((
-            "select(index: int | \"#\", ...args: any): any",
-            "If index is a number, returns all arguments after argument number `index`. If `\"#\"`, returns the count of arguments.",
-        )),
-        "collectgarbage" => Some((
-            "collectgarbage(opt?: string, arg?: int): any",
-            "Performs a garbage collection cycle or queries GC statistics.",
-        )),
-        "require" => Some((
-            "require(modname: string): any",
-            "Loads and returns the given module, caching the result in `package.loaded`.",
-        )),
-        "os" => Some((
-            "module os",
-            "Operating system interaction: processes, environment, clock, and filesystem.",
-        )),
-        "string" => Some((
-            "module string",
-            "String manipulation, formatting, pattern matching, and encoding.",
-        )),
-        "table" => Some((
-            "module table",
-            "Table manipulation, sorting, packing, and freezing.",
-        )),
-        "math" => Some((
-            "module math",
-            "Standard mathematical functions, trigonometric operations, and constants.",
-        )),
-        "coroutine" => Some((
-            "module coroutine",
-            "Cooperative multithreading and fiber manipulation.",
-        )),
-        "task" => Some((
-            "module task",
-            "Task scheduler: spawn, defer, delay, wait and cancel coroutine tasks.",
-        )),
-        "json" => Some(("module json", "Fast JSON encoding and decoding.")),
-        "fs" => Some((
-            "module fs",
-            "Filesystem operations: reading, writing, directories, file metadata.",
-        )),
-        "crypto" => Some((
-            "module crypto",
-            "Cryptographic hashing, HMAC, encryption, key generation, and OS CSPRNG.",
-        )),
-        "function" => Some(("keyword function", "Defines a named or anonymous function.")),
-        "local" => Some((
-            "keyword local",
-            "Declares a lexical local variable or constant.",
-        )),
-        "if" => Some((
-            "keyword if",
-            "Conditional control flow: `if <cond> then <stmts> end`.",
-        )),
-        "then" => Some((
-            "keyword then",
-            "Delimits the condition in an `if` or `elseif` statement.",
-        )),
-        "else" => Some((
-            "keyword else",
-            "Specifies alternative branch in an `if` statement.",
-        )),
-        "elseif" => Some((
-            "keyword elseif",
-            "Chained conditional branch in an `if` statement.",
-        )),
-        "for" => Some((
-            "keyword for",
-            "Loop construct: numeric `for i = 1, 10 do` or generic `for k, v in iter do`.",
-        )),
-        "while" => Some((
-            "keyword while",
-            "While loop: executes body while condition is truthy.",
-        )),
-        "repeat" => Some((
-            "keyword repeat",
-            "Repeat-until loop: executes body until condition becomes truthy.",
-        )),
-        "until" => Some((
-            "keyword until",
-            "Terminates a `repeat` loop when condition is truthy.",
-        )),
-        "return" => Some((
-            "keyword return",
-            "Returns values from the enclosing function or chunk.",
-        )),
-        "break" => Some((
-            "keyword break",
-            "Terminates execution of the innermost loop.",
-        )),
-        "continue" => Some((
-            "keyword continue",
-            "Skips to the next iteration of the innermost loop.",
-        )),
-        "match" => Some((
-            "keyword match",
-            "Pattern-matching statement: `match <expr> case <pattern>: ... end`.",
-        )),
-        "case" => Some((
-            "keyword case",
-            "Pattern-matching clause in a `match` statement.",
-        )),
-        "default" => Some(("keyword default", "Fallback clause in a `match` statement.")),
-        "enum" => Some((
-            "keyword enum",
-            "Defines an enumeration table: `enum <Name> ... end`.",
-        )),
-        "do" => Some((
-            "keyword do",
-            "Introduces an explicit lexical block scope or loop body.",
-        )),
-        "end" => Some((
-            "keyword end",
-            "Closes a function, block, loop, condition, match, or enum.",
-        )),
-        _ => None,
-    }
-}
-
 /// Runs the LSP server listening on stdio.
 pub fn run_lsp_server() -> io::Result<()> {
     let stdin = io::stdin();
@@ -2066,6 +1166,19 @@ mod tests {
         assert!(resp_str.contains("\"completionProvider\""));
         assert!(resp_str.contains("\"definitionProvider\":true"));
         assert!(resp_str.contains("\"documentSymbolProvider\":true"));
+        assert!(resp_str.contains("\"signatureHelpProvider\""));
+    }
+
+    #[test]
+    fn test_lsp_initialize_reports_server_info() {
+        let mut server = LspServer::new();
+        let init_req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let resp = server.handle_message(init_req.as_bytes()).unwrap();
+        let resp_str = String::from_utf8(resp).unwrap();
+        assert!(resp_str.contains(&format!(
+            "\"serverInfo\":{{\"name\":\"neyuki\",\"version\":\"{}\"}}",
+            env!("CARGO_PKG_VERSION")
+        )));
     }
 
     #[test]
@@ -2166,8 +1279,8 @@ mod tests {
         let hover_req = r#"{"jsonrpc":"2.0","id":20,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///test.nyk"},"position":{"line":1,"character":2}}}"#;
         let resp = server.handle_message(hover_req.as_bytes()).unwrap();
         let resp_str = String::from_utf8(resp).unwrap();
-        assert!(resp_str.contains("print(...: any): void"));
-        assert!(resp_str.contains("Prints formatted values"));
+        assert!(resp_str.contains("print(...: any): ()"));
+        assert!(resp_str.contains("Writes its arguments to standard output"));
     }
 
     #[test]
@@ -2320,58 +1433,325 @@ mod tests {
         assert!(resp_str.contains("\"name\":\"solve\""));
     }
 
+    /// Opens `text` as `file:///test.nyk`.
+    fn open_document(server: &mut LspServer, text: &str) {
+        let open_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///test.nyk","text":{}}}}}}}"#,
+            dap_json::render_json(&Json::Str(text.to_string()))
+        );
+        let _ = server.handle_message(open_req.as_bytes());
+    }
+
+    /// Sends a request that takes a position and returns the response.
+    fn position_request(
+        server: &mut LspServer,
+        method: &str,
+        line: usize,
+        character: usize,
+    ) -> String {
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":100,"method":"{}","params":{{"textDocument":{{"uri":"file:///test.nyk"}},"position":{{"line":{},"character":{}}}}}}}"#,
+            method, line, character
+        );
+        let resp = server.handle_message(req.as_bytes()).unwrap();
+        String::from_utf8(resp).unwrap()
+    }
+
+    /// The line and UTF-16 column at the end of `text`.
+    fn end_position(text: &str) -> (usize, usize) {
+        let line = text.split('\n').count() - 1;
+        let last = text.split('\n').next_back().unwrap_or("");
+        (line, char_col_to_utf16_col(last, last.chars().count()))
+    }
+
+    /// Opens `text` and sends `method` with the cursor at its end.
+    fn query_at_end(text: &str, method: &str) -> String {
+        let mut server = LspServer::new();
+        open_document(&mut server, text);
+        let (line, character) = end_position(text);
+        position_request(&mut server, method, line, character)
+    }
+
+    fn complete_at_end(text: &str) -> String {
+        query_at_end(text, "textDocument/completion")
+    }
+
+    #[test]
+    fn test_lsp_completion_through_require_binding() {
+        let resp = complete_at_end("local g = require(\"@neyuki/ui\")\ng.");
+        assert!(resp.contains("\"label\":\"open\""));
+        assert!(resp.contains("\"label\":\"isAvailable\""));
+        // Methods of Window belong after `w:`, not after `ui.`.
+        assert!(!resp.contains("\"label\":\"fillRect\""));
+
+        let resp = complete_at_end("local m = require(\"@neyuki/math\")\nm.fl");
+        assert!(resp.contains("\"label\":\"floor\""));
+        assert!(!resp.contains("\"label\":\"ceil\""));
+    }
+
+    #[test]
+    fn test_lsp_completion_of_nested_namespace() {
+        let resp = complete_at_end("local hid = require(\"@neyuki/hid\")\nhid.");
+        assert!(resp.contains("\"label\":\"keyboard\""));
+        let resp = complete_at_end("hid.keyboard.pr");
+        assert!(resp.contains("\"label\":\"press\""));
+        assert!(!resp.contains("\"label\":\"tap\""));
+    }
+
+    #[test]
+    fn test_lsp_completion_importall_binds_bundled_modules() {
+        let resp = complete_at_end("--!importall\nlocal w = ui.open({})\nw:");
+        assert!(resp.contains("\"label\":\"fillRect\""));
+        assert!(resp.contains("\"label\":\"close\""));
+        // The type of `w` is known, so strings are not guessed.
+        assert!(!resp.contains("\"label\":\"upper\""));
+    }
+
+    #[test]
+    fn test_lsp_method_completion_from_known_types() {
+        // The receiver is the result of a known call through a require alias.
+        let resp = complete_at_end("local g = require(\"@neyuki/ui\")\nlocal w = g.open({})\nw:cl");
+        assert!(resp.contains("\"label\":\"clear\""));
+        assert!(resp.contains("\"label\":\"close\""));
+        assert!(!resp.contains("\"label\":\"fillRect\""));
+
+        // The receiver is annotated.
+        let resp = complete_at_end("local win: Window? = nil\nwin:");
+        assert!(resp.contains("\"label\":\"fillRect\""));
+        assert!(!resp.contains("\"label\":\"upper\""));
+
+        // A string literal, directly or through a variable: the string
+        // functions without their first parameter.
+        let resp = complete_at_end("local s = \"abc\"\ns:");
+        assert!(resp.contains("\"detail\":\"sub(i: number, j: number?): string\""));
+        let resp = complete_at_end("(\"abc\"):up");
+        assert!(resp.contains("\"label\":\"upper\""));
+        assert!(!resp.contains("\"label\":\"lower\""));
+    }
+
+    #[test]
+    fn test_lsp_completion_inside_strings_and_comments_is_empty() {
+        assert!(complete_at_end("print(\"fs.").contains("\"result\":[]"));
+        assert!(complete_at_end("-- math.").contains("\"result\":[]"));
+        assert!(complete_at_end("local s = [[\nmath.").contains("\"result\":[]"));
+        // Inside an interpolated expression it is code again.
+        assert!(complete_at_end("local s = `{math.fl").contains("\"label\":\"floor\""));
+    }
+
+    #[test]
+    fn test_lsp_completion_of_module_names_and_types() {
+        let resp = complete_at_end("local x = require(\"@neyuki/f");
+        assert!(resp.contains("\"label\":\"@neyuki/fs\""));
+        assert!(resp.contains("\"newText\":\"@neyuki/fs\""));
+        assert!(!resp.contains("\"label\":\"@neyuki/ui\""));
+
+        let resp = complete_at_end("local x = require(\"ma");
+        assert!(resp.contains("\"label\":\"math\""));
+
+        let resp = complete_at_end("local w: Wi");
+        assert!(resp.contains("\"label\":\"Window\""));
+        assert!(!resp.contains("\"label\":\"number\""));
+    }
+
+    #[test]
+    fn test_lsp_completion_of_names_in_scope() {
+        // Declarations of the document come from the parser, so the text
+        // has to parse: the cursor is after the `co` of a call.
+        let mut server = LspServer::new();
+        open_document(&mut server, "local counter = 1\nco()\n");
+        let resp = position_request(&mut server, "textDocument/completion", 1, 2);
+        assert!(resp.contains("\"label\":\"counter\""));
+        assert!(resp.contains("\"label\":\"coroutine\""));
+        let resp = complete_at_end("loc");
+        assert!(resp.contains("\"label\":\"local\""));
+        let resp = complete_at_end("pri");
+        assert!(resp.contains("\"label\":\"print\""));
+    }
+
+    #[test]
+    fn test_lsp_completion_items_carry_documentation_and_snippets() {
+        let resp = complete_at_end("math.fl");
+        assert!(resp.contains("\"detail\":\"floor(n: number): number\""));
+        assert!(resp.contains("\"documentation\":{\"kind\":\"markdown\",\"value\":\"```neyuki"));
+        // Snippets only when the client says it supports them.
+        assert!(!resp.contains("insertText"));
+
+        let mut server = LspServer::new();
+        let init_req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"textDocument":{"completion":{"completionItem":{"snippetSupport":true}}}}}}"#;
+        let _ = server.handle_message(init_req.as_bytes());
+        assert!(server.snippet_support);
+        open_document(&mut server, "math.fl\nos.cl");
+        let resp = position_request(&mut server, "textDocument/completion", 0, 7);
+        assert!(resp.contains("\"insertText\":\"floor($0)\""));
+        assert!(resp.contains("\"insertTextFormat\":2"));
+        // A function without parameters puts the cursor after the parentheses.
+        let resp = position_request(&mut server, "textDocument/completion", 1, 5);
+        assert!(resp.contains("\"insertText\":\"clock()$0\""));
+    }
+
+    #[test]
+    fn test_lsp_signature_help_active_parameter_with_nested_calls() {
+        let text = "local ui = require(\"@neyuki/ui\")\nlocal w = ui.open({})\nw:fillRect(1, math.max(2, 3), ";
+        let resp = query_at_end(text, "textDocument/signatureHelp");
+        assert!(resp.contains(
+            "\"label\":\"fillRect(x: number, y: number, w: number, h: number, color: any, options: table?)\""
+        ));
+        assert!(resp.contains("\"activeParameter\":2"));
+
+        // Commas in strings and in brackets do not count.
+        let resp = query_at_end(
+            "string.find(\"a,b\", {1, 2}, ",
+            "textDocument/signatureHelp",
+        );
+        assert!(resp.contains("\"activeParameter\":2"));
+
+        // The innermost call is the one being typed.
+        let resp = query_at_end("string.find(math.max(1, ", "textDocument/signatureHelp");
+        assert!(resp.contains("\"label\":\"max(...: number): number\""));
+        assert!(resp.contains("\"activeParameter\":0"));
+    }
+
+    #[test]
+    fn test_lsp_signature_help_variadic_methods_and_no_call() {
+        // A variadic parameter stays active.
+        let resp = query_at_end("print(1, 2, 3, ", "textDocument/signatureHelp");
+        assert!(resp.contains("\"label\":\"print(...: any)\""));
+        assert!(resp.contains("\"activeParameter\":0"));
+
+        // `s:sub(...)` leaves out the receiver.
+        let resp = query_at_end("local s = \"abc\"\ns:sub(1, ", "textDocument/signatureHelp");
+        assert!(resp.contains("\"label\":\"sub(i: number, j: number?): string\""));
+        assert!(resp.contains("\"activeParameter\":1"));
+
+        assert!(
+            query_at_end("local x = 1", "textDocument/signatureHelp").contains("\"result\":null")
+        );
+        assert!(
+            query_at_end("unknown(1, ", "textDocument/signatureHelp").contains("\"result\":null")
+        );
+    }
+
+    #[test]
+    fn test_lsp_hover_through_bindings() {
+        let text = "local ui = require(\"@neyuki/ui\")\nlocal w = ui.open({})\nw:clear()\nprint(\"math.floor\")\n";
+        let mut server = LspServer::new();
+        open_document(&mut server, text);
+
+        // A method of a known type.
+        let resp = position_request(&mut server, "textDocument/hover", 2, 3);
+        assert!(resp.contains("Window:clear(color: any?): ()"));
+        // A bundled module.
+        let resp = position_request(&mut server, "textDocument/hover", 1, 11);
+        assert!(resp.contains("**@neyuki/ui**"));
+        // Inside a string the words are not names.
+        let resp = position_request(&mut server, "textDocument/hover", 3, 10);
+        assert!(resp.contains("\"result\":null"));
+    }
+
+    #[test]
+    fn test_lsp_utf16_positions_after_non_ascii_text() {
+        // The crab is two UTF-16 units and four bytes, the accent one unit
+        // and two bytes, so the columns differ from both counts.
+        let before_member = "local s = \"\u{e9}\u{1f980}\"; ui.";
+        let line = format!("{before_member}open({{}}) -- \u{65e5}\u{672c}");
+        let text = format!("local ui = require(\"@neyuki/ui\")\n{line}\n");
+        let column = char_col_to_utf16_col(before_member, before_member.chars().count());
+        assert_ne!(column, before_member.chars().count());
+
+        let mut server = LspServer::new();
+        open_document(&mut server, &text);
+        // Completion with the cursor right after `ui.`.
+        let resp = position_request(&mut server, "textDocument/completion", 1, column);
+        assert!(resp.contains("\"label\":\"open\""));
+        // Hover inside `open`.
+        let resp = position_request(&mut server, "textDocument/hover", 1, column + 2);
+        assert!(resp.contains("ui.open(options: table?): Window"));
+        // The hover range is in UTF-16 units as well.
+        assert!(resp.contains(&format!("\"character\":{}", column)));
+        assert!(resp.contains(&format!("\"character\":{}", column + 4)));
+        // Signature help inside the parentheses.
+        let resp = position_request(&mut server, "textDocument/signatureHelp", 1, column + 5);
+        assert!(resp.contains("\"label\":\"open(options: table?): Window\""));
+    }
+
+    /// The value `root` holds at `path` (`read`, `keyboard.press`), nil if absent.
+    fn exists_in(root: &Value, path: &str) -> bool {
+        let mut current = root.clone();
+        for part in path.split('.') {
+            let next = match &current {
+                Value::Table(table) => table.borrow().get_str(part),
+                _ => return false,
+            };
+            current = next;
+        }
+        !matches!(current, Value::Nil)
+    }
+
+    /// What `require(module)` returns in a fresh VM.
+    fn load_module(module: &str) -> Value {
+        let source = format!("return require('{module}')");
+        let proto =
+            crate::compiler::compile_program(&source, "test", crate::compiler::Options::RUN)
+                .expect("Failed to compile require script");
+        let mut vm = crate::vm::machine::VM::new();
+        vm.execute(proto).expect("Failed to execute require")
+    }
+
     #[test]
     fn test_lsp_completion_items_match_runtime_tables() {
+        let api = api::api();
         let vm = crate::vm::machine::VM::new();
-        for (lib_name, methods) in [
-            ("os", OS_METHODS),
-            ("string", STRING_METHODS),
-            ("table", TABLE_METHODS),
-            ("math", MATH_METHODS),
-            ("coroutine", COROUTINE_METHODS),
-            ("task", TASK_METHODS),
-            ("json", JSON_METHODS),
-        ] {
-            let global_val = vm
-                .globals
-                .get(&crate::vm::value::StrRef::from(lib_name))
-                .unwrap_or_else(|| panic!("Global {} not found in VM", lib_name));
-            let Value::Table(tbl) = global_val else {
-                panic!("Global {} is not a table", lib_name);
-            };
-            for (method, _, _) in methods {
-                let val = tbl.borrow().get_str(method);
-                assert!(
-                    !matches!(val, Value::Nil),
-                    "Method {}.{} does not exist in runtime VM table",
-                    lib_name,
-                    method
-                );
-            }
-        }
+        let standard: Vec<String> = api
+            .standard_namespaces()
+            .into_iter()
+            .filter_map(|lib| lib.module)
+            .collect();
+        // The bundled modules that load without a desktop session or a web
+        // engine. `ui`, `hid` and `webview` need one, so what their pages
+        // document is not compared with the runtime here.
+        let headless = ["crypto", "fs", "http", "io", "net", "profile", "sql"];
+        let modules: HashMap<&str, Value> = headless
+            .iter()
+            .map(|name| (*name, load_module(&format!("@neyuki/{name}"))))
+            .collect();
 
-        // Test bundled libraries fs and crypto
-        for (module_req, methods) in [
-            ("return require('@neyuki/fs')", FS_METHODS),
-            ("return require('@neyuki/crypto')", CRYPTO_METHODS),
-        ] {
-            let proto =
-                crate::compiler::compile_program(module_req, "test", crate::compiler::Options::RUN)
-                    .expect("Failed to compile require script");
-            let mut test_vm = crate::vm::machine::VM::new();
-            let res = test_vm.execute(proto).expect("Failed to execute require");
-            let Value::Table(tbl) = res else {
-                panic!("Require did not return a table for {}", module_req);
+        let mut missing = Vec::new();
+        for entry in &api.entries {
+            // Methods belong to values a script gets back, not to a table.
+            if entry.kind == api::EntryKind::Method {
+                continue;
+            }
+            let page = entry.page.as_str();
+            let path = entry.name.as_str();
+            let present = if page == "globals" || standard.iter().any(|name| name == page) {
+                // `math.floor` is the field `floor` of the global `math`.
+                let (first, rest) = match path.split_once('.') {
+                    Some((first, rest)) => (first, Some(rest)),
+                    None => (path, None),
+                };
+                let root = vm
+                    .globals
+                    .get(&crate::vm::value::StrRef::from(first))
+                    .cloned()
+                    .unwrap_or(Value::Nil);
+                match rest {
+                    Some(rest) => exists_in(&root, rest),
+                    None => !matches!(root, Value::Nil),
+                }
+            } else if let Some(module) = modules.get(page) {
+                // `fs.read` is the field `read` of what `require` returns.
+                let rest = path.split_once('.').map_or(path, |(_, rest)| rest);
+                exists_in(module, rest)
+            } else {
+                continue;
             };
-            for (method, _, _) in methods {
-                let val = tbl.borrow().get_str(method);
-                assert!(
-                    !matches!(val, Value::Nil),
-                    "Method {} does not exist in required module {}",
-                    method,
-                    module_req
-                );
+            if !present {
+                missing.push(entry.name.clone());
             }
         }
+        assert!(
+            missing.is_empty(),
+            "documented in docs/reference but absent at runtime: {missing:?}"
+        );
     }
 }

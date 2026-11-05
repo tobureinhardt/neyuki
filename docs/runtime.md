@@ -12,6 +12,7 @@ neyuki test                       run every .nyk file in tests/
 neyuki build [project]            build a standalone app executable
 neyuki pkg <command>              manage the project manifest and packages
 neyuki dap                        Debug Adapter Protocol server on stdio
+neyuki lsp                        Language Server Protocol server on stdio
 neyuki disasm <file>              print the bytecode the compiler emits
 neyuki dump-ir <file>             print the IR before and after optimization
 neyuki help | --version
@@ -48,6 +49,12 @@ The bytecode format changes between Neyuki versions. A `.nykb` written by anothe
 ### Debugging
 
 `neyuki dap` speaks the Debug Adapter Protocol on standard input and output, which the VS Code extension uses for breakpoints, stepping, the call stack and variables. Scripts can also inspect themselves with the [debug library](reference/debug.md) and time functions with [@neyuki/profile](reference/profile.md).
+
+### Editor support
+
+`neyuki lsp` speaks the Language Server Protocol on standard input and output, so any editor with an LSP client gets diagnostics (the same checks as `neyuki lint`), formatting (as `neyuki fmt`), hover, go to definition, the document outline, completion and signature help.
+
+What the server knows about the standard library is the [library reference](reference/README.md), compiled into the `neyuki` executable. Completion after `ns.` (for the standard libraries and every bundled module, also through `local x = require("@neyuki/x")` and the names `--!importall` adds), methods after `x:` when the type of `x` is known from an annotation or from a call such as `ui.open(...)`, module names inside `require("`, hover and signature help therefore always match the installed version, and upgrading Neyuki upgrades the editor features with no editor update. The server reports its name and version in the `serverInfo` of the `initialize` result. Snippet insertion is used only for clients that advertise `snippetSupport`.
 
 ## Modules and packages
 

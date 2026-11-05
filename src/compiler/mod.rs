@@ -90,7 +90,7 @@ pub fn parse(source: &str) -> Result<Parsed, String> {
 }
 
 /// Whether a `--!importall` line comes before the first line of code.
-fn has_import_all(source: &str) -> bool {
+pub(crate) fn has_import_all(source: &str) -> bool {
     source
         .lines()
         .map(str::trim)

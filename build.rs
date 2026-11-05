@@ -27,7 +27,40 @@ fn main() {
     }
     generated.push_str("]\n");
 
-    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("bundled_libraries.rs");
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let output = out_dir.join("bundled_libraries.rs");
+    fs::write(&output, generated)
+        .unwrap_or_else(|err| panic!("failed to write {}: {}", output.display(), err));
+
+    // The library reference pages (all but the README), which the language
+    // server answers completion and hover from.
+    let reference_dir = manifest_dir.join("docs").join("reference");
+    println!("cargo:rerun-if-changed={}", reference_dir.display());
+
+    let mut pages = fs::read_dir(&reference_dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {}", reference_dir.display(), err))
+        .map(|entry| entry.expect("failed to read reference entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .collect::<Vec<_>>();
+    pages.sort();
+
+    let mut generated = String::from("&[\n");
+    for path in pages {
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_else(|| panic!("invalid reference filename: {}", path.display()));
+        if name == "README" {
+            continue;
+        }
+        generated.push_str(&format!(
+            "    ({name:?}, include_str!({:?})),\n",
+            path.to_string_lossy()
+        ));
+    }
+    generated.push_str("]\n");
+
+    let output = out_dir.join("reference_pages.rs");
     fs::write(&output, generated)
         .unwrap_or_else(|err| panic!("failed to write {}: {}", output.display(), err));
 }
