@@ -909,7 +909,10 @@ impl<'a> SemanticAnalyzer<'a> {
             if (col == 0 || !is_word(bytes[col - 1]))
                 && bytes.get(after).is_none_or(|b| !is_word(*b))
             {
-                return Span::single_line(line, col as u32 + 1, after as u32 + 1);
+                // Columns count characters, as the tokenizer's do; `col` and
+                // `after` are byte offsets.
+                let start = text[..col].chars().count() as u32 + 1;
+                return Span::single_line(line, start, start + ident.chars().count() as u32);
             }
             from = col + 1;
         }

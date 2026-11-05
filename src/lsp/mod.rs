@@ -8,8 +8,10 @@ use crate::diagnostics::severity::Severity;
 
 pub mod analysis;
 pub mod api;
+pub mod modules;
+pub mod scopes;
 
-use analysis::Context;
+use analysis::{Binding, Context};
 use api::MemberSource;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +32,8 @@ pub struct LspServer {
     /// Whether the client accepts snippet syntax in completion items,
     /// read from the `initialize` request.
     pub snippet_support: bool,
+    /// The modules the documents require, read as they are asked for.
+    pub modules: modules::ModuleStore,
 }
 
 impl Default for LspServer {
@@ -69,6 +73,24 @@ impl LspServer {
             is_exit: false,
             exit_code: None,
             snippet_support: false,
+            modules: modules::ModuleStore::new(),
+        }
+    }
+
+    /// What completion, hover and signature help know of the document
+    /// `uri` whose text is `text`: the standard library and the modules it
+    /// requires.
+    fn source(&self, uri: &str, text: &str) -> modules::ProjectSource<'_> {
+        modules::ProjectSource::new(api::api(), &self.modules, &self.documents, uri, text)
+    }
+
+    /// Reads the shape of a document when it changes, so that the last text
+    /// that parsed is remembered while the next ones do not.
+    fn track(&self, uri: &str) {
+        if let Some(text) = self.documents.get(uri) {
+            let _ = self
+                .modules
+                .shape_of_text(&modules::document_key(uri), text);
         }
     }
 
@@ -144,6 +166,17 @@ impl LspServer {
                                     ),
                                     ("definitionProvider".to_string(), Json::Bool(true)),
                                     ("documentSymbolProvider".to_string(), Json::Bool(true)),
+                                    ("referencesProvider".to_string(), Json::Bool(true)),
+                                    (
+                                        "renameProvider".to_string(),
+                                        Json::Obj(vec![(
+                                            "prepareProvider".to_string(),
+                                            Json::Bool(true),
+                                        )]),
+                                    ),
+                                    ("documentHighlightProvider".to_string(), Json::Bool(true)),
+                                    ("foldingRangeProvider".to_string(), Json::Bool(true)),
+                                    ("workspaceSymbolProvider".to_string(), Json::Bool(true)),
                                 ]),
                             ),
                             // Editors read the version to know which Neyuki they talk to.
@@ -190,6 +223,7 @@ impl LspServer {
                             .unwrap_or("")
                             .to_string();
                         self.documents.insert(uri.clone(), content.clone());
+                        self.track(&uri);
                         let symbols = extract_document_symbols(&content);
                         if !symbols.is_empty() {
                             self.last_valid_symbols.insert(uri.clone(), symbols);
@@ -212,6 +246,7 @@ impl LspServer {
                             && let Some(new_text) = first.get("text").and_then(|t| t.as_str())
                         {
                             self.documents.insert(uri.clone(), new_text.to_string());
+                            self.track(&uri);
                             let symbols = extract_document_symbols(new_text);
                             if !symbols.is_empty() {
                                 self.last_valid_symbols.insert(uri.clone(), symbols);
@@ -241,6 +276,7 @@ impl LspServer {
                     {
                         if let Some(text) = params.get("text").and_then(|t| t.as_str()) {
                             self.documents.insert(uri.to_string(), text.to_string());
+                            self.track(uri);
                         }
                         if let Some(content) = self.documents.get(uri) {
                             let symbols = extract_document_symbols(content);
@@ -312,7 +348,8 @@ impl LspServer {
                     let (uri, line, character) = parse_text_document_position(&json);
                     let cached = self.last_valid_symbols.get(uri).map(|s| s.as_slice());
                     let result = if let Some(content) = self.documents.get(uri) {
-                        handle_hover(content, line, character, cached, api::api())
+                        let src = self.source(uri, content);
+                        handle_hover(content, line, character, cached, &src)
                     } else {
                         Json::Null
                     };
@@ -325,13 +362,14 @@ impl LspServer {
                     let (uri, line, character) = parse_text_document_position(&json);
                     let cached = self.last_valid_symbols.get(uri).map(|s| s.as_slice());
                     let items = if let Some(content) = self.documents.get(uri) {
+                        let src = self.source(uri, content);
                         handle_completion(
                             content,
                             line,
                             character,
                             cached,
                             self.snippet_support,
-                            api::api(),
+                            &src,
                         )
                     } else {
                         Json::Arr(Vec::new())
@@ -344,7 +382,8 @@ impl LspServer {
                     let req_id = id.cloned().unwrap_or(Json::Null);
                     let (uri, line, character) = parse_text_document_position(&json);
                     let result = if let Some(content) = self.documents.get(uri) {
-                        analysis::signature_help(content, line, character, api::api())
+                        let src = self.source(uri, content);
+                        analysis::signature_help(content, line, character, &src)
                     } else {
                         Json::Null
                     };
@@ -357,11 +396,94 @@ impl LspServer {
                     let (uri, line, character) = parse_text_document_position(&json);
                     let cached = self.last_valid_symbols.get(uri).map(|s| s.as_slice());
                     let result = if let Some(content) = self.documents.get(uri) {
-                        handle_definition(uri, content, line, character, cached)
+                        let src = self.source(uri, content);
+                        handle_definition(uri, content, line, character, cached, &src)
                     } else {
                         Json::Null
                     };
 
+                    let resp = json_response(req_id, result);
+                    return Some(dap_json::render_json(&resp).into_bytes());
+                }
+                "textDocument/references" => {
+                    let req_id = id.cloned().unwrap_or(Json::Null);
+                    let (uri, line, character) = parse_text_document_position(&json);
+                    let include_declaration = json
+                        .get("params")
+                        .and_then(|p| p.get("context"))
+                        .and_then(|c| c.get("includeDeclaration"))
+                        != Some(&Json::Bool(false));
+                    let result = match self.documents.get(uri) {
+                        Some(content) => {
+                            handle_references(uri, content, line, character, include_declaration)
+                        }
+                        None => Json::Null,
+                    };
+                    let resp = json_response(req_id, result);
+                    return Some(dap_json::render_json(&resp).into_bytes());
+                }
+                "textDocument/documentHighlight" => {
+                    let req_id = id.cloned().unwrap_or(Json::Null);
+                    let (uri, line, character) = parse_text_document_position(&json);
+                    let result = match self.documents.get(uri) {
+                        Some(content) => handle_highlight(content, line, character),
+                        None => Json::Null,
+                    };
+                    let resp = json_response(req_id, result);
+                    return Some(dap_json::render_json(&resp).into_bytes());
+                }
+                "textDocument/prepareRename" => {
+                    let req_id = id.cloned().unwrap_or(Json::Null);
+                    let (uri, line, character) = parse_text_document_position(&json);
+                    let result = match self.documents.get(uri) {
+                        Some(content) => handle_prepare_rename(content, line, character),
+                        None => Json::Null,
+                    };
+                    let resp = json_response(req_id, result);
+                    return Some(dap_json::render_json(&resp).into_bytes());
+                }
+                "textDocument/rename" => {
+                    let req_id = id.cloned().unwrap_or(Json::Null);
+                    let (uri, line, character) = parse_text_document_position(&json);
+                    let new_name = json
+                        .get("params")
+                        .and_then(|p| p.get("newName"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    let outcome = match self.documents.get(uri) {
+                        Some(content) => handle_rename(uri, content, line, character, new_name),
+                        None => Ok(Json::Null),
+                    };
+                    let resp = match outcome {
+                        Ok(edit) => json_response(req_id, edit),
+                        // InvalidParams: the message is shown to the user.
+                        Err(message) => json_error(req_id, -32602, &message),
+                    };
+                    return Some(dap_json::render_json(&resp).into_bytes());
+                }
+                "textDocument/foldingRange" => {
+                    let req_id = id.cloned().unwrap_or(Json::Null);
+                    let uri = json
+                        .get("params")
+                        .and_then(|p| p.get("textDocument"))
+                        .and_then(|d| d.get("uri"))
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("");
+                    let result = match self.documents.get(uri) {
+                        Some(content) => handle_folding_ranges(content),
+                        None => Json::Arr(Vec::new()),
+                    };
+                    let resp = json_response(req_id, result);
+                    return Some(dap_json::render_json(&resp).into_bytes());
+                }
+                "workspace/symbol" => {
+                    let req_id = id.cloned().unwrap_or(Json::Null);
+                    let query = json
+                        .get("params")
+                        .and_then(|p| p.get("query"))
+                        .and_then(|q| q.as_str())
+                        .unwrap_or("");
+                    let result = handle_workspace_symbols(self, query);
                     let resp = json_response(req_id, result);
                     return Some(dap_json::render_json(&resp).into_bytes());
                 }
@@ -443,68 +565,69 @@ fn char_col_to_utf16_col(line: &str, char_col_0_based: usize) -> usize {
         .sum()
 }
 
+/// `DiagnosticTag.Unnecessary`.
+const TAG_UNNECESSARY: f64 = 1.0;
+
+/// The diagnostics of `neyuki lint` for a document, as the client takes them:
+/// the same checks and codes, severities mapped to LSP's four levels, the
+/// help text under the message and UTF-16 columns.
 fn create_publish_diagnostics(uri: &str, content: &str) -> Json {
     let diags = crate::lint::lint_source(content);
     let mut diag_items = Vec::new();
     let doc_lines: Vec<&str> = content.lines().collect();
 
+    let line_text = |index: usize| doc_lines.get(index).copied().unwrap_or("");
+
     for d in diags {
-        let (start_line, start_char, end_line, end_char) = if let Some(ref l) = d.primary_label {
-            let s_line = l.span.start.line.saturating_sub(1) as usize;
-            let s_col = l.span.start.column.saturating_sub(1) as usize;
-            let s_char = doc_lines
-                .get(s_line)
-                .map(|line| char_col_to_utf16_col(line, s_col))
-                .unwrap_or(s_col);
+        // Lines and columns are 1-based, columns count characters.
+        let span = d.primary_label.as_ref().map(|l| l.span).unwrap_or_default();
+        let start_line = (span.start.line.max(1) - 1) as usize;
+        let end_line = (span.end.line.max(span.start.line).max(1) - 1) as usize;
+        let start_col = (span.start.column.max(1) - 1) as usize;
+        let end_col = (span.end.column.max(1) - 1) as usize;
+        let mut start_char = char_col_to_utf16_col(line_text(start_line), start_col);
+        let mut end_char = char_col_to_utf16_col(line_text(end_line), end_col);
+        if end_line == start_line && end_char <= start_char {
+            // A position without a length marks the code of its line.
+            let text = line_text(start_line);
+            start_char = text.encode_utf16().count() - text.trim_start().encode_utf16().count();
+            end_char = text.trim_end().encode_utf16().count().max(start_char + 1);
+        }
 
-            let e_line = l.span.end.line.saturating_sub(1) as usize;
-            let e_col = l.span.end.column.saturating_sub(1) as usize;
-            let e_char = doc_lines
-                .get(e_line)
-                .map(|line| char_col_to_utf16_col(line, e_col))
-                .unwrap_or(e_col);
-
-            (s_line as f64, s_char as f64, e_line as f64, e_char as f64)
-        } else {
-            (0.0, 0.0, 0.0, 0.0)
+        // DiagnosticSeverity: 1 Error, 2 Warning, 3 Information, 4 Hint.
+        let severity = match d.severity {
+            Severity::Error => 1.0,
+            Severity::Warning => 2.0,
+            Severity::Info => 3.0,
+            Severity::Help => 4.0,
         };
-
-        let severity = if d.severity == Severity::Error {
-            1.0 // DiagnosticSeverity.Error
-        } else {
-            2.0 // DiagnosticSeverity.Warning
+        let code = d.code.map(|code| code.as_str().to_string());
+        let message = match &d.help {
+            Some(help) => format!("{}\n{}", d.message, help),
+            None => d.message.clone(),
         };
 
         let mut fields = vec![
             (
                 "range".to_string(),
-                Json::Obj(vec![
-                    (
-                        "start".to_string(),
-                        Json::Obj(vec![
-                            ("line".to_string(), Json::Num(start_line)),
-                            ("character".to_string(), Json::Num(start_char)),
-                        ]),
-                    ),
-                    (
-                        "end".to_string(),
-                        Json::Obj(vec![
-                            ("line".to_string(), Json::Num(end_line.max(start_line))),
-                            (
-                                "character".to_string(),
-                                Json::Num(end_char.max(start_char + 1.0)),
-                            ),
-                        ]),
-                    ),
+                json_obj([
+                    ("start", position_json(start_line, start_char)),
+                    ("end", position_json(end_line, end_char)),
                 ]),
             ),
             ("severity".to_string(), Json::Num(severity)),
-            ("message".to_string(), Json::Str(d.message)),
+            ("message".to_string(), Json::Str(message)),
             ("source".to_string(), Json::Str("neyuki".to_string())),
         ];
-
-        if let Some(code) = d.code {
-            fields.push(("code".to_string(), Json::Str(code.as_str().to_string())));
+        if let Some(code) = &code {
+            fields.push(("code".to_string(), Json::Str(code.clone())));
+        }
+        // Unused and unreachable code is faded out, not underlined.
+        if matches!(code.as_deref(), Some("W0001" | "W0002" | "W0004")) {
+            fields.push((
+                "tags".to_string(),
+                Json::Arr(vec![Json::Num(TAG_UNNECESSARY)]),
+            ));
         }
 
         diag_items.push(Json::Obj(fields));
@@ -689,13 +812,96 @@ fn handle_hover(
     Json::Null
 }
 
+fn json_obj<const N: usize>(fields: [(&str, Json); N]) -> Json {
+    Json::Obj(
+        fields
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+    )
+}
+
+fn position_json(line: usize, character: usize) -> Json {
+    json_obj([
+        ("line", Json::Num(line as f64)),
+        ("character", Json::Num(character as f64)),
+    ])
+}
+
+/// The range between two byte offsets of `content`.
+fn byte_range_json(content: &str, start: usize, end: usize) -> Json {
+    let (start_line, start_character) = scopes::position_at(content, start);
+    let (end_line, end_character) = scopes::position_at(content, end);
+    json_obj([
+        ("start", position_json(start_line, start_character)),
+        ("end", position_json(end_line, end_character)),
+    ])
+}
+
+/// A place in a file, from `api::Definition`.
+fn definition_json(definition: &api::Definition) -> Json {
+    json_obj([
+        ("uri", Json::Str(modules::path_to_uri(&definition.file))),
+        (
+            "range",
+            json_obj([
+                (
+                    "start",
+                    position_json(definition.line, definition.character),
+                ),
+                (
+                    "end",
+                    position_json(definition.line, definition.character + definition.length),
+                ),
+            ]),
+        ),
+    ])
+}
+
+/// Go to definition. A `require` string leads to the file it names, a name
+/// of a required module (`k`, `k.new`, `k.Options`) to where the module
+/// declares it, and any other name to its declaration in this document.
 fn handle_definition(
     uri: &str,
     content: &str,
     line: usize,
     character: usize,
     cached_symbols: Option<&[FoundSymbol]>,
+    src: &dyn MemberSource,
 ) -> Json {
+    if let Some(module) = analysis::require_at(content, line, character) {
+        // The libraries of the reference are inside the executable.
+        let located = match src.namespace_for_module(&module) {
+            Some(namespace) if !namespace.starts_with("@m") => None,
+            _ => modules::uri_to_path(uri)
+                .and_then(|requester| modules::resolve_module_file(&requester, &module)),
+        };
+        return match located {
+            Some(file) => definition_json(&api::Definition {
+                file,
+                line: 0,
+                character: 0,
+                length: 0,
+            }),
+            None => Json::Null,
+        };
+    }
+
+    if let Some(chain) = analysis::chain_at(content, line, character) {
+        let offset = analysis::offset_at(content, line, character);
+        let binds = analysis::bindings_at(content, offset, src);
+        let head = chain.split(['.', ':']).next().unwrap_or("");
+        // Only through the name of a module: a variable of a type declared
+        // there goes to its own declaration.
+        let through_module =
+            matches!(binds.get(head), Some(Binding::Namespace(ns)) if ns.starts_with("@m"));
+        if through_module
+            && let Some(definition) = src.definition(&analysis::canonical(&chain, &binds))
+        {
+            return definition_json(&definition);
+        }
+    }
+
     let word = get_ident_at_position(content, line, character)
         .or_else(|| get_word_at_position(content, line, character));
 
@@ -817,6 +1023,216 @@ fn handle_document_symbols(content: &str, cached_symbols: Option<&[FoundSymbol]>
     Json::Arr(symbol_objs)
 }
 
+/// The name at a position and everything in the document that is the same
+/// name. `None` where there is no name, or the document does not parse.
+fn symbol_at_position(content: &str, line: usize, character: usize) -> Option<scopes::Symbol> {
+    let offset = analysis::offset_at(content, line, character);
+    scopes::analyze(content)?.symbol_at(offset)
+}
+
+fn handle_references(
+    uri: &str,
+    content: &str,
+    line: usize,
+    character: usize,
+    include_declaration: bool,
+) -> Json {
+    let Some(symbol) = symbol_at_position(content, line, character) else {
+        return Json::Null;
+    };
+    let length = symbol.name.len();
+    Json::Arr(
+        symbol
+            .occurrences
+            .iter()
+            .filter(|occurrence| include_declaration || !occurrence.declaration)
+            .map(|occurrence| {
+                json_obj([
+                    ("uri", Json::Str(uri.to_string())),
+                    (
+                        "range",
+                        byte_range_json(content, occurrence.start, occurrence.start + length),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn handle_highlight(content: &str, line: usize, character: usize) -> Json {
+    let Some(symbol) = symbol_at_position(content, line, character) else {
+        return Json::Null;
+    };
+    let length = symbol.name.len();
+    Json::Arr(
+        symbol
+            .occurrences
+            .iter()
+            .map(|occurrence| {
+                // DocumentHighlightKind: 2 is Read, 3 is Write.
+                let kind = if occurrence.write { 3.0 } else { 2.0 };
+                json_obj([
+                    (
+                        "range",
+                        byte_range_json(content, occurrence.start, occurrence.start + length),
+                    ),
+                    ("kind", Json::Num(kind)),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// The range of the name that can be renamed at a position, or null.
+fn handle_prepare_rename(content: &str, line: usize, character: usize) -> Json {
+    let offset = analysis::offset_at(content, line, character);
+    let Some(symbol) = symbol_at_position(content, line, character) else {
+        return Json::Null;
+    };
+    if !symbol.renamable {
+        return Json::Null;
+    }
+    let length = symbol.name.len();
+    let Some(touched) = symbol
+        .occurrences
+        .iter()
+        .find(|o| o.start <= offset && offset <= o.start + length)
+    else {
+        return Json::Null;
+    };
+    json_obj([
+        (
+            "range",
+            byte_range_json(content, touched.start, touched.start + length),
+        ),
+        ("placeholder", Json::Str(symbol.name.clone())),
+    ])
+}
+
+/// Renames the name at a position everywhere it refers to the same
+/// declaration. The error is the message for the user.
+fn handle_rename(
+    uri: &str,
+    content: &str,
+    line: usize,
+    character: usize,
+    new_name: &str,
+) -> Result<Json, String> {
+    let valid = new_name
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && new_name.bytes().all(analysis::is_word_byte)
+        && !analysis::KEYWORDS.contains(&new_name);
+    if !valid {
+        return Err(format!("'{new_name}' is not a valid name"));
+    }
+    let Some(symbol) = symbol_at_position(content, line, character) else {
+        return Ok(Json::Null);
+    };
+    if !symbol.renamable {
+        return Err(format!(
+            "'{}' cannot be renamed: it is not declared in this file, or a use of it cannot be located",
+            symbol.name
+        ));
+    }
+    let length = symbol.name.len();
+    let edits = symbol
+        .occurrences
+        .iter()
+        .map(|occurrence| {
+            json_obj([
+                (
+                    "range",
+                    byte_range_json(content, occurrence.start, occurrence.start + length),
+                ),
+                ("newText", Json::Str(new_name.to_string())),
+            ])
+        })
+        .collect();
+    Ok(json_obj([(
+        "changes",
+        Json::Obj(vec![(uri.to_string(), Json::Arr(edits))]),
+    )]))
+}
+
+fn handle_folding_ranges(content: &str) -> Json {
+    Json::Arr(
+        scopes::folding_ranges(content)
+            .into_iter()
+            .map(|fold| {
+                let mut fields = vec![
+                    ("startLine", Json::Num(fold.start_line as f64)),
+                    ("endLine", Json::Num(fold.end_line as f64)),
+                ];
+                if fold.comment {
+                    fields.push(("kind", Json::Str("comment".to_string())));
+                }
+                Json::Obj(
+                    fields
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value))
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The functions and types of the open documents whose name contains
+/// `query`, ignoring case.
+fn handle_workspace_symbols(server: &LspServer, query: &str) -> Json {
+    const MAX_SYMBOLS: usize = 200;
+    let query = query.to_lowercase();
+    let mut uris: Vec<&String> = server.documents.keys().collect();
+    uris.sort();
+    let mut found = Vec::new();
+    for uri in uris {
+        let Some(content) = server.documents.get(uri) else {
+            continue;
+        };
+        let Some(symbols) = server.last_valid_symbols.get(uri) else {
+            continue;
+        };
+        let file = modules::uri_to_path(uri)
+            .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        for symbol in symbols {
+            // Function and TypeParameter, which is how aliases are listed.
+            if !matches!(symbol.kind, 12 | 26) || !symbol.name.to_lowercase().contains(&query) {
+                continue;
+            }
+            let line_index = symbol.line_1_based.saturating_sub(1) as usize;
+            let line_text = content.lines().nth(line_index).unwrap_or("");
+            let start = find_ident_in_line(line_text, &symbol.name)
+                .map_or(0, |col| char_col_to_utf16_col(line_text, col));
+            let end = start + symbol.name.chars().map(char::len_utf16).sum::<usize>();
+            found.push(json_obj([
+                ("name", Json::Str(symbol.name.clone())),
+                ("kind", Json::Num(symbol.kind as f64)),
+                ("containerName", Json::Str(file.clone())),
+                (
+                    "location",
+                    json_obj([
+                        ("uri", Json::Str(uri.clone())),
+                        (
+                            "range",
+                            json_obj([
+                                ("start", position_json(line_index, start)),
+                                ("end", position_json(line_index, end)),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]));
+            if found.len() >= MAX_SYMBOLS {
+                return Json::Arr(found);
+            }
+        }
+    }
+    Json::Arr(found)
+}
+
 /// Completion at a position. What the cursor follows decides the answer
 /// (see `analysis::Context`); the members of namespaces and types come from
 /// `src`, so another source of modules can be consulted next to the
@@ -831,23 +1247,30 @@ fn handle_completion(
 ) -> Json {
     let offset = analysis::offset_at(content, line, character);
     let context = analysis::completion_context(&content[..offset]);
-    let binds = analysis::bindings(content, src);
+    let binds = analysis::bindings_at(content, offset, src);
 
     let mut items = Vec::new();
     match context {
         Context::None => {}
         Context::Module { prefix } => {
             let start = character.saturating_sub(prefix.len());
+            // `./name` offers the files of the project only.
+            let (dot, typed) = match prefix.strip_prefix("./") {
+                Some(rest) => ("./", rest),
+                None => ("", prefix.as_str()),
+            };
             for lib in src.modules() {
-                if let Some(name) = lib.module.as_deref()
-                    && name.starts_with(&prefix)
-                {
-                    items.push(analysis::library_item(
-                        &lib,
-                        name,
-                        Some((line, start, character)),
-                    ));
+                let Some(name) = lib.module.as_deref() else {
+                    continue;
+                };
+                if !name.starts_with(typed) || (!dot.is_empty() && lib.file.is_none()) {
+                    continue;
                 }
+                items.push(analysis::library_item(
+                    &lib,
+                    &format!("{dot}{name}"),
+                    Some((line, start, character)),
+                ));
             }
         }
         Context::Member { chain, prefix } => {
@@ -865,7 +1288,22 @@ fn handle_completion(
                 }
             }
         }
-        Context::Type { prefix } => {
+        Context::Type {
+            qualifier: Some(chain),
+            prefix,
+        } => {
+            // `k.` in an annotation: the types the module exports.
+            let namespace = analysis::canonical(&chain, &binds);
+            for entry in src.type_aliases(&namespace) {
+                if analysis::short_name(&entry.name).starts_with(&prefix) {
+                    items.push(analysis::type_item(&entry));
+                }
+            }
+        }
+        Context::Type {
+            qualifier: None,
+            prefix,
+        } => {
             for name in analysis::TYPES {
                 if name.starts_with(&prefix) {
                     items.push(analysis::word_item(name, "type"));
@@ -876,8 +1314,41 @@ fn handle_completion(
                     items.push(analysis::word_item(&name, "class"));
                 }
             }
+            // The types declared in this document.
+            for entry in src.local_types() {
+                if analysis::short_name(&entry.name).starts_with(&prefix) {
+                    items.push(analysis::type_item(&entry));
+                }
+            }
+            // The modules to qualify a type with.
+            let mut names: Vec<&String> = binds.keys().collect();
+            names.sort();
+            for name in names {
+                let exports_types = matches!(
+                    binds.get(name),
+                    Some(Binding::Namespace(ns)) if !src.type_aliases(ns).is_empty()
+                );
+                if exports_types && name.starts_with(&prefix) {
+                    items.push(analysis::word_item(name, "module"));
+                }
+            }
         }
         Context::Global { prefix } => {
+            // Inside the table of a typed declaration: its fields.
+            if let Some((namespace, typed)) =
+                analysis::constructor_context(&content[..offset], &binds)
+            {
+                let fields = src.namespace_members(&namespace);
+                if !fields.is_empty() {
+                    for entry in fields {
+                        if analysis::short_name(&entry.name).starts_with(&typed) {
+                            items.push(analysis::field_item(&entry));
+                        }
+                    }
+                    return Json::Arr(items);
+                }
+            }
+
             // Declarations of the document come first, then what is always
             // in scope: globals, standard libraries and keywords.
             let parsed_symbols = extract_document_symbols(content);
@@ -1753,5 +2224,663 @@ mod tests {
             missing.is_empty(),
             "documented in docs/reference but absent at runtime: {missing:?}"
         );
+    }
+
+    // ---- modules, types and navigation across files
+
+    /// A module with a documented function, a method, a value and two types.
+    const MODULE: &str = "-- Creates a window.\nexport type Options = { name: string?, size: number, inner: Inner }\ntype Inner = { depth: int }\nlocal khione = {}\nkhione.version = \"1.0\"\n-- Opens it.\nfunction khione.new(options: Options, flag: boolean?): Inner\n    return nil\nend\nfunction khione:close(code: int)\nend\nreturn khione\n";
+
+    /// A directory of its own under the system temp directory.
+    fn cleanup(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("neyuki_lsp_server_{}_{}", name, std::process::id()));
+        cleanup(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_file(path: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn json_string(text: &str) -> String {
+        dap_json::render_json(&Json::Str(text.to_string()))
+    }
+
+    /// Opens `text` as the file `path`, which need not exist, and returns its
+    /// URI.
+    fn open_file(server: &mut LspServer, path: &std::path::Path, text: &str) -> String {
+        let uri = modules::path_to_uri(path);
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":{},"text":{}}}}}}}"#,
+            json_string(&uri),
+            json_string(text)
+        );
+        let _ = server.handle_message(req.as_bytes());
+        uri
+    }
+
+    fn change_file(server: &mut LspServer, uri: &str, text: &str) {
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":{}}},"contentChanges":[{{"text":{}}}]}}}}"#,
+            json_string(uri),
+            json_string(text)
+        );
+        let _ = server.handle_message(req.as_bytes());
+    }
+
+    fn request_in(
+        server: &mut LspServer,
+        uri: &str,
+        method: &str,
+        line: usize,
+        character: usize,
+    ) -> String {
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":101,"method":"{}","params":{{"textDocument":{{"uri":{}}},"position":{{"line":{}, "character":{}}}}}}}"#,
+            method,
+            json_string(uri),
+            line,
+            character
+        );
+        let resp = server.handle_message(req.as_bytes()).unwrap();
+        String::from_utf8(resp).unwrap()
+    }
+
+    /// Opens `text` as `main.nyk` of `dir` and sends `method` at its end.
+    fn query_in(dir: &std::path::Path, text: &str, method: &str) -> String {
+        let mut server = LspServer::new();
+        let uri = open_file(&mut server, &dir.join("main.nyk"), text);
+        let (line, character) = end_position(text);
+        request_in(&mut server, &uri, method, line, character)
+    }
+
+    #[test]
+    fn test_lsp_initialize_advertises_the_navigation_features() {
+        let mut server = LspServer::new();
+        let init_req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let resp = server.handle_message(init_req.as_bytes()).unwrap();
+        let resp_str = String::from_utf8(resp).unwrap();
+        assert!(resp_str.contains("\"referencesProvider\":true"));
+        assert!(resp_str.contains("\"renameProvider\":{\"prepareProvider\":true}"));
+        assert!(resp_str.contains("\"documentHighlightProvider\":true"));
+        assert!(resp_str.contains("\"foldingRangeProvider\":true"));
+        assert!(resp_str.contains("\"workspaceSymbolProvider\":true"));
+    }
+
+    #[test]
+    fn test_lsp_completion_lists_members_of_a_required_sibling_file() {
+        let dir = scratch("members");
+        write_file(&dir.join("khione.nyk"), MODULE);
+        let resp = query_in(
+            &dir,
+            "local k = require(\"khione\")\nk.",
+            "textDocument/completion",
+        );
+        assert!(resp.contains("\"label\":\"new\""));
+        assert!(resp.contains("\"detail\":\"new(options: Options, flag: boolean?): Inner\""));
+        assert!(resp.contains("Opens it."));
+        assert!(resp.contains("\"label\":\"version\""));
+        // The prefix filters, and the types are not values.
+        let resp = query_in(
+            &dir,
+            "local k = require(\"khione\")\nk.ne",
+            "textDocument/completion",
+        );
+        assert!(resp.contains("\"label\":\"new\""));
+        assert!(!resp.contains("\"label\":\"version\""));
+        assert!(!resp.contains("\"label\":\"Options\""));
+        // After a colon: the functions declared with one.
+        let resp = query_in(
+            &dir,
+            "local k = require(\"khione\")\nk:",
+            "textDocument/completion",
+        );
+        assert!(resp.contains("\"label\":\"close\""));
+        assert!(!resp.contains("\"label\":\"new\""));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_lsp_completion_prefers_the_unsaved_text_of_an_open_module() {
+        let dir = scratch("unsaved");
+        write_file(&dir.join("khione.nyk"), MODULE);
+        let mut server = LspServer::new();
+        let module = open_file(
+            &mut server,
+            &dir.join("khione.nyk"),
+            "local m = {}\nfunction m.unsaved() end\nreturn m\n",
+        );
+        let text = "local k = require(\"khione\")\nk.";
+        let main = open_file(&mut server, &dir.join("main.nyk"), text);
+        let (line, character) = end_position(text);
+        let resp = request_in(
+            &mut server,
+            &main,
+            "textDocument/completion",
+            line,
+            character,
+        );
+        assert!(resp.contains("\"label\":\"unsaved\""));
+        assert!(!resp.contains("\"label\":\"new\""));
+        // Typing in the module shows up in the next request.
+        change_file(
+            &mut server,
+            &module,
+            "local m = {}\nfunction m.unsaved() end\nfunction m.later() end\nreturn m\n",
+        );
+        let resp = request_in(
+            &mut server,
+            &main,
+            "textDocument/completion",
+            line,
+            character,
+        );
+        assert!(resp.contains("\"label\":\"later\""));
+        // Once it is closed the file on disk is read again.
+        let close = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didClose","params":{{"textDocument":{{"uri":{}}}}}}}"#,
+            json_string(&module)
+        );
+        let _ = server.handle_message(close.as_bytes());
+        let resp = request_in(
+            &mut server,
+            &main,
+            "textDocument/completion",
+            line,
+            character,
+        );
+        assert!(resp.contains("\"label\":\"new\""));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_lsp_missing_and_broken_modules_answer_nothing() {
+        let dir = scratch("broken");
+        write_file(&dir.join("broken.nyk"), "local m = {\nfunction (");
+        for module in ["missing", "broken", "../escape", "@neyuki/nope"] {
+            let text = format!("local m = require(\"{module}\")\nm.");
+            for method in ["textDocument/completion", "textDocument/hover"] {
+                let resp = query_in(&dir, &text, method);
+                assert!(
+                    resp.contains("\"result\":[]") || resp.contains("\"result\":null"),
+                    "{resp}"
+                );
+            }
+        }
+        // The first broken line is a syntax error only the client sees.
+        let resp = query_in(
+            &dir,
+            "local m = require(\"broken\")\nm.new(",
+            "textDocument/signatureHelp",
+        );
+        assert!(resp.contains("\"result\":null"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_lsp_module_cycles_do_not_hang() {
+        let dir = scratch("cycle");
+        write_file(
+            &dir.join("a.nyk"),
+            "local b = require(\"b\")\nlocal a = {}\nfunction a.one() end\nreturn a\n",
+        );
+        write_file(
+            &dir.join("b.nyk"),
+            "local a = require(\"a\")\nlocal b = {}\nfunction b.two() end\nreturn b\n",
+        );
+        write_file(&dir.join("x.nyk"), "return require(\"y\")\n");
+        write_file(&dir.join("y.nyk"), "return require(\"x\")\n");
+        let resp = query_in(
+            &dir,
+            "local a = require(\"a\")\na.",
+            "textDocument/completion",
+        );
+        assert!(resp.contains("\"label\":\"one\""));
+        let resp = query_in(
+            &dir,
+            "local x = require(\"x\")\nx.",
+            "textDocument/completion",
+        );
+        assert!(resp.contains("\"result\":[]"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_lsp_require_completion_lists_bundled_modules_packages_and_files() {
+        let dir = scratch("require");
+        write_file(
+            &dir.join("neyuki.toml"),
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\n\n[dependencies]\ndep = \"1.0.0\"\n",
+        );
+        write_file(&dir.join("khione.nyk"), MODULE);
+        write_file(&dir.join("sub").join("inner.nyk"), "return {}");
+        write_file(&dir.join("target").join("skipped.nyk"), "return {}");
+        write_file(&dir.join(".hidden").join("skipped.nyk"), "return {}");
+        let resp = query_in(&dir, "local m = require(\"", "textDocument/completion");
+        for label in ["@neyuki/ui", "math", "dep", "khione", "sub/inner"] {
+            assert!(
+                resp.contains(&format!("\"label\":\"{label}\"")),
+                "{label}: {resp}"
+            );
+        }
+        assert!(!resp.contains("skipped"));
+        // A prefix narrows the list; `./` offers files only.
+        let resp = query_in(&dir, "local m = require(\"kh", "textDocument/completion");
+        assert!(resp.contains("\"label\":\"khione\""));
+        assert!(!resp.contains("@neyuki"));
+        let resp = query_in(&dir, "local m = require(\"./s", "textDocument/completion");
+        assert!(resp.contains("\"newText\":\"./sub/inner\""));
+        assert!(!resp.contains("\"label\":\"dep\""));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_lsp_exported_types_complete_in_type_position() {
+        let dir = scratch("types");
+        write_file(&dir.join("khione.nyk"), MODULE);
+        let head = "local k = require(\"khione\")\n";
+        // After `k.`: the exported types, and only them.
+        let resp = query_in(
+            &dir,
+            &format!("{head}local o: k."),
+            "textDocument/completion",
+        );
+        assert!(resp.contains("\"label\":\"Options\""));
+        assert!(!resp.contains("\"label\":\"Inner\""));
+        assert!(!resp.contains("\"label\":\"new\""));
+        for text in [
+            format!("{head}function f(a: number, b: k.Op"),
+            format!("{head}function f(): k.Op"),
+            format!("{head}local list: {{k.Op"),
+        ] {
+            let resp = query_in(&dir, &text, "textDocument/completion");
+            assert!(resp.contains("\"label\":\"Options\""), "{text}: {resp}");
+        }
+        // Not in a type position: `k.` is the members of the module.
+        let resp = query_in(
+            &dir,
+            &format!("{head}local o = k."),
+            "textDocument/completion",
+        );
+        assert!(resp.contains("\"label\":\"new\""));
+        assert!(!resp.contains("\"label\":\"Options\""));
+
+        // Without a qualifier: built-in types, the types of the document and
+        // the modules that export types.
+        let mut server = LspServer::new();
+        let valid = format!("type Local = {{ a: number }}\n{head}local o: Local = nil\n");
+        let uri = open_file(&mut server, &dir.join("main.nyk"), &valid);
+        let typing = format!("type Local = {{ a: number }}\n{head}local o: ");
+        change_file(&mut server, &uri, &typing);
+        let (line, character) = end_position(&typing);
+        let resp = request_in(
+            &mut server,
+            &uri,
+            "textDocument/completion",
+            line,
+            character,
+        );
+        assert!(resp.contains("\"label\":\"number\""));
+        assert!(resp.contains("\"label\":\"Local\""));
+        assert!(resp.contains("\"label\":\"k\""));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_lsp_record_fields_complete_for_parameters_and_constructors() {
+        let dir = scratch("records");
+        write_file(&dir.join("khione.nyk"), MODULE);
+
+        // `function khione.new(options: Options)`: `options.` lists the
+        // fields of the alias declared in the same file. The text does not
+        // parse while it is typed, so the last good one is used.
+        let mut server = LspServer::new();
+        let valid = "export type Options = { name: string?, size: number }\nlocal khione = {}\nfunction khione.new(options: Options)\n    local n = options\nend\nreturn khione\n";
+        let module = open_file(&mut server, &dir.join("mine.nyk"), valid);
+        let typing = "export type Options = { name: string?, size: number }\nlocal khione = {}\nfunction khione.new(options: Options)\n    options.";
+        change_file(&mut server, &module, typing);
+        let (line, character) = end_position(typing);
+        let resp = request_in(
+            &mut server,
+            &module,
+            "textDocument/completion",
+            line,
+            character,
+        );
+        assert!(resp.contains("\"label\":\"name\""), "{resp}");
+        assert!(resp.contains("\"label\":\"size\""));
+        assert!(resp.contains("\"detail\":\"name: string?\""));
+        // The prefix filters the fields.
+        let prefix_typed = typing.to_string() + "na";
+        change_file(&mut server, &module, &prefix_typed);
+        let (line, character) = end_position(&prefix_typed);
+        let resp = request_in(
+            &mut server,
+            &module,
+            "textDocument/completion",
+            line,
+            character,
+        );
+        assert!(resp.contains("\"label\":\"name\""));
+        assert!(!resp.contains("\"label\":\"size\""));
+
+        // A value annotated with an exported type of a module.
+        let head = "local k = require(\"khione\")\nlocal o: k.Options = nil\no.";
+        let resp = query_in(&dir, head, "textDocument/completion");
+        for field in ["name", "size", "inner"] {
+            assert!(resp.contains(&format!("\"label\":\"{field}\"")), "{field}");
+        }
+        // And the fields of a field that is a record.
+        let resp = query_in(&dir, &format!("{head}inner."), "textDocument/completion");
+        assert!(resp.contains("\"label\":\"depth\""), "{resp}");
+
+        // Inside the table constructor of a typed declaration.
+        for text in [
+            "local k = require(\"khione\")\nlocal o: k.Options = { ",
+            "local k = require(\"khione\")\nlocal o: k.Options = {\n    name = \"x\",\n    si",
+        ] {
+            let resp = query_in(&dir, text, "textDocument/completion");
+            assert!(resp.contains("\"label\":\"size\""), "{text}: {resp}");
+            assert!(resp.contains("\"insertText\":\"size = \""));
+            // Names in scope are not mixed in.
+            assert!(!resp.contains("\"label\":\"print\""));
+        }
+        let resp = query_in(
+            &dir,
+            "local k = require(\"khione\")\nlocal o: k.Options = { inner = { ",
+            "textDocument/completion",
+        );
+        assert!(resp.contains("\"label\":\"depth\""), "{resp}");
+        // An untyped table is not a record.
+        let resp = query_in(&dir, "local o = { ", "textDocument/completion");
+        assert!(resp.contains("\"label\":\"print\""));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_lsp_local_aliases_complete_fields_of_annotated_values() {
+        let dir = scratch("alias");
+        // The alias comes from the last text that parsed.
+        let mut server = LspServer::new();
+        let valid = "type Point = { x: number, y: number }\nlocal p: Point = nil\nlocal n = p\n";
+        let uri = open_file(&mut server, &dir.join("main.nyk"), valid);
+        let typing = "type Point = { x: number, y: number }\nlocal p: Point = nil\np.";
+        change_file(&mut server, &uri, typing);
+        let (line, character) = end_position(typing);
+        let resp = request_in(
+            &mut server,
+            &uri,
+            "textDocument/completion",
+            line,
+            character,
+        );
+        assert!(resp.contains("\"label\":\"x\""), "{resp}");
+        assert!(resp.contains("\"label\":\"y\""));
+        // The elements of a list of the bundled module's type.
+        let text = "local ui = require(\"@neyuki/ui\")\nfunction frame(events: {ui.Event}, dt: number)\n    for _, e in events do\n        e.";
+        let resp = query_in(&dir, text, "textDocument/completion");
+        assert!(resp.contains("\"label\":\"kind\""), "{resp}");
+        assert!(resp.contains("\"label\":\"key\""));
+        // `--!importall` makes the types available as well.
+        let text = "--!importall\nlocal e: ui.Event = nil\ne.";
+        let resp = query_in(&dir, text, "textDocument/completion");
+        assert!(resp.contains("\"label\":\"kind\""), "{resp}");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_lsp_hover_and_signature_help_on_module_members_and_types() {
+        let dir = scratch("hover");
+        write_file(&dir.join("khione.nyk"), MODULE);
+        let mut server = LspServer::new();
+        let text = "local k = require(\"khione\")\nlocal o: k.Options = nil\nk.new(o)\ntype Mine = { a: number }\nlocal m: Mine = nil\nk:close(1)\n";
+        let uri = open_file(&mut server, &dir.join("main.nyk"), text);
+
+        // A function of the module, with its comment.
+        let resp = request_in(&mut server, &uri, "textDocument/hover", 2, 3);
+        assert!(resp.contains("khione.new(options: Options, flag: boolean?): Inner"));
+        assert!(resp.contains("Opens it."));
+        // An exported type through the module name, and a local alias.
+        let resp = request_in(&mut server, &uri, "textDocument/hover", 1, 13);
+        assert!(
+            resp.contains("export type Options = { name: string?, size: number, inner: Inner }")
+        );
+        assert!(resp.contains("Creates a window."));
+        let resp = request_in(&mut server, &uri, "textDocument/hover", 4, 10);
+        assert!(resp.contains("type Mine = { a: number }"));
+        // The module itself.
+        let resp = request_in(&mut server, &uri, "textDocument/hover", 0, 6);
+        assert!(resp.contains("khione.nyk"));
+
+        // Signature help for a call and for a method call, with the call
+        // left open as it is while it is typed.
+        let typing = "local k = require(\"khione\")\nlocal o: k.Options = nil\nk.new(o, \nk:close(";
+        change_file(&mut server, &uri, typing);
+        let resp = request_in(&mut server, &uri, "textDocument/signatureHelp", 2, 9);
+        assert!(resp.contains("\"label\":\"new(options: Options, flag: boolean?): Inner\""));
+        assert!(resp.contains("\"activeParameter\":1"), "{resp}");
+        let (line, character) = end_position(typing);
+        let resp = request_in(
+            &mut server,
+            &uri,
+            "textDocument/signatureHelp",
+            line,
+            character,
+        );
+        assert!(resp.contains("\"label\":\"close(code: int)\""), "{resp}");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_lsp_the_result_type_of_a_module_function_is_known() {
+        let dir = scratch("result");
+        write_file(
+            &dir.join("khione.nyk"),
+            "export type Window = { title: string, width: number }\nlocal khione = {}\nfunction khione.open(): Window\nend\nreturn khione\n",
+        );
+        let text = "local k = require(\"khione\")\nlocal w = k.open()\nw.";
+        let resp = query_in(&dir, text, "textDocument/completion");
+        assert!(resp.contains("\"label\":\"title\""), "{resp}");
+        assert!(resp.contains("\"label\":\"width\""));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_lsp_definition_across_files() {
+        let dir = scratch("definition");
+        write_file(&dir.join("khione.nyk"), MODULE);
+        let target = modules::path_to_uri(&dir.join("khione.nyk"));
+        let mut server = LspServer::new();
+        let text = "local k = require(\"khione\")\nlocal o: k.Options = nil\nk.new(o)\nlocal v = k.version\nrequire(\"@neyuki/ui\")\nrequire(\"missing\")\nlocal local_value = 1\nprint(local_value)\n";
+        let uri = open_file(&mut server, &dir.join("main.nyk"), text);
+
+        // A member: `function khione.new` is on line 6 of the module.
+        let resp = request_in(&mut server, &uri, "textDocument/definition", 2, 3);
+        assert!(
+            resp.contains(&format!("\"uri\":{}", json_string(&target))),
+            "{resp}"
+        );
+        assert!(resp.contains("\"line\":6"), "{resp}");
+        assert!(resp.contains("\"character\":16"));
+        // A value, and an exported type through the module name.
+        let resp = request_in(&mut server, &uri, "textDocument/definition", 3, 14);
+        assert!(resp.contains("\"line\":4"), "{resp}");
+        let resp = request_in(&mut server, &uri, "textDocument/definition", 1, 13);
+        assert!(resp.contains(&json_string(&target)));
+        assert!(resp.contains("\"line\":1"), "{resp}");
+        assert!(resp.contains("\"character\":12"));
+        // The module name goes to the file, and so does the string.
+        let resp = request_in(&mut server, &uri, "textDocument/definition", 0, 6);
+        assert!(resp.contains(&json_string(&target)), "{resp}");
+        let resp = request_in(&mut server, &uri, "textDocument/definition", 0, 22);
+        assert!(resp.contains(&json_string(&target)), "{resp}");
+        assert!(resp.contains("\"line\":0"));
+        // Bundled modules have no file, and a missing one has none either.
+        let resp = request_in(&mut server, &uri, "textDocument/definition", 4, 18);
+        assert!(resp.contains("\"result\":null"), "{resp}");
+        let resp = request_in(&mut server, &uri, "textDocument/definition", 5, 14);
+        assert!(resp.contains("\"result\":null"), "{resp}");
+        // A name of this document still goes to its declaration.
+        let resp = request_in(&mut server, &uri, "textDocument/definition", 7, 8);
+        assert!(resp.contains("\"line\":6"), "{resp}");
+        assert!(resp.contains(&json_string(&uri)));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_lsp_references_highlights_and_rename_follow_scopes() {
+        let text = "local x = 1\nlocal function f(x)\n    return x + 1\nend\nprint(x)\n";
+        let mut server = LspServer::new();
+        open_document(&mut server, text);
+
+        // The outer `x`: its declaration and the print, not the parameter.
+        let resp = position_request(&mut server, "textDocument/references", 0, 6);
+        assert_eq!(resp.matches("\"uri\":").count(), 2, "{resp}");
+        assert!(resp.contains("\"line\":4"));
+        assert!(!resp.contains("\"line\":2"));
+        // Without the declaration.
+        let req = r#"{"jsonrpc":"2.0","id":7,"method":"textDocument/references","params":{"textDocument":{"uri":"file:///test.nyk"},"position":{"line":0,"character":6},"context":{"includeDeclaration":false}}}"#;
+        let resp = String::from_utf8(server.handle_message(req.as_bytes()).unwrap()).unwrap();
+        assert_eq!(resp.matches("\"uri\":").count(), 1, "{resp}");
+
+        // The parameter: a write at its declaration and a read.
+        let resp = position_request(&mut server, "textDocument/documentHighlight", 2, 11);
+        assert_eq!(resp.matches("\"range\":").count(), 2, "{resp}");
+        assert!(resp.contains("\"kind\":3"));
+        assert!(resp.contains("\"kind\":2"));
+
+        // Rename the parameter: its two places, nothing else.
+        let req = r#"{"jsonrpc":"2.0","id":8,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///test.nyk"},"position":{"line":2,"character":11},"newName":"count"}}"#;
+        let resp = String::from_utf8(server.handle_message(req.as_bytes()).unwrap()).unwrap();
+        assert_eq!(resp.matches("\"newText\":\"count\"").count(), 2, "{resp}");
+        assert!(resp.contains("\"changes\":{\"file:///test.nyk\":["));
+        assert!(!resp.contains("\"line\":4"));
+        // And the outer one.
+        let req = req.replace("\"line\":2,\"character\":11", "\"line\":0,\"character\":6");
+        let resp = String::from_utf8(server.handle_message(req.as_bytes()).unwrap()).unwrap();
+        assert_eq!(resp.matches("\"newText\":\"count\"").count(), 2, "{resp}");
+        assert!(resp.contains("\"line\":4"));
+
+        // Names that are not valid are refused, and so are keywords.
+        for bad in ["", "1x", "a b", "end"] {
+            let req = format!(
+                r#"{{"jsonrpc":"2.0","id":9,"method":"textDocument/rename","params":{{"textDocument":{{"uri":"file:///test.nyk"}},"position":{{"line":0,"character":6}},"newName":{}}}}}"#,
+                json_string(bad)
+            );
+            let resp = String::from_utf8(server.handle_message(req.as_bytes()).unwrap()).unwrap();
+            assert!(resp.contains("\"code\":-32602"), "{bad}: {resp}");
+        }
+    }
+
+    #[test]
+    fn test_lsp_prepare_rename_rejects_names_that_cannot_be_renamed() {
+        let text = "local t = {}\nt.field = print\nif t then end\n";
+        let mut server = LspServer::new();
+        open_document(&mut server, text);
+        // A local can.
+        let resp = position_request(&mut server, "textDocument/prepareRename", 0, 6);
+        assert!(resp.contains("\"placeholder\":\"t\""), "{resp}");
+        assert!(resp.contains("\"character\":6"));
+        // A global of the standard library, a field and a keyword cannot.
+        for (line, character) in [(1, 11), (1, 3), (2, 6)] {
+            let resp = position_request(&mut server, "textDocument/prepareRename", line, character);
+            assert!(
+                resp.contains("\"result\":null"),
+                "{line}:{character} {resp}"
+            );
+        }
+        // Renaming a global is refused with a message.
+        let req = r#"{"jsonrpc":"2.0","id":8,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///test.nyk"},"position":{"line":1,"character":11},"newName":"show"}}"#;
+        let resp = String::from_utf8(server.handle_message(req.as_bytes()).unwrap()).unwrap();
+        assert!(resp.contains("\"code\":-32602"), "{resp}");
+        assert!(resp.contains("cannot be renamed"));
+    }
+
+    #[test]
+    fn test_lsp_references_are_confined_to_the_document() {
+        // The same names in a second document are not touched.
+        let dir = scratch("confined");
+        let mut server = LspServer::new();
+        let one = open_file(
+            &mut server,
+            &dir.join("one.nyk"),
+            "local value = 1\nprint(value)\n",
+        );
+        let _two = open_file(
+            &mut server,
+            &dir.join("two.nyk"),
+            "local value = 2\nprint(value)\n",
+        );
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"textDocument/rename","params":{{"textDocument":{{"uri":{}}},"position":{{"line":0,"character":6}},"newName":"other"}}}}"#,
+            json_string(&one)
+        );
+        let resp = String::from_utf8(server.handle_message(req.as_bytes()).unwrap()).unwrap();
+        assert_eq!(resp.matches("\"newText\":\"other\"").count(), 2, "{resp}");
+        assert!(!resp.contains("two.nyk"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_lsp_folding_ranges_and_workspace_symbols() {
+        let text = "-- a\n-- b\nfunction compute(x)\n    local t = {\n        1,\n    }\n    return x\nend\ntype Shape = { a: number }\n";
+        let mut server = LspServer::new();
+        open_document(&mut server, text);
+        let req = r#"{"jsonrpc":"2.0","id":11,"method":"textDocument/foldingRange","params":{"textDocument":{"uri":"file:///test.nyk"}}}"#;
+        let resp = String::from_utf8(server.handle_message(req.as_bytes()).unwrap()).unwrap();
+        assert!(
+            resp.contains("{\"startLine\":0,\"endLine\":1,\"kind\":\"comment\"}"),
+            "{resp}"
+        );
+        assert!(resp.contains("{\"startLine\":2,\"endLine\":6}"), "{resp}");
+        assert!(resp.contains("{\"startLine\":3,\"endLine\":4}"), "{resp}");
+
+        let req =
+            r#"{"jsonrpc":"2.0","id":12,"method":"workspace/symbol","params":{"query":"COMP"}}"#;
+        let resp = String::from_utf8(server.handle_message(req.as_bytes()).unwrap()).unwrap();
+        assert!(resp.contains("\"name\":\"compute\""), "{resp}");
+        assert!(resp.contains("\"uri\":\"file:///test.nyk\""));
+        assert!(!resp.contains("\"name\":\"Shape\""));
+        let req =
+            r#"{"jsonrpc":"2.0","id":13,"method":"workspace/symbol","params":{"query":"shape"}}"#;
+        let resp = String::from_utf8(server.handle_message(req.as_bytes()).unwrap()).unwrap();
+        assert!(resp.contains("\"name\":\"Shape\""), "{resp}");
+        assert!(resp.contains("\"line\":8"));
+    }
+
+    #[test]
+    fn test_lsp_diagnostics_carry_severity_tags_and_help() {
+        let mut server = LspServer::new();
+        let open = |server: &mut LspServer, text: &str| -> String {
+            let req = format!(
+                r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///test.nyk","text":{}}}}}}}"#,
+                json_string(text)
+            );
+            String::from_utf8(server.handle_message(req.as_bytes()).unwrap()).unwrap()
+        };
+        // Unused code is faded out.
+        let resp = open(&mut server, "local unused = 10\n");
+        assert!(resp.contains("\"code\":\"W0001\""), "{resp}");
+        assert!(resp.contains("\"severity\":2"));
+        assert!(resp.contains("\"tags\":[1]"));
+        // A syntax error is an error and is not faded.
+        let resp = open(&mut server, "local x = \n");
+        assert!(resp.contains("\"severity\":1"), "{resp}");
+        assert!(!resp.contains("\"tags\""));
+        // A clean document has none.
+        let resp = open(&mut server, "print(1)\n");
+        assert!(resp.contains("\"diagnostics\":[]"), "{resp}");
+        // Columns are UTF-16 units: the crab is two of them.
+        let resp = open(&mut server, "local s = \"\u{1f980}\"; local unused = 1\n");
+        let before = "local s = \"\u{1f980}\"; local ";
+        let column = char_col_to_utf16_col(before, before.chars().count());
+        assert!(resp.contains(&format!("\"character\":{column}")), "{resp}");
     }
 }

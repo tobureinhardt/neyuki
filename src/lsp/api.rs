@@ -15,6 +15,7 @@
 //! always in scope and every other page is a namespace such as `math`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// Every `docs/reference/*.md` page but the README, as (file name without
@@ -72,11 +73,23 @@ pub struct Library {
     pub module: Option<String>,
     /// The overview above the first entry.
     pub doc: String,
+    /// The file of a module that belongs to a project; none for the
+    /// libraries of the reference.
+    pub file: Option<PathBuf>,
+}
+
+/// Where a name is declared in a file: a 0-based line and UTF-16 columns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Definition {
+    pub file: PathBuf,
+    pub line: usize,
+    pub character: usize,
+    pub length: usize,
 }
 
 /// Where completion, hover and signature help get the members of namespaces
-/// and object types. The standard library is `Api`; a source for the modules
-/// of a project would implement this as well and be consulted next to it.
+/// and object types. The standard library is `Api`; `modules::ProjectSource`
+/// adds the modules of a project and is consulted next to it.
 pub trait MemberSource {
     /// Entries in scope without a namespace: `print`, `pcall`, ...
     fn globals(&self) -> Vec<Entry>;
@@ -97,6 +110,41 @@ pub trait MemberSource {
     fn type_methods(&self, type_name: &str) -> Vec<Entry>;
     /// Every object type that has methods.
     fn type_names(&self) -> Vec<String>;
+    /// The types a module exports, as value entries named
+    /// `namespace.Name` whose `returns` is the aliased type.
+    fn type_aliases(&self, _namespace: &str) -> Vec<Entry> {
+        Vec::new()
+    }
+    /// The types declared in the document being edited, named `Name`.
+    fn local_types(&self) -> Vec<Entry> {
+        Vec::new()
+    }
+    /// A type written in the module `entry` belongs to, rewritten so that
+    /// its names read in the file that calls the entry.
+    fn qualify_type(&self, _entry: &str, ty: &str) -> String {
+        ty.to_string()
+    }
+    /// Where an entry is declared, for the ones that come from a file.
+    fn definition(&self, _name: &str) -> Option<Definition> {
+        None
+    }
+}
+
+/// Some pages head a method with the variable it is usually called on
+/// (`conn:read`) while the functions return the type (`Connection`). Method
+/// completion goes by type, so these owners are read as the type.
+const OWNER_ALIASES: &[(&str, &str)] = &[
+    ("conn", "Connection"),
+    ("ws", "WebSocket"),
+    ("view", "WebView"),
+];
+
+/// The object type a method heading's owner stands for.
+fn owner_type(owner: &str) -> &str {
+    OWNER_ALIASES
+        .iter()
+        .find(|pair| pair.0 == owner)
+        .map_or(owner, |pair| pair.1)
 }
 
 /// The parsed library reference.
@@ -137,7 +185,10 @@ impl Api {
         for (index, entry) in entries.iter().enumerate() {
             by_name.insert(entry.name.clone(), index);
             if let (EntryKind::Method, Some(owner)) = (entry.kind, &entry.owner) {
-                methods.entry(owner.clone()).or_default().push(index);
+                methods
+                    .entry(owner_type(owner).to_string())
+                    .or_default()
+                    .push(index);
             }
         }
         let mut by_module = HashMap::new();
@@ -313,6 +364,7 @@ fn read_page(
         title,
         module,
         doc: intro.join("\n").trim().to_string(),
+        file: None,
     });
 
     for (heading, body) in sections {
@@ -577,5 +629,19 @@ mod tests {
         );
         assert!(api.type_names().contains(&"Window".to_string()));
         assert_eq!(api.entry("ui.open").unwrap().returns, "Window");
+    }
+
+    #[test]
+    fn test_methods_headed_by_a_variable_belong_to_the_type() {
+        // net.md and webview.md write `conn:read`, `ws:send` and
+        // `view:navigate`, while the functions return the types.
+        let api = api();
+        let has = |ty: &str, name: &str| api.type_methods(ty).iter().any(|e| e.name == name);
+        assert!(has("Connection", "conn:read"));
+        assert!(has("WebSocket", "ws:send"));
+        assert!(has("WebView", "view:navigate"));
+        assert!(!api.type_names().contains(&"conn".to_string()));
+        // The entries keep their headings.
+        assert!(api.entry("conn:read").is_some());
     }
 }

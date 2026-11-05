@@ -26,13 +26,14 @@ pub const TYPES: &[&str] = &[
 /// LSP `CompletionItemKind` values.
 const KIND_METHOD: usize = 2;
 const KIND_FUNCTION: usize = 3;
+const KIND_FIELD: usize = 5;
 const KIND_CLASS: usize = 7;
 const KIND_MODULE: usize = 9;
 const KIND_KEYWORD: usize = 14;
 const KIND_CONSTANT: usize = 21;
 const KIND_TYPE_PARAMETER: usize = 25;
 
-fn is_word_byte(byte: u8) -> bool {
+pub fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
@@ -177,8 +178,12 @@ pub fn mask_text(text: &str) -> String {
 pub enum Binding {
     /// A namespace such as `math` or `ui` (from a `require` or a global).
     Namespace(String),
-    /// An object type such as `Window`, or `string`.
+    /// An object type such as `Window`, or `string`; a type declared in a
+    /// module is written `@m0.Options`, the way `MemberSource` names it.
     Type(String),
+    /// A list whose elements have this type, from an annotation like
+    /// `{ui.Event}`.
+    Array(String),
 }
 
 /// A word is a run of letters, digits and underscores; every other
@@ -251,6 +256,16 @@ impl<'a> Tokens<'a> {
             _ => "",
         }
     }
+
+    /// The byte offset where token `k` starts.
+    fn start(&self, k: usize) -> Option<usize> {
+        self.list.get(k).map(|token| token.start)
+    }
+
+    /// The byte offset where token `k` ends.
+    fn end(&self, k: usize) -> Option<usize> {
+        self.list.get(k).map(|token| token.end)
+    }
 }
 
 fn is_declaration_keyword(word: &str) -> bool {
@@ -266,15 +281,16 @@ fn trailing_ident(text: &str) -> &str {
     text[start..].trim_start_matches(|c: char| c.is_ascii_digit())
 }
 
-/// The base type name of a type annotation: `Window?` -> `Window`.
+/// The base type name of a type annotation: `Window?` -> `Window`,
+/// `ui.Event` stays whole.
 fn base_type(ty: &str) -> Option<String> {
     let ty = ty.trim();
     let ty = ty.strip_prefix('(').unwrap_or(ty).trim_start();
     let end = ty
         .bytes()
-        .position(|b| !is_word_byte(b))
+        .position(|b| !(is_word_byte(b) || b == b'.' || b == b'@'))
         .unwrap_or(ty.len());
-    let name = &ty[..end];
+    let name = ty[..end].trim_end_matches('.');
     if name.is_empty() || name.as_bytes()[0].is_ascii_digit() {
         None
     } else {
@@ -282,10 +298,49 @@ fn base_type(ty: &str) -> Option<String> {
     }
 }
 
+/// Whether `text` is a name or names joined by dots: `Options`, `ui.Event`.
+fn is_dotted_name(text: &str) -> bool {
+    !text.is_empty()
+        && text.split('.').all(|part| {
+            !part.is_empty()
+                && !part.as_bytes()[0].is_ascii_digit()
+                && part.bytes().all(is_word_byte)
+        })
+}
+
+/// What an annotation says about a name: the type itself, or for `{Type}` the
+/// type of its elements. Optional (`?`) types count as the type; anything
+/// that is not one name (unions, functions, record literals) says nothing.
+/// Names are read through `binds`, so `k.Options` is the type `@m0.Options`
+/// after `local k = require("khione")`.
+fn type_binding(annotation: &str, binds: &HashMap<String, Binding>) -> Option<Binding> {
+    let ty = annotation.trim().trim_end_matches('?').trim_end();
+    if let Some(inner) = ty.strip_prefix('{') {
+        let inner = inner.strip_suffix('}')?.trim();
+        return is_dotted_name(inner).then(|| Binding::Array(canonical(inner, binds)));
+    }
+    is_dotted_name(ty).then(|| Binding::Type(canonical(ty, binds)))
+}
+
+/// The annotation that starts at byte `from` of `masked`, up to the `=` or
+/// the end of the line.
+fn annotation_at(masked: &str, from: usize) -> &str {
+    let rest = &masked[from..];
+    let end = rest.find(['=', '\n']).unwrap_or(rest.len());
+    rest[..end].trim()
+}
+
 /// What the names declared in `text` stand for: a namespace (the standard
 /// libraries, `require`, `--!importall`), an object type (from an annotation
 /// or a call whose result type is known) or `string` for string literals.
 pub fn bindings(text: &str, src: &dyn MemberSource) -> HashMap<String, Binding> {
+    bindings_at(text, text.len(), src)
+}
+
+/// Like `bindings` for the code at byte `offset`: the parameters of a
+/// function only count when the function starts before it, the nearest
+/// function first, and a loop variable once its loop has started.
+pub fn bindings_at(text: &str, offset: usize, src: &dyn MemberSource) -> HashMap<String, Binding> {
     let masked = mask_text(text);
     let bytes = masked.as_bytes();
     let mut result = HashMap::new();
@@ -350,21 +405,105 @@ pub fn bindings(text: &str, src: &dyn MemberSource) -> HashMap<String, Binding> 
         if !is_declaration_keyword(tokens.text(k))
             || !tokens.is_name(k + 1)
             || tokens.text(k + 2) != ":"
-            || !tokens.is_name(k + 3)
         {
             continue;
         }
-        let mut last = k + 3;
-        while tokens.text(last + 1) == "."
-            && tokens.adjacent(last, last + 1)
-            && tokens.is_name(last + 2)
-            && tokens.adjacent(last + 1, last + 2)
-        {
-            last += 2;
+        let Some(from) = tokens.start(k + 3) else {
+            continue;
+        };
+        if let Some(binding) = type_binding(annotation_at(&masked, from), &result) {
+            result
+                .entry(tokens.text(k + 1).to_string())
+                .or_insert(binding);
         }
-        result
-            .entry(tokens.text(k + 1).to_string())
-            .or_insert_with(|| Binding::Type(tokens.span(k + 3, last).to_string()));
+    }
+
+    // `function f(name: Type, ...)`: the parameters of the functions that
+    // start before the cursor. The nearest function wins.
+    let headers: Vec<usize> = (0..tokens.len())
+        .filter(|&k| tokens.text(k) == "function" && tokens.start(k).is_some_and(|at| at < offset))
+        .collect();
+    for &k in headers.iter().rev() {
+        let mut open = k + 1;
+        // The name: `a.b` or `a:b`.
+        while tokens.is_name(open) || matches!(tokens.text(open), "." | ":") {
+            open += 1;
+        }
+        if tokens.text(open) != "(" {
+            continue;
+        }
+        // Each parameter runs to a comma outside brackets or to the `)`.
+        let mut depth = 0usize;
+        let mut first = open + 1;
+        let mut at = open + 1;
+        let mut segments: Vec<(usize, usize)> = Vec::new();
+        loop {
+            match tokens.text(at) {
+                "" => {
+                    segments.push((first, at));
+                    break;
+                }
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => {
+                    if depth == 0 {
+                        segments.push((first, at));
+                        break;
+                    }
+                    depth -= 1;
+                }
+                "," if depth == 0 => {
+                    segments.push((first, at));
+                    first = at + 1;
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        for (first, end) in segments {
+            if !tokens.is_name(first) || tokens.text(first + 1) != ":" || first + 2 >= end {
+                continue;
+            }
+            let (Some(from), Some(to)) = (tokens.start(first + 2), tokens.end(end - 1)) else {
+                continue;
+            };
+            if let Some(binding) = type_binding(&masked[from..to], &result) {
+                result
+                    .entry(tokens.text(first).to_string())
+                    .or_insert(binding);
+            }
+        }
+    }
+
+    // `for _, e in events do` and `for _, e in ipairs(events) do`: `e` has
+    // the element type of the list `events`.
+    for k in 0..tokens.len() {
+        if tokens.text(k) != "for" || !tokens.start(k).is_some_and(|at| at < offset) {
+            continue;
+        }
+        let mut vars = Vec::new();
+        let mut at = k + 1;
+        while tokens.is_name(at) {
+            vars.push(at);
+            at += 1;
+            if tokens.text(at) == "," {
+                at += 1;
+            } else {
+                break;
+            }
+        }
+        if vars.len() != 2 || tokens.text(at) != "in" {
+            continue;
+        }
+        let mut source = at + 1;
+        if matches!(tokens.text(source), "ipairs" | "pairs") && tokens.text(source + 1) == "(" {
+            source += 2;
+        }
+        if !tokens.is_name(source) {
+            continue;
+        }
+        if let Some(Binding::Array(element)) = result.get(tokens.text(source)).cloned() {
+            result.insert(tokens.text(vars[1]).to_string(), Binding::Type(element));
+        }
     }
 
     // `local name = a.b(...)` where the entry for `a.b` says what it returns.
@@ -389,7 +528,7 @@ pub fn bindings(text: &str, src: &dyn MemberSource) -> HashMap<String, Binding> 
             continue;
         }
         let returned = resolve_entry(tokens.span(k + 3, last), &result, src)
-            .and_then(|entry| base_type(&entry.returns));
+            .and_then(|entry| base_type(&src.qualify_type(&entry.name, &entry.returns)));
         if let Some(ty) = returned
             && ty != "any"
             && ty != "table"
@@ -433,7 +572,7 @@ pub fn canonical(chain: &str, binds: &HashMap<String, Binding>) -> String {
         Some(Binding::Namespace(name)) | Some(Binding::Type(name)) => {
             format!("{name}{}", &chain[end..])
         }
-        None => chain.to_string(),
+        Some(Binding::Array(_)) | None => chain.to_string(),
     }
 }
 
@@ -463,6 +602,14 @@ pub fn methods_for(
         if !methods.is_empty() {
             return methods;
         }
+    }
+    // The functions a module declares with a colon: `function m:name()`.
+    if let Some(Binding::Namespace(namespace)) = bound {
+        return src
+            .namespace_members(namespace)
+            .into_iter()
+            .filter(|entry| entry.kind == EntryKind::Method)
+            .collect();
     }
     if ty == Some("string") || bound.is_none() {
         // Strings carry the string library as methods; for an unknown
@@ -518,8 +665,12 @@ pub enum Context {
     /// After `x:`: methods of the receiver, which is empty when it is a
     /// string literal or a call.
     Method { receiver: String, prefix: String },
-    /// Where a type annotation is written.
-    Type { prefix: String },
+    /// Where a type annotation is written. `qualifier` is the dotted name
+    /// before the last dot: `k` for `k.Op`.
+    Type {
+        qualifier: Option<String>,
+        prefix: String,
+    },
     /// Anywhere else: names in scope.
     Global { prefix: String },
 }
@@ -540,11 +691,28 @@ pub fn completion_context(before: &str) -> Context {
         return Context::None;
     }
 
-    if let Some((chain, prefix)) = member_context(before) {
+    // Where an annotation is written, `a.b` names a type of the module `a`.
+    let line_start = before.rfind('\n').map_or(0, |at| at + 1);
+    let line = &before[line_start..];
+    let member = member_context(before);
+    let prefix = trailing_ident(before);
+    let name_start = match &member {
+        Some((_, _, chain_start)) => *chain_start,
+        None => before.len() - prefix.len(),
+    };
+    if let Some(start) = name_start.checked_sub(line_start)
+        && in_type_position(line, start)
+    {
+        return Context::Type {
+            qualifier: member.as_ref().map(|(chain, _, _)| chain.clone()),
+            prefix: prefix.to_string(),
+        };
+    }
+
+    if let Some((chain, prefix, _)) = member {
         return Context::Member { chain, prefix };
     }
 
-    let prefix = trailing_ident(before);
     let head = before[..before.len() - prefix.len()].trim_end();
     if let Some(head) = head.strip_suffix(':') {
         let head = head.trim_end();
@@ -555,13 +723,6 @@ pub fn completion_context(before: &str) -> Context {
             _ => None,
         };
         if let Some(receiver) = receiver {
-            // A colon after a name could also start a type annotation.
-            let line = &before[before.rfind('\n').map_or(0, |at| at + 1)..];
-            if is_declaration_line(line) || in_parameters(line) || in_return_type(line) {
-                return Context::Type {
-                    prefix: prefix.to_string(),
-                };
-            }
             return Context::Method {
                 receiver: receiver.to_string(),
                 prefix: prefix.to_string(),
@@ -573,11 +734,60 @@ pub fn completion_context(before: &str) -> Context {
     }
 }
 
+/// Whether the name that starts at byte `start` of `line` (the line up to the
+/// cursor) is written where a type is expected: after the `:` of
+/// `local x: `, of a parameter or of a return type, after `->`, after the
+/// `=` of a `type` declaration, or inside such a type.
+fn in_type_position(line: &str, start: usize) -> bool {
+    let head = &line[..start];
+    let bytes = head.as_bytes();
+    let alias_line = {
+        let trimmed = line.trim_start();
+        let trimmed = match trimmed.strip_prefix("export ") {
+            Some(rest) => rest.trim_start(),
+            None => trimmed,
+        };
+        trimmed.starts_with("type ")
+    };
+    // Walk back over the text before the name. A bracket pair that closed
+    // before it is skipped, one that is still open is stepped out of.
+    let mut depth = 0i32;
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' => depth = (depth - 1).max(0),
+            // Another parameter or declaration starts after a comma.
+            b',' if depth == 0 => return false,
+            b'=' if depth == 0 => return alias_line,
+            b'>' if depth == 0 && i > 0 && bytes[i - 1] == b'-' => return true,
+            b':' if depth == 0 => {
+                let before = head[..i].trim_end();
+                if before.ends_with(')') {
+                    // `function f(a): Type`
+                    return !function_ends(before).is_empty();
+                }
+                if !before.bytes().next_back().is_some_and(is_word_byte) {
+                    return false;
+                }
+                // `local x: Type` has no `=` before the colon; `local x = w:m`
+                // is a method call.
+                return alias_line
+                    || (is_declaration_line(line) && !before.contains('='))
+                    || in_parameters(head);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The module name typed so far inside `require("`.
 fn require_prefix(before: &str) -> Option<&str> {
     let start = before
         .bytes()
-        .rposition(|b| !(is_word_byte(b) || b == b'@' || b == b'/'))
+        .rposition(|b| !(is_word_byte(b) || matches!(b, b'@' | b'/' | b'.' | b'-')))
         .map_or(0, |at| at + 1);
     let head = before[..start].strip_suffix(['"', '\''])?.trim_end();
     let head = match head.strip_suffix('(') {
@@ -591,8 +801,9 @@ fn require_prefix(before: &str) -> Option<&str> {
     Some(&before[start..])
 }
 
-/// `a.b.` with the member prefix typed so far, as (`a.b`, prefix).
-fn member_context(before: &str) -> Option<(String, String)> {
+/// `a.b.` with the member prefix typed so far, as (`a.b`, prefix, the byte
+/// offset of the `a`).
+fn member_context(before: &str) -> Option<(String, String, usize)> {
     let prefix = trailing_ident(before);
     let head = before[..before.len() - prefix.len()]
         .trim_end()
@@ -617,7 +828,7 @@ fn member_context(before: &str) -> Option<(String, String)> {
         return None;
     }
     segments.reverse();
-    Some((segments.join("."), prefix.to_string()))
+    Some((segments.join("."), prefix.to_string(), chain_start))
 }
 
 /// Whether `line` starts a declaration: `local x: ...`.
@@ -645,24 +856,6 @@ fn in_parameters(line: &str) -> bool {
     function_ends(line)
         .last()
         .is_some_and(|&end| !line[end..].contains(')'))
-}
-
-/// Whether the cursor is at the return type of a `function` on `line`:
-/// `function f(a): Ty`.
-fn in_return_type(line: &str) -> bool {
-    function_ends(line).into_iter().any(|end| {
-        let rest = &line[end..];
-        let Some(open) = rest.find('(') else {
-            return false;
-        };
-        let Some(close) = rest[open..].find(')') else {
-            return false;
-        };
-        rest[open + close + 1..]
-            .trim_start()
-            .strip_prefix(':')
-            .is_some_and(|ty| ty.trim_start().bytes().all(is_word_byte))
-    })
 }
 
 /// The call the cursor is inside.
@@ -731,6 +924,11 @@ fn chain_ending(head: &str) -> Option<String> {
     let mut chain_start = head.len() - ident.len();
     let mut rest = &head[..chain_start];
     while let Some(earlier) = rest.trim_end().strip_suffix(['.', ':']) {
+        // A colon joins a method to its receiver only when nothing separates
+        // them: `w:m`, but not the `: ` of `local x: T`.
+        if rest.trim_end().ends_with(':') && rest.ends_with(char::is_whitespace) {
+            break;
+        }
         let earlier = earlier.trim_end();
         let ident = trailing_ident(earlier);
         if ident.is_empty() {
@@ -913,6 +1111,7 @@ pub fn word_item(label: &str, kind: &str) -> Json {
     let (number, detail) = match kind {
         "keyword" => (KIND_KEYWORD, "keyword"),
         "class" => (KIND_CLASS, "type"),
+        "module" => (KIND_MODULE, "module"),
         _ => (KIND_TYPE_PARAMETER, "type"),
     };
     obj([
@@ -920,6 +1119,158 @@ pub fn word_item(label: &str, kind: &str) -> Json {
         ("kind", Json::Num(number as f64)),
         ("detail", Json::Str(detail.to_string())),
     ])
+}
+
+/// A completion item for a type a module or the document declares.
+pub fn type_item(entry: &Entry) -> Json {
+    obj([
+        ("label", Json::Str(short_name(&entry.name).to_string())),
+        ("kind", Json::Num(KIND_CLASS as f64)),
+        ("detail", Json::Str(entry.signature.clone())),
+        ("documentation", markup(entry_markdown(entry))),
+    ])
+}
+
+/// A completion item for a field of a record type, inserted as `name = `
+/// where a table constructor is being written.
+pub fn field_item(entry: &Entry) -> Json {
+    let label = short_name(&entry.name);
+    obj([
+        ("label", Json::Str(label.to_string())),
+        ("kind", Json::Num(KIND_FIELD as f64)),
+        ("detail", Json::Str(entry.signature.clone())),
+        ("insertText", Json::Str(format!("{label} = "))),
+    ])
+}
+
+/// Inside the table constructor of a typed declaration, as in
+/// `local o: k.Options = { na`: the namespace whose members are the fields
+/// that can be written there (the type, followed by the keys of the tables
+/// the cursor is nested in) and the field prefix typed so far.
+pub fn constructor_context(
+    before: &str,
+    binds: &HashMap<String, Binding>,
+) -> Option<(String, String)> {
+    let masked = mask_text(before);
+    let prefix = trailing_ident(&masked);
+    let head = masked[..masked.len() - prefix.len()].trim_end();
+    // A key is written right after the brace or after a comma.
+    if !(head.ends_with('{') || head.ends_with(',') || head.ends_with(';')) {
+        return None;
+    }
+    let mut open: Vec<usize> = Vec::new();
+    for (at, byte) in masked.bytes().enumerate() {
+        match byte {
+            b'{' => open.push(at),
+            b'}' => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    // From the innermost table outwards: `key = {` names a field of the
+    // table around it, `local name: Type = {` starts the walk.
+    let mut keys: Vec<&str> = Vec::new();
+    for (index, &brace) in open.iter().enumerate().rev() {
+        let from = if index == 0 { 0 } else { open[index - 1] + 1 };
+        let assigned = masked[from..brace].trim_end().strip_suffix('=')?.trim_end();
+        if index == 0 {
+            let line = &assigned[assigned.rfind('\n').map_or(0, |at| at + 1)..];
+            let annotation = declared_annotation(line)?;
+            let Binding::Type(root) = type_binding(annotation, binds)? else {
+                return None;
+            };
+            keys.reverse();
+            let mut namespace = root;
+            for key in keys {
+                namespace.push('.');
+                namespace.push_str(key);
+            }
+            return Some((namespace, prefix.to_string()));
+        }
+        let key = trailing_ident(assigned);
+        if key.is_empty() {
+            return None;
+        }
+        keys.push(key);
+    }
+    None
+}
+
+/// The annotation of a declaration on `line`, which ends where the `=` was:
+/// `local name: Type` -> `Type`.
+fn declared_annotation(line: &str) -> Option<&str> {
+    let mut words = line.trim_start();
+    let mut declared = false;
+    loop {
+        let mut stripped = false;
+        for keyword in ["local", "const", "global"] {
+            if let Some(after) = words.strip_prefix(keyword)
+                && after.starts_with(char::is_whitespace)
+            {
+                words = after.trim_start();
+                declared = true;
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    if !declared {
+        return None;
+    }
+    let colon = words.find(':')?;
+    let name = words[..colon].trim();
+    if name.is_empty() || !name.bytes().all(is_word_byte) {
+        return None;
+    }
+    Some(words[colon + 1..].trim())
+}
+
+/// The module named by the `require("...")` string the position is inside.
+pub fn require_at(content: &str, line: usize, character: usize) -> Option<String> {
+    let line_text = content.lines().nth(line)?;
+    let at = super::utf16_col_to_byte_offset(line_text, character);
+    let masked = mask_text(line_text);
+    let bytes = masked.as_bytes();
+    for (index, _) in masked.match_indices("require") {
+        if index > 0 && is_word_byte(bytes[index - 1]) {
+            continue;
+        }
+        let mut quote = skip_whitespace(&masked, index + "require".len());
+        if bytes.get(quote) == Some(&b'(') {
+            quote = skip_whitespace(&masked, quote + 1);
+        }
+        let Some(&mark) = bytes.get(quote) else {
+            continue;
+        };
+        if mark != b'"' && mark != b'\'' {
+            continue;
+        }
+        let Some(length) = line_text[quote + 1..].find(mark as char) else {
+            continue;
+        };
+        if at > quote && at <= quote + 1 + length {
+            return Some(line_text[quote + 1..quote + 1 + length].to_string());
+        }
+    }
+    None
+}
+
+/// The dotted name that ends at the identifier under the position, with
+/// anything inside a string or comment ignored: `k.Options` for the cursor
+/// in `Options`.
+pub fn chain_at(content: &str, line: usize, character: usize) -> Option<String> {
+    let line_text = content.lines().nth(line)?;
+    let at = super::utf16_col_to_byte_offset(line_text, character);
+    let (start, end) = ident_range_at(line_text, at)?;
+    let masked = mask_text(content);
+    if masked.as_bytes().get(offset_at(content, line, 0) + start) == Some(&b' ') {
+        return None;
+    }
+    chain_ending(&line_text[..end])
 }
 
 /// Hover for the library name under the cursor: `Some(Json::Null)` inside a
@@ -937,7 +1288,7 @@ pub fn hover(content: &str, line: usize, character: usize, src: &dyn MemberSourc
     }
 
     let chain = chain_ending(&line_text[..end])?;
-    let binds = bindings(content, src);
+    let binds = bindings_at(content, word_offset, src);
     let value = match entry_for_chain(&chain, &binds, src) {
         Some(entry) => entry_markdown(&entry),
         None => {
@@ -969,7 +1320,7 @@ pub fn signature_help(
     let Some(call) = call_context(&content[..offset]) else {
         return Json::Null;
     };
-    let binds = bindings(content, src);
+    let binds = bindings_at(content, offset, src);
     let Some(entry) = entry_for_chain(&call.callee, &binds, src) else {
         return Json::Null;
     };
@@ -1068,18 +1419,58 @@ mod tests {
                 prefix: "up".to_string()
             }
         );
+        let unqualified = |prefix: &str| Context::Type {
+            qualifier: None,
+            prefix: prefix.to_string(),
+        };
+        let qualified = |qualifier: &str, prefix: &str| Context::Type {
+            qualifier: Some(qualifier.to_string()),
+            prefix: prefix.to_string(),
+        };
+        assert_eq!(completion_context("local w: Wi"), unqualified("Wi"));
+        assert_eq!(completion_context("function f(a: Nu"), unqualified("Nu"));
+        // Every place a type is written, plain or qualified.
+        assert_eq!(completion_context("local w: k."), qualified("k", ""));
+        assert_eq!(completion_context("local w: k.Op"), qualified("k", "Op"));
+        assert_eq!(completion_context("local w: {k.Ev"), qualified("k", "Ev"));
         assert_eq!(
-            completion_context("local w: Wi"),
-            Context::Type {
-                prefix: "Wi".to_string()
-            }
+            completion_context("local w: A | k.Ev"),
+            qualified("k", "Ev")
         );
         assert_eq!(
-            completion_context("function f(a: Nu"),
-            Context::Type {
-                prefix: "Nu".to_string()
+            completion_context("function f(a: number, b: k.Op"),
+            qualified("k", "Op")
+        );
+        assert_eq!(
+            completion_context("function f(a: number): k.Op"),
+            qualified("k", "Op")
+        );
+        assert_eq!(
+            completion_context("local cb: (n: number) -> Re"),
+            unqualified("Re")
+        );
+        assert_eq!(completion_context("type A = k.Op"), qualified("k", "Op"));
+        assert_eq!(
+            completion_context("export type A = {x: Op"),
+            unqualified("Op")
+        );
+        // The name of the next parameter or declaration is not a type, and
+        // neither is the receiver of a method call on a declaration line.
+        assert!(matches!(
+            completion_context("function f(a: number, b"),
+            Context::Global { .. }
+        ));
+        assert_eq!(
+            completion_context("local r = win:cl"),
+            Context::Method {
+                receiver: "win".to_string(),
+                prefix: "cl".to_string()
             }
         );
+        assert!(matches!(
+            completion_context("local r = k.Op"),
+            Context::Member { .. }
+        ));
         assert_eq!(
             completion_context("pri"),
             Context::Global {
@@ -1110,5 +1501,72 @@ mod tests {
         assert_eq!(call_context("f(1, 2)"), None);
         assert_eq!(call_context("if (a and "), None);
         assert_eq!(call_context("x = 1\nlocal y = "), None);
+    }
+
+    #[test]
+    fn test_bindings_read_parameter_and_list_annotations() {
+        let text = "local ui = require(\"@neyuki/ui\")\nfunction run(options: Opts, events: {ui.Event}, n: number?)\n    for _, e in events do\n    end\nend\n";
+        let src = crate::lsp::api::api();
+        let binds = bindings_at(text, text.len(), src);
+        assert_eq!(
+            binds.get("options"),
+            Some(&Binding::Type("Opts".to_string()))
+        );
+        assert_eq!(
+            binds.get("events"),
+            Some(&Binding::Array("ui.Event".to_string()))
+        );
+        assert_eq!(binds.get("e"), Some(&Binding::Type("ui.Event".to_string())));
+        assert_eq!(binds.get("n"), Some(&Binding::Type("number".to_string())));
+        // Before the function starts its parameters are not known.
+        let early = bindings_at(text, 10, src);
+        assert!(!early.contains_key("options"));
+        // `ipairs(events)` iterates the same list.
+        let text = "function run(events: {Ev})\n    for i, e in ipairs(events) do\n";
+        let binds = bindings(text, src);
+        assert_eq!(binds.get("e"), Some(&Binding::Type("Ev".to_string())));
+    }
+
+    #[test]
+    fn test_constructor_context_finds_the_declared_type() {
+        let src = crate::lsp::api::api();
+        let binds = bindings("local k = require(\"@neyuki/ui\")\n", src);
+        let at = |text: &str| constructor_context(text, &binds);
+        let found =
+            |namespace: &str, prefix: &str| Some((namespace.to_string(), prefix.to_string()));
+        assert_eq!(at("local o: k.Event = { ki"), found("ui.Event", "ki"));
+        assert_eq!(
+            at("local o: Options = {\n    name = 1,\n    "),
+            found("Options", "")
+        );
+        assert_eq!(
+            at("local o: Options = { inner = { de"),
+            found("Options.inner", "de")
+        );
+        // Not a typed declaration, not where a key goes.
+        assert_eq!(at("local o = { na"), None);
+        assert_eq!(at("local o: Options = f({ na"), None);
+        assert_eq!(at("local o: Options = { name = "), None);
+        assert_eq!(at("local o: Options = {}"), None);
+    }
+
+    #[test]
+    fn test_require_at_finds_the_string_under_the_cursor() {
+        let text = "local k = require(\"khione\")\nlocal s = \"require('x')\" -- require(\"y\")\n";
+        // Inside the name, and right after it, but not on the call.
+        assert_eq!(require_at(text, 0, 20).as_deref(), Some("khione"));
+        assert_eq!(require_at(text, 0, 25).as_deref(), Some("khione"));
+        assert_eq!(require_at(text, 0, 12), None);
+        // A `require` in a string or a comment is not a call.
+        assert_eq!(require_at(text, 1, 20), None);
+        assert_eq!(require_at(text, 1, 40), None);
+    }
+
+    #[test]
+    fn test_chain_at_names_the_whole_qualified_type() {
+        let text = "local o: k.Options = {}\nprint(\"k.Options\")\n";
+        assert_eq!(chain_at(text, 0, 14).as_deref(), Some("k.Options"));
+        assert_eq!(chain_at(text, 0, 9).as_deref(), Some("k"));
+        assert_eq!(chain_at(text, 1, 10), None);
     }
 }
