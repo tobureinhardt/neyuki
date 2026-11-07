@@ -284,6 +284,11 @@ end
 
 local canvas = ui.canvas(20, 10)
 assert(canvas.width == 20 and canvas.height == 10 and canvas.scale == 1, "a canvas knows its size")
+assert(canvas:scaleFactor() == 1, "a canvas reports its scale as a method too")
+assert(canvas.scale == canvas:scaleFactor(), "the scale field and scaleFactor agree")
+local scaled = ui.canvas(8, 8, { scale = 2 })
+assert(scaled.scale == 2 and scaled:scaleFactor() == 2, "scaleFactor follows options.scale")
+scaled:close()
 local w, h = canvas:size()
 assert(w == 20 and h == 10)
 local r, g, b, a = canvas:getPixel(1, 1)
@@ -479,6 +484,16 @@ assert(win:title() == "Neyuki test")
 local width, height = win:size()
 assert(width > 0 and height > 0, "a window has a size")
 assert(win:scale() > 0, "a window has a scale factor")
+assert(win:scaleFactor() == win:scale(), "scaleFactor matches scale on a window")
+-- The same code must work on either surface; `scale` is a field on a canvas
+-- and a method on a window, so only `scaleFactor()` is common to both.
+local function surfaceScale(surface: any): number
+    return surface:scaleFactor()
+end
+local shared = ui.canvas(4, 4, { scale = 2 })
+assert(surfaceScale(shared) == 2, "shared code reads a canvas scale")
+assert(surfaceScale(win) == win:scale(), "shared code reads a window scale")
+shared:close()
 win:setTitle("Renamed")
 assert(win:title() == "Renamed")
 

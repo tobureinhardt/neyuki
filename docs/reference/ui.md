@@ -162,7 +162,7 @@ A new image with every frame blurred by a gaussian whose standard deviation is `
 
 ## ui.canvas(w: number, h: number, options: table?): Canvas
 
-Makes an off-screen surface of `w` x `h` logical pixels, transparent at first. A canvas has every drawing method of a window (`clear`, `fillRect`, `text`, `pushClip`, `getPixel` and the rest; `clear()` without a color makes it transparent again) but no `present`, and it needs no display. Draw it onto a window or another canvas with `drawImage`, which takes `x`, `y`, `width`, `height`, `opacity`, `radius` and `fit` like it does for an image. It also has `width`, `height`, `scale`, `canvas:size()` and `canvas:close()`.
+Makes an off-screen surface of `w` x `h` logical pixels, transparent at first. A canvas has every drawing method of a window (`clear`, `fillRect`, `text`, `pushClip`, `getPixel` and the rest; `clear()` without a color makes it transparent again) but no `present`, and it needs no display. Draw it onto a window or another canvas with `drawImage`, which takes `x`, `y`, `width`, `height`, `opacity`, `radius` and `fit` like it does for an image. It also has the fields `width`, `height` and `scale`, and the methods `canvas:size()`, `canvas:scaleFactor()` and `canvas:close()`. A canvas's scale is a field because it is fixed when the canvas is made, while a window's follows the display and so is the method `window:scale()`; `scaleFactor()` is on both surfaces for code that draws to either.
 
 `options.scale` is the canvas's physical pixels per logical pixel (default 1). Pass `win:scale()` for a canvas drawn one to one on a HiDPI display; otherwise it is resampled when drawn. Canvases are not resized for you: cache a panel's rendering in one and redraw it instead of redrawing every row each frame.
 
@@ -311,6 +311,11 @@ Resizes the window.
 ## Window:scale(): number
 
 Physical pixels per logical pixel (2 on a typical HiDPI display).
+
+## Window:scaleFactor(): number
+
+The same as `scale()`. A canvas has this method too, so code that draws to
+either surface can ask for the scale without knowing which one it has.
 
 ## Window:title(): string
 

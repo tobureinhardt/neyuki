@@ -914,6 +914,15 @@ function ui.open(options: WindowOptions?): Window
         return s
     end
 
+    -- Physical pixels per logical pixel, the same as `scale()`. A canvas
+    -- has this method too, so code that draws to either surface can ask
+    -- without knowing which one it has.
+    function window.scaleFactor(self: Window): number
+        ensureOpen()
+        local _, _, s = __ui_size(id)
+        return s
+    end
+
     -- Shows everything drawn since the last call. `options.dirty` lists the
     -- `{x, y, w, h}` rectangles (logical pixels) that changed; only those
     -- are sent to the screen. Drawing is not limited to them, so the script
@@ -1089,6 +1098,14 @@ function ui.canvas(w: number, h: number, options: CanvasOptions?): Canvas
 
     function canvas.size(self: Canvas): (number, number)
         return w, h
+    end
+
+    -- Physical pixels per logical pixel, the `scale` field as a method, so
+    -- that the same code works on a window or a canvas. A canvas is never
+    -- resized, so this never changes; a window's does on `dpichange`.
+    function canvas.scaleFactor(self: Canvas): number
+        ensureOpen()
+        return scale
     end
 
     function canvas.close(self: Canvas): ()
