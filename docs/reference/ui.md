@@ -64,7 +64,7 @@ Without decorations, Windows 11 does not show the Snap Layouts flyout when hover
 
 ## ui.run(handler: (events: {table}, dt: number) -> any, options: table?): ()
 
-Calls `handler(events, dt)` about 60 times a second (`options.fps`, or `"auto"`) until every window is closed, where `dt` is the seconds since the previous call. Tweens from `ui.animate` are stepped just before each call. Close requests close their window unless `options.autoClose` is `false`. An error in the handler closes the windows and is raised again.
+Calls `handler(events, dt)` about 60 times a second (`options.fps`, or `"auto"`) until every window is closed, where `dt` is the seconds since the previous call. Time spent in the handler counts towards the frame, and a handler slower than the frame runs again as soon as it can. `fps` is also a cap: events that arrive during a frame are collected for the next call rather than running it early. Tweens from `ui.animate` are stepped just before each call. Close requests close their window unless `options.autoClose` is `false`. An error in the handler closes the windows and is raised again.
 
 With `fps = "auto"` the loop runs at 60 fps only while a `ui.animate` tween is running, events arrived in the last step or the handler returned `true` (return it while an animated image is visible). Otherwise it waits in the event loop for up to a second, so an idle window uses almost no CPU.
 

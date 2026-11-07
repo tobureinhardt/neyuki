@@ -618,4 +618,63 @@ assert(hostedFrames == 3, "the handler ran until it closed the window: " .. tost
 assert(not hosted:isOpen())
 assert(table.concat(order, ",") == "before,main,run returned", "main ran first: " .. table.concat(order, ","))
 
+-- Busy-waits, so the time is spent inside the handler as real work would be.
+function spin(seconds: number)
+    local stop = os.clock() + seconds
+    while (os.clock() < stop) do end
+end
+
+-- Time in the handler counts towards the frame. Sleeping a full frame after
+-- 60 ms of work at 20 fps would take 110 ms per call.
+local paced = ui.open({ width = 100, height = 100, visible = false })
+local pacedFrames = 0
+local pacedStart = os.clock()
+local pacedElapsed = 0
+ui.run(function(frameEvents: {Event}, dt: number)
+    pacedFrames += 1
+    spin(0.06)
+    if (pacedFrames >= 8) then
+        pacedElapsed = os.clock() - pacedStart
+        paced:close()
+    end
+end, { fps = 20 })
+assert(pacedElapsed / pacedFrames < 0.085, "a slow handler runs close to 1 / work: " .. tostring(pacedElapsed / pacedFrames))
+
+-- A handler slower than the frame still lets a `run` task yield on every
+-- frame, so the main program keeps running between calls.
+local slowHosted = ui.open({ width = 100, height = 100, visible = false })
+local slowFrames = 0
+local slowTicks = 0
+local slowGame = task.spawn(function()
+    ui.run(function(frameEvents: {Event}, dt: number)
+        slowFrames += 1
+        spin(0.03)
+        if (slowFrames >= 6) then slowHosted:close() end
+    end, { fps = 60 })
+end)
+assert(coroutine.status(slowGame) == "suspended", "a slow run task parks: " .. coroutine.status(slowGame))
+patience = os.clock() + 10
+while (coroutine.status(slowGame) ~= "dead" and os.clock() < patience) do
+    task.wait(0.001)
+    slowTicks += 1
+end
+assert(coroutine.status(slowGame) == "dead", "the slow task finished")
+assert(slowTicks >= 5, "main runs between slow frames: " .. tostring(slowTicks))
+
+-- A task timer ends the event wait early but must not run the handler above
+-- `fps`.
+local capped = ui.open({ width = 100, height = 100, visible = false })
+local timerRunning = true
+task.spawn(function()
+    while (timerRunning) do task.wait(0.001) end
+end)
+local cappedFrames = 0
+local cappedStart = os.clock()
+ui.run(function(frameEvents: {Event}, dt: number)
+    cappedFrames += 1
+    if (os.clock() - cappedStart >= 0.5) then capped:close() end
+end, { fps = 20 })
+timerRunning = false
+assert(cappedFrames <= 12, "wake-ups do not exceed fps: " .. tostring(cappedFrames))
+
 print("ui: live window checks passed")

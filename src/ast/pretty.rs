@@ -43,6 +43,9 @@ pub fn pretty_print_stmt(stmt: &Stmt, indent: usize) -> String {
                 (false, true) => "const",
                 (false, false) => "local",
             };
+            if initializers.is_empty() {
+                return format!("{}{} {}", pad, kw, names.join(", "));
+            }
             let inits = initializers
                 .iter()
                 .map(pretty_print_expr)
@@ -358,5 +361,23 @@ pub fn to_sexpr(expr: &Expr) -> String {
             out
         }
         _ => pretty_print_expr(expr),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::NodeId;
+
+    #[test]
+    fn test_pretty_print_local_many_without_initializers() {
+        let stmt = Stmt::LocalMany {
+            names: vec!["a".to_string(), "b".to_string()],
+            is_const: false,
+            is_global: false,
+            initializers: Vec::new(),
+            id: NodeId::next(),
+        };
+        assert_eq!(pretty_print_stmt(&stmt, 0), "local a, b");
     }
 }

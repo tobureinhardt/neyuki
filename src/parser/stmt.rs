@@ -365,10 +365,12 @@ pub fn parse_binding(parser: &mut Parser) -> Result<Stmt, String> {
         while parser.match_symbol(",") {
             names.push(parser.expect_name()?);
         }
-        parser.expect_symbol("=")?;
-        let mut initializers = vec![parse_expr(parser)?];
-        while parser.match_symbol(",") {
+        let mut initializers = Vec::new();
+        if parser.match_symbol("=") {
             initializers.push(parse_expr(parser)?);
+            while parser.match_symbol(",") {
+                initializers.push(parse_expr(parser)?);
+            }
         }
         return Ok(Stmt::LocalMany {
             id: NodeId::next(),

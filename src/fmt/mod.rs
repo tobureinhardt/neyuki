@@ -647,6 +647,12 @@ mod tests {
     }
 
     #[test]
+    fn test_format_source_keeps_names_without_initializers() {
+        let input = "local a, b, c\nconst d, e\nprint(a)\n";
+        assert_eq!(format_source(input).unwrap(), input);
+    }
+
+    #[test]
     fn test_format_source_preserves_multiline_raw_strings() {
         let input = "local s = [[\nfirst line\n    indented line\nlast line\n]]\nlocal x = 1\n";
         let formatted = format_source(input).unwrap();

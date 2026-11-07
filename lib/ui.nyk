@@ -1214,8 +1214,23 @@ end
 -- `ui.animate` are still running, so `fps = "auto"` knows when to idle.
 local loopState = { tweens = 0 }
 
+-- The shortest wait `ui.run` polls with, in seconds. `ui.poll(0)` does not
+-- yield, so a handler slower than the frame would stop a `ui.run` task from
+-- ever suspending and block the rest of the program.
+const MIN_POLL_WAIT = 0.0001
+
+-- Seconds until the next frame is due, given when the last one started.
+-- `os.clock` is wall-clock time, so a clock moved backwards is capped at one
+-- frame rather than stalling the loop.
+function frameRemaining(frame: number, last: number): number
+    return math.min(frame - (os.clock() - last), frame)
+end
+
 -- Runs `handler(events, dt)` about 60 times a second until every window is
--- closed, where `dt` is the seconds since the previous call. Tweens from
+-- closed, where `dt` is the seconds since the previous call. Time spent in
+-- the handler counts towards the frame, and a handler slower than the frame
+-- runs again as soon as it can. Events that arrive during a frame are
+-- collected for the next call rather than running it early. Tweens from
 -- `ui.animate` are stepped just before each call. `close` events
 -- are honoured before the handler sees them unless `options.autoClose` is
 -- false. An error inside the handler closes the windows and is re-raised.
@@ -1241,9 +1256,20 @@ function ui.run(handler: ({Event}, number) -> any, options: RunOptions?): ()
     local last = os.clock()
     local busy = true
     while (openCount > 0) do
-        local wait = frame
-        if (auto and not busy and loopState.tweens == 0) then wait = 1 end
-        local events = ui.poll(wait)
+        local idle = auto and not busy and loopState.tweens == 0
+        local remaining = frameRemaining(frame, last)
+        local wait = remaining
+        if (idle) then wait = 1 end
+        local events = ui.poll(math.max(wait, MIN_POLL_WAIT))
+        -- A wait ends early on the first event or task timer. Keep collecting
+        -- until the frame is due so those cannot run the handler above `fps`.
+        remaining = frameRemaining(frame, last)
+        while (remaining > 0 and openCount > 0) do
+            for _, event in ui.poll(math.max(remaining, MIN_POLL_WAIT)) do
+                events[#events + 1] = event
+            end
+            remaining = frameRemaining(frame, last)
+        end
         busy = #events > 0
         if (autoClose) then
             for _, event in events do

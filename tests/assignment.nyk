@@ -70,4 +70,20 @@ local arr = {1, 2}
 arr[1] += 10
 assert(arr[1] == 11, "+= on an index")
 
+-- Several names without an initializer all start as nil, like a single one.
+local noInitA, noInitB, noInitC
+assert(noInitA == nil and noInitB == nil and noInitC == nil, "uninitialized names are nil")
+noInitA, noInitB, noInitC = 1, 2, 3
+assert(noInitA + noInitB + noInitC == 6, "uninitialized names can be assigned")
+const noInitD, noInitE
+assert(noInitD == nil and noInitE == nil, "const names without a value match `const a`")
+global noInitF, noInitG
+assert(noInitF == nil and noInitG == nil, "global names without a value are nil")
+function noInitInFunction(): number
+    local x, y
+    x, y = 4, 5
+    return x + y
+end
+assert(noInitInFunction() == 9, "uninitialized names work in a function")
+
 print("assignment ok")
