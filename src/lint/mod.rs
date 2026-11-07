@@ -27,7 +27,49 @@ pub fn lint_source(source: &str) -> Vec<Diagnostic> {
             .unwrap_or((0, 0))
     });
     diagnostics.dedup_by(|a, b| a.code == b.code && a.message == b.message);
+    // Appended after the dedup above, which collapses equal messages and
+    // would drop a second identical escape on a nearby line.
+    diagnostics.extend(escape_diagnostics(source));
+    diagnostics.sort_by_key(|d| {
+        d.primary_label
+            .as_ref()
+            .map(|l| (l.span.start.line, l.span.start.column))
+            .unwrap_or((0, 0))
+    });
     diagnostics
+}
+
+/// Warns about `\xHH` and `\ddd` escapes of 128 and above (`W0006`). Neyuki
+/// strings are UTF-8 text, so such an escape names the code point of that
+/// value and encodes as two bytes, where Lua would store the single byte.
+fn escape_diagnostics(source: &str) -> Vec<Diagnostic> {
+    let mut tokenizer = crate::parser::tokenizer::TokenizerEngine::new(source);
+    if tokenizer.tokenize().is_err() {
+        return Vec::new();
+    }
+    tokenizer
+        .take_escape_warnings()
+        .into_iter()
+        .map(|warning| {
+            let line = warning.line.min(u32::MAX as usize) as u32;
+            let col = warning.col.min(u32::MAX as usize) as u32;
+            let end = col.saturating_add(warning.escape.len() as u32);
+            let bytes = char::from_u32(warning.value).map_or(2, char::len_utf8);
+            Diagnostic::warning(format!(
+                "escape `{}` is a code point, not a byte",
+                warning.escape
+            ))
+            .with_code(ErrorCode::W0006)
+            .with_label(
+                Span::single_line(line.max(1), col.max(1), end.max(1)),
+                format!("stores U+{:04X} as {} bytes", warning.value, bytes),
+            )
+            .with_help(format!(
+                "write `\\u{{{:X}}}` for that character, or build raw bytes with `buffer`",
+                warning.value
+            ))
+        })
+        .collect()
 }
 
 /// Turns a parser error such as `[line 4] expected symbol ")"` into a
@@ -124,6 +166,59 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warns_on_byte_escapes_above_ascii() {
+        let diags = lint_source(r#"local a = "\x89""#);
+        let warning = diags
+            .iter()
+            .find(|d| d.code == Some(ErrorCode::W0006))
+            .expect("W0006 warning");
+        assert!(warning.message.contains(r"\x89"));
+        let span = warning.primary_label.as_ref().unwrap().span;
+        assert_eq!(span.start.line, 1);
+        // The backslash sits at column 12 of `local a = "\x89"`.
+        assert_eq!(span.start.column, 12);
+        assert_eq!(span.end.column, 16);
+    }
+
+    #[test]
+    fn warns_on_decimal_escapes_above_ascii() {
+        let diags = lint_source(r#"local a = "\137""#);
+        let warning = diags
+            .iter()
+            .find(|d| d.code == Some(ErrorCode::W0006))
+            .expect("W0006 warning");
+        assert!(warning.message.contains(r"\137"));
+    }
+
+    #[test]
+    fn ascii_and_unicode_escapes_are_quiet() {
+        for source in [
+            r#"local a = "\x41\65\n\t""#,
+            r#"local a = "\u{89}""#,
+            r#"local a = [[\x89]]"#,
+        ] {
+            let diags = lint_source(source);
+            assert!(
+                !diags.iter().any(|d| d.code == Some(ErrorCode::W0006)),
+                "unexpected W0006 for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_identical_escapes_are_all_reported() {
+        let diags = lint_source(
+            r#"local a = "\x89"
+local b = "\x89""#,
+        );
+        let count = diags
+            .iter()
+            .filter(|d| d.code == Some(ErrorCode::W0006))
+            .count();
+        assert_eq!(count, 2, "both escapes should survive the dedup");
+    }
 
     #[test]
     fn clean_source_has_no_diagnostics() {

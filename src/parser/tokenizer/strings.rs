@@ -52,6 +52,11 @@ impl StringEngine {
                 scanner.line()
             ));
         }
+        // The caller has already consumed the backslash, so it sits one
+        // column back; `esc_start` is where the escape's own text begins.
+        let esc_line = scanner.line();
+        let esc_col = scanner.col().saturating_sub(1).max(1);
+        let esc_start = scanner.pos();
         let esc = scanner.advance();
         match esc {
             'a' => out.push('\x07'),
@@ -80,6 +85,10 @@ impl StringEngine {
                         value
                     ));
                 }
+                if value >= 0x80 {
+                    let text = format!("{}{}", '\\', scanner.slice_from(esc_start));
+                    scanner.warn_escape(esc_line, esc_col, text, value);
+                }
                 out.push(char::from(value as u8));
             }
             'x' => {
@@ -93,6 +102,10 @@ impl StringEngine {
                         hex
                     )
                 })?;
+                if value >= 0x80 {
+                    let text = format!("{}{}", '\\', scanner.slice_from(esc_start));
+                    scanner.warn_escape(esc_line, esc_col, text, u32::from(value));
+                }
                 out.push(value as char);
             }
             'u' if scanner.peek() == '{' => {

@@ -30,6 +30,7 @@ pub enum ErrorCode {
     W0003, // Variable shadowing
     W0004, // Unreachable code
     W0005, // Redundant expression or statement
+    W0006, // Byte escape above ASCII in a string literal
 }
 
 impl ErrorCode {
@@ -54,6 +55,7 @@ impl ErrorCode {
             ErrorCode::W0003 => "W0003",
             ErrorCode::W0004 => "W0004",
             ErrorCode::W0005 => "W0005",
+            ErrorCode::W0006 => "W0006",
         }
     }
 
@@ -78,6 +80,7 @@ impl ErrorCode {
             ErrorCode::W0003 => "variable shadows outer declaration",
             ErrorCode::W0004 => "unreachable code",
             ErrorCode::W0005 => "redundant operation",
+            ErrorCode::W0006 => "byte escape above ASCII is a code point",
         }
     }
 }

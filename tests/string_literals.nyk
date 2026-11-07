@@ -2,6 +2,15 @@
 
 assert("\65\066" == "AB", "decimal escapes")
 assert("\x41\u{42}" == "AB", "hex and unicode escapes")
+
+-- Strings are UTF-8 text, so `\xHH` and `\ddd` name a code point,
+-- not a byte: above ASCII they encode as two bytes where Lua stores one.
+-- `neyuki lint` reports these as W0006. See docs/language.md.
+assert(#"\x41" == 1, "an ASCII hex escape is one byte")
+assert(#"\x89" == 2, "a hex escape above ASCII is a code point")
+assert("\x89" == "\u{89}", "\\xHH and \\u{} agree above ASCII")
+assert(#"\137" == 2, "a decimal escape above ASCII is a code point")
+assert("\137" == "\x89", "decimal and hex escapes agree")
 assert("a\z
        b" == "ab", "\\z skips whitespace")
 assert("line\

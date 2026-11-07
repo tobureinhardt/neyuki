@@ -8,7 +8,7 @@ pub mod words;
 
 pub use comments::{CommentEngine, DocComment};
 pub use numbers::{NumberEngine, NumberFormat, NumberResult, NumberType};
-pub use scanner::{Scanner, SourcePos};
+pub use scanner::{EscapeWarning, Scanner, SourcePos};
 pub use strings::StringEngine;
 pub use words::WordEngine;
 
@@ -30,6 +30,12 @@ impl<'a> TokenizerEngine<'a> {
     pub fn tokenize(&mut self) -> Result<Vec<Token>, String> {
         let (tokens, _) = self.tokenize_with_comments()?;
         Ok(tokens)
+    }
+
+    /// Takes the `\xHH` and `\ddd` escapes above ASCII seen so far. Call
+    /// after tokenizing; see `W0006`.
+    pub fn take_escape_warnings(&mut self) -> Vec<EscapeWarning> {
+        self.scanner.take_escape_warnings()
     }
 
     pub fn tokenize_with_comments(&mut self) -> Result<(Vec<Token>, Vec<DocComment>), String> {

@@ -13,12 +13,28 @@ impl SourcePos {
     }
 }
 
+/// A `\xHH` or `\ddd` escape whose value is above ASCII.
+/// The tokenizer stores the code point, not the byte, so these are worth
+/// reporting; see `W0006` and the escape table in `docs/language.md`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EscapeWarning {
+    /// 1-based line of the backslash.
+    pub line: usize,
+    /// 1-based column of the backslash.
+    pub col: usize,
+    /// The escape as written, such as `\x89` or `\128`.
+    pub escape: String,
+    /// The value the escape asks for, 128 to 255.
+    pub value: u32,
+}
+
 pub struct Scanner<'a> {
     src: &'a str,
     pos: usize,
     line: usize,
     col: usize,
     len: usize,
+    escape_warnings: Vec<EscapeWarning>,
 }
 
 impl<'a> Scanner<'a> {
@@ -29,6 +45,7 @@ impl<'a> Scanner<'a> {
             line: 1,
             col: 1,
             len: source.len(),
+            escape_warnings: Vec::new(),
         }
     }
 
@@ -55,6 +72,22 @@ impl<'a> Scanner<'a> {
     #[inline(always)]
     pub fn current_pos(&self) -> SourcePos {
         SourcePos::new(self.pos, self.line, self.col)
+    }
+
+    /// Records a `\xHH` or `\ddd` escape above ASCII. `line` and `col`
+    /// point at the backslash and `escape` is the text as written.
+    pub fn warn_escape(&mut self, line: usize, col: usize, escape: String, value: u32) {
+        self.escape_warnings.push(EscapeWarning {
+            line,
+            col,
+            escape,
+            value,
+        });
+    }
+
+    /// Takes the escape warnings collected so far, leaving none behind.
+    pub fn take_escape_warnings(&mut self) -> Vec<EscapeWarning> {
+        std::mem::take(&mut self.escape_warnings)
     }
 
     #[inline(always)]

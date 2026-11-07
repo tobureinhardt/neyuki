@@ -100,6 +100,16 @@ local message = `{count} items, {count * 2} halves`
 
 Escapes in quoted and backtick strings: `\n`, `\t`, `\r`, `\a`, `\b`, `\f`, `\v`, `\\`, `\"`, `\'`, `\ddd` (a decimal character code up to 255), `\xHH`, `\u{1F600}`, `\z` (skips the following whitespace and line breaks) and a backslash at the end of a line (keeps the line break).
 
+`\ddd` and `\xHH` give a character code, not a byte. Strings are UTF-8 text, so a value of 128 or above names that code point and takes the two bytes UTF-8 needs for it: `#"\x89"` is 2, and `"\x89"` is the same string as `"\u{89}"`. Lua stores the single byte `0x89` there, so byte-oriented Lua code does not port across unchanged. `neyuki lint` reports such an escape as `W0006`. Below 128 the two agree, and `\x41` is one byte.
+
+For arbitrary bytes use a `buffer`, which holds bytes rather than text:
+
+```lua
+local header = buffer.fromhex("89504e47")   -- the four PNG magic bytes
+local one = buffer.create(1)
+buffer.writeu8(one, 0, 0x89)
+```
+
 Backtick strings interpolate: each `{expression}` is evaluated and converted to text. Write `\{` for a literal brace and `` \` `` for a backtick.
 
 Every string has the `string` library as methods: `("hello"):upper()`, `name:sub(1, 3)`, `line:split(",")`.
