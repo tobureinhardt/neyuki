@@ -22,6 +22,11 @@ default = ["webview"]
 # On Linux this links WebKitGTK and GTK 3 (libwebkit2gtk-4.1-dev, libgtk-3-dev);
 # build with `--no-default-features` where those are not installed.
 webview = ["dep:wry", "dep:gtk"]
+# `@neyuki/gpu`: a GPU surface on a `ui` window through `wgpu` (Direct3D 12,
+# Vulkan, Metal). Off by default while the module is a spike: it adds a large
+# dependency tree and several MiB to the executable, and `@neyuki/ui` keeps
+# rendering on the CPU either way.
+gpu = ["dep:wgpu", "dep:pollster"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
@@ -112,6 +117,19 @@ open = "5"
 # and the clipboard through `arboard`.
 enigo = "0.6"
 arboard = { version = "3", default-features = false }
+
+# `@neyuki/gpu` talks to the platform graphics API through `wgpu`: Direct3D 12
+# on Windows, Metal on macOS, Vulkan (with an OpenGL ES fallback) elsewhere.
+# `webgpu` is dropped from the defaults, as it only targets the browser and
+# pulls in `wasm-bindgen` and `web-sys`; `wgsl` keeps the shader front end
+# that every backend needs. Behind the `gpu` feature, so a default build links
+# none of it.
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "gles", "wgsl"], optional = true }
+# wgpu's adapter and device requests are futures. They resolve on the calling
+# thread on every native backend, but the API is a future either way, so
+# `pollster` (no dependencies of its own) parks the thread properly instead
+# of spinning on it.
+pollster = { version = "0.4", optional = true }
 
 # `@neyuki/webview` hosts WebView2 (Windows), WKWebView (macOS) and WebKitGTK
 # (Linux) through `wry`, inside the same `winit` event loop as `@neyuki/ui`.

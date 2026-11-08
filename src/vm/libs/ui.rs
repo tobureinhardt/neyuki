@@ -32,6 +32,7 @@ use std::io::Read;
 use std::num::NonZeroU32;
 use std::path::{Path as FsPath, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,7 @@ use winit::window::{
 };
 
 use crate::vm::libs::args::array as new_table;
+use crate::vm::libs::gpu;
 use crate::vm::libs::task;
 use crate::vm::libs::webview;
 use crate::vm::machine::VM;
@@ -356,9 +358,23 @@ const URL_SCHEMES: &[&str] = &["http://", "https://", "mailto:"];
 
 /// An open window: the OS handle, the surface frames are blitted to, and the
 /// back buffer at physical size that the drawing natives paint into.
+///
+/// A window opened with `gpu = true` has neither: `@neyuki/gpu` presents to
+/// it instead, and softbuffer and wgpu cannot both own one window's
+/// presentation. It keeps a 1x1 placeholder `pixmap` so nothing has to
+/// handle a missing one; `with_target` refuses the window before any drawing
+/// native can reach it.
+///
+/// The handle is an `Arc`, not an `Rc`, because wgpu's safe surface API
+/// wants a `Send + Sync` window handle it can own. Both surfaces hold a
+/// clone of it, so the window outlives them whatever the field order.
 struct Win {
-    window: Rc<Window>,
-    surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
+    window: Arc<Window>,
+    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// The wgpu swap chain, for a window opened with `gpu = true`. On a
+    /// build without the `gpu` feature the type has no values, so this is
+    /// always `None` and costs nothing.
+    gpu: Option<gpu::Surface>,
     pixmap: Pixmap,
     scale: f64,
     modifiers: ModifiersState,
@@ -537,6 +553,8 @@ struct OpenRequest {
     min_height: f64,
     transparent: bool,
     shadow: bool,
+    /// Present through `@neyuki/gpu` instead of the CPU back buffer.
+    gpu: bool,
     icon: Option<Icon>,
 }
 
@@ -704,7 +722,11 @@ fn font_ids_arg(args: &[Value], index: usize, name: &str) -> Result<Vec<u64>, St
 /// `"#rrggbbaa"` string, or an `{ r, g, b, a? }` table (also as `{ 1, 2,
 /// 3, 4? }`) of 0-255 channels. Errors read as `packColor`'s do, so the
 /// drawing methods can hand colors over without unpacking them first.
-fn color_arg(args: &[Value], index: usize, name: &str) -> Result<(u8, u8, u8, u8), String> {
+pub(crate) fn color_arg(
+    args: &[Value],
+    index: usize,
+    name: &str,
+) -> Result<(u8, u8, u8, u8), String> {
     let value = args.get(index).unwrap_or(&Value::Nil);
     match value {
         Value::Int(_) | Value::Float(_) | Value::BigInt(_) => {
@@ -1322,18 +1344,31 @@ fn create_window(event_loop: &ActiveEventLoop, request: OpenRequest) -> Result<(
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let _ = request.shadow;
-    let window = Rc::new(
+    let window = Arc::new(
         event_loop
             .create_window(attributes)
             .map_err(|err| format!("cannot create window: {}", tidy_os_error(&err.to_string())))?,
     );
-    let context = softbuffer::Context::new(window.clone())
-        .map_err(|err| format!("cannot create window: {}", err))?;
-    let surface = softbuffer::Surface::new(&context, window.clone())
-        .map_err(|err| format!("cannot create window: {}", err))?;
+    // A GPU window gets no softbuffer surface and no real back buffer: the
+    // two presentation paths are exclusive, and the drawing natives are
+    // turned away in `with_target` rather than handed a buffer nobody shows.
+    let (surface, gpu) = if request.gpu {
+        let surface = gpu::create_surface(&window)?;
+        (None, Some(surface))
+    } else {
+        let context = softbuffer::Context::new(window.clone())
+            .map_err(|err| format!("cannot create window: {}", err))?;
+        let surface = softbuffer::Surface::new(&context, window.clone())
+            .map_err(|err| format!("cannot create window: {}", err))?;
+        (Some(surface), None)
+    };
     let scale = window.scale_factor();
     let size = window.inner_size();
-    let mut pixmap = Pixmap::new(size.width.max(1), size.height.max(1))
+    let (buffer_width, buffer_height) = match request.gpu {
+        true => (1, 1),
+        false => (size.width.max(1), size.height.max(1)),
+    };
+    let mut pixmap = Pixmap::new(buffer_width, buffer_height)
         .ok_or_else(|| "cannot create window: back buffer too large".to_string())?;
     pixmap.fill(blank(request.transparent));
 
@@ -1341,6 +1376,7 @@ fn create_window(event_loop: &ActiveEventLoop, request: OpenRequest) -> Result<(
     let mut win = Win {
         window: window.clone(),
         surface,
+        gpu,
         pixmap,
         scale,
         modifiers: ModifiersState::empty(),
@@ -1355,8 +1391,11 @@ fn create_window(event_loop: &ActiveEventLoop, request: OpenRequest) -> Result<(
     };
     // Wayland only maps a window once it has a frame, so show the blank
     // canvas straight away; a failure here just means the first real
-    // `present` does it.
-    let _ = blit(&mut win, None);
+    // `present` does it. A GPU window has nothing to show until the script
+    // clears it.
+    if win.gpu.is_none() {
+        let _ = blit(&mut win, None);
+    }
     WINDOW_IDS.with(|ids| ids.borrow_mut().insert(window.id(), id));
     WINDOWS.with(|windows| windows.borrow_mut().insert(id, win));
     Ok((id, scale))
@@ -1371,7 +1410,9 @@ fn translate_event(id: u64, win: &mut Win, event: WindowEvent, out: &mut Vec<Val
     match event {
         WindowEvent::CloseRequested => push("close", vec![]),
         WindowEvent::Resized(size) => {
-            if let Some(pixmap) = Pixmap::new(size.width.max(1), size.height.max(1)) {
+            if let Some(surface) = win.gpu.as_mut() {
+                gpu::resize(surface, size.width, size.height);
+            } else if let Some(pixmap) = Pixmap::new(size.width.max(1), size.height.max(1)) {
                 let mut pixmap = pixmap;
                 pixmap.fill(blank(win.transparent));
                 win.pixmap = pixmap;
@@ -1616,6 +1657,70 @@ fn with_window<T>(id: u64, body: impl FnOnce(&mut Win) -> Result<T, String>) -> 
     })
 }
 
+/// Runs `body` on the wgpu surface of window `id`, for the `@neyuki/gpu`
+/// natives. A window opened without `gpu = true` has none. Only those
+/// natives call it, and without the feature they do not exist.
+#[cfg(feature = "gpu")]
+pub(crate) fn with_window_gpu<T>(
+    id: u64,
+    body: impl FnOnce(&mut gpu::Surface) -> Result<T, String>,
+) -> Result<T, String> {
+    with_window(id, |win| match win.gpu.as_mut() {
+        Some(surface) => body(surface),
+        None => Err(NOT_A_GPU_WINDOW.to_string()),
+    })
+}
+
+/// Runs `body` on the pixels of image or canvas `id`, for `@neyuki/gpu`
+/// uploading it as a texture. The bytes are premultiplied RGBA, eight bits
+/// a channel and tightly packed, which is how `tiny-skia` keeps them: an
+/// image's first frame, or a canvas exactly as it stands, which is what
+/// makes a canvas usable as a heads-up display over a frame.
+///
+/// A canvas is measured in physical pixels, so one made at a scale is that
+/// much bigger here than the size it was asked for -- the same pixels
+/// `window:drawCanvas` would copy.
+#[cfg(feature = "gpu")]
+pub(crate) fn with_pixels_rgba<T>(
+    id: u64,
+    body: impl FnOnce(u32, u32, &[u8]) -> Result<T, String>,
+) -> Result<T, String> {
+    if CANVASES.with(|canvases| canvases.borrow().contains_key(&id)) {
+        return CANVASES.with(|canvases| {
+            let canvases = canvases.borrow();
+            let canvas = canvases
+                .get(&id)
+                .ok_or_else(|| "canvas is closed".to_string())?;
+            body(
+                canvas.pixmap.width(),
+                canvas.pixmap.height(),
+                canvas.pixmap.data(),
+            )
+        });
+    }
+    IMAGES.with(|images| {
+        let images = images.borrow();
+        let entry = images
+            .get(&id)
+            .ok_or_else(|| "the image or canvas is closed".to_string())?;
+        let frame = &entry.frames[0];
+        body(
+            frame.pixmap.width(),
+            frame.pixmap.height(),
+            frame.pixmap.data(),
+        )
+    })
+}
+
+/// What the drawing natives report for a window opened with `gpu = true`,
+/// which has no back buffer for them to paint into.
+const IS_A_GPU_WINDOW: &str =
+    "this window was opened with gpu = true, so it is drawn through @neyuki/gpu";
+
+/// What the `@neyuki/gpu` natives report for a window opened without it.
+#[cfg(feature = "gpu")]
+const NOT_A_GPU_WINDOW: &str = "this window was not opened with gpu = true";
+
 /// Runs `body` on the window or canvas `id`, whichever it names.
 fn with_target<T>(
     id: u64,
@@ -1623,6 +1728,9 @@ fn with_target<T>(
 ) -> Result<T, String> {
     if WINDOWS.with(|windows| windows.borrow().contains_key(&id)) {
         return with_window(id, |win| {
+            if win.gpu.is_some() {
+                return Err(IS_A_GPU_WINDOW.to_string());
+            }
             body(&mut Target {
                 pixmap: &mut win.pixmap,
                 scale: win.scale,
@@ -1650,15 +1758,17 @@ fn with_target<T>(
 /// byte, premultiplied as compositors expect; backends that read only
 /// `0RGB` ignore it.
 fn blit(win: &mut Win, dirty: Option<&[(i32, i32, i32, i32)]>) -> Result<(), String> {
+    let Some(surface) = win.surface.as_mut() else {
+        return Err(IS_A_GPU_WINDOW.to_string());
+    };
     let (width, height) = (win.pixmap.width(), win.pixmap.height());
     let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
         return Ok(());
     };
-    win.surface
+    surface
         .resize(w, h)
         .map_err(|err| format!("cannot present window: {}", err))?;
-    let mut buffer = win
-        .surface
+    let mut buffer = surface
         .buffer_mut()
         .map_err(|err| format!("cannot present window: {}", err))?;
     // Only a buffer that still holds the previous frame can be updated in
@@ -3225,8 +3335,8 @@ fn builtin_available(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String
 }
 
 /// `__ui_open(title, width, height, resizable, visible, decorations?,
-/// minWidth?, minHeight?, transparent?, shadow?, icon?)` creates a window
-/// and returns its id and DPI scale factor. `icon` is an image id.
+/// minWidth?, minHeight?, transparent?, shadow?, gpu?, icon?)` creates a
+/// window and returns its id and DPI scale factor. `icon` is an image id.
 fn builtin_open(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let request = OpenRequest {
         title: string_arg(args, 0, "title")?,
@@ -3239,7 +3349,8 @@ fn builtin_open(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         min_height: optional_float_arg(args, 7, "minHeight", 0.0)?,
         transparent: bool_arg(args, 8, "transparent", false)?,
         shadow: bool_arg(args, 9, "shadow", true)?,
-        icon: icon_arg(args, 10)?,
+        gpu: bool_arg(args, 10, "gpu", false)?,
+        icon: icon_arg(args, 11)?,
     };
     if request.width <= 0.0 || request.height <= 0.0 {
         return Err("width and height must be positive".to_string());
@@ -3268,6 +3379,10 @@ fn builtin_close(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let id = integer_arg(args, 0, "window")?;
     let removed = WINDOWS.with(|windows| windows.borrow_mut().remove(&id));
     if let Some(win) = removed {
+        // A frame still open holds this window's next image, which cannot
+        // outlive the surface it came from. `win` still owns that surface
+        // here, so the frame goes first.
+        gpu::discard_window_frame(id);
         // The OS controls belong to the window, so the session ends with it.
         MEDIA.with(|media| {
             let mut media = media.borrow_mut();

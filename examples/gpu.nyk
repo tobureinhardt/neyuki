@@ -1,0 +1,206 @@
+-- A textured cube, depth tested, through `@neyuki/gpu`. One mesh in a
+-- `buffer`, one WGSL shader, one pipeline, one uniform matrix per frame.
+--
+-- `@neyuki/gpu` needs a build with the `gpu` cargo feature, which stock
+-- builds do not have:
+--
+--     cargo run --features gpu -- examples/gpu.nyk
+--
+-- Escape or the close button ends it.
+
+local gpu = require("@neyuki/gpu")
+local ui = require("@neyuki/ui")
+local math = require("@neyuki/math")
+
+if (not gpu.isAvailable()) then
+    print("no GPU support in this build of Neyuki, or no adapter on this machine")
+    return
+end
+
+-- MATRICES -----------------------------------------------------------------
+--
+-- Column-major, column-vector, as `@neyuki/gpu` fixes them: a 4x4 matrix is
+-- 16 numbers written column after column, which is what a WGSL
+-- `mat4x4<f32>` reads with no transpose. `at(column, row)` indexes one.
+
+function at(column: number, row: number): number
+    return column * 4 + row + 1
+end
+
+function multiply(a: {number}, b: {number}): {number}
+    local out = {}
+    for column = 0, 3 do
+        for row = 0, 3 do
+            local sum = 0
+            for k = 0, 3 do
+                sum += a[at(k, row)] * b[at(column, k)]
+            end
+            out[at(column, row)] = sum
+        end
+    end
+    return out
+end
+
+-- Right-handed, y up, looking down -z, with z mapped to 0 at the near plane
+-- and 1 at the far one.
+function perspective(fovY: number, aspect: number, near: number, far: number): {number}
+    local h = 1 / math.tan(fovY / 2)
+    local range = far / (near - far)
+    return {
+        h / aspect, 0, 0, 0,
+        0, h, 0, 0,
+        0, 0, range, -1,
+        0, 0, range * near, 0
+    }
+end
+
+function translation(x: number, y: number, z: number): {number}
+    return { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1 }
+end
+
+function rotationX(angle: number): {number}
+    local c, s = math.cos(angle), math.sin(angle)
+    return { 1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1 }
+end
+
+function rotationY(angle: number): {number}
+    local c, s = math.cos(angle), math.sin(angle)
+    return { c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1 }
+end
+
+-- A TEXTURE ----------------------------------------------------------------
+--
+-- Drawn with `@neyuki/ui` on a canvas and handed straight to the GPU, so the
+-- example needs no asset on disk and no image decoding. A canvas is also how
+-- text and anything else two-dimensional reaches a GPU window: draw it with
+-- `ui`, upload it, and refresh it with `texture:update`.
+
+function checkerCanvas(cells: number, pixels: number): any
+    local size = cells * pixels
+    local checker = ui.canvas(size, size)
+    for y = 0, cells - 1 do
+        for x = 0, cells - 1 do
+            local dark = (x + y) % 2 == 0
+            checker:fillRect(x * pixels, y * pixels, pixels, pixels,
+                dark and "#283c5a" or "#9ac2e8")
+        end
+    end
+    return checker
+end
+
+-- A CUBE -------------------------------------------------------------------
+--
+-- Six faces of four vertices, each `x, y, z, u, v`, wound
+-- counter-clockwise seen from outside so `cull = "back"` keeps them. The
+-- faces are separate vertices because their texture coordinates differ.
+
+local faces = {
+    { 1, -1, 1, 1, -1, -1, 1, 1, -1, 1, 1, 1 },
+    { -1, -1, -1, -1, -1, 1, -1, 1, 1, -1, 1, -1 },
+    { -1, 1, 1, 1, 1, 1, 1, 1, -1, -1, 1, -1 },
+    { -1, -1, -1, 1, -1, -1, 1, -1, 1, -1, -1, 1 },
+    { -1, -1, 1, 1, -1, 1, 1, 1, 1, -1, 1, 1 },
+    { 1, -1, -1, -1, -1, -1, -1, 1, -1, 1, 1, -1 }
+}
+-- The corners of a face in the order its vertices are given.
+local corners = { 0, 1, 1, 1, 1, 0, 0, 0 }
+
+local vertices = buffer.create(#faces * 4 * 20)
+local indices = buffer.create(#faces * 6 * 2)
+for f = 1, #faces do
+    local face = faces[f]
+    for corner = 0, 3 do
+        local offset = ((f - 1) * 4 + corner) * 20
+        buffer.writef32(vertices, offset, face[corner * 3 + 1])
+        buffer.writef32(vertices, offset + 4, face[corner * 3 + 2])
+        buffer.writef32(vertices, offset + 8, face[corner * 3 + 3])
+        buffer.writef32(vertices, offset + 12, corners[corner * 2 + 1])
+        buffer.writef32(vertices, offset + 16, corners[corner * 2 + 2])
+    end
+    local base = (f - 1) * 4
+    local order = { 0, 1, 2, 0, 2, 3 }
+    for i = 1, 6 do
+        buffer.writeu16(indices, ((f - 1) * 6 + i - 1) * 2, base + order[i])
+    end
+end
+
+-- DRAWING ------------------------------------------------------------------
+
+local shaderSource = [[
+struct Uniforms {
+    clip: mat4x4<f32>,
+}
+
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(0) @binding(1) var surface: texture_2d<f32>;
+@group(0) @binding(2) var surfaceSampler: sampler;
+
+struct Vertex {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vertex(@location(0) position: vec3<f32>, @location(1) uv: vec2<f32>) -> Vertex {
+    var out: Vertex;
+    out.clip = uniforms.clip * vec4<f32>(position, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fragment(in: Vertex) -> @location(0) vec4<f32> {
+    return textureSample(surface, surfaceSampler, in.uv);
+}
+]]
+
+local win = ui.open({ title = "Neyuki GPU", width = 720, height = 480, gpu = true })
+local device = gpu.device(win)
+
+local info = gpu.adapter()
+print("adapter: " .. info.name .. " (" .. info.backend .. ", " .. info.type .. ")")
+
+local texture = device:texture(checkerCanvas(8, 8))
+local sampler = device:sampler({ filter = "nearest" })
+local mesh = device:buffer(vertices, "vertex")
+local elements = device:buffer(indices, "index")
+local uniforms = device:buffer(64, "uniform")
+local pipeline = device:pipeline({
+    shader = device:shader(shaderSource),
+    vertex = { "vec3", "vec2" },
+    depth = true,
+    cull = "back"
+})
+
+local matrix = buffer.create(64)
+local spin = 0
+
+ui.run(function(events: {Event}, dt: number)
+    for _, event in events do
+        if (event.kind == "keydown" and event.key == "escape") then
+            win:close()
+            return
+        end
+    end
+
+    spin += dt
+    local w, h = win:size()
+    local clip = multiply(
+        perspective(math.pi / 3, w / h, 0.1, 100),
+        multiply(translation(0, 0, -4.5), multiply(rotationY(spin), rotationX(spin * 0.6))))
+    for i = 1, 16 do
+        buffer.writef32(matrix, (i - 1) * 4, clip[i])
+    end
+    uniforms:write(matrix)
+
+    device:frame({ clear = "#11131a" })
+        :pipeline(pipeline)
+        :bind(0, uniforms)
+        :bind(1, texture)
+        :bind(2, sampler)
+        :vertices(mesh)
+        :indices(elements, "u16")
+        :draw(#faces * 6)
+        :finish()
+    return true
+end)

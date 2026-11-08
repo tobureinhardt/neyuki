@@ -4,4 +4,6 @@ Cargo.lock
 /tests/sql.local
 # opt-in marker for the live window checks in tests/ui.nyk
 /tests/ui.local
+# opt-in marker for the live GPU checks in tests/gpu.nyk
+/tests/gpu.local
 /fuzz-artifacts/

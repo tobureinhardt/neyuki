@@ -832,6 +832,11 @@ end
 -- or Image), `transparent` (default false) and `shadow` (default true:
 -- keep the drop shadow when frameless). The canvas starts out white, or
 -- clear when transparent.
+--
+-- `gpu = true` instead gives the window to `@neyuki/gpu`, which presents it
+-- through the platform graphics API. Such a window has no CPU back buffer:
+-- every drawing call on it, and `window:present()`, raises an error, and
+-- `@neyuki/gpu` draws and presents it instead.
 function ui.open(options: WindowOptions?): Window
     checkOptionalTable(options, "options")
     options = options ?? {}
@@ -845,6 +850,7 @@ function ui.open(options: WindowOptions?): Window
     checkOptionalNumber(options.minHeight, "minHeight")
     checkOptionalBoolean(options.transparent, "transparent")
     checkOptionalBoolean(options.shadow, "shadow")
+    checkOptionalBoolean(options.gpu, "gpu")
     local width = options.width ?? 800
     local height = options.height ?? 600
     if (width <= 0 or height <= 0) then error("width and height must be positive") end
@@ -856,7 +862,8 @@ function ui.open(options: WindowOptions?): Window
     local id = withIcon(options.icon, function(icon: number?): number
         local opened = __ui_open(title, width, height, options.resizable ?? true,
             options.visible ?? true, options.decorations ?? true, minWidth, minHeight,
-            options.transparent ?? false, options.shadow ?? true, icon)
+            options.transparent ?? false, options.shadow ?? true, options.gpu ?? false,
+            icon)
         return opened
     end)
     local closed = false

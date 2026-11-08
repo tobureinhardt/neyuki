@@ -12,6 +12,7 @@ pub mod coroutine;
 pub mod crypto;
 pub mod debug;
 pub mod fs;
+pub mod gpu;
 pub mod hid;
 pub mod http;
 pub mod io;
@@ -58,6 +59,7 @@ pub fn register_natives(vm: &mut VM) {
     for natives in [
         crypto::NATIVES,
         fs::NATIVES,
+        gpu::NATIVES,
         hid::NATIVES,
         http::NATIVES,
         io::NATIVES,

@@ -1,0 +1,776 @@
+-- A chunked voxel landscape through `@neyuki/gpu`: the module's acceptance
+-- test, and the shape of workload it exists for. Every chunk is meshed once
+-- into a `buffer` and uploaded once; every frame is one matrix, one draw per
+-- chunk, and a heads-up display drawn with `@neyuki/ui` on a canvas and
+-- uploaded over the same texture.
+--
+-- `@neyuki/gpu` needs a build with the `gpu` cargo feature, which stock
+-- builds do not have:
+--
+--     cargo run --features gpu -- examples/gpu_terrain.nyk
+--
+-- Options, which also make it a benchmark:
+--
+--     --chunks N    how far to see, in 16-block chunks each way (default 6)
+--     --seed N      which landscape (default 77)
+--     --bench N     fly a fixed circle for N seconds, print the timings,
+--                   and exit instead of waiting for a key
+--     --cpu         draw the same quads with `@neyuki/ui` polygons instead,
+--                   which is the baseline the GPU path is measured against
+--     --headless    open no visible window and check the last frame's
+--                   pixels, so the whole thing runs with no display
+--
+-- With `NEYUKI_GPU_SOFTWARE=1` it runs on the software adapter, which is
+-- how a machine with no GPU runs it at all.
+--
+-- W, A, S, D and the arrow keys fly; escape or the close button ends it.
+
+local gpu = require("@neyuki/gpu")
+local ui = require("@neyuki/ui")
+local math = require("@neyuki/math")
+local os = require("@neyuki/os")
+
+-- OPTIONS ------------------------------------------------------------------
+
+local options = { chunks = 6, seed = 77, bench = 0, cpu = false, headless = false }
+local args = os.args()
+local index = 1
+while (index <= #args) do
+    local name = args[index]
+    if (name == "--cpu") then
+        options.cpu = true
+    elseif (name == "--headless") then
+        options.headless = true
+    elseif (name == "--chunks" or name == "--seed" or name == "--bench") then
+        local value = tonumber(args[index + 1])
+        if (value == nil) then error(name .. " needs a number") end
+        options[string.sub(name, 3)] = value
+        index += 1
+    else
+        error("unknown option: " .. name .. " (see the comment at the top)")
+    end
+    index += 1
+end
+
+if (not options.cpu and not gpu.isAvailable()) then
+    print("no GPU support in this build of Neyuki, or no adapter on this machine")
+    print("(--cpu draws the same scene through @neyuki/ui and needs neither)")
+    return
+end
+
+-- MATRICES -----------------------------------------------------------------
+--
+-- Column-major, column-vector, as `@neyuki/gpu` fixes them: 16 numbers
+-- written column after column, which a WGSL `mat4x4<f32>` reads with no
+-- transpose. `at(column, row)` indexes one.
+
+function at(column: number, row: number): number
+    return column * 4 + row + 1
+end
+
+function multiply(a: {number}, b: {number}): {number}
+    local out = {}
+    for column = 0, 3 do
+        for row = 0, 3 do
+            local sum = 0
+            for k = 0, 3 do
+                sum += a[at(k, row)] * b[at(column, k)]
+            end
+            out[at(column, row)] = sum
+        end
+    end
+    return out
+end
+
+-- Right-handed, y up, looking down -z, z mapped to 0 at the near plane and
+-- 1 at the far one.
+function perspective(fovY: number, aspect: number, near: number, far: number): {number}
+    local h = 1 / math.tan(fovY / 2)
+    local range = far / (near - far)
+    return {
+        h / aspect, 0, 0, 0,
+        0, h, 0, 0,
+        0, 0, range, -1,
+        0, 0, range * near, 0
+    }
+end
+
+function normalize(x: number, y: number, z: number): (number, number, number)
+    local length = math.sqrt(x * x + y * y + z * z)
+    if (length == 0) then return 0, 0, 0 end
+    return x / length, y / length, z / length
+end
+
+-- Looks from `eye` along `yaw` and `pitch`, with y up.
+function view(ex: number, ey: number, ez: number, yaw: number, pitch: number): {number}
+    local fx, fy, fz = normalize(
+        math.cos(pitch) * math.sin(yaw), math.sin(pitch), -math.cos(pitch) * math.cos(yaw))
+    -- The forward direction crossed with world up, which cannot be parallel
+    -- to it here because the pitch is clamped short of straight down.
+    local sx, sy, sz = normalize(-fz, 0, fx)
+    local ux, uy, uz = sy * fz - sz * fy, sz * fx - sx * fz, sx * fy - sy * fx
+    return {
+        sx, ux, -fx, 0,
+        sy, uy, -fy, 0,
+        sz, uz, -fz, 0,
+        -(sx * ex + sy * ey + sz * ez),
+        -(ux * ex + uy * ey + uz * ez),
+        fx * ex + fy * ey + fz * ez,
+        1
+    }
+end
+
+-- THE LANDSCAPE ------------------------------------------------------------
+--
+-- Value noise over an integer grid, three octaves, all in plain arithmetic:
+-- every intermediate stays under 2^53, so nothing turns into a bigint in the
+-- middle of a mesh.
+
+local HASH = 1048576
+
+function hash(x: number, z: number, seed: number): number
+    local n = (x * 73856093 + z * 19349663 + seed * 83492791) % HASH
+    return ((n * 1103515245 + 12345) % HASH) / HASH
+end
+
+function noise(x: number, z: number, seed: number): number
+    local x0, z0 = x // 1, z // 1
+    local tx, tz = x - x0, z - z0
+    tx, tz = tx * tx * (3 - 2 * tx), tz * tz * (3 - 2 * tz)
+    local a, b = hash(x0, z0, seed), hash(x0 + 1, z0, seed)
+    local c, d = hash(x0, z0 + 1, seed), hash(x0 + 1, z0 + 1, seed)
+    local near = a + (b - a) * tx
+    return near + ((c + (d - c) * tx) - near) * tz
+end
+
+-- The height of the column at `x, z`, as a whole number of blocks.
+function heightAt(x: number, z: number): number
+    local seed = options.seed
+    local h = noise(x / 28, z / 28, seed) * 20
+        + noise(x / 11, z / 11, seed + 101) * 7
+        + noise(x / 4, z / 4, seed + 202) * 2
+    return h // 1
+end
+
+-- THE MESH -----------------------------------------------------------------
+--
+-- One chunk is meshed once, into one vertex buffer and one index buffer, and
+-- uploaded once. A vertex is `x, y, z` then `u, v` then a grey tint, which is
+-- `{ "vec3", "vec2", "unorm4" }`: 24 bytes, written with no padding and no
+-- table in between.
+
+local CHUNK = 16
+local STRIDE = 24
+-- How far down a cliff is meshed. A drop taller than this is never visible
+-- from a sane camera, and the cap keeps a chunk's mesh bounded.
+local MAX_SIDE = 24
+-- Where a quad's corners land in its tile, in the order the corners are
+-- given below. v runs down the image, as it does in `@neyuki/ui`.
+local UV = { 0, 1, 1, 1, 1, 0, 0, 0 }
+-- The atlas is 2x2 tiles. Half a texel of inset keeps a tile from sampling
+-- its neighbour along the seam.
+local INSET = 1 / 128
+local TILE = 0.5 - 2 * INSET
+
+-- Which tile the top of a column gets, and which its sides get.
+function tileFor(height: number): (number, number)
+    if (height >= 20) then return 3, 2 end
+    if (height >= 13) then return 2, 2 end
+    return 0, 1
+end
+
+-- Meshes the chunk at `cx, cz`, returning its vertices, its indices and how
+-- many indices there are.
+function meshChunk(cx: number, cz: number): (buffer, buffer, number)
+    -- The chunk's own heights plus a one-block border, so a side face knows
+    -- how far down to go without asking the chunk next door.
+    local span = CHUNK + 2
+    local heights = {}
+    for z = -1, CHUNK do
+        for x = -1, CHUNK do
+            heights[(z + 1) * span + (x + 1) + 1] = heightAt(cx * CHUNK + x, cz * CHUNK + z)
+        end
+    end
+
+    -- How much of a column's side is exposed towards `step`.
+    local function exposed(base: number, step: number): number
+        local d = heights[base] - heights[base + step]
+        if (d <= 0) then return 0 end
+        if (d > MAX_SIDE) then return MAX_SIDE end
+        return d
+    end
+
+    -- Counted first, so both buffers are allocated once at the size needed.
+    local quads = 0
+    for z = 0, CHUNK - 1 do
+        for x = 0, CHUNK - 1 do
+            local base = (z + 1) * span + (x + 1) + 1
+            quads += 1 + exposed(base, 1) + exposed(base, -1)
+                + exposed(base, span) + exposed(base, -span)
+        end
+    end
+
+    local vertices = buffer.create(quads * 4 * STRIDE)
+    local indices = buffer.create(quads * 6 * 4)
+    local written = 0
+    local order = { 0, 1, 2, 0, 2, 3 }
+
+    -- One quad: four corners given counter-clockwise seen from outside,
+    -- which is the winding `cull = "back"` keeps.
+    local function quad(corners: {number}, tile: number, shade: number)
+        local first = written * 4
+        local tu, tv = (tile % 2) * 0.5 + INSET, (tile // 2) * 0.5 + INSET
+        for corner = 0, 3 do
+            local offset = (first + corner) * STRIDE
+            buffer.writef32(vertices, offset, corners[corner * 3 + 1])
+            buffer.writef32(vertices, offset + 4, corners[corner * 3 + 2])
+            buffer.writef32(vertices, offset + 8, corners[corner * 3 + 3])
+            buffer.writef32(vertices, offset + 12, tu + UV[corner * 2 + 1] * TILE)
+            buffer.writef32(vertices, offset + 16, tv + UV[corner * 2 + 2] * TILE)
+            buffer.writeu8(vertices, offset + 20, shade)
+            buffer.writeu8(vertices, offset + 21, shade)
+            buffer.writeu8(vertices, offset + 22, shade)
+            buffer.writeu8(vertices, offset + 23, 255)
+        end
+        for i = 1, 6 do
+            buffer.writeu32(indices, (written * 6 + i - 1) * 4, first + order[i])
+        end
+        written += 1
+    end
+
+    for z = 0, CHUNK - 1 do
+        for x = 0, CHUNK - 1 do
+            local base = (z + 1) * span + (x + 1) + 1
+            local height = heights[base]
+            local x0, z0 = cx * CHUNK + x, cz * CHUNK + z
+            local x1, z1 = x0 + 1, z0 + 1
+            local y = height + 1
+            local top, side = tileFor(height)
+
+            -- The top of the column, facing +y and lit full.
+            quad({ x0, y, z1, x1, y, z1, x1, y, z0, x0, y, z0 }, top, 255)
+
+            -- The four sides, one quad a block down to the neighbour's top.
+            -- The shades stand in for a light from the front right.
+            for step = 0, exposed(base, 1) - 1 do
+                local yt = y - step
+                quad({ x1, yt - 1, z1, x1, yt - 1, z0, x1, yt, z0, x1, yt, z1 }, side, 205)
+            end
+            for step = 0, exposed(base, -1) - 1 do
+                local yt = y - step
+                quad({ x0, yt - 1, z0, x0, yt - 1, z1, x0, yt, z1, x0, yt, z0 }, side, 165)
+            end
+            for step = 0, exposed(base, span) - 1 do
+                local yt = y - step
+                quad({ x0, yt - 1, z1, x1, yt - 1, z1, x1, yt, z1, x0, yt, z1 }, side, 230)
+            end
+            for step = 0, exposed(base, -span) - 1 do
+                local yt = y - step
+                quad({ x1, yt - 1, z0, x0, yt - 1, z0, x0, yt, z0, x1, yt, z0 }, side, 150)
+            end
+        end
+    end
+
+    return vertices, indices, written * 6
+end
+
+-- THE ATLAS ----------------------------------------------------------------
+--
+-- Drawn with `@neyuki/ui` on a canvas and handed straight to the GPU, so the
+-- example needs no asset on disk and no image decoding.
+
+function atlasCanvas(): any
+    local atlas = ui.canvas(64, 64)
+    local ground = { "#6f9f4a", "#8a6a44", "#8d8f93", "#e8eef2" }
+    local grit = { "#5d8a3e", "#75583a", "#7a7c80", "#cfd8de" }
+    for tile = 0, 3 do
+        local ox, oy = (tile % 2) * 32, (tile // 2) * 32
+        atlas:fillRect(ox, oy, 32, 32, ground[tile + 1])
+        for i = 0, 71 do
+            local sx = (hash(i, tile, 7) * 30) // 1
+            local sy = (hash(tile, i, 11) * 30) // 1
+            atlas:fillRect(ox + sx, oy + sy, 2, 2, grit[tile + 1])
+        end
+    end
+    return atlas
+end
+
+-- WHAT IS DRAWN ------------------------------------------------------------
+
+local side = options.chunks * 2 + 1
+print(string.format("meshing %d chunks (%d x %d blocks), seed %d",
+    side * side, side * CHUNK, side * CHUNK, options.seed))
+
+local meshStart = os.clock()
+local chunks = {}
+local quadTotal = 0
+for cz = -options.chunks, options.chunks do
+    for cx = -options.chunks, options.chunks do
+        local vertices, indices, count = meshChunk(cx, cz)
+        table.insert(chunks, { vertices = vertices, indices = indices, count = count })
+        quadTotal += count // 6
+    end
+end
+print(string.format("meshed %d quads (%d triangles) in %.2f s",
+    quadTotal, quadTotal * 2, os.clock() - meshStart))
+
+-- The camera, and the circle a benchmark flies it around.
+local eye = { x = 0.5, y = heightAt(0, 0) + 14, z = 0.5 }
+local yaw, pitch = 0.6, -0.45
+local orbit = options.chunks * CHUNK * 0.75 + 20
+
+function benchCamera(t: number): ()
+    local angle = t * 0.35
+    eye.x = math.sin(angle) * orbit
+    eye.z = math.cos(angle) * orbit
+    eye.y = 24 + orbit * 0.45 + math.sin(angle * 2) * 4
+    -- Aimed at the middle of the landscape, so a small view distance and a
+    -- large one both fill the frame and the numbers stay comparable.
+    yaw = -angle
+    pitch = -math.atan((eye.y - 14) / orbit)
+end
+
+-- The frame times a benchmark collects, and what it makes of them. The
+-- interval between frames is what is measured, not the time spent in the
+-- handler: `frame:finish()` hands the work over and returns, so the time
+-- inside a frame says nothing about when the GPU was done with it. The
+-- first half second is dropped, because the first frame of all pays for
+-- pipelines, shader compilation and the driver waking up.
+local WARMUP = 0.5
+local samples = {}
+
+function sample(elapsed: number, dt: number): ()
+    if (options.bench > 0 and elapsed > WARMUP) then
+        table.insert(samples, dt * 1000)
+    end
+end
+
+function report(label: string): ()
+    if (#samples == 0) then
+        print("no frames were drawn")
+        return
+    end
+    local total = 0
+    for _, ms in samples do total += ms end
+    table.sort(samples)
+    local worst = samples[math.max(1, (#samples * 0.99) // 1)]
+    print(string.format("%s: %d frames, %.1f fps average (%.2f ms a frame)",
+        label, #samples, 1000 / (total / #samples), total / #samples))
+    print(string.format("     %.1f fps at the worst 1 percent (%.2f ms), %.2f ms worst of all",
+        1000 / worst, worst, samples[#samples]))
+    print(string.format("     %d quads, %d triangles, %d chunks, %d blocks of view",
+        quadTotal, quadTotal * 2, #chunks, options.chunks * CHUNK))
+end
+
+-- THE GPU PATH -------------------------------------------------------------
+
+local terrainShader = [[
+struct Uniforms {
+    clip: mat4x4<f32>,
+}
+
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(0) @binding(1) var atlas: texture_2d<f32>;
+@group(0) @binding(2) var atlasSampler: sampler;
+
+struct Vertex {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) tint: vec4<f32>,
+}
+
+@vertex
+fn vertex(
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) tint: vec4<f32>,
+) -> Vertex {
+    var out: Vertex;
+    out.clip = uniforms.clip * vec4<f32>(position, 1.0);
+    out.uv = uv;
+    out.tint = tint;
+    return out;
+}
+
+@fragment
+fn fragment(in: Vertex) -> @location(0) vec4<f32> {
+    return textureSample(atlas, atlasSampler, in.uv) * in.tint;
+}
+]]
+
+-- The heads-up display is one textured quad in clip space, with no depth and
+-- premultiplied blending, drawn in the same frame as the landscape.
+local hudShader = [[
+@group(0) @binding(0) var hud: texture_2d<f32>;
+@group(0) @binding(1) var hudSampler: sampler;
+
+struct Vertex {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vertex(@location(0) position: vec2<f32>, @location(1) uv: vec2<f32>) -> Vertex {
+    var out: Vertex;
+    out.clip = vec4<f32>(position, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fragment(in: Vertex) -> @location(0) vec4<f32> {
+    return textureSample(hud, hudSampler, in.uv);
+}
+]]
+
+function runOnGpu(): ()
+    local win = ui.open({
+        title = "Neyuki GPU terrain",
+        width = 960,
+        height = 560,
+        visible = not options.headless,
+        gpu = true
+    })
+    local device = gpu.device(win)
+    local info = gpu.adapter()
+    print(string.format("adapter: %s (%s, %s)", info.name, info.backend, info.type))
+
+    local atlas = atlasCanvas()
+    local texture = device:texture(atlas)
+    local sampler = device:sampler({ filter = "nearest" })
+    local uniforms = device:buffer(64, "uniform")
+    local pipeline = device:pipeline({
+        shader = device:shader(terrainShader),
+        vertex = { "vec3", "vec2", "unorm4" },
+        depth = true,
+        cull = "back"
+    })
+
+    -- Every chunk's mesh goes to the GPU once, and the bytes behind it are
+    -- let go: from here on a frame is one matrix and one draw a chunk.
+    local uploadStart = os.clock()
+    local meshes = {}
+    local uploaded = 0
+    for _, chunk in chunks do
+        table.insert(meshes, {
+            vertices = device:buffer(chunk.vertices, "vertex"),
+            indices = device:buffer(chunk.indices, "index"),
+            count = chunk.count
+        })
+        uploaded += buffer.len(chunk.vertices) + buffer.len(chunk.indices)
+        chunk.vertices = nil
+        chunk.indices = nil
+    end
+    print(string.format("uploaded %.1f MiB in %.2f s",
+        uploaded / 1048576, os.clock() - uploadStart))
+
+    -- The display, drawn with `@neyuki/ui` on a canvas and uploaded over the
+    -- same texture a few times a second rather than every frame: the text
+    -- costs far more than the copy does.
+    local panel = ui.canvas(268, 74)
+    local hudTexture = device:texture(panel)
+    local hudSampler = device:sampler({ filter = "nearest" })
+    local hudPipeline = device:pipeline({
+        shader = device:shader(hudShader),
+        vertex = { "vec2", "vec2" },
+        blend = "alpha"
+    })
+    local hudQuad = device:buffer(96, "vertex")
+    local placed = { width = 0, height = 0 }
+
+    local matrix = buffer.create(64)
+    local quadBytes = buffer.create(96)
+    local fps, since, counted = 0, 0, 0
+    local elapsed = 0
+
+    local function drawPanel()
+        panel:clear()
+        panel:fillRect(0, 0, 268, 74, "#101420cc", { radius = 8 })
+        panel:text(12, 8, string.format("%.0f fps   %d triangles", fps, quadTotal * 2),
+            { color = "#e8eef2", size = 15 })
+        panel:text(12, 30, string.format("%d chunks, %d blocks of view",
+            #meshes, options.chunks * CHUNK), { color = "#9ac2e8", size = 13 })
+        panel:text(12, 50, string.format("%s (%s)", info.name, info.backend),
+            { color = "#7f8c9b", size = 12 })
+        hudTexture:update(panel)
+    end
+
+    -- The quad the panel is drawn on, in clip space, remade when the window
+    -- changes size so the panel keeps its size in pixels.
+    local function placePanel(w: number, h: number)
+        if (placed.width == w and placed.height == h) then return end
+        placed.width, placed.height = w, h
+        local x0, y0 = -1 + 2 * 12 / w, 1 - 2 * 12 / h
+        local x1, y1 = -1 + 2 * (12 + 268) / w, 1 - 2 * (12 + 74) / h
+        local points = {
+            x0, y0, 0, 0, x0, y1, 0, 1, x1, y1, 1, 1,
+            x0, y0, 0, 0, x1, y1, 1, 1, x1, y0, 1, 0
+        }
+        for i = 1, #points do
+            buffer.writef32(quadBytes, (i - 1) * 4, points[i])
+        end
+        hudQuad:write(quadBytes)
+    end
+
+    -- Reads the last frame of a headless run back instead of only presenting
+    -- it, so the example can check itself with no display: the landscape has
+    -- to cover a good part of the frame, and the sky has to survive where it
+    -- does not.
+    local function check(frame: {any})
+        local presented, pixels, pw, ph = frame:read()
+        if (not presented) then error("the frame was skipped, so nothing was checked") end
+        local land = 0
+        for i = 0, pw * ph - 1 do
+            local r = buffer.readu8(pixels, i * 4)
+            local g = buffer.readu8(pixels, i * 4 + 1)
+            if (r != 154 or g != 194) then land += 1 end
+        end
+        print(string.format("headless check: %d x %d, %.0f%% landscape, %.0f%% sky",
+            pw, ph, land / (pw * ph) * 100, (pw * ph - land) / (pw * ph) * 100))
+        if (land * 4 < pw * ph) then
+            error("under a quarter of the frame is landscape, so nothing was drawn")
+        end
+        if (land == pw * ph) then
+            error("none of the frame is sky, so the clear colour never reached it")
+        end
+    end
+
+    drawPanel()
+
+    local held = {}
+    ui.run(function(events: {table}, dt: number)
+        for _, event in events do
+            if (event.kind == "keydown") then
+                if (event.key == "escape") then
+                    win:close()
+                    return
+                end
+                held[event.key] = true
+            elseif (event.kind == "keyup") then
+                held[event.key] = false
+            end
+        end
+
+        elapsed += dt
+        local last = options.bench > 0 and elapsed >= options.bench
+        if (options.bench > 0) then
+            benchCamera(elapsed)
+        else
+            local speed = 24 * dt
+            if (held["shift"]) then speed *= 4 end
+            local fx, fz = math.sin(yaw), -math.cos(yaw)
+            if (held["w"]) then eye.x += fx * speed eye.z += fz * speed end
+            if (held["s"]) then eye.x -= fx * speed eye.z -= fz * speed end
+            if (held["a"]) then eye.x += fz * speed eye.z -= fx * speed end
+            if (held["d"]) then eye.x -= fz * speed eye.z += fx * speed end
+            if (held["q"]) then eye.y -= speed end
+            if (held["e"]) then eye.y += speed end
+            if (held["arrowleft"]) then yaw -= dt * 1.5 end
+            if (held["arrowright"]) then yaw += dt * 1.5 end
+            if (held["arrowup"]) then pitch = math.min(1.4, pitch + dt * 1.2) end
+            if (held["arrowdown"]) then pitch = math.max(-1.4, pitch - dt * 1.2) end
+        end
+
+        local w, h = win:size()
+        local clip = multiply(
+            perspective(math.pi / 3, w / h, 0.3, options.chunks * CHUNK * 3 + 200),
+            view(eye.x, eye.y, eye.z, yaw, pitch))
+        for i = 1, 16 do
+            buffer.writef32(matrix, (i - 1) * 4, clip[i])
+        end
+        uniforms:write(matrix)
+        placePanel(w, h)
+
+        local frame = device:frame({ clear = "#9ac2e8" })
+        frame:pipeline(pipeline):bind(0, uniforms):bind(1, texture):bind(2, sampler)
+        for _, mesh in meshes do
+            frame:vertices(mesh.vertices):indices(mesh.indices, "u32"):draw(mesh.count)
+        end
+        -- The same frame, with no depth test and blending on: the landscape
+        -- behind it was depth tested, and this goes over all of it.
+        frame:pipeline(hudPipeline):bind(0, hudTexture):bind(1, hudSampler)
+        frame:vertices(hudQuad):draw(6)
+
+        if (last and options.headless) then
+            check(frame)
+        else
+            frame:finish()
+        end
+        sample(elapsed, dt)
+
+        counted += 1
+        since += dt
+        if (since >= 0.25) then
+            fps = counted / since
+            counted, since = 0, 0
+            drawPanel()
+        end
+
+        if (last) then
+            win:close()
+            return
+        end
+        return true
+    end, { fps = options.bench > 0 and 10000 or 60 })
+
+    if (options.bench > 0) then report("gpu") end
+end
+
+-- THE CPU BASELINE ---------------------------------------------------------
+--
+-- The same quads through `@neyuki/ui`, which is what the module is measured
+-- against. `ui` has no depth buffer and no textures, so this is the best a
+-- CPU path can do: project the corners, drop the ones facing away, sort back
+-- to front and fill each quad flat. The quads live in tables here rather than
+-- in a `buffer`, because table access is the faster of the two and the
+-- baseline should be the fast version of itself.
+
+function runOnCpu(): ()
+    local win = ui.open({
+        title = "Neyuki CPU terrain",
+        width = 960,
+        height = 560,
+        visible = not options.headless
+    })
+
+    -- 12 coordinates and a shade for every quad, read out of the meshes once.
+    local flat = {}
+    local shades = {}
+    local count = 0
+    for _, chunk in chunks do
+        local quads = chunk.count // 6
+        for q = 0, quads - 1 do
+            local base = count * 12
+            for corner = 0, 3 do
+                local offset = (q * 4 + corner) * STRIDE
+                flat[base + corner * 3 + 1] = buffer.readf32(chunk.vertices, offset)
+                flat[base + corner * 3 + 2] = buffer.readf32(chunk.vertices, offset + 4)
+                flat[base + corner * 3 + 3] = buffer.readf32(chunk.vertices, offset + 8)
+            end
+            -- The tint byte stands in for the texture the CPU path has not
+            -- got, mixed with the tile's own colour.
+            local shade = buffer.readu8(chunk.vertices, q * 4 * STRIDE + 20)
+            local tile = buffer.readf32(chunk.vertices, q * 4 * STRIDE + 12) < 0.5 and 0 or 1
+            shades[count + 1] = string.format("#%02x%02x%02x",
+                (shade * (tile == 0 and 0.44 or 0.55)) // 1,
+                (shade * (tile == 0 and 0.62 or 0.42)) // 1,
+                (shade * (tile == 0 and 0.29 or 0.27)) // 1)
+            count += 1
+        end
+        chunk.vertices = nil
+        chunk.indices = nil
+    end
+    print(string.format("%d quads ready for the CPU path", count))
+
+    local depth = {}
+    local order = {}
+    local screen = {}
+    local elapsed = 0
+
+    ui.run(function(events: {table}, dt: number)
+        for _, event in events do
+            if (event.kind == "keydown" and event.key == "escape") then
+                win:close()
+                return
+            end
+        end
+
+        elapsed += dt
+        local last = options.bench > 0 and elapsed >= options.bench
+        if (options.bench > 0) then benchCamera(elapsed) end
+
+        local w, h = win:size()
+        local clip = multiply(
+            perspective(math.pi / 3, w / h, 0.3, options.chunks * CHUNK * 3 + 200),
+            view(eye.x, eye.y, eye.z, yaw, pitch))
+        -- Project, cull and depth sort, which is what a CPU has to do for
+        -- every quad of every frame because there is no depth buffer.
+        local visible = 0
+        for q = 0, count - 1 do
+            local base = q * 12
+            local keep = true
+            local far = 0
+            for corner = 0, 3 do
+                local x = flat[base + corner * 3 + 1]
+                local y = flat[base + corner * 3 + 2]
+                local z = flat[base + corner * 3 + 3]
+                local cw = clip[4] * x + clip[8] * y + clip[12] * z + clip[16]
+                if (cw <= 0.1) then
+                    keep = false
+                    break
+                end
+                local cx = clip[1] * x + clip[5] * y + clip[9] * z + clip[13]
+                local cy = clip[2] * x + clip[6] * y + clip[10] * z + clip[14]
+                screen[corner * 2 + 1] = (cx / cw + 1) * 0.5 * w
+                screen[corner * 2 + 2] = (1 - cy / cw) * 0.5 * h
+                far += cw
+            end
+            if (keep) then
+                -- Twice the signed area: negative is a face turned away, the
+                -- cheap stand-in for `cull = "back"`.
+                local area = (screen[3] - screen[1]) * (screen[6] + screen[2])
+                    + (screen[5] - screen[3]) * (screen[8] + screen[6])
+                    + (screen[7] - screen[5]) * (screen[2] + screen[8])
+                if (area > 0) then
+                    visible += 1
+                    depth[visible] = far
+                    order[visible] = q
+                end
+            end
+        end
+
+        local indices = {}
+        for i = 1, visible do indices[i] = i end
+        table.sort(indices, function(a: number, b: number): boolean
+            return depth[a] > depth[b]
+        end)
+
+        win:clear("#9ac2e8")
+        for i = 1, visible do
+            local slot = indices[i]
+            local q = order[slot]
+            local base = q * 12
+            local points = {}
+            for corner = 0, 3 do
+                local x = flat[base + corner * 3 + 1]
+                local y = flat[base + corner * 3 + 2]
+                local z = flat[base + corner * 3 + 3]
+                local cw = clip[4] * x + clip[8] * y + clip[12] * z + clip[16]
+                local cx = clip[1] * x + clip[5] * y + clip[9] * z + clip[13]
+                local cy = clip[2] * x + clip[6] * y + clip[10] * z + clip[14]
+                points[corner * 2 + 1] = (cx / cw + 1) * 0.5 * w
+                points[corner * 2 + 2] = (1 - cy / cw) * 0.5 * h
+            end
+            win:polygon(points, shades[q + 1])
+        end
+        win:present()
+
+        sample(elapsed, dt)
+        if (last) then
+            print(string.format("%d of %d quads were drawn", visible, count))
+            -- The same check the GPU path makes, through the one pixel
+            -- reader a CPU window has: the landscape has to be there, and
+            -- the sky has to survive where it is not.
+            local land, looked = 0, 0
+            for y = 4, h - 4, 7 do
+                for x = 4, w - 4, 7 do
+                    local r, g = win:getPixel(x, y)
+                    looked += 1
+                    if (r != 154 or g != 194) then land += 1 end
+                end
+            end
+            print(string.format("checked %d pixels: %.0f%% landscape, %.0f%% sky",
+                looked, land / looked * 100, (looked - land) / looked * 100))
+            if (land * 4 < looked) then
+                error("under a quarter of the frame is landscape, so nothing was drawn")
+            end
+            win:close()
+            return
+        end
+        return true
+    end, { fps = options.bench > 0 and 10000 or 60 })
+
+    if (options.bench > 0) then report("cpu") end
+end
+
+if (options.cpu) then runOnCpu() else runOnGpu() end

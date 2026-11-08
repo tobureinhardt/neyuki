@@ -1,0 +1,481 @@
+local gpu = require("@neyuki/gpu")
+local fs = require("@neyuki/fs")
+local string = require("@neyuki/string")
+
+function expectError(f: any, needle: string, message: string, ...: any)
+    local ok, err = try(f, ...)
+    assert(not ok and string.find(tostring(err), needle, 1, true) != nil, message .. ": " .. tostring(err))
+end
+
+-- ARGUMENTS (no display or adapter needed) ---------------------------------
+
+assert(type(gpu.isAvailable()) == "boolean", "isAvailable reports a boolean")
+expectError(gpu.clear, "window must be a window from ui.open", "clear checks its window", nil, "#fff")
+expectError(gpu.clear, "window must be a window from ui.open", "clear rejects a plain table", {}, "#fff")
+expectError(gpu.device, "window must be a window from ui.open", "device checks its window", nil)
+expectError(gpu.device, "window must be a window from ui.open", "device rejects a plain table", {})
+
+-- Without the `gpu` cargo feature everything but `isAvailable` says so, and
+-- `ui.open` refuses `gpu = true`. With it, the adapter is chosen for the
+-- first GPU window, so `gpu.adapter()` raises until one exists -- except
+-- that the suite runs each script twice in one process, which can leave an
+-- earlier window's device behind. Either answer is right; describing a
+-- device that is not there would not be.
+local adapted, info = try(gpu.adapter)
+assert(not adapted or type(info.name) == "string",
+    "adapter either raises or describes an adapter")
+if (not adapted) then
+    assert(string.find(tostring(info), "GPU", 1, true) != nil,
+        "adapter says why it cannot answer: " .. tostring(info))
+end
+
+-- LIVE WINDOW (opt in with an empty tests/gpu.local file) ------------------
+--
+-- Needs a build with the `gpu` cargo feature, a display and an adapter --
+-- and, on macOS, the main thread, which `cargo test` does not provide. The
+-- marker keeps CI headless, like tests/ui.local does for @neyuki/ui.
+local ui = require("@neyuki/ui")
+if (not fs.exists("tests/gpu.local")) then
+    print("gpu: skipping the live checks (no tests/gpu.local)")
+    return
+end
+
+assert(ui.isAvailable(), "tests/gpu.local is present but no display is available")
+if (not gpu.isAvailable()) then
+    expectError(ui.open, "no GPU support", "ui.open refuses gpu = true without the feature",
+        { visible = false, gpu = true })
+    print("gpu: skipping the live checks (this build has no GPU support)")
+    return
+end
+
+local win = ui.open({ title = "Neyuki gpu test", width = 160, height = 120, visible = false, gpu = true })
+
+info = gpu.adapter()
+assert(type(info.name) == "string" and #info.name > 0, "the adapter has a name")
+assert(info.backend == "vulkan" or info.backend == "dx12" or info.backend == "metal"
+    or info.backend == "gl", "the backend is one of the known ones, got " .. tostring(info.backend))
+
+-- A GPU window has no CPU back buffer, so every `ui` drawing call and
+-- `present` must refuse it with an error rather than crash.
+expectError(win.line, "gpu = true", "line refuses a GPU window", win, 0, 0, 10, 10, "#fff")
+expectError(win.clear, "gpu = true", "clear refuses a GPU window", win, "#fff")
+expectError(win.fillRect, "gpu = true", "fillRect refuses a GPU window", win, 0, 0, 5, 5, "#fff")
+expectError(win.text, "gpu = true", "text refuses a GPU window", win, 0, 0, "hi")
+expectError(win.getPixel, "gpu = true", "getPixel refuses a GPU window", win, 0, 0)
+expectError(win.present, "gpu = true", "present refuses a GPU window", win)
+
+gpu.clear(win, "#9ac2e8")
+gpu.clear(win, { r = 10, g = 20, b = 30 })
+gpu.clear(win, 0x9ac2e8ff)
+expectError(gpu.clear, "color must be", "clear checks its colour", win, "nope")
+
+-- A CPU window is the other way round: `ui` draws it and `@neyuki/gpu` will
+-- not touch it.
+local cpu = ui.open({ width = 80, height = 60, visible = false })
+cpu:clear("#000")
+cpu:present()
+expectError(gpu.clear, "not opened with gpu = true", "gpu.clear refuses a CPU window", cpu, "#fff")
+expectError(gpu.device, "not opened with gpu = true", "gpu.device refuses a CPU window", cpu)
+cpu:close()
+
+-- RESOURCES ---------------------------------------------------------------
+
+local device = gpu.device(win)
+
+-- Positions straight into clip space, so `z` is the depth the test uses and
+-- no matrix is needed. One triangle covers the whole viewport.
+local source = [[
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var texSampler: sampler;
+
+struct Vertex {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vertex(@location(0) position: vec3<f32>, @location(1) uv: vec2<f32>) -> Vertex {
+    var out: Vertex;
+    out.clip = vec4<f32>(position, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fragment(in: Vertex) -> @location(0) vec4<f32> {
+    return textureSample(tex, texSampler, in.uv);
+}
+]]
+
+local shader = device:shader(source)
+expectError(device.shader, "source must be a string", "shader checks its source", device, 7)
+
+-- A WGSL mistake has to reach the script with somewhere to look: the line,
+-- the column and a snippet of its own source. wgpu's own framing -- which
+-- function was called and what this module labelled the shader module --
+-- says nothing to a script and is trimmed off.
+local compiled, why = try(device.shader, device,
+    "@vertex
+fn vertex() -> @builtin(position) vec4<f32> {
+    return nonsense;
+}
+")
+assert(not compiled, "a broken shader raises")
+why = tostring(why)
+assert(string.find(why, "cannot compile the shader", 1, true) != nil,
+    "the shader error says what failed: " .. why)
+assert(string.find(why, "wgsl:3:", 1, true) != nil,
+    "the shader error carries the line and column: " .. why)
+assert(string.find(why, "nonsense", 1, true) != nil,
+    "the shader error quotes the source: " .. why)
+assert(string.find(why, "create_shader_module", 1, true) == nil,
+    "the shader error leaves wgpu's framing out: " .. why)
+
+-- tests/fixtures/pixels.bmp is 3x2: red, green, blue across the top row and
+-- white, black, grey across the bottom. Sampling the top row with `nearest`
+-- gives one of the three primaries, which is what the checks below read.
+local image = ui.loadImage("tests/fixtures/pixels.bmp")
+local texture = device:texture(image)
+assert(texture.width == 3 and texture.height == 2, "the texture kept the image's size")
+expectError(device.texture, "must be an image", "texture checks its image", device, {})
+
+local sampler = device:sampler({ filter = "nearest" })
+expectError(device.sampler, "filter must be", "sampler checks its filter", device, { filter = "fuzzy" })
+expectError(device.sampler, "wrap must be", "sampler checks its wrap", device, { wrap = "around" })
+
+-- Two viewport-covering triangles, the first nearer than the second and
+-- sampling a different colour: `x, y, z, u, v` each.
+--
+-- Depth runs 0 near to 1 far, so the first triangle is in front. It is also
+-- drawn first, which is what makes this a test of depth and not of order.
+--
+-- The third is the first wound the other way, for the culling check: front
+-- faces are counter-clockwise, so that one has to disappear.
+local vertices = buffer.create(9 * 20)
+function writeTriangle(index: number, z: number, u: number, clockwise: boolean)
+    local corners = { -1, -1, 3, -1, -1, 3 }
+    if (clockwise) then corners = { -1, -1, -1, 3, 3, -1 } end
+    for corner = 0, 2 do
+        local offset = (index * 3 + corner) * 20
+        buffer.writef32(vertices, offset, corners[corner * 2 + 1])
+        buffer.writef32(vertices, offset + 4, corners[corner * 2 + 2])
+        buffer.writef32(vertices, offset + 8, z)
+        buffer.writef32(vertices, offset + 12, u)
+        buffer.writef32(vertices, offset + 16, 0.25)
+    end
+end
+writeTriangle(0, 0.25, 1 / 6, false)
+writeTriangle(1, 0.75, 5 / 6, false)
+writeTriangle(2, 0.25, 1 / 6, true)
+
+local mesh = device:buffer(vertices, "vertex")
+assert(mesh.size == 180 and mesh.usage == "vertex", "the vertex buffer is the size of its data")
+expectError(device.buffer, "usage must be", "buffer checks its usage", device, vertices, "scratch")
+expectError(device.buffer, "data must be a buffer", "buffer checks its data", device, "lots", "vertex")
+
+-- A uniform buffer is rounded up to a multiple of 16, which is how a
+-- binding is read.
+local padded = device:buffer(12, "uniform")
+assert(padded.size == 16, "a uniform buffer is padded to 16 bytes, got " .. tostring(padded.size))
+expectError(padded.write, "runs past the end", "a write past the end is refused", padded,
+    buffer.create(20), 0)
+expectError(padded.write, "multiple of 4", "a misaligned write is refused", padded, buffer.create(4), 2)
+
+local layout = { "vec3", "vec2" }
+local depthTested = device:pipeline({ shader = shader, vertex = layout, depth = true, cull = "none" })
+local flat = device:pipeline({ shader = shader, vertex = layout, depth = false, cull = "none" })
+expectError(device.pipeline, "vertex must hold", "pipeline checks its attributes", device,
+    { shader = shader, vertex = { "vec5" } })
+expectError(device.pipeline, "vertex must name at least one", "pipeline needs attributes", device,
+    { shader = shader, vertex = {} })
+expectError(device.pipeline, "must be a shader", "pipeline checks its shader", device,
+    { vertex = layout })
+expectError(device.pipeline, "cull must be", "pipeline checks its cull mode", device,
+    { shader = shader, vertex = layout, cull = "sideways" })
+expectError(device.pipeline, "topology must be", "pipeline checks its topology", device,
+    { shader = shader, vertex = layout, topology = "blobs" })
+
+-- FRAMES ------------------------------------------------------------------
+
+-- The near triangle is drawn first and the far one second. With depth
+-- testing the near one has to survive; without it the far one paints over.
+function drawNear(pipeline: any): (number, number, number)
+    local frame = device:frame({ clear = "#000" })
+    frame:pipeline(pipeline):bind(0, texture):bind(1, sampler):vertices(mesh)
+    frame:draw(3)
+    local presented, pixels, width, height = frame:read()
+    assert(presented, "a hidden window still presents")
+    -- The size is in physical pixels, so it is the logical 160x120 times
+    -- whatever the display scales by.
+    assert(width > 0 and height > 0, "the frame came back with a size")
+    assert(buffer.len(pixels) == width * height * 4, "the frame is tightly packed RGBA")
+    local middle = ((height // 2) * width + width // 2) * 4
+    return buffer.readu8(pixels, middle), buffer.readu8(pixels, middle + 1),
+        buffer.readu8(pixels, middle + 2)
+end
+
+-- One triangle at a time first, to show the texture arrives at all: the
+-- near triangle samples the red pixel.
+local r, g, b = drawNear(depthTested)
+assert(r > 200 and g < 60 and b < 60,
+    "a textured triangle is red in the middle, got " .. tostring(r) .. "," .. tostring(g) .. "," .. tostring(b))
+
+-- Now both, depth tested: the near red triangle stays in front of the far
+-- blue one although the blue one is drawn second.
+function drawPair(pipeline: any): (number, number, number)
+    local frame = device:frame({ clear = "#000" })
+    frame:pipeline(pipeline):bind(0, texture):bind(1, sampler):vertices(mesh)
+    frame:draw(6)
+    local presented, pixels, width, height = frame:read()
+    assert(presented, "the pair presented")
+    local middle = ((height // 2) * width + width // 2) * 4
+    return buffer.readu8(pixels, middle), buffer.readu8(pixels, middle + 1),
+        buffer.readu8(pixels, middle + 2)
+end
+
+r, g, b = drawPair(depthTested)
+assert(r > 200 and b < 60,
+    "depth testing keeps the near triangle, got " .. tostring(r) .. "," .. tostring(g) .. "," .. tostring(b))
+
+-- The same geometry without depth testing: the far triangle wins because it
+-- is drawn last. This is what proves `depth = true` is doing the work.
+r, g, b = drawPair(flat)
+assert(b > 200 and r < 60,
+    "without depth the far triangle paints over, got " .. tostring(r) .. "," .. tostring(g) .. "," .. tostring(b))
+
+-- Front faces are counter-clockwise, which is what makes `cull = "back"`
+-- keep the geometry a script wound that way and drop the rest. Both
+-- triangles cover the whole viewport, so the one that survives is plain to
+-- see. Getting this backwards is the kind of mistake that is invisible on a
+-- closed mesh until something is inside out, hence the check.
+local culled = device:pipeline({ shader = shader, vertex = layout, cull = "back" })
+function drawWound(first: number): (number, number, number)
+    local order = buffer.create(6)
+    for i = 0, 2 do
+        buffer.writeu16(order, i * 2, first + i)
+    end
+    local picked = device:buffer(order, "index")
+    local frame = device:frame({ clear = "#000" })
+    frame:pipeline(culled):bind(0, texture):bind(1, sampler):vertices(mesh)
+    frame:indices(picked, "u16"):draw(3)
+    local presented, pixels, width, height = frame:read()
+    assert(presented, "the wound triangle presented")
+    picked:close()
+    local middle = ((height // 2) * width + width // 2) * 4
+    return buffer.readu8(pixels, middle), buffer.readu8(pixels, middle + 1),
+        buffer.readu8(pixels, middle + 2)
+end
+
+r, g, b = drawWound(0)
+assert(r > 200, "a counter-clockwise triangle survives cull = \"back\", got "
+    .. tostring(r) .. "," .. tostring(g) .. "," .. tostring(b))
+r, g, b = drawWound(6)
+assert(r == 0 and g == 0 and b == 0, "a clockwise triangle is culled as a back face, got "
+    .. tostring(r) .. "," .. tostring(g) .. "," .. tostring(b))
+culled:close()
+
+-- An indexed draw of the same two triangles, in the other order, still
+-- leaves the near one in front.
+local order = buffer.create(12)
+for i = 0, 5 do
+    buffer.writeu16(order, i * 2, (i + 3) % 6)
+end
+local elements = device:buffer(order, "index")
+local frame = device:frame({ clear = "#000" })
+frame:pipeline(depthTested):bind(0, texture):bind(1, sampler):vertices(mesh)
+frame:indices(elements, "u16"):draw(6)
+local presented, pixels, width, height = frame:read()
+assert(presented, "the indexed draw presented")
+local middle = ((height // 2) * width + width // 2) * 4
+assert(buffer.readu8(pixels, middle) > 200 and buffer.readu8(pixels, middle + 2) < 60,
+    "an indexed depth-tested draw keeps the near triangle")
+
+-- A frame that drew nothing is still a frame: the clear colour is what
+-- comes back.
+frame = device:frame({ clear = "#204060" })
+presented, pixels, width, height = frame:read()
+assert(presented and buffer.readu8(pixels, 0) == 0x20 and buffer.readu8(pixels, 1) == 0x40
+    and buffer.readu8(pixels, 2) == 0x60, "the clear colour reaches the surface unchanged")
+
+-- FAILURES ----------------------------------------------------------------
+
+frame = device:frame()
+expectError(frame.draw, "no pipeline is set", "a draw needs a pipeline", frame, 3)
+frame:pipeline(depthTested)
+expectError(frame.draw, "no vertex buffer is set", "a draw needs vertices", frame, 3)
+frame:vertices(mesh)
+expectError(frame.draw, "vertex buffer holds", "a draw past the end of the buffer is refused", frame, 10)
+expectError(frame.vertices, "usage \"vertex\"", "vertices refuses an index buffer", frame, elements)
+expectError(frame.indices, "usage \"index\"", "indices refuses a vertex buffer", frame, mesh)
+expectError(frame.bind, "resource must be", "bind checks its resource", frame, 0, {})
+expectError(frame.bind, "only a uniform buffer", "bind refuses a vertex buffer", frame, 0, mesh)
+expectError(device.frame, "already open", "only one frame at a time", device)
+expectError(gpu.clear, "a frame is open", "gpu.clear refuses an open frame", win, "#fff")
+assert(frame:finish(), "the frame finished")
+expectError(frame.finish, "frame is finished", "a finished frame is unusable", frame)
+expectError(frame.draw, "frame is finished", "a finished frame cannot draw", frame, 3)
+
+-- A shader that declares no bindings draws without any, and binding one
+-- anyway is the driver's answer, raised where the draw happened.
+local bare = device:shader([[
+@vertex
+fn vertex(@location(0) position: vec3<f32>, @location(1) uv: vec2<f32>) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(position, 1.0);
+}
+
+@fragment
+fn fragment() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+}
+]])
+local bareline = device:pipeline({ shader = bare, vertex = layout, cull = "none" })
+frame = device:frame()
+frame:pipeline(bareline):vertices(mesh):draw(3)
+assert(frame:finish(), "a shader with no bindings draws")
+
+frame = device:frame()
+frame:pipeline(bareline):bind(0, sampler):vertices(mesh)
+expectError(frame.draw, "cannot bind", "binding a shader that takes none is refused", frame, 3)
+frame:finish()
+
+-- Only group 0 is bound, so bindings a shader puts elsewhere are not
+-- reachable; that is the one thing the shader cannot decide for itself.
+
+-- A pipeline whose bindings the shader does not match is the driver's
+-- answer, raised where the draw happened.
+frame = device:frame()
+frame:pipeline(depthTested):bind(0, sampler):bind(1, texture):vertices(mesh)
+expectError(frame.draw, "cannot bind", "a mistyped binding is refused", frame, 3)
+frame:finish()
+
+-- A CANVAS AS A TEXTURE ---------------------------------------------------
+--
+-- A heads-up display is an `@neyuki/ui` canvas uploaded as a texture and
+-- drawn flat over depth-tested geometry, in the same frame. The canvas here
+-- is two texels wide: the left one opaque blue, the right one left
+-- transparent, and the mesh samples the left.
+
+local panel = ui.canvas(2, 1)
+panel:fillRect(0, 0, 1, 1, "#0000ff")
+local hud = device:texture(panel)
+assert(hud.width == 2 and hud.height == 1,
+    "a canvas texture is the canvas's size in physical pixels")
+local overlay = device:pipeline({
+    shader = shader, vertex = layout, depth = false, blend = "alpha" })
+
+function drawWithHud(): (number, number, number)
+    local held = device:frame({ clear = "#000" })
+    held:pipeline(depthTested):bind(0, texture):bind(1, sampler):vertices(mesh):draw(3)
+    -- Flat and blended, over geometry that was depth tested: one depth
+    -- attachment fits every pipeline, so this needs no second render pass.
+    held:pipeline(overlay):bind(0, hud):bind(1, sampler):vertices(mesh):draw(3)
+    local shown, shot, shotWidth, shotHeight = held:read()
+    assert(shown, "the frame with a display on it presented")
+    local spot = ((shotHeight // 2) * shotWidth + shotWidth // 2) * 4
+    return buffer.readu8(shot, spot), buffer.readu8(shot, spot + 1),
+        buffer.readu8(shot, spot + 2)
+end
+
+local hr, hg, hb = drawWithHud()
+assert(hr == 0 and hg == 0 and hb == 255, "an opaque display covers the geometry under it, got "
+    .. tostring(hr) .. "," .. tostring(hg) .. "," .. tostring(hb))
+
+-- Redrawn and written over the same texture, which is the path a display
+-- that changes every frame needs: no new texture, and so no new bind group.
+panel:clear()
+hud:update(panel)
+hr, hg, hb = drawWithHud()
+assert(hr == 255 and hg == 0 and hb == 0, "a transparent display lets the geometry through, got "
+    .. tostring(hr) .. "," .. tostring(hg) .. "," .. tostring(hb))
+
+-- An image can be written over a texture too, and a canvas that grew cannot:
+-- a texture is not resizable, so the script is told to make another.
+hud:close()
+hud = device:texture(image)
+hud:update(image)
+expectError(hud.update, "cannot be resized", "a source of another size is refused", hud,
+    ui.canvas(4, 4))
+expectError(hud.update, "must be an image", "update checks its source", hud, {})
+hud:close()
+expectError(hud.update, "texture is closed", "a closed texture cannot be written", hud, image)
+
+-- Setting a pipeline starts the bindings over, because a layout comes from
+-- one shader's own declarations and the next shader's are not the same. The
+-- display above is exactly the case: two bindings, then a pipeline that
+-- takes none, in one frame.
+frame = device:frame()
+frame:pipeline(depthTested):bind(0, texture):bind(1, sampler):vertices(mesh):draw(3)
+frame:pipeline(bareline):draw(3)
+assert(frame:finish(), "a pipeline that binds nothing follows one that binds two")
+
+-- And the other way round: the group the first pipeline set is not left on
+-- the pass for the second to draw with, so forgetting to bind names the
+-- binding that is missing instead of quietly drawing the wrong resources.
+frame = device:frame()
+frame:pipeline(bareline):vertices(mesh):draw(3)
+frame:pipeline(depthTested)
+expectError(frame.draw, "cannot bind", "a pipeline change needs its own bindings", frame, 3)
+-- Finished rather than cancelled: the first draw did land, and a run of
+-- cancels in a row can leave the surface with no image to hand out, which
+-- the next frame reports as skipped.
+frame:finish()
+
+-- CANCELLING A FRAME ------------------------------------------------------
+--
+-- An error on a frame leaves the frame open, because a mistyped argument
+-- must not be the end of the window. The frame holds the window's next
+-- image, though, so something has to let go of it: without that, one
+-- caught error in a draw loop refuses every frame after it.
+
+frame = device:frame()
+expectError(frame.draw, "no pipeline is set", "the draw failed as intended", frame, 3)
+frame:cancel()
+expectError(frame.finish, "frame is finished", "a cancelled frame cannot be finished", frame)
+expectError(frame.cancel, "frame is finished", "a cancelled frame cannot be cancelled twice", frame)
+assert(not gpu.cancelFrame(), "nothing is open after a cancel")
+frame = device:frame()
+assert(frame:finish(), "a frame starts again after a cancel")
+
+-- The same recovery with no handle, which is what a loop has after an
+-- error it caught: the frame is open and nothing names it.
+frame = device:frame()
+expectError(device.frame, "already open", "the frame is still open", device)
+assert(gpu.cancelFrame(), "cancelFrame reports the frame it discarded")
+assert(not gpu.cancelFrame(), "and reports nothing the second time")
+gpu.clear(win, "#000")
+
+-- A window closed with a frame open used to drop the window's image after
+-- the surface it came from, which panics inside the driver -- in a thread
+-- local's destructor, so it aborted the process instead of reaching the
+-- script. The frame has to go with the window.
+local doomed = ui.open({ title = "Neyuki gpu close", width = 64, height = 64,
+    visible = false, gpu = true })
+local doomedDevice = gpu.device(doomed)
+doomedDevice:frame({ clear = "#000" })
+doomed:close()
+assert(not gpu.cancelFrame(), "closing a window discards its open frame")
+
+-- Resources can be freed, and a freed one is not usable again.
+elements:close()
+elements:close()
+frame = device:frame()
+expectError(frame.indices, "buffer is closed", "a closed buffer is unusable", frame, elements)
+frame:finish()
+gpu.clear(win, "#000")
+
+texture:close()
+overlay:close()
+panel:close()
+sampler:close()
+mesh:close()
+padded:close()
+depthTested:close()
+flat:close()
+bareline:close()
+shader:close()
+bare:close()
+image:close()
+
+win:close()
+expectError(gpu.clear, "window is closed", "a closed GPU window is unusable", win, "#fff")
+print("gpu: live checks passed")

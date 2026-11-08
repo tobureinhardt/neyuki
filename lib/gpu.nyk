@@ -1,0 +1,421 @@
+local table = require("@neyuki/table")
+
+local gpu = {}
+
+-- Types other files can name as `gpu.Device`, `gpu.Pipeline`, ... They are
+-- erased at compile time and deliberately loose, as in `@neyuki/ui`.
+export type Device = { [string]: any }
+export type Shader = { [string]: any }
+-- `Buffer` is already the name of Neyuki's own byte buffers, so the GPU
+-- side of one is `GpuBuffer`.
+export type GpuBuffer = { [string]: any }
+export type Texture = { [string]: any }
+export type Sampler = { [string]: any }
+export type Pipeline = { [string]: any }
+export type Frame = { [string]: any }
+export type PipelineOptions = { [string]: any }
+export type SamplerOptions = { [string]: any }
+export type FrameOptions = { [string]: any }
+
+-- GPU rendering on top of the `__gpu_*` natives in src/vm/libs/gpu.rs
+-- (`wgpu`: Direct3D 12 on Windows, Metal on macOS, Vulkan or OpenGL ES
+-- elsewhere).
+--
+-- This is a separate path from `@neyuki/ui`, not a backend for it. `ui`
+-- keeps rendering on the CPU with the same guarantees as before: no GPU, no
+-- driver, works headless. A window opened with `gpu = true` is given to this
+-- module instead, has no CPU back buffer, and raises an error from every
+-- `ui` drawing call and from `window:present()`.
+--
+-- The module is behind a cargo feature that is off in stock builds of
+-- Neyuki, so always check `gpu.isAvailable()` first.
+--
+-- Shaders are WGSL. A pipeline's bindings are read from the shader itself --
+-- whatever it declares as `@group(0) @binding(n)` -- so there is no second
+-- place to keep in step. The conventions everything else is built on:
+--
+--  * Clip space: x and y in -1..1 with **y up**, z in **0..1** (0 near,
+--    1 far) -- the Direct3D and Metal depth range, not OpenGL's -1..1.
+--  * Framebuffer and texture coordinates: origin **top left**, y down,
+--    as in `@neyuki/ui`.
+--  * World and view space: **right-handed**, y up, looking down -z. The
+--    projection matrix does the flip into clip space.
+--  * Matrices: **column-major**, column-vector convention, so
+--    `clip = projection * view * model * position` and a 4x4 uniform is
+--    16 numbers written column after column -- what a WGSL `mat4x4<f32>`
+--    reads with no transpose.
+--  * Front faces are **counter-clockwise**, which is what `cull = "back"`
+--    keeps.
+
+function checkString(s: any, name: string)
+    if (s == nil) then error(name .. " must be provided") end
+    if (type(s) != "string") then error(name .. " must be a string") end
+end
+
+function checkNumber(n: any, name: string)
+    if (n == nil) then error(name .. " must be provided") end
+    if (type(n) != "number") then error(name .. " must be a number") end
+end
+
+function checkOptionalString(s: any, name: string)
+    if (s != nil and type(s) != "string") then error(name .. " must be a string") end
+end
+
+function checkOptionalNumber(n: any, name: string)
+    if (n != nil and type(n) != "number") then error(name .. " must be a number") end
+end
+
+function checkOptionalBoolean(b: any, name: string)
+    if (b != nil and type(b) != "boolean") then error(name .. " must be a boolean") end
+end
+
+function checkOptionalTable(t: any, name: string)
+    if (t != nil and type(t) != "table") then error(name .. " must be a table") end
+end
+
+function checkWindow(window: any, name: string)
+    if (type(window) != "table" or type(window.id) != "number") then
+        error(name .. " must be a window from ui.open")
+    end
+end
+
+-- Every handle this module hands out carries its `kind`, which is also what
+-- `frame:bind` passes to the native to say which registry an id is in.
+function checkHandle(value: any, kind: string, name: string)
+    if (type(value) != "table" or value.kind != kind) then
+        error(name .. " must be a " .. kind .. " from device:" .. kind .. "()")
+    end
+end
+
+-- The attribute list of a pipeline, joined for the native. The list order is
+-- the order of the bytes in a vertex and of `@location(0)`, `@location(1)`,
+-- ... in the shader.
+function vertexSpec(list: any): string
+    if (type(list) != "table") then error("vertex must be a list of attribute names") end
+    if (#list == 0) then error("vertex must name at least one attribute") end
+    local spec = ""
+    for i = 1, #list do
+        checkString(list[i], "vertex[" .. tostring(i) .. "]")
+        if (i > 1) then spec = spec .. "," end
+        spec = spec .. list[i]
+    end
+    return spec
+end
+
+-- Whether this build has GPU support and the machine has an adapter. False
+-- on a build without the `gpu` cargo feature, and on a machine with no
+-- usable graphics driver. Every other function raises an error there.
+function gpu.isAvailable(): boolean
+    return __gpu_available()
+end
+
+-- The adapter in use: `name`, `backend` ("vulkan", "dx12", "metal", "gl"),
+-- `type` ("discrete", "integrated", "cpu", "virtual", "other") and
+-- `driver`. The adapter is chosen for the first GPU window, so this raises
+-- an error until one is open.
+function gpu.adapter(): {any}
+    return __gpu_adapter()
+end
+
+-- Fills `window` with `color` and presents the frame, the whole of drawing
+-- it in one call. `window` must have been opened with `gpu = true`; `color`
+-- takes the same forms as in `@neyuki/ui` ("#rgb", "#rrggbb", "#rrggbbaa", a
+-- { r, g, b, a? } table or a packed integer). Raises while a frame from
+-- `device:frame` is open.
+function gpu.clear(window: {any}, color: any): ()
+    checkWindow(window, "window")
+    __gpu_clear(window.id, color)
+end
+
+-- Discards whatever frame is open, as `frame:cancel()` does, and reports
+-- whether there was one. Nothing is presented.
+--
+-- This is the way out when the handle is gone. An error raised between
+-- `device:frame()` and `frame:finish()` leaves the frame open -- which is
+-- what lets a mistyped argument be an ordinary error rather than the end of
+-- the window -- and a draw loop that caught the error has usually lost the
+-- frame with the call that raised. A loop can call this before starting a
+-- frame, or after catching an error, and need keep no handle.
+function gpu.cancelFrame(): boolean
+    return __gpu_cancel_frame()
+end
+
+-- FRAMES -------------------------------------------------------------------
+
+-- Builds the `Frame` object around an open frame. Each call checks its
+-- arguments whatever the frame is doing, so a mistake is reported on a
+-- window nobody can see as readily as on one in front of the user.
+function makeFrame(id: number): Frame
+    local frame = {}
+    frame.kind = "frame"
+
+    -- Draws with `pipeline` from here on. The bindings are rebuilt against
+    -- its layout, so set the pipeline before binding.
+    function frame.pipeline(self: Frame, pipeline: Pipeline): Frame
+        checkHandle(pipeline, "pipeline", "pipeline")
+        __gpu_frame_pipeline(id, pipeline.id)
+        return self
+    end
+
+    -- Points `@group(0) @binding(index)` at a uniform buffer, a texture or
+    -- a sampler. The shader decides what each index has to be; a mismatch
+    -- is reported by the next `draw`.
+    function frame.bind(self: Frame, index: number, resource: any): Frame
+        checkNumber(index, "index")
+        if (type(resource) != "table" or type(resource.kind) != "string"
+            or type(resource.id) != "number") then
+            error("resource must be a buffer, texture or sampler")
+        end
+        __gpu_frame_bind(id, index, resource.kind, resource.id)
+        return self
+    end
+
+    -- The vertex buffer to read attributes from.
+    function frame.vertices(self: Frame, buffer: GpuBuffer): Frame
+        checkHandle(buffer, "buffer", "buffer")
+        __gpu_frame_vertices(id, buffer.id)
+        return self
+    end
+
+    -- Makes the next draw indexed. `format` is "u32" (the default) or
+    -- "u16".
+    function frame.indices(self: Frame, buffer: GpuBuffer, format: string?): Frame
+        checkHandle(buffer, "buffer", "buffer")
+        checkOptionalString(format, "format")
+        __gpu_frame_indices(id, buffer.id, format ?? "u32")
+        return self
+    end
+
+    -- Draws `count` vertices, or `count` indices once `indices` was called,
+    -- `instances` times (1 by default).
+    function frame.draw(self: Frame, count: number, instances: number?): Frame
+        checkNumber(count, "count")
+        checkOptionalNumber(instances, "instances")
+        __gpu_frame_draw(id, count, instances ?? 1)
+        return self
+    end
+
+    -- Submits the frame and presents the window. Returns false when the
+    -- frame was skipped because the window could not be drawn -- minimized,
+    -- hidden, or the compositor was busy -- which is not an error. A frame
+    -- cannot be used again afterwards.
+    function frame.finish(self: Frame): boolean
+        return __gpu_frame_finish(id)
+    end
+
+    -- Throws the frame away without presenting it: the window keeps
+    -- whatever it last showed. A frame cannot be used again afterwards.
+    --
+    -- This is how a draw loop recovers from an error raised mid-frame.
+    -- Such an error leaves the frame open, and the frame holds the
+    -- window's next image, so every later `device:frame()` is refused
+    -- until it is let go of. Use `gpu.cancelFrame()` where the handle is
+    -- out of reach.
+    function frame.cancel(self: Frame): ()
+        __gpu_frame_cancel(id)
+    end
+
+    -- Finishes the frame as `finish` does, and also reads the image back:
+    -- `presented, pixels, width, height`, where `pixels` is a `buffer` of
+    -- tightly packed RGBA and the size is in physical pixels. `pixels` is
+    -- nil when the frame was skipped.
+    --
+    -- This waits for the GPU, so it is for tests and screenshots, not for a
+    -- draw loop. It is what lets a script check that what was drawn is what
+    -- was meant, on a hidden window and with no GPU at all.
+    function frame.read(self: Frame): (boolean, any, number?, number?)
+        return __gpu_frame_read(id)
+    end
+
+    return table.freeze(frame)
+end
+
+-- DEVICE -------------------------------------------------------------------
+
+-- Builds the `Device` object. One device, adapter and queue are shared by
+-- every GPU window, so this is a handle to them reached through `window`,
+-- and the frames it opens are that window's.
+function makeDevice(window: {any}): Device
+    local device = {}
+    device.kind = "device"
+    device.window = window
+
+    -- Compiles a WGSL shader. A shader that does not compile raises with
+    -- the driver's message, which carries the line and column and a snippet
+    -- of the source.
+    function device.shader(self: Device, source: string): Shader
+        checkString(source, "source")
+        local id = __gpu_shader(source)
+        local shader = { kind = "shader", id = id }
+        local freed = false
+
+        -- Frees the shader. A pipeline built from it keeps working: the
+        -- driver holds what it needs. Closing twice does nothing.
+        function shader.close(self: Shader): ()
+            if (freed) then return end
+            freed = true
+            __gpu_free("shader", id)
+        end
+
+        return table.freeze(shader)
+    end
+
+    -- A buffer, from the bytes of a `buffer` or, given a number, that many
+    -- zero bytes. `usage` is "vertex", "index" or "uniform". `size` is what
+    -- was actually allocated: the request rounded up to what the usage
+    -- needs, so a 12-byte uniform buffer is 16 bytes.
+    function device.buffer(self: Device, data: any, usage: string): GpuBuffer
+        checkString(usage, "usage")
+        if (type(data) != "buffer" and type(data) != "number") then
+            error("data must be a buffer or a size in bytes")
+        end
+        local id, size = __gpu_buffer(data, usage)
+        local buffer = { kind = "buffer", id = id, size = size, usage = usage }
+        local freed = false
+
+        -- Replaces part of the contents, which is how a uniform buffer is
+        -- refreshed each frame without making a new one. `offset` must be a
+        -- multiple of 4.
+        function buffer.write(self: GpuBuffer, data: any, offset: number?): ()
+            checkOptionalNumber(offset, "offset")
+            __gpu_buffer_write(id, data, offset ?? 0)
+        end
+
+        -- Frees the buffer. The GPU memory goes when the driver is
+        -- finished with it, which may be after a frame still using it has
+        -- been submitted. Closing twice does nothing.
+        function buffer.close(self: GpuBuffer): ()
+            if (freed) then return end
+            freed = true
+            __gpu_free("buffer", id)
+        end
+
+        return table.freeze(buffer)
+    end
+
+    -- Uploads an `@neyuki/ui` image or canvas as a texture: an image's
+    -- first frame, or a canvas as it stands, RGBA and premultiplied as
+    -- `@neyuki/ui` keeps it, which is why `blend = "alpha"` blends
+    -- premultiplied.
+    --
+    -- `width` and `height` on the result are physical pixels, so a canvas
+    -- made at a scale gives a texture that much bigger than the size it
+    -- was asked for.
+    function device.texture(self: Device, source: {any}): Texture
+        if (type(source) != "table" or type(source.id) != "function") then
+            error("source must be an image from ui.loadImage or ui.decodeImage, " ..
+                "or a canvas from ui.canvas")
+        end
+        local id, width, height = __gpu_texture(source:id())
+        local texture = { kind = "texture", id = id, width = width, height = height }
+        local freed = false
+
+        -- Writes a redrawn image or canvas over the texture, which is how a
+        -- heads-up display reaches the GPU each frame: one copy, with no new
+        -- texture and so no new bind group. The size has to match.
+        function texture.update(self: Texture, source: {any}): Texture
+            if (type(source) != "table" or type(source.id) != "function") then
+                error("source must be an image from ui.loadImage or ui.decodeImage, " ..
+                    "or a canvas from ui.canvas")
+            end
+            if (freed) then error("texture is closed") end
+            __gpu_texture_update(id, source:id())
+            return self
+        end
+
+        function texture.close(self: Texture): ()
+            if (freed) then return end
+            freed = true
+            __gpu_free("texture", id)
+        end
+
+        return table.freeze(texture)
+    end
+
+    -- A sampler. `options.filter` is "linear" (the default) or "nearest";
+    -- `options.wrap` is "clamp" (the default), "repeat" or "mirror".
+    function device.sampler(self: Device, options: SamplerOptions?): Sampler
+        checkOptionalTable(options, "options")
+        options = options ?? {}
+        checkOptionalString(options.filter, "filter")
+        checkOptionalString(options.wrap, "wrap")
+        local id = __gpu_sampler(options.filter ?? "linear", options.wrap ?? "clamp")
+        local sampler = { kind = "sampler", id = id }
+        local freed = false
+
+        function sampler.close(self: Sampler): ()
+            if (freed) then return end
+            freed = true
+            __gpu_free("sampler", id)
+        end
+
+        return table.freeze(sampler)
+    end
+
+    -- A pipeline: one shader, one vertex layout and the fixed state around
+    -- them.
+    --
+    --   shader    the compiled WGSL, with one vertex and one fragment entry
+    --             point
+    --   vertex    the attribute list, packed in order from the start of a
+    --             vertex and numbered from @location(0): "float", "vec2",
+    --             "vec3", "vec4", "half2", "half4", "int", "uint",
+    --             "ubyte4" or "unorm4"
+    --   depth     test and write the depth buffer (false by default; a
+    --             pipeline without it draws over whatever is there)
+    --   cull      "none" (the default), "back" or "front"
+    --   topology  "triangles" (the default), "triangleStrip", "lines",
+    --             "lineStrip" or "points"
+    --   blend     "none" (the default) or "alpha", premultiplied
+    function device.pipeline(self: Device, options: PipelineOptions): Pipeline
+        if (type(options) != "table") then error("options must be a table") end
+        checkHandle(options.shader, "shader", "shader")
+        checkOptionalBoolean(options.depth, "depth")
+        checkOptionalString(options.cull, "cull")
+        checkOptionalString(options.topology, "topology")
+        checkOptionalString(options.blend, "blend")
+        local id = __gpu_pipeline(options.shader.id, vertexSpec(options.vertex),
+            options.depth ?? false, options.cull ?? "none",
+            options.topology ?? "triangles", options.blend ?? "none")
+        local pipeline = { kind = "pipeline", id = id }
+        local freed = false
+
+        function pipeline.close(self: Pipeline): ()
+            if (freed) then return end
+            freed = true
+            __gpu_free("pipeline", id)
+        end
+
+        return table.freeze(pipeline)
+    end
+
+    -- Starts a frame on this device's window: clears the colour and depth
+    -- buffers and opens a render pass. `options.clear` is the colour (black
+    -- by default) and `options.depth` the depth to clear to (1, the far
+    -- plane, by default).
+    --
+    -- Only one frame can be open at a time, because it holds the window's
+    -- next image. Call `frame:finish()` to present it.
+    function device.frame(self: Device, options: FrameOptions?): Frame
+        checkOptionalTable(options, "options")
+        options = options ?? {}
+        checkOptionalNumber(options.depth, "depth")
+        return makeFrame(__gpu_frame(window.id, options.clear ?? "#000", options.depth ?? 1))
+    end
+
+    return table.freeze(device)
+end
+
+-- The device for `window`, which must have been opened with `gpu = true`.
+-- The device, its adapter and its queue are shared by every GPU window; the
+-- frames this one opens are `window`'s.
+--
+-- Raises here, rather than from the first resource built, when the machine
+-- has no adapter or this build has no GPU support.
+function gpu.device(window: {any}): Device
+    checkWindow(window, "window")
+    __gpu_device(window.id)
+    return makeDevice(window)
+end
+
+return table.freeze(gpu)

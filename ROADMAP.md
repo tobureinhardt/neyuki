@@ -66,10 +66,14 @@ This document outlines the architectural milestones and engineering trajectory f
   - [x] `ui.canvas` off-screen surfaces with the full drawing API, drawable like an image, and `ui.path` with `fillPath`, `strokePath` and `getPixel`.
   - [x] Rectangle and path clipping (`pushClip`, `pushClipPath`), group opacity (`pushOpacity`), linear/radial gradients and box shadows on fills.
   - [x] Gaussian blur: `blurRegion` backdrop blur with rounded masks and `Image:blur`.
-  - [x] CPU render performance: `present({ dirty })` partial present, `ui.run({ fps = "auto" })` idle throttling, `ui.stats()` frame timing and an opaque glyph fast path. A GPU backend (wgpu) is left out unless these prove too slow.
+  - [x] CPU render performance: `present({ dirty })` partial present, `ui.run({ fps = "auto" })` idle throttling, `ui.stats()` frame timing and an opaque glyph fast path. A GPU backend *behind* these drawing calls is still left out: `@neyuki/gpu` sits beside them as its own module, so `ui` keeps rendering on the CPU with no driver.
 - [x] Async I/O: `http.request`, `os.run` and `fs.read` suspend only the calling task and run on background threads; `ui.run` pumps the completions every frame so windows stay responsive.
 - [x] `@neyuki/net`: named pipes, Unix sockets, TCP sockets and a WebSocket client with reader threads and buffered reads that suspend only the calling task, plus `os.spawn` for child processes with streamed stdin, stdout and stderr.
-- [x] `@neyuki/webview`: web pages through the system web engine (WebView2, WKWebView, WebKitGTK) in the `ui` event loop, with a custom asset protocol and page/script messaging. GPU rendering for `ui` is out of scope; embedded web content covers GPU-accelerated drawing.
+- [x] `@neyuki/webview`: web pages through the system web engine (WebView2, WKWebView, WebKitGTK) in the `ui` event loop, with a custom asset protocol and page/script messaging. Embedded web content is one route to GPU-accelerated drawing; `@neyuki/gpu` is the other.
+- [x] `@neyuki/gpu`: GPU rendering on a `ui` window through `wgpu` (Direct3D 12, Metal, Vulkan), behind the `gpu` cargo feature, which is off in stock builds because it adds several MiB to the executable.
+  - [x] WGSL shaders with errors that carry a line and a column, pipelines, and vertex, index and uniform data straight from `buffer` values.
+  - [x] Textures from `@neyuki/ui` images and canvases, with `texture:update` for a canvas that is redrawn: 2D drawing and text over 3D without leaving `ui`.
+  - [x] A depth buffer on every frame, back-face culling, premultiplied blending, and `frame:read()` so a frame can be checked with no display and no GPU.
 - [ ] Tray icon with a menu whose items arrive as events.
 - [ ] Single-instance apps: a second launch signals and focuses the first.
 - [ ] Auto-update support.

@@ -789,9 +789,9 @@ mod tests {
     fn test_bigint_mod_floor_and_div_equivalence() {
         let values = [
             BigInt::from(1i64) << 100,
-            -&(BigInt::from(1i64) << 100),
+            -&(BigInt::from(1i64) << 100u32),
             (BigInt::from(1i64) << 65) | BigInt::from(123456789i64),
-            -&((BigInt::from(1i64) << 65) | BigInt::from(123456789i64)),
+            -&((BigInt::from(1i64) << 65u32) | BigInt::from(123456789i64)),
             BigInt::from(i64::MAX as u64) + 1i64,
             BigInt::from(i64::MIN) - 1i64,
         ];
@@ -838,7 +838,7 @@ mod tests {
                 5u64,
             ),
             (
-                Value::from_bigint(-&((BigInt::from(1i64) << 70) | BigInt::from(5i64))),
+                Value::from_bigint(-&((BigInt::from(1i64) << 70u32) | BigInt::from(5i64))),
                 (-5i64) as u64,
             ),
         ];

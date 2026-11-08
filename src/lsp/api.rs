@@ -581,6 +581,7 @@ mod tests {
         assert_eq!(
             api.skipped_headings,
             vec![
+                ("gpu".to_string(), "Conventions".to_string()),
                 ("task".to_string(), "Blocking calls".to_string()),
                 ("task".to_string(), "Windows in a task".to_string()),
             ]

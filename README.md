@@ -32,7 +32,13 @@ print(`total: {total}`)
 
 ## Install
 
-Build from source with a recent stable Rust and a C compiler (on Linux also `pkg-config` and the OpenSSL headers; see [CONTRIBUTING.md](CONTRIBUTING.md#building) for each OS):
+With a recent stable Rust and a C compiler (on Linux also `pkg-config` and the OpenSSL headers; see [CONTRIBUTING.md](CONTRIBUTING.md#building) for each OS):
+
+```bash
+cargo install neyuki
+```
+
+Or from a clone, which is what you want to work on Neyuki itself:
 
 ```bash
 git clone https://github.com/neyuki-lang/neyuki
@@ -41,6 +47,8 @@ cargo build --release
 ```
 
 The executable is `target/release/neyuki` (`neyuki.exe` on Windows); put it on your `PATH`.
+
+[@neyuki/gpu](docs/reference/gpu.md) is the one module a stock build leaves out, because `wgpu` adds several MiB to the executable. Add `--features gpu` to either command for a build that has it — `cargo install neyuki --features gpu` — or take the `neyuki-gpu` that sits beside `neyuki` in every release archive. The two are otherwise the same build, and `gpu.isAvailable()` tells a script which one it is running on.
 
 ## Use
 
