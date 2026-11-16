@@ -1,12 +1,17 @@
 pub mod buffer;
 pub mod builtins;
+pub mod call;
 pub mod frame;
 pub mod gc;
 pub mod hash;
+pub mod interp;
 pub mod libs;
 pub mod machine;
+pub mod metamethod;
 pub mod ops;
 pub mod table;
+pub mod traceback;
+pub mod upvalue;
 pub mod value;
 
 pub use machine::VM;
