@@ -1404,4 +1404,90 @@ return path .. \" \" .. params.name .. \" \" .. http.encode(\"a b\")";
         let allowed_env = compile_src("return type(os.getenv('PATH'))");
         assert!(vm.execute(allowed_env).is_ok());
     }
+
+    #[test]
+    fn test_super_instructions_addk_and_compare_jump_emitted() {
+        let proto = compile_src(
+            "local function f(x)
+                if x < 10 then
+                    return x + 1
+                end
+                return x * 2 - 3
+            end
+            return f(4) + f(10)",
+        );
+        let child = &proto.protos[0];
+        let has_ltk = child
+            .instructions
+            .iter()
+            .any(|i| matches!(i, crate::bytecode::instruction::Instruction::LtK { .. }));
+        let has_addk = child
+            .instructions
+            .iter()
+            .any(|i| matches!(i, crate::bytecode::instruction::Instruction::AddK { .. }));
+        let has_subk = child
+            .instructions
+            .iter()
+            .any(|i| matches!(i, crate::bytecode::instruction::Instruction::SubK { .. }));
+        let has_mulk = child
+            .instructions
+            .iter()
+            .any(|i| matches!(i, crate::bytecode::instruction::Instruction::MulK { .. }));
+        assert!(has_ltk && has_addk && has_subk && has_mulk);
+
+        let mut vm = VM::new();
+        let res = vm.execute(proto).unwrap();
+        assert_eq!(res.to_string(), "22");
+    }
+
+    #[test]
+    fn test_quickening_deopts_on_type_change_and_overflow() {
+        let code = "local function step(x)
+            if x < 100 then
+                return x + 1
+            end
+            return x + 1
+        end
+        local a = step(5)
+        local b = step(2.5)
+        local c = step(9223372036854775807)
+        return a == 6 and b == 3.5 and c == 9223372036854775808";
+        assert_eq!(run_code(code).to_string(), "true");
+    }
+
+    #[test]
+    fn test_inline_cache_globals_and_table_fields() {
+        let code = "global g = 10
+        local t = { x = 1, y = 2 }
+        local sum = 0
+        for i = 1, 10 do
+            if i == 5 then
+                g = 20
+                t.z = 3
+                t.w = 4
+                t.u = 5
+            end
+            sum += g + t.x + t.y
+            t.x += 1
+        end
+        return sum == 235 and t.x == 11";
+        assert_eq!(run_code(code).to_string(), "true");
+    }
+
+    #[test]
+    fn test_super_instructions_serialize_disasm_roundtrip() {
+        let proto = compile_src(
+            "local function cmp(x)
+                if x == 5 then return x + 2 end
+                if x != 1 then return x - 1 end
+                return x * 3
+            end
+            return cmp(5) + cmp(2) + cmp(1)",
+        );
+        let bytes = crate::bytecode::serialize(&proto);
+        let decoded = crate::bytecode::deserialize(&bytes).expect("deserialize failed");
+        let mut vm = VM::new();
+        let res = vm.execute(decoded).expect("execute failed");
+        assert_eq!(res.to_string(), "11");
+    }
 }

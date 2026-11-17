@@ -415,6 +415,84 @@ fn write_instruction(buf: &mut Vec<u8>, inst: &Instruction) {
             write_u8(buf, 54);
             write_u8(buf, *reg);
         }
+        Instruction::AddK { dst, a, k } => {
+            write_u8(buf, 55);
+            write_u8(buf, *dst);
+            write_u8(buf, *a);
+            write_u16(buf, *k);
+        }
+        Instruction::SubK { dst, a, k } => {
+            write_u8(buf, 56);
+            write_u8(buf, *dst);
+            write_u8(buf, *a);
+            write_u16(buf, *k);
+        }
+        Instruction::MulK { dst, a, k } => {
+            write_u8(buf, 57);
+            write_u8(buf, *dst);
+            write_u8(buf, *a);
+            write_u16(buf, *k);
+        }
+        Instruction::EqK {
+            a,
+            k,
+            jump_if_false,
+        } => {
+            write_u8(buf, 58);
+            write_u8(buf, *a);
+            write_u16(buf, *k);
+            write_i16(buf, *jump_if_false);
+        }
+        Instruction::NeK {
+            a,
+            k,
+            jump_if_false,
+        } => {
+            write_u8(buf, 59);
+            write_u8(buf, *a);
+            write_u16(buf, *k);
+            write_i16(buf, *jump_if_false);
+        }
+        Instruction::LtK {
+            a,
+            k,
+            jump_if_false,
+        } => {
+            write_u8(buf, 60);
+            write_u8(buf, *a);
+            write_u16(buf, *k);
+            write_i16(buf, *jump_if_false);
+        }
+        Instruction::LeK {
+            a,
+            k,
+            jump_if_false,
+        } => {
+            write_u8(buf, 61);
+            write_u8(buf, *a);
+            write_u16(buf, *k);
+            write_i16(buf, *jump_if_false);
+        }
+        Instruction::GtK {
+            a,
+            k,
+            jump_if_false,
+        } => {
+            write_u8(buf, 62);
+            write_u8(buf, *a);
+            write_u16(buf, *k);
+            write_i16(buf, *jump_if_false);
+        }
+        Instruction::GeK {
+            a,
+            k,
+            jump_if_false,
+        } => {
+            write_u8(buf, 63);
+            write_u8(buf, *a);
+            write_u16(buf, *k);
+            write_i16(buf, *jump_if_false);
+        }
     }
 }
 

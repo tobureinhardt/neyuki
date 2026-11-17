@@ -168,6 +168,13 @@ fn verify_proto_depth(proto: &Proto, depth: usize) -> Result<(), BytecodeVerifyE
                 check_reg(*a, pc)?;
                 check_reg(*b, pc)?;
             }
+            Instruction::AddK { dst, a, k }
+            | Instruction::SubK { dst, a, k }
+            | Instruction::MulK { dst, a, k } => {
+                check_reg(*dst, pc)?;
+                check_reg(*a, pc)?;
+                check_const(*k, pc)?;
+            }
             Instruction::Unm { dst, src }
             | Instruction::Not { dst, src }
             | Instruction::Len { dst, src }
@@ -374,6 +381,40 @@ fn verify_proto_depth(proto: &Proto, depth: usize) -> Result<(), BytecodeVerifyE
             } => {
                 check_reg(*a, pc)?;
                 check_reg(*b, pc)?;
+                check_jump(*jump_if_false, pc)?;
+            }
+            Instruction::EqK {
+                a,
+                k,
+                jump_if_false,
+            }
+            | Instruction::NeK {
+                a,
+                k,
+                jump_if_false,
+            }
+            | Instruction::LtK {
+                a,
+                k,
+                jump_if_false,
+            }
+            | Instruction::LeK {
+                a,
+                k,
+                jump_if_false,
+            }
+            | Instruction::GtK {
+                a,
+                k,
+                jump_if_false,
+            }
+            | Instruction::GeK {
+                a,
+                k,
+                jump_if_false,
+            } => {
+                check_reg(*a, pc)?;
+                check_const(*k, pc)?;
                 check_jump(*jump_if_false, pc)?;
             }
             Instruction::ForPrep { base, jump } => {

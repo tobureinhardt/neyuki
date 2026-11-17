@@ -190,5 +190,38 @@ fn format_instruction(inst: &Instruction) -> String {
         Instruction::TForCall { base, retc } => format!("TFORCALL     R{}, {}", base, retc),
         Instruction::TForLoop { base, jump } => format!("TFORLOOP     R{}, {}", base, jump),
         Instruction::CloseUpval { reg } => format!("CLOSEUPVAL   R{}", reg),
+        Instruction::AddK { dst, a, k } => format!("ADDK         R{}, R{}, K{}", dst, a, k),
+        Instruction::SubK { dst, a, k } => format!("SUBK         R{}, R{}, K{}", dst, a, k),
+        Instruction::MulK { dst, a, k } => format!("MULK         R{}, R{}, K{}", dst, a, k),
+        Instruction::EqK {
+            a,
+            k,
+            jump_if_false,
+        } => format!("EQK          R{}, K{}, {:+}", a, k, jump_if_false),
+        Instruction::NeK {
+            a,
+            k,
+            jump_if_false,
+        } => format!("NEK          R{}, K{}, {:+}", a, k, jump_if_false),
+        Instruction::LtK {
+            a,
+            k,
+            jump_if_false,
+        } => format!("LTK          R{}, K{}, {:+}", a, k, jump_if_false),
+        Instruction::LeK {
+            a,
+            k,
+            jump_if_false,
+        } => format!("LEK          R{}, K{}, {:+}", a, k, jump_if_false),
+        Instruction::GtK {
+            a,
+            k,
+            jump_if_false,
+        } => format!("GTK          R{}, K{}, {:+}", a, k, jump_if_false),
+        Instruction::GeK {
+            a,
+            k,
+            jump_if_false,
+        } => format!("GEK          R{}, K{}, {:+}", a, k, jump_if_false),
     }
 }

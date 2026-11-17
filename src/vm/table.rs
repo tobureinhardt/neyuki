@@ -230,6 +230,7 @@ pub struct FieldEntry {
 pub struct FieldMap {
     entries: Vec<Option<FieldEntry>>,
     count: usize,
+    shape_version: u64,
 }
 
 impl FieldMap {
@@ -238,6 +239,7 @@ impl FieldMap {
         Self {
             entries: Vec::new(),
             count: 0,
+            shape_version: 0,
         }
     }
 
@@ -249,7 +251,33 @@ impl FieldMap {
             let n = (cap * 4 / 3 + 1).next_power_of_two().max(4);
             let mut entries = Vec::with_capacity(n);
             entries.resize_with(n, || None);
-            Self { entries, count: 0 }
+            Self {
+                entries,
+                count: 0,
+                shape_version: 0,
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn shape_version(&self) -> u64 {
+        self.shape_version
+    }
+
+    #[inline(always)]
+    pub fn get_slot(&self, idx: usize) -> Option<&Value> {
+        self.entries
+            .get(idx)
+            .and_then(|opt| opt.as_ref().map(|e| &e.val))
+    }
+
+    #[inline(always)]
+    pub fn set_slot(&mut self, idx: usize, val: Value) -> bool {
+        if let Some(Some(entry)) = self.entries.get_mut(idx) {
+            entry.val = val;
+            true
+        } else {
+            false
         }
     }
 
@@ -340,6 +368,7 @@ impl FieldMap {
                 None => {
                     self.entries[idx] = Some(FieldEntry { hash, key, val });
                     self.count += 1;
+                    self.shape_version = self.shape_version.wrapping_add(1);
                     return None;
                 }
                 Some(entry) => {
@@ -367,6 +396,7 @@ impl FieldMap {
             new_entries[idx] = Some(entry);
         }
         self.entries = new_entries;
+        self.shape_version = self.shape_version.wrapping_add(1);
     }
 
     pub fn remove(&mut self, key: &str) -> Option<Value> {
@@ -389,6 +419,7 @@ impl FieldMap {
         };
         let removed = self.entries[found].take().map(|e| e.val);
         self.count -= 1;
+        self.shape_version = self.shape_version.wrapping_add(1);
         let mut i = found;
         let mut j = (found + 1) & mask;
         while let Some(entry) = &self.entries[j] {
@@ -427,6 +458,7 @@ impl FieldMap {
         };
         let removed = self.entries[found].take().map(|e| e.val);
         self.count -= 1;
+        self.shape_version = self.shape_version.wrapping_add(1);
         let mut i = found;
         let mut j = (found + 1) & mask;
         while let Some(entry) = &self.entries[j] {
@@ -446,6 +478,7 @@ impl FieldMap {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.count = 0;
+        self.shape_version = self.shape_version.wrapping_add(1);
     }
 
     #[inline]

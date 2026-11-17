@@ -98,15 +98,30 @@ pub enum Instruction {
         a: u8,
         b: u8,
     },
+    AddK {
+        dst: u8,
+        a: u8,
+        k: u16,
+    },
     Sub {
         dst: u8,
         a: u8,
         b: u8,
     },
+    SubK {
+        dst: u8,
+        a: u8,
+        k: u16,
+    },
     Mul {
         dst: u8,
         a: u8,
         b: u8,
+    },
+    MulK {
+        dst: u8,
+        a: u8,
+        k: u16,
     },
     Div {
         dst: u8,
@@ -227,6 +242,36 @@ pub enum Instruction {
     Ge {
         a: u8,
         b: u8,
+        jump_if_false: i16,
+    },
+    EqK {
+        a: u8,
+        k: u16,
+        jump_if_false: i16,
+    },
+    NeK {
+        a: u8,
+        k: u16,
+        jump_if_false: i16,
+    },
+    LtK {
+        a: u8,
+        k: u16,
+        jump_if_false: i16,
+    },
+    LeK {
+        a: u8,
+        k: u16,
+        jump_if_false: i16,
+    },
+    GtK {
+        a: u8,
+        k: u16,
+        jump_if_false: i16,
+    },
+    GeK {
+        a: u8,
+        k: u16,
         jump_if_false: i16,
     },
 

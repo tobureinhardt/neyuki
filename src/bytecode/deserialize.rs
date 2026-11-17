@@ -412,6 +412,51 @@ fn read_instruction(bytes: &[u8], cursor: &mut usize) -> Result<Instruction, Str
         54 => Ok(Instruction::CloseUpval {
             reg: read_u8(bytes, cursor)?,
         }),
+        55 => Ok(Instruction::AddK {
+            dst: read_u8(bytes, cursor)?,
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+        }),
+        56 => Ok(Instruction::SubK {
+            dst: read_u8(bytes, cursor)?,
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+        }),
+        57 => Ok(Instruction::MulK {
+            dst: read_u8(bytes, cursor)?,
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+        }),
+        58 => Ok(Instruction::EqK {
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        59 => Ok(Instruction::NeK {
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        60 => Ok(Instruction::LtK {
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        61 => Ok(Instruction::LeK {
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        62 => Ok(Instruction::GtK {
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        63 => Ok(Instruction::GeK {
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
         _ => Err(format!("unknown instruction tag: {}", tag)),
     }
 }

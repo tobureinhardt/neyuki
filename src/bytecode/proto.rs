@@ -65,6 +65,138 @@ pub struct ProtoCache {
     values: OnceCell<Vec<Value>>,
     verified: Cell<bool>,
     imports: RefCell<Vec<ImportSlot>>,
+    globals: RefCell<Vec<GlobalCacheSlot>>,
+    tables: RefCell<Vec<TableCacheSlot>>,
+    quick_ops: RefCell<Vec<QuickOp>>,
+}
+
+/// Inline cache entry for `GetGlobal` at a specific instruction index.
+#[derive(Clone)]
+pub struct GlobalCacheSlot {
+    pub epoch: u64,
+    pub value: Value,
+}
+
+impl Default for GlobalCacheSlot {
+    fn default() -> Self {
+        Self {
+            epoch: u64::MAX,
+            value: Value::Nil,
+        }
+    }
+}
+
+/// Inline cache entry for `GetTableK` / `SetTableK` at a specific instruction
+/// index: caches the table pointer, `FieldMap::shape_version`, and the direct
+/// entry slot index so repeated reads/writes skip hashing and probing.
+#[derive(Clone, Copy)]
+pub struct TableCacheSlot {
+    pub table_ptr: usize,
+    pub shape_version: u64,
+    pub slot_idx: usize,
+}
+
+impl Default for TableCacheSlot {
+    fn default() -> Self {
+        Self {
+            table_ptr: 0,
+            shape_version: u64::MAX,
+            slot_idx: 0,
+        }
+    }
+}
+
+/// Type-specialized fast-path opcode populated lazily by the VM on first
+/// execution. Falls back to `QuickOp::None` (deoptimization) if a guard fails.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum QuickOp {
+    #[default]
+    None,
+    AddInt {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
+    AddFloat {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
+    SubInt {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
+    SubFloat {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
+    MulInt {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
+    MulFloat {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
+    AddIntK {
+        dst: u8,
+        a: u8,
+        imm: i64,
+    },
+    AddFloatK {
+        dst: u8,
+        a: u8,
+        imm: f64,
+    },
+    SubIntK {
+        dst: u8,
+        a: u8,
+        imm: i64,
+    },
+    SubFloatK {
+        dst: u8,
+        a: u8,
+        imm: f64,
+    },
+    MulIntK {
+        dst: u8,
+        a: u8,
+        imm: i64,
+    },
+    MulFloatK {
+        dst: u8,
+        a: u8,
+        imm: f64,
+    },
+    LtInt {
+        a: u8,
+        b: u8,
+        jump_if_false: i16,
+    },
+    LeInt {
+        a: u8,
+        b: u8,
+        jump_if_false: i16,
+    },
+    LtIntK {
+        a: u8,
+        imm: i64,
+        jump_if_false: i16,
+    },
+    LeIntK {
+        a: u8,
+        imm: i64,
+        jump_if_false: i16,
+    },
+    EqIntK {
+        a: u8,
+        imm: i64,
+        jump_if_false: i16,
+    },
 }
 
 /// One cached `module.field` resolution for a `GetImport` site: the globals
@@ -243,5 +375,65 @@ impl Proto {
                 return;
             }
         }
+    }
+
+    #[inline]
+    pub fn quick_op(&self, ip: usize) -> QuickOp {
+        let ops = self.cache.quick_ops.borrow();
+        ops.get(ip).copied().unwrap_or(QuickOp::None)
+    }
+
+    #[inline]
+    pub fn set_quick_op(&self, ip: usize, op: QuickOp) {
+        let mut ops = self.cache.quick_ops.borrow_mut();
+        if ops.len() < self.instructions.len() {
+            ops.resize(self.instructions.len(), QuickOp::None);
+        }
+        if let Some(slot) = ops.get_mut(ip) {
+            *slot = op;
+        }
+    }
+
+    #[inline]
+    pub fn global_cache_get(&self, ip: usize, epoch: u64) -> Option<Value> {
+        let cache = self.cache.globals.borrow();
+        let slot = cache.get(ip)?;
+        if slot.epoch == epoch {
+            Some(slot.value.clone())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn global_cache_set(&self, ip: usize, epoch: u64, value: Value) {
+        let mut cache = self.cache.globals.borrow_mut();
+        if cache.len() <= ip {
+            cache.resize_with(
+                self.instructions.len().max(ip + 1),
+                GlobalCacheSlot::default,
+            );
+        }
+        cache[ip] = GlobalCacheSlot { epoch, value };
+    }
+
+    #[inline]
+    pub fn table_cache_get(&self, ip: usize) -> Option<TableCacheSlot> {
+        let cache = self.cache.tables.borrow();
+        let slot = cache.get(ip).copied()?;
+        if slot.table_ptr != 0 {
+            Some(slot)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn table_cache_set(&self, ip: usize, slot: TableCacheSlot) {
+        let mut cache = self.cache.tables.borrow_mut();
+        if cache.len() <= ip {
+            cache.resize_with(self.instructions.len().max(ip + 1), TableCacheSlot::default);
+        }
+        cache[ip] = slot;
     }
 }

@@ -179,6 +179,53 @@ fn compare_instruction(op: IrBinaryOp, a: u8, b: u8) -> Instruction {
     }
 }
 
+fn compare_const_instruction(op: IrBinaryOp, a: u8, k: u16) -> Instruction {
+    let jump_if_false = 0;
+    match op {
+        IrBinaryOp::Eq => Instruction::EqK {
+            a,
+            k,
+            jump_if_false,
+        },
+        IrBinaryOp::Ne => Instruction::NeK {
+            a,
+            k,
+            jump_if_false,
+        },
+        IrBinaryOp::Lt => Instruction::LtK {
+            a,
+            k,
+            jump_if_false,
+        },
+        IrBinaryOp::Le => Instruction::LeK {
+            a,
+            k,
+            jump_if_false,
+        },
+        IrBinaryOp::Gt => Instruction::GtK {
+            a,
+            k,
+            jump_if_false,
+        },
+        IrBinaryOp::Ge => Instruction::GeK {
+            a,
+            k,
+            jump_if_false,
+        },
+        _ => unreachable!("not a comparison"),
+    }
+}
+
+fn ir_const_to_bytecode(proto: &mut Proto, val: &IrConstant) -> u16 {
+    match val {
+        IrConstant::Nil => proto.add_constant(Constant::Nil),
+        IrConstant::Bool(b) => proto.add_constant(Constant::Bool(*b)),
+        IrConstant::Int(i) => proto.add_constant(Constant::Int(i.clone())),
+        IrConstant::Float(f) => proto.add_constant(Constant::Float(*f)),
+        IrConstant::String(s) => proto.add_constant(Constant::String(s.clone())),
+    }
+}
+
 pub fn ir_to_bytecode(module: &IrModule) -> Result<Proto, String> {
     ir_function_to_proto(&module.main, 0)
 }
@@ -307,20 +354,22 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
     // nothing else, its `LoadK` is not emitted at all.
     let mut def_count: HashMap<IrVar, usize> = HashMap::new();
     let mut const_keys: HashMap<IrVar, &str> = HashMap::new();
+    let mut const_vals: HashMap<IrVar, &IrConstant> = HashMap::new();
     for inst in &func.instructions {
         for var in inst.def_vars() {
             *def_count.entry(var).or_insert(0) += 1;
         }
-        if let IrInst::LoadConst {
-            dst,
-            val: IrConstant::String(s),
-        } = inst
-        {
-            const_keys.insert(*dst, s.as_str());
+        if let IrInst::LoadConst { dst, val } = inst {
+            const_vals.insert(*dst, val);
+            if let IrConstant::String(s) = val {
+                const_keys.insert(*dst, s.as_str());
+            }
         }
     }
     const_keys.retain(|var, _| def_count.get(var) == Some(&1));
+    const_vals.retain(|var, _| def_count.get(var) == Some(&1));
     let mut key_uses: HashMap<IrVar, usize> = HashMap::new();
+    let mut imm_uses: HashMap<IrVar, usize> = HashMap::new();
     for inst in &func.instructions {
         match inst {
             IrInst::GetTable { table, key, .. } if table != key => {
@@ -329,9 +378,28 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
             IrInst::SetTable { table, key, val } if table != key && val != key => {
                 *key_uses.entry(*key).or_insert(0) += 1;
             }
+            IrInst::BinOp { op, lhs, rhs, .. }
+                if lhs != rhs
+                    && matches!(
+                        op,
+                        IrBinaryOp::Add
+                            | IrBinaryOp::Sub
+                            | IrBinaryOp::Mul
+                            | IrBinaryOp::Eq
+                            | IrBinaryOp::Ne
+                            | IrBinaryOp::Lt
+                            | IrBinaryOp::Le
+                            | IrBinaryOp::Gt
+                            | IrBinaryOp::Ge
+                    ) =>
+            {
+                *imm_uses.entry(*rhs).or_insert(0) += 1;
+            }
             IrInst::DebugLocal { var, .. } => {
                 key_uses.remove(var);
                 const_keys.remove(var);
+                imm_uses.remove(var);
+                const_vals.remove(var);
             }
             _ => {}
         }
@@ -339,6 +407,12 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
     let key_only = |var: &IrVar| {
         const_keys.contains_key(var)
             && key_uses
+                .get(var)
+                .is_some_and(|n| Some(n) == use_count.get(var))
+    };
+    let imm_only = |var: &IrVar| {
+        const_vals.contains_key(var)
+            && imm_uses
                 .get(var)
                 .is_some_and(|n| Some(n) == use_count.get(var))
     };
@@ -435,7 +509,7 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
             IrInst::Label(l) => {
                 label_positions.insert(*l, proto.instructions.len());
             }
-            IrInst::LoadConst { dst, .. } if key_only(dst) => {}
+            IrInst::LoadConst { dst, .. } if key_only(dst) || imm_only(dst) => {}
             IrInst::LoadConst { dst, val } => {
                 let r = regs.get(*dst, &mut proto);
                 match val {
@@ -479,7 +553,13 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
             IrInst::BinOp { dst, op, lhs, rhs } => {
                 let rd = regs.get(*dst, &mut proto);
                 let ra = regs.get(*lhs, &mut proto);
-                let rb = regs.get(*rhs, &mut proto);
+                let imm_k = if imm_only(rhs) {
+                    const_vals
+                        .get(rhs)
+                        .map(|val| ir_const_to_bytecode(&mut proto, val))
+                } else {
+                    None
+                };
                 match op {
                     IrBinaryOp::Eq
                     | IrBinaryOp::Ne
@@ -487,6 +567,12 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                     | IrBinaryOp::Le
                     | IrBinaryOp::Gt
                     | IrBinaryOp::Ge => {
+                        let cmp_inst = if let Some(k) = imm_k {
+                            compare_const_instruction(*op, ra, k)
+                        } else {
+                            let rb = regs.get(*rhs, &mut proto);
+                            compare_instruction(*op, ra, rb)
+                        };
                         // A comparison whose only reader is the branch right
                         // after it becomes that branch: the VM's comparison
                         // instructions already jump when the test fails.
@@ -495,62 +581,12 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                             && cond == dst
                             && single_use(*dst)
                         {
-                            let ip = proto.emit(compare_instruction(*op, ra, rb), 1);
+                            let ip = proto.emit(cmp_inst, 1);
                             jump_patches.push((ip, *target));
                             skipped_indices.insert(next_idx);
                             continue;
                         }
-                        let false_jump = match op {
-                            IrBinaryOp::Eq => proto.emit(
-                                Instruction::Eq {
-                                    a: ra,
-                                    b: rb,
-                                    jump_if_false: 0,
-                                },
-                                1,
-                            ),
-                            IrBinaryOp::Ne => proto.emit(
-                                Instruction::Ne {
-                                    a: ra,
-                                    b: rb,
-                                    jump_if_false: 0,
-                                },
-                                1,
-                            ),
-                            IrBinaryOp::Lt => proto.emit(
-                                Instruction::Lt {
-                                    a: ra,
-                                    b: rb,
-                                    jump_if_false: 0,
-                                },
-                                1,
-                            ),
-                            IrBinaryOp::Le => proto.emit(
-                                Instruction::Le {
-                                    a: ra,
-                                    b: rb,
-                                    jump_if_false: 0,
-                                },
-                                1,
-                            ),
-                            IrBinaryOp::Gt => proto.emit(
-                                Instruction::Gt {
-                                    a: ra,
-                                    b: rb,
-                                    jump_if_false: 0,
-                                },
-                                1,
-                            ),
-                            IrBinaryOp::Ge => proto.emit(
-                                Instruction::Ge {
-                                    a: ra,
-                                    b: rb,
-                                    jump_if_false: 0,
-                                },
-                                1,
-                            ),
-                            _ => unreachable!("the outer match arm only takes comparisons"),
-                        };
+                        let false_jump = proto.emit(cmp_inst, 1);
                         proto.emit(Instruction::LoadBool { dst: rd, val: true }, 1);
                         let skip = proto.emit(Instruction::Jump { offset: 1 }, 1);
                         let false_target = proto.instructions.len();
@@ -574,6 +610,24 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                             }
                             | Instruction::Ge {
                                 jump_if_false: o, ..
+                            }
+                            | Instruction::EqK {
+                                jump_if_false: o, ..
+                            }
+                            | Instruction::NeK {
+                                jump_if_false: o, ..
+                            }
+                            | Instruction::LtK {
+                                jump_if_false: o, ..
+                            }
+                            | Instruction::LeK {
+                                jump_if_false: o, ..
+                            }
+                            | Instruction::GtK {
+                                jump_if_false: o, ..
+                            }
+                            | Instruction::GeK {
+                                jump_if_false: o, ..
                             } => *o = false_offset,
                             _ => {}
                         }
@@ -590,7 +644,18 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                             *o = skip_offset;
                         }
                     }
+                    IrBinaryOp::Add | IrBinaryOp::Sub | IrBinaryOp::Mul if imm_k.is_some() => {
+                        let k = imm_k.unwrap();
+                        let inst = match op {
+                            IrBinaryOp::Add => Instruction::AddK { dst: rd, a: ra, k },
+                            IrBinaryOp::Sub => Instruction::SubK { dst: rd, a: ra, k },
+                            IrBinaryOp::Mul => Instruction::MulK { dst: rd, a: ra, k },
+                            _ => unreachable!(),
+                        };
+                        proto.emit(inst, 1);
+                    }
                     _ => {
+                        let rb = regs.get(*rhs, &mut proto);
                         let inst = match op {
                             IrBinaryOp::Add => Instruction::Add {
                                 dst: rd,
@@ -1143,6 +1208,24 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                 }
                 | Instruction::Ge {
                     jump_if_false: o, ..
+                }
+                | Instruction::EqK {
+                    jump_if_false: o, ..
+                }
+                | Instruction::NeK {
+                    jump_if_false: o, ..
+                }
+                | Instruction::LtK {
+                    jump_if_false: o, ..
+                }
+                | Instruction::LeK {
+                    jump_if_false: o, ..
+                }
+                | Instruction::GtK {
+                    jump_if_false: o, ..
+                }
+                | Instruction::GeK {
+                    jump_if_false: o, ..
                 } => *o = offset,
                 Instruction::ForPrep { jump: o, .. } => *o = offset,
                 Instruction::ForLoop { jump: o, .. } => *o = offset,
@@ -1182,6 +1265,30 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                 ..
             }
             | Instruction::Ge {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::EqK {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::NeK {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::LtK {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::LeK {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::GtK {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::GeK {
                 jump_if_false: offset,
                 ..
             } => {
@@ -1240,6 +1347,30 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                     ..
                 }
                 | Instruction::Ge {
+                    jump_if_false: offset,
+                    ..
+                }
+                | Instruction::EqK {
+                    jump_if_false: offset,
+                    ..
+                }
+                | Instruction::NeK {
+                    jump_if_false: offset,
+                    ..
+                }
+                | Instruction::LtK {
+                    jump_if_false: offset,
+                    ..
+                }
+                | Instruction::LeK {
+                    jump_if_false: offset,
+                    ..
+                }
+                | Instruction::GtK {
+                    jump_if_false: offset,
+                    ..
+                }
+                | Instruction::GeK {
                     jump_if_false: offset,
                     ..
                 } => *offset = new_offset,
