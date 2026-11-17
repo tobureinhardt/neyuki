@@ -1,0 +1,47 @@
+local ffi = require("@neyuki/ffi")
+
+assert(ffi.sizeof("i8") == 1)
+assert(ffi.sizeof("i32") == 4)
+assert(ffi.sizeof("f64") == 8)
+assert(ffi.sizeof("ptr") >= 4)
+
+-- Memory allocation, typed read/write, and C string reading
+local ptr = ffi.alloc(16)
+assert(ptr != nil and ptr != 0)
+
+ffi.write(ptr, "i32", -42, 0)
+assert(ffi.read(ptr, "i32", 0) == -42)
+
+ffi.write(ptr, "f64", 3.5, 8)
+assert(ffi.read(ptr, "f64", 8) == 3.5)
+
+-- Write "hi\0" and read back with readCString
+ffi.write(ptr, "u8", 104, 0)
+ffi.write(ptr, "u8", 105, 1)
+ffi.write(ptr, "u8", 0, 2)
+assert(ffi.readCString(ptr) == "hi")
+
+-- Out-of-bounds access must fail cleanly
+local okOob, _ = pcall(function() return ffi.read(ptr, "i64", 12) end)
+assert(not okOob)
+
+ffi.free(ptr)
+
+-- Double-free must fail cleanly
+local okDoubleFree, _ = pcall(function() ffi.free(ptr) end)
+assert(not okDoubleFree)
+
+-- Unix process-local C symbols (libc strlen & abs)
+if (os.getenv("OS") == nil) then
+    local c = ffi.open(nil, {
+        strlen = { args = { "string" }, returns = "usize" },
+        abs = { args = { "i32" }, returns = "i32" },
+    })
+    assert(c.strlen("neyuki") == 6)
+    assert(c.abs(-77) == 77)
+    assert(c:close())
+    local okClosed, _ = pcall(function() return c.abs(1) end)
+    assert(not okClosed)
+end
+
+print("[pass] ffi")

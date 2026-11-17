@@ -45,6 +45,7 @@ Commands:
     --allow-net[=HOSTS]   Allow network access
     --allow-run[=CMDS]    Allow subprocess execution
     --allow-env[=VARS]    Allow environment variable access
+    --allow-ffi[=PATHS]   Allow loading dynamic libraries / native extensions
     --max-instructions=N  Stop after executing N VM instructions
     --max-memory=BYTES    Cap live GC heap (supports K, M, G suffixes)
     --timeout=DUR         Stop after duration (e.g. 500ms, 5s, 1m)
@@ -372,6 +373,7 @@ fn parse_run_args(
     let mut net_scope: Option<vm::PermissionScope> = None;
     let mut run_scope: Option<vm::PermissionScope> = None;
     let mut env_scope: Option<vm::PermissionScope> = None;
+    let mut ffi_scope: Option<vm::PermissionScope> = None;
     let mut limits = vm::ExecutionLimits::new();
 
     let mut idx = 0;
@@ -428,6 +430,14 @@ fn parse_run_args(
             } else {
                 return Err(format!("unknown flag '{}'", arg));
             }
+        } else if let Some(rest) = arg.strip_prefix("--allow-ffi") {
+            let val = rest.strip_prefix('=');
+            if rest.is_empty() || val.is_some() {
+                sandboxed = true;
+                ffi_scope = Some(parse_scope(val));
+            } else {
+                return Err(format!("unknown flag '{}'", arg));
+            }
         } else if let Some(raw) = arg
             .strip_prefix("--max-instructions=")
             .or_else(|| arg.strip_prefix("--instruction-budget="))
@@ -473,6 +483,9 @@ fn parse_run_args(
         }
         if let Some(s) = env_scope {
             perms = perms.with_env(s);
+        }
+        if let Some(s) = ffi_scope {
+            perms = perms.with_ffi(s);
         }
         perms
     };

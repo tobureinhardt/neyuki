@@ -1397,6 +1397,10 @@ return path .. \" \" .. params.name .. \" \" .. http.encode(\"a b\")";
             "got: {err}"
         );
 
+        let ffi_proto = compile_src("local ffi = require('@neyuki/ffi'); return ffi.alloc(8)");
+        let err = vm.execute(ffi_proto).unwrap_err();
+        assert!(err.contains("permission denied: FFI"), "got: {err}");
+
         // Granting specific env var succeeds while others remain blocked
         vm.set_permissions(Permissions::deny_all().with_env(
             crate::vm::permissions::PermissionScope::AllowList(vec!["PATH".into()]),

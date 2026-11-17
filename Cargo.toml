@@ -158,6 +158,8 @@ wry = { version = "0.52", optional = true }
 # `os.date` formats times and reads the local time zone through the
 # operating system (Windows API bindings, /etc/localtime, CoreFoundation).
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# `@neyuki/ffi` loads dynamic shared libraries and native Neyuki extensions.
+libloading = "0.8"
 fontdb = "0.23"
 
 # `neyuki build` sets the icon, version resource and subsystem of the Windows

@@ -20,6 +20,7 @@ pub struct Permissions {
     pub net: PermissionScope,
     pub run: PermissionScope,
     pub env: PermissionScope,
+    pub ffi: PermissionScope,
 }
 
 impl Default for Permissions {
@@ -37,6 +38,7 @@ impl Permissions {
             net: PermissionScope::AllowAll,
             run: PermissionScope::AllowAll,
             env: PermissionScope::AllowAll,
+            ffi: PermissionScope::AllowAll,
         }
     }
 
@@ -48,6 +50,7 @@ impl Permissions {
             net: PermissionScope::DenyAll,
             run: PermissionScope::DenyAll,
             env: PermissionScope::DenyAll,
+            ffi: PermissionScope::DenyAll,
         }
     }
 
@@ -73,6 +76,11 @@ impl Permissions {
 
     pub fn with_env(mut self, scope: PermissionScope) -> Self {
         self.env = scope;
+        self
+    }
+
+    pub fn with_ffi(mut self, scope: PermissionScope) -> Self {
+        self.ffi = scope;
         self
     }
 
@@ -133,6 +141,18 @@ impl Permissions {
                 format!(
                     "permission denied: environment access to '{}', run with --allow-env",
                     var
+                )
+            })
+    }
+
+    /// Checks whether loading native library or FFI extension `path` is permitted.
+    pub fn check_ffi(&self, path: &str) -> Result<(), String> {
+        check_path_scope(&self.ffi, path)
+            .then_some(())
+            .ok_or_else(|| {
+                format!(
+                    "permission denied: FFI / native extension access to '{}', run with --allow-ffi",
+                    path
                 )
             })
     }
