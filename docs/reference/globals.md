@@ -70,7 +70,7 @@ Converts a number or numeric string to a floating-point number. Raises an error 
 
 ## require(name: string): any
 
-Loads a module once and returns its value. Standard libraries load by name (`"math"`), bundled modules by `"@neyuki/name"`, and any other name is looked up from the entry script's directory, then the working directory, as `name.nyk`, `name/init.nyk`, then under `modules/`, `packages/` and `neyuki_packages/` (where `neyuki pkg` keeps packages, entered through `init.nyk` or `main.nyk`). Paths may not leave the project (`..` and absolute paths are rejected). Every name for the same file shares one loaded value.
+Loads a module once and returns its value. Standard libraries load by name (`"math"`), bundled modules by `"@neyuki/name"`, registry packages by `"@pkg/user/package"` (installed in the project) or `"@user/package"` (installed with `neyuki pkg install -g`), and any other name is looked up from the entry script's directory, then the working directory, as `name.nyk`, `name/init.nyk`, then under `modules/`, `packages/` and `neyuki_packages/` (where `neyuki pkg` keeps packages, entered through `init.nyk` or `main.nyk`). Paths may not leave the project (`..` and absolute paths are rejected). Every name for the same file shares one loaded value.
 
 ## pairs(t: table): (function, table, nil)
 

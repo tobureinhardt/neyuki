@@ -27,7 +27,7 @@ print(`total: {total}`)
 - **A familiar language.** Lua's tables, closures, metatables and coroutines, a Luau-style `task` scheduler, plus `!=`, `??`, `+=`, `continue`, `` `{interpolation}` `` and `function T:method()`.
 - **Exact integers.** Integers never overflow or lose precision; `2 ^ 100` is exact.
 - **Optional types, checked before running.** `local n: number = "x"` is reported with its line before anything executes, and `neyuki lint` shows the same diagnostics in your editor.
-- **Batteries for daily work.** Files and paths, JSON, TOML, CSV and HTML, dates, running programs, HTTP client and server, PostgreSQL and MySQL, hashing and encryption, windows with 2D drawing and animation, and keyboard and mouse automation.
+- **Batteries for daily work.** Files and paths, JSON, TOML, CSV and HTML, dates, running programs, HTTP client and server, PostgreSQL, MySQL and SQLite, hashing and encryption, windows with 2D drawing and animation, and keyboard and mouse automation.
 - **One executable.** No runtime to install; on Linux, TLS uses the system's OpenSSL. Scripts can also be compiled to verified bytecode.
 
 ## Install

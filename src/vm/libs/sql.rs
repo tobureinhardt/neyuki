@@ -1,16 +1,17 @@
 //! Native database primitives backing `@neyuki/sql`.
 //!
 //! `__sql_open` connects to a PostgreSQL server through the `postgres` crate
-//! or to a MySQL/MariaDB server through `mysql` and parks the connection here
-//! under an id; `__sql_query` and `__sql_execute` run statements on it and
-//! `__sql_close` drops it. Both drivers are synchronous, with
-//! TLS through the platform's `native-tls` like `@neyuki/http`.
+//! or to a MySQL/MariaDB server through `mysql`, or opens an SQLite database
+//! in-process through `rusqlite`, and parks the connection here under an id;
+//! `__sql_query` and `__sql_execute` run statements on it and `__sql_close`
+//! drops it. All drivers are synchronous; the network ones use TLS through
+//! the platform's `native-tls` like `@neyuki/http`.
 //!
-//! Statements run through each server's prepared-statement protocol with
-//! positional parameters (`$1` on PostgreSQL, `?` on MySQL), so values never
-//! get spliced into SQL text. PostgreSQL parameters are sent in text format
-//! so the server converts them to whatever type the statement expects, the
-//! way `psql` does; results come back in binary and are decoded here.
+//! Statements run as prepared statements with positional parameters (`$1` on
+//! PostgreSQL, `?` on MySQL and SQLite), so values never get spliced into SQL
+//! text. PostgreSQL parameters are sent in text format so the server converts
+//! them to whatever type the statement expects, the way `psql` does; results
+//! come back in binary and are decoded here.
 //! `lib/sql.nyk` builds the `Connection` object on top.
 
 use std::cell::RefCell;
@@ -56,6 +57,7 @@ enum Connection {
     // Boxed: the client embeds its tokio runtime and dwarfs the MySQL side.
     Postgres(Box<postgres::Client>),
     MySql(mysql::Conn),
+    Sqlite(rusqlite::Connection),
 }
 
 thread_local! {
@@ -253,23 +255,42 @@ fn driver_name(options: &OpenOptions) -> Result<&'static str, String> {
     let name = match &options.driver {
         Some(driver) => driver.to_ascii_lowercase(),
         None => match &options.url {
+            // `sqlite:` URLs may skip the `//` (`sqlite::memory:`, `sqlite:app.db`).
+            Some(url) if sqlite_url_path(url).is_some() => "sqlite".to_string(),
             Some(url) => url
                 .split_once("://")
                 .map(|(scheme, _)| scheme.to_ascii_lowercase())
                 .ok_or_else(|| {
                     format!("`{}` is not a database URL (expected scheme://...)", url)
                 })?,
-            None => return Err("driver must be provided (\"postgres\" or \"mysql\")".to_string()),
+            None => {
+                return Err(
+                    "driver must be provided (\"postgres\", \"mysql\" or \"sqlite\")".to_string(),
+                );
+            }
         },
     };
     match name.as_str() {
         "postgres" | "postgresql" | "pg" => Ok("postgres"),
         "mysql" | "mariadb" => Ok("mysql"),
+        "sqlite" | "sqlite3" => Ok("sqlite"),
         other => Err(format!(
-            "unknown database driver `{}` (expected \"postgres\" or \"mysql\")",
+            "unknown database driver `{}` (expected \"postgres\", \"mysql\" or \"sqlite\")",
             other
         )),
     }
+}
+
+/// The file name in an `sqlite:` or `sqlite3:` URL, with the optional `//`
+/// removed: `sqlite:///tmp/app.db` names `/tmp/app.db`, `sqlite://app.db`
+/// and `sqlite:app.db` the relative `app.db`, and `sqlite::memory:` an
+/// in-memory database. None when the URL has another scheme.
+fn sqlite_url_path(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once(':')?;
+    if !scheme.eq_ignore_ascii_case("sqlite") && !scheme.eq_ignore_ascii_case("sqlite3") {
+        return None;
+    }
+    Some(rest.strip_prefix("//").unwrap_or(rest))
 }
 
 /// Whether `host` names this machine, so a connection to it never crosses a
@@ -388,6 +409,30 @@ fn open_mysql(options: &OpenOptions) -> Result<mysql::Conn, String> {
     mysql::Conn::new(builder).map_err(my_error)
 }
 
+/// Opens (creating if needed) the database file named by `database` or the
+/// URL. `:memory:` gives a private in-memory database, and `file:` URIs pass
+/// through to SQLite, so `file:app.db?mode=ro` opens read-only. `timeout` is
+/// how long a statement waits for another process's lock before failing.
+fn open_sqlite(options: &OpenOptions) -> Result<rusqlite::Connection, String> {
+    let path = match (&options.database, &options.url) {
+        (Some(database), _) => database.as_str(),
+        (None, Some(url)) => sqlite_url_path(url).unwrap_or(""),
+        (None, None) => "",
+    };
+    // SQLite would quietly open a temporary database for an empty name.
+    if path.is_empty() {
+        return Err(
+            "database must be provided (a file path, or \":memory:\" for an in-memory database)"
+                .to_string(),
+        );
+    }
+    let conn = rusqlite::Connection::open(path).map_err(lite_error)?;
+    if let Some(timeout) = options.timeout {
+        conn.busy_timeout(timeout).map_err(lite_error)?;
+    }
+    Ok(conn)
+}
+
 /// `__sql_open(options)` connects and returns the connection id followed by
 /// its driver name. `options` holds `driver` and/or `url` plus optional
 /// `host`, `port`, `user`, `password`, `database`, `ssl` and `timeout`
@@ -403,7 +448,8 @@ fn builtin_open(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let driver = driver_name(&options)?;
     let connection = match driver {
         "postgres" => Connection::Postgres(Box::new(open_postgres(&options)?)),
-        _ => Connection::MySql(open_mysql(&options)?),
+        "mysql" => Connection::MySql(open_mysql(&options)?),
+        _ => Connection::Sqlite(open_sqlite(&options)?),
     };
     let id = next_id();
     CONNECTIONS.with(|connections| connections.borrow_mut().insert(id, connection));
@@ -417,13 +463,15 @@ fn builtin_close(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![Value::Nil])
 }
 
-/// `__sql_ping(connection)` returns whether the server still answers.
+/// `__sql_ping(connection)` returns whether the server still answers. An
+/// SQLite database lives in this process, so an open one always does.
 fn builtin_ping(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let id = integer_arg(args, 0, "connection")?;
     let alive = with_connection(id, |connection| {
         Ok(match connection {
             Connection::Postgres(client) => client.is_valid(Duration::from_secs(30)).is_ok(),
             Connection::MySql(conn) => conn.ping().is_ok(),
+            Connection::Sqlite(_) => true,
         })
     })?;
     Ok(vec![Value::Bool(alive)])
@@ -439,15 +487,17 @@ fn builtin_query(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let result = with_connection(id, |connection| match connection {
         Connection::Postgres(client) => pg_query(client, &sql, &params),
         Connection::MySql(conn) => my_query(conn, &sql, &params),
+        Connection::Sqlite(conn) => lite_query(conn, &sql, &params),
     })?;
     Ok(vec![result])
 }
 
 /// `__sql_execute(connection, sql, params?)` runs one statement and returns
-/// the number of rows it affected followed by the last inserted id (MySQL
-/// auto-increment only; nil elsewhere). Without parameters the statement
-/// goes through the simple protocol, which also accepts what servers refuse
-/// to prepare (`BEGIN`, DDL on some versions).
+/// the number of rows it affected followed by the id of the inserted row
+/// (MySQL auto-increment and SQLite rowid; nil on PostgreSQL). Without
+/// parameters the statement goes through the simple protocol, which also
+/// accepts what servers refuse to prepare (`BEGIN`, DDL on some versions);
+/// SQLite then runs every `;`-separated statement in the text.
 fn builtin_execute(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let id = integer_arg(args, 0, "connection")?;
     let sql = string_arg(args, 1, "sql")?;
@@ -455,14 +505,9 @@ fn builtin_execute(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let (affected, last_id) = with_connection(id, |connection| match connection {
         Connection::Postgres(client) => pg_execute(client, &sql, &params),
         Connection::MySql(conn) => my_execute(conn, &sql, &params),
+        Connection::Sqlite(conn) => lite_execute(conn, &sql, &params),
     })?;
-    Ok(vec![
-        integer(affected),
-        match last_id {
-            Some(id) => integer(id),
-            None => Value::Nil,
-        },
-    ])
+    Ok(vec![integer(affected), last_id.unwrap_or(Value::Nil)])
 }
 
 // --- PostgreSQL -------------------------------------------------------------
@@ -842,7 +887,7 @@ fn pg_execute(
     client: &mut postgres::Client,
     sql: &str,
     params: &[Value],
-) -> Result<(u64, Option<u64>), String> {
+) -> Result<(u64, Option<Value>), String> {
     if params.is_empty() {
         let messages = client.simple_query(sql).map_err(pg_error)?;
         let affected = messages
@@ -988,20 +1033,151 @@ fn my_execute(
     conn: &mut mysql::Conn,
     sql: &str,
     params: &[Value],
-) -> Result<(u64, Option<u64>), String> {
+) -> Result<(u64, Option<Value>), String> {
     if params.is_empty() {
         let result = conn.query_iter(sql).map_err(my_error)?;
         Ok((
             result.affected_rows(),
-            result.last_insert_id().filter(|id| *id != 0),
+            result.last_insert_id().filter(|id| *id != 0).map(integer),
         ))
     } else {
         let result = conn.exec_iter(sql, my_params(params)?).map_err(my_error)?;
         Ok((
             result.affected_rows(),
-            result.last_insert_id().filter(|id| *id != 0),
+            result.last_insert_id().filter(|id| *id != 0).map(integer),
         ))
     }
+}
+
+// --- SQLite -----------------------------------------------------------------
+
+/// Errors from SQLite itself keep their message and extended result code
+/// (2067 is `SQLITE_CONSTRAINT_UNIQUE`); the others are rusqlite's own.
+fn lite_error(err: rusqlite::Error) -> String {
+    match err {
+        rusqlite::Error::SqliteFailure(code, message) => format!(
+            "{} (SQLite error {})",
+            message.unwrap_or_else(|| code.to_string()),
+            code.extended_code
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// SQLite has no boolean type, so booleans bind as 1 and 0, the way its own
+/// `TRUE` and `FALSE` read. Integers past 64 bits bind as their digits, which
+/// a numeric column stores as a float.
+fn lite_param(value: &Value, index: usize) -> Result<rusqlite::types::Value, String> {
+    use rusqlite::types::Value as Lite;
+    Ok(match value {
+        Value::Nil => Lite::Null,
+        Value::Bool(value) => Lite::Integer(i64::from(*value)),
+        Value::Int(value) => Lite::Integer(*value),
+        Value::BigInt(big) => Lite::Text(big.to_string()),
+        Value::Float(value) => Lite::Real(*value),
+        Value::String(value) => Lite::Text(value.to_string()),
+        other => {
+            return Err(format!(
+                "parameter {} must be nil, a boolean, a number or a string, got {}",
+                index + 1,
+                other.type_name()
+            ));
+        }
+    })
+}
+
+/// Binds `params` to `?` (or `?NNN`) in order. SQLite would leave a missing
+/// parameter NULL, so the counts have to match.
+fn lite_bind(statement: &mut rusqlite::Statement<'_>, params: &[Value]) -> Result<(), String> {
+    if statement.parameter_count() != params.len() {
+        return Err(format!(
+            "statement takes {} parameter(s) but {} were given",
+            statement.parameter_count(),
+            params.len()
+        ));
+    }
+    for (index, value) in params.iter().enumerate() {
+        statement
+            .raw_bind_parameter(index + 1, lite_param(value, index)?)
+            .map_err(lite_error)?;
+    }
+    Ok(())
+}
+
+/// Each value keeps its storage class; text and blobs become strings.
+fn lite_value(value: rusqlite::types::ValueRef<'_>) -> Value {
+    use rusqlite::types::ValueRef;
+    match value {
+        ValueRef::Null => Value::Nil,
+        ValueRef::Integer(value) => Value::Int(value),
+        ValueRef::Real(value) => Value::Float(value),
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => Value::string(bytes_to_string(bytes)),
+    }
+}
+
+fn lite_query(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<Value, String> {
+    let mut statement = conn.prepare(sql).map_err(lite_error)?;
+    lite_bind(&mut statement, params)?;
+    let columns: Vec<String> = statement.column_names().map(str::to_string).collect();
+    let mut rows = statement.raw_query();
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(lite_error)? {
+        let mut values = Vec::with_capacity(columns.len());
+        for index in 0..columns.len() {
+            values.push(lite_value(row.get_ref(index).map_err(lite_error)?));
+        }
+        out.push(row_table(&columns, values));
+    }
+    Ok(result_table(columns, out))
+}
+
+/// Steps `statement` to the end, discarding any rows (a `PRAGMA` may return
+/// some), and reports what it changed. `changes()` keeps the count of the
+/// last statement that wrote anything, so it only counts when the total
+/// moved; likewise the rowid is only reported when this statement set it.
+fn lite_run(
+    conn: &rusqlite::Connection,
+    statement: &mut rusqlite::Statement<'_>,
+) -> Result<(u64, Option<i64>), String> {
+    let total_before = conn.total_changes();
+    let rowid_before = conn.last_insert_rowid();
+    let mut rows = statement.raw_query();
+    while rows.next().map_err(lite_error)?.is_some() {}
+    drop(rows);
+    if conn.total_changes() == total_before {
+        return Ok((0, None));
+    }
+    let rowid = conn.last_insert_rowid();
+    Ok((conn.changes(), (rowid != rowid_before).then_some(rowid)))
+}
+
+fn lite_execute(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[Value],
+) -> Result<(u64, Option<Value>), String> {
+    if !params.is_empty() {
+        let mut statement = conn.prepare(sql).map_err(lite_error)?;
+        lite_bind(&mut statement, params)?;
+        let (affected, rowid) = lite_run(conn, &mut statement)?;
+        return Ok((affected, rowid.map(Value::Int)));
+    }
+    // Like PostgreSQL's simple protocol, a script runs statement by statement;
+    // the counts add up and the last rowid set wins.
+    let mut batch = rusqlite::Batch::new(conn, sql);
+    let mut affected = 0;
+    let mut last_id = None;
+    // rusqlite's `FallibleIterator` is a newer major than the one imported
+    // above for the PostgreSQL arrays, so it is named in full.
+    while let Some(mut statement) =
+        rusqlite::fallible_iterator::FallibleIterator::next(&mut batch).map_err(lite_error)?
+    {
+        lite_bind(&mut statement, &[])?;
+        let (count, rowid) = lite_run(conn, &mut statement)?;
+        affected += count;
+        last_id = rowid.or(last_id);
+    }
+    Ok((affected, last_id.map(Value::Int)))
 }
 
 #[cfg(test)]
@@ -1095,13 +1271,109 @@ mod tests {
             driver_name(&options(Some("MariaDB"), None)).unwrap(),
             "mysql"
         );
+        assert_eq!(
+            driver_name(&options(None, Some("sqlite://x"))).unwrap(),
+            "sqlite"
+        );
+        assert_eq!(
+            driver_name(&options(None, Some("SQLite::memory:"))).unwrap(),
+            "sqlite"
+        );
+        assert_eq!(
+            driver_name(&options(Some("sqlite3"), None)).unwrap(),
+            "sqlite"
+        );
         assert!(
-            driver_name(&options(None, Some("sqlite://x")))
+            driver_name(&options(None, Some("oracle://x")))
                 .unwrap_err()
-                .contains("sqlite")
+                .contains("oracle")
         );
         assert!(driver_name(&options(None, None)).is_err());
         assert!(driver_name(&options(None, Some("nope"))).is_err());
+    }
+
+    #[test]
+    fn sqlite_urls_name_a_file() {
+        assert_eq!(sqlite_url_path("sqlite:///tmp/app.db"), Some("/tmp/app.db"));
+        assert_eq!(sqlite_url_path("sqlite://app.db"), Some("app.db"));
+        assert_eq!(sqlite_url_path("sqlite:app.db"), Some("app.db"));
+        assert_eq!(sqlite_url_path("sqlite::memory:"), Some(":memory:"));
+        assert_eq!(sqlite_url_path("sqlite://:memory:"), Some(":memory:"));
+        assert_eq!(
+            sqlite_url_path("sqlite3://C:/data/app.db"),
+            Some("C:/data/app.db")
+        );
+        assert_eq!(sqlite_url_path("postgres://a@b/c"), None);
+        assert_eq!(sqlite_url_path("app.db"), None);
+    }
+
+    #[test]
+    fn sqlite_round_trips_values() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let (affected, _) = lite_execute(
+            &conn,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL, flag INTEGER, note TEXT); \
+             INSERT INTO t (name) VALUES ('first');",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(affected, 1);
+        let (affected, rowid) = lite_execute(
+            &conn,
+            "INSERT INTO t (name, score, flag, note) VALUES (?, ?, ?, ?)",
+            &[
+                Value::str("ada"),
+                Value::Float(1.5),
+                Value::Bool(true),
+                Value::Nil,
+            ],
+        )
+        .unwrap();
+        assert_eq!(affected, 1);
+        assert!(matches!(rowid, Some(Value::Int(2))));
+        // A statement that writes nothing reports no rowid, even after an insert.
+        let (affected, rowid) = lite_execute(
+            &conn,
+            "UPDATE t SET flag = 0 WHERE id = ?",
+            &[Value::Int(99)],
+        )
+        .unwrap();
+        assert_eq!(affected, 0);
+        assert!(rowid.is_none());
+        let (affected, rowid) = lite_execute(&conn, "UPDATE t SET flag = 0", &[]).unwrap();
+        assert_eq!(affected, 2);
+        assert!(rowid.is_none());
+        assert!(
+            lite_execute(&conn, "INSERT INTO t (name) VALUES (?)", &[])
+                .unwrap_err()
+                .contains("takes 1 parameter")
+        );
+        assert!(
+            lite_query(&conn, "SELECT * FROM missing", &[])
+                .unwrap_err()
+                .contains("SQLite error")
+        );
+        let rows = lite_query(
+            &conn,
+            "SELECT id, name, score, note FROM t WHERE id = ?",
+            &[Value::Int(2)],
+        )
+        .unwrap();
+        let Value::Table(rows) = rows else {
+            panic!("query should return a table")
+        };
+        let rows = rows.borrow();
+        assert_eq!(rows.array.len(), 1);
+        let Value::Table(row) = &rows.array[0] else {
+            panic!("rows should be tables")
+        };
+        let row = row.borrow();
+        assert!(matches!(row.fields.get("id"), Some(Value::Int(2))));
+        assert!(matches!(row.fields.get("score"), Some(Value::Float(score)) if *score == 1.5));
+        assert!(
+            matches!(row.fields.get("name"), Some(Value::String(name)) if name.to_string() == "ada")
+        );
+        assert!(!row.fields.contains_key("note"));
     }
 
     #[test]

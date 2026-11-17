@@ -7,8 +7,8 @@ local string = require("@neyuki/string")
 local ok, err = try(sql.connect, 42)
 assert(not ok and string.find(err, "URL string or an options table", 1, true) != nil, "connect should reject non-targets: " .. tostring(err))
 
-ok, err = try(sql.connect, "sqlite://db.sqlite")
-assert(not ok and string.find(err, "sqlite", 1, true) != nil, "connect should name an unknown driver: " .. tostring(err))
+ok, err = try(sql.connect, "oracle://db")
+assert(not ok and string.find(err, "oracle", 1, true) != nil, "connect should name an unknown driver: " .. tostring(err))
 
 ok, err = try(sql.connect, "not a url")
 assert(not ok and string.find(err, "scheme", 1, true) != nil, "connect should reject a URL without a scheme: " .. tostring(err))
@@ -30,6 +30,97 @@ ok, err = try(sql.connect, "postgres://u:p@127.0.0.1:1/db")
 assert(not ok, "connecting to a closed port should fail")
 ok, err = try(sql.connect, { driver = "mariadb", host = "127.0.0.1", port = 1, user = "u", timeout = 5 })
 assert(not ok, "connecting to a closed port should fail")
+
+ok, err = try(sql.connect, { driver = "sqlite" })
+assert(not ok and string.find(err, "database must be provided", 1, true) != nil, "sqlite should demand a database: " .. tostring(err))
+
+ok, err = try(sql.connect, "sqlite:")
+assert(not ok and string.find(err, "database must be provided", 1, true) != nil, "an empty sqlite URL should be refused: " .. tostring(err))
+
+-- SQLITE (in-process, always runs) -----------------------------------------
+
+do
+    local mem = sql.connect("sqlite::memory:")
+    assert(mem.driver == "sqlite", "sqlite: URLs should pick the sqlite driver")
+    assert(mem:isOpen() and mem:ping(), "an open sqlite database should answer a ping")
+
+    -- without params, execute runs a whole script
+    local affected, lastId = mem:execute([[
+        CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, score REAL, active INTEGER, note TEXT, data BLOB);
+        INSERT INTO people (name) VALUES ('zed');
+        INSERT INTO people (name) VALUES ('yan');
+    ]])
+    assert(affected == 2, "a script should add up its changes: " .. tostring(affected))
+    assert(lastId == 2, "a script should report the last rowid: " .. tostring(lastId))
+
+    affected, lastId = mem:execute("INSERT INTO people (name, score, active, note, data) VALUES (?, ?, ?, ?, ?)", { "ada", 1.5, true, nil, "blob" })
+    assert(affected == 1 and lastId == 3, "insert should report the new rowid")
+    affected, lastId = mem:execute("UPDATE people SET active = ?1 WHERE id = ?2", { false, 99 })
+    assert(affected == 0 and lastId == nil, "an update that matches nothing should touch nothing and set no rowid")
+    affected, lastId = mem:execute("UPDATE people SET score = score + 1 WHERE score IS NOT NULL")
+    assert(affected == 1 and lastId == nil, "an update should count its rows but set no rowid")
+
+    assert(not try(mem.execute, mem, "INSERT INTO people (name) VALUES (?)", {}), "too few parameters should error")
+    assert(not try(mem.query, mem, "SELECT ?", { 1, 2 }), "too many parameters should error")
+    assert(not try(mem.query, mem, "SELECT 1; SELECT 2"), "query should take one statement")
+
+    local rows = mem:query("SELECT id, name, score, active, note, data FROM people ORDER BY id")
+    assert(#rows == 3, "every row should come back")
+    assert(rows.columns[1] == "id" and rows.columns[6] == "data", "columns should be listed in select order")
+    assert(rows[3].id == 3 and rows[3].name == "ada" and rows[3].score == 2.5, "values should keep their storage class")
+    assert(rows[3].active == 1 and rows[3].data == "blob", "booleans bind as 1/0 and blobs read as strings")
+    assert(rows[1].score == nil and rows[3].note == nil, "NULL should read as nil")
+
+    local row = mem:queryOne("SELECT name FROM people WHERE id = ?", { 2 })
+    assert(row != nil and row.name == "yan", "queryOne should return the matching row")
+    assert(mem:queryOne("SELECT name FROM people WHERE id = ?", { 99 }) == nil, "queryOne should return nil for no rows")
+    row = mem:queryOne("INSERT INTO people (name) VALUES (?) RETURNING id", { "bo" })
+    assert(row.id == 4, "RETURNING should work through query")
+
+    ok, err = try(mem.execute, mem, "INSERT INTO people (name) VALUES (?)", { "ada" })
+    assert(not ok and string.find(err, "UNIQUE", 1, true) != nil and string.find(err, "SQLite error 2067", 1, true) != nil,
+        "constraint errors should carry the message and extended code: " .. tostring(err))
+    ok, err = try(mem.query, mem, "SELECT * FROM neyuki_no_such_table")
+    assert(not ok and string.find(err, "no such table", 1, true) != nil, "errors should carry SQLite's message: " .. tostring(err))
+
+    -- transactions roll back on error and commit on return
+    ok, err = try(mem.transaction, mem, function(tx: Connection)
+        tx:execute("DELETE FROM people")
+        error("abort")
+    end)
+    assert(not ok and string.find(err, "abort", 1, true) != nil, "transaction should re-raise the body's error")
+    assert(#mem:query("SELECT id FROM people") == 4, "a failed transaction should be rolled back")
+    local count = mem:transaction(function(tx: Connection)
+        tx:execute("DELETE FROM people WHERE id = ?", { 1 })
+        return #tx:query("SELECT id FROM people")
+    end)
+    assert(count == 3 and #mem:query("SELECT id FROM people") == 3, "a successful transaction should be committed")
+
+    -- PRAGMAs that return a row still work through execute
+    mem:execute("PRAGMA foreign_keys = ON")
+    assert(mem:queryOne("PRAGMA foreign_keys").foreign_keys == 1, "pragmas should apply")
+
+    mem:close()
+    assert(not mem:isOpen(), "close should mark the connection closed")
+    assert(not try(mem.query, mem, "SELECT 1"), "a closed connection should refuse queries")
+    mem:close()
+
+    -- a file database keeps its data between connections
+    local dbPath = ".tmp_sql_test.sqlite"
+    if (fs.exists(dbPath)) then fs.remove(dbPath) end
+    local file = sql.connect({ driver = "sqlite", database = dbPath, timeout = 2 })
+    file:execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)")
+    file:execute("INSERT INTO kv VALUES (?, ?)", { "greeting", "hello" })
+    file:close()
+    assert(fs.exists(dbPath), "connecting should create the database file")
+    file = sql.connect("sqlite://" .. dbPath)
+    assert(file:queryOne("SELECT v FROM kv WHERE k = ?", { "greeting" }).v == "hello", "data should persist in the file")
+    file:close()
+    local readonly = sql.connect("sqlite:file:" .. dbPath .. "?mode=ro")
+    assert(not try(readonly.execute, readonly, "INSERT INTO kv VALUES ('a', 'b')"), "mode=ro should open read-only")
+    readonly:close()
+    fs.remove(dbPath)
+end
 
 -- LIVE ROUND TRIPS (opt in with server URLs in tests/sql.local) ------------
 --

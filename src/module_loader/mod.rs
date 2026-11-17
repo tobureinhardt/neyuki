@@ -2,6 +2,7 @@
 //! directories and search paths.
 
 pub mod cache;
+pub mod packages;
 pub mod path;
 pub mod searcher;
 

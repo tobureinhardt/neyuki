@@ -1,23 +1,38 @@
-//! The package manager.
+//! The package manager: `neyuki.toml`, `neyuki.lock`, the registry at
+//! neyuki.cc and the `neyuki pkg` commands.
 
 pub mod cli;
+pub mod credentials;
+pub mod install;
 pub mod lockfile;
 pub mod manifest;
+pub mod paths;
+pub mod publish;
+pub mod registry;
 pub mod resolver;
 pub mod store;
+pub mod tarball;
 pub mod version;
 
 pub use cli::run_pkg_cli;
 pub use lockfile::{LockedPackage, Lockfile};
 pub use manifest::{AppManifest, PackageManifest};
-pub use resolver::{AvailablePackage, DependencyResolver};
+pub use paths::PackageName;
 pub use store::PackageStore;
 pub use version::{Version, VersionReq};
+
+/// Lowercase hex SHA-256, the checksum format of `neyuki.lock` and the registry.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn test_semver_comparisons_and_caret() {
@@ -84,28 +99,58 @@ test = "neyuki test"
     }
 
     #[test]
-    fn test_dependency_resolver_multi_version() {
-        let mut resolver = DependencyResolver::new();
-        resolver.register_candidate(AvailablePackage {
-            name: "math_lib".to_string(),
-            version: Version::new(1, 0, 0),
-            dependencies: HashMap::new(),
-            checksum: "h1".to_string(),
-        });
-        resolver.register_candidate(AvailablePackage {
-            name: "math_lib".to_string(),
-            version: Version::new(1, 5, 2),
-            dependencies: HashMap::new(),
-            checksum: "h2".to_string(),
-        });
+    fn version_requirements() {
+        let v = |s: &str| s.parse::<Version>().unwrap();
+        let range = VersionReq::parse(">=1.2, <2").unwrap();
+        assert!(
+            range.matches(&v("1.9.9"))
+                && !range.matches(&v("2.0.0"))
+                && !range.matches(&v("1.1.0"))
+        );
+        assert_eq!(range.to_string(), ">=1.2.0, <2.0.0");
+        assert!(
+            !VersionReq::parse("^1.0.0")
+                .unwrap()
+                .matches(&v("1.1.0-beta")),
+            "prereleases need asking for"
+        );
+        assert!(
+            VersionReq::parse("^1.1.0-beta")
+                .unwrap()
+                .matches(&v("1.1.0-beta.2"))
+        );
+        assert!(v("1.0.0-alpha") < v("1.0.0-alpha.1"));
+        assert!(
+            v("1.0.0-alpha.2") < v("1.0.0-alpha.10"),
+            "numeric identifiers compare as numbers"
+        );
+        assert!(v("1.0.0-rc.1") < v("1.0.0"));
+    }
 
-        let mut manifest = PackageManifest::new("app", Version::new(0, 1, 0));
-        manifest.add_dependency("math_lib", VersionReq::parse("^1.0.0").unwrap());
+    #[test]
+    fn manifest_with_registry_names() {
+        let text = "[package]
+name = \"@yuki/app\"
+version = \"1.0.0\"
+entry = \"init.nyk\"
+license = \"MIT\"
+keywords = [\"a\", \"b\"]
 
-        let lock = resolver.resolve(&manifest).unwrap();
-        assert_eq!(lock.packages.len(), 1);
-        assert_eq!(lock.packages[0].name, "math_lib");
-        // Should resolve to the highest matching version 1.5.2
-        assert_eq!(lock.packages[0].version, Version::new(1, 5, 2));
+[dependencies]
+\"@yuki/router\" = \"^1.2\"
+";
+        let manifest = PackageManifest::parse(text).unwrap();
+        assert_eq!(
+            manifest.dependencies.keys().collect::<Vec<_>>(),
+            vec!["@yuki/router"]
+        );
+        assert_eq!(manifest.keywords, vec!["a", "b"]);
+        let again = PackageManifest::parse(&manifest.serialize()).unwrap();
+        assert_eq!(again, manifest);
+        assert!(
+            manifest
+                .serialize()
+                .contains("\"@yuki/router\" = \"^1.2.0\"")
+        );
     }
 }

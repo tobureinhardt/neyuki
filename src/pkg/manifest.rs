@@ -11,6 +11,12 @@ pub struct PackageManifest {
     pub version: Version,
     pub description: Option<String>,
     pub entry: String,
+    /// An SPDX expression such as `MIT`, shown on the registry.
+    pub license: Option<String>,
+    /// Where the source lives, an http(s) URL.
+    pub repository: Option<String>,
+    /// Up to ten search words for the registry.
+    pub keywords: Vec<String>,
     pub dependencies: BTreeMap<String, VersionReq>,
     pub dev_dependencies: BTreeMap<String, VersionReq>,
     pub scripts: BTreeMap<String, String>,
@@ -41,6 +47,19 @@ impl AppManifest {
     }
 }
 
+/// A TOML key: bare when it can be, otherwise quoted (`"@yuki/colors"`).
+fn toml_key(key: &str) -> String {
+    if !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        key.to_string()
+    } else {
+        format!("\"{}\"", key)
+    }
+}
+
 /// Reads `["a", "b"]` (or a single `"a"`) as a list of strings.
 fn parse_string_list(raw: &str) -> Vec<String> {
     let inner = raw.trim();
@@ -62,6 +81,9 @@ impl Default for PackageManifest {
             version: Version::new(0, 1, 0),
             description: None,
             entry: "main.nyk".to_string(),
+            license: None,
+            repository: None,
+            keywords: Vec::new(),
             dependencies: BTreeMap::new(),
             dev_dependencies: BTreeMap::new(),
             scripts: BTreeMap::new(),
@@ -109,7 +131,8 @@ impl PackageManifest {
             let Some((key, val_raw)) = trimmed.split_once('=') else {
                 continue;
             };
-            let key = key.trim();
+            // Registry names need quoted keys: `"@yuki/colors" = "^1.0"`.
+            let key = key.trim().trim_matches('"').trim_matches('\'');
             let val = val_raw.trim().trim_matches('"').trim_matches('\'');
 
             match current_section {
@@ -118,6 +141,9 @@ impl PackageManifest {
                     "version" => manifest.version = Version::from_str(val)?,
                     "description" => manifest.description = Some(val.to_string()),
                     "entry" => manifest.entry = val.to_string(),
+                    "license" => manifest.license = Some(val.to_string()),
+                    "repository" => manifest.repository = Some(val.to_string()),
+                    "keywords" => manifest.keywords = parse_string_list(val_raw),
                     _ => {}
                 },
                 "dependencies" => {
@@ -159,12 +185,23 @@ impl PackageManifest {
         if let Some(desc) = &self.description {
             out.push_str(&format!("description = \"{}\"\n", desc));
         }
-        out.push_str(&format!("entry = \"{}\"\n\n", self.entry));
+        out.push_str(&format!("entry = \"{}\"\n", self.entry));
+        if let Some(license) = &self.license {
+            out.push_str(&format!("license = \"{}\"\n", license));
+        }
+        if let Some(repository) = &self.repository {
+            out.push_str(&format!("repository = \"{}\"\n", repository));
+        }
+        if !self.keywords.is_empty() {
+            let quoted: Vec<String> = self.keywords.iter().map(|k| format!("\"{}\"", k)).collect();
+            out.push_str(&format!("keywords = [{}]\n", quoted.join(", ")));
+        }
+        out.push('\n');
 
         if !self.dependencies.is_empty() {
             out.push_str("[dependencies]\n");
             for (k, v) in &self.dependencies {
-                out.push_str(&format!("{} = \"{}\"\n", k, v));
+                out.push_str(&format!("{} = \"{}\"\n", toml_key(k), v));
             }
             out.push('\n');
         }
@@ -172,7 +209,7 @@ impl PackageManifest {
         if !self.dev_dependencies.is_empty() {
             out.push_str("[dev-dependencies]\n");
             for (k, v) in &self.dev_dependencies {
-                out.push_str(&format!("{} = \"{}\"\n", k, v));
+                out.push_str(&format!("{} = \"{}\"\n", toml_key(k), v));
             }
             out.push('\n');
         }

@@ -50,6 +50,15 @@ This document outlines the architectural milestones and engineering trajectory f
 
 ---
 
+## Milestone: Package registry
+- [x] Accounts on neyuki.cc with email confirmation, password reset and API tokens.
+- [x] `@user/package` registry: publish, yank, search, package and profile pages, download counts.
+- [x] `neyuki pkg`: add, remove, install (`--frozen`), update, global installs (`-g`), login, publish (`.neyukiignore`), yank, search, info; `neyuki.lock` with SHA-256 checksums.
+- [x] `require("@pkg/user/package")` for project packages and `require("@user/package")` for global ones.
+- [ ] Organizations and co-owners for shared scopes.
+
+---
+
 ## Milestone: Desktop app platform
 - [x] `neyuki build`: package an entry script and an asset folder into a standalone executable with an embedded read-only file system.
 - [x] `[app]` manifest section: name, identifier, icon, publisher, copyright; no console window by default on Windows.

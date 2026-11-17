@@ -2,17 +2,18 @@ local table = require("@neyuki/table")
 
 local sql = {}
 
--- The drivers are native (src/vm/libs/sql.rs, on the `postgres` and `mysql`
--- crates); this module validates arguments and builds the `Connection`
--- object. Statements take positional parameters in the server's own
--- syntax, `$1, $2` on PostgreSQL and `?` on MySQL, and a params array
--- supplies them, so values never get spliced into SQL text. A nil entry
--- binds as NULL.
+-- The drivers are native (src/vm/libs/sql.rs, on the `postgres`, `mysql`
+-- and `rusqlite` crates); this module validates arguments and builds the
+-- `Connection` object. Statements take positional parameters in the
+-- database's own syntax, `$1, $2` on PostgreSQL and `?` on MySQL and
+-- SQLite, and a params array supplies them, so values never get spliced
+-- into SQL text. A nil entry binds as NULL.
 --
 -- Rows come back as { column = value } tables: integers stay integers,
 -- floats floats, booleans booleans (PostgreSQL) and text strings; NULL is
 -- nil. Decimals, dates, times, timestamps, uuids and json arrive as strings
--- in the server's text form so nothing is rounded.
+-- in the server's text form so nothing is rounded. SQLite values keep
+-- their storage class, and blobs arrive as strings.
 
 function checkString(s: string, name: string)
     if (s == nil) then error(name .. " must be provided") end
@@ -24,12 +25,16 @@ function checkOptionalTable(t: {any}?, name: string)
 end
 
 -- Opens a connection. `target` is a URL such as
--- "postgres://user:pass@host:5432/db" or "mysql://user:pass@host/db", or a
--- table with `driver` ("postgres" or "mysql") plus `host`, `port`, `user`,
--- `password`, `database`, `ssl` (true to require TLS, false to refuse it;
--- unset, TLS is required for any host but this machine unless a PostgreSQL
--- URL sets `sslmode`) and `timeout` (seconds to wait for the connection). A
--- table may carry a `url` too, with the other fields overriding parts of it.
+-- "postgres://user:pass@host:5432/db", "mysql://user:pass@host/db" or
+-- "sqlite:app.db" ("sqlite::memory:" for an in-memory database), or a
+-- table with `driver` ("postgres", "mysql" or "sqlite") plus `host`,
+-- `port`, `user`, `password`, `database`, `ssl` (true to require TLS, false
+-- to refuse it; unset, TLS is required for any host but this machine unless
+-- a PostgreSQL URL sets `sslmode`) and `timeout` (seconds to wait for the
+-- connection). A table may carry a `url` too, with the other fields
+-- overriding parts of it.
+-- SQLite needs only `database`, the file to open (created if missing), and
+-- reads `timeout` as how long to wait for another process's lock.
 function sql.connect(target: string | ConnectOptions): Connection
     local options
     if (type(target) == "string") then
@@ -67,8 +72,9 @@ function sql.connect(target: string | ConnectOptions): Connection
 
     -- Runs a statement for its effect and returns the number of rows it
     -- touched, followed by the id MySQL assigned to an auto-increment
-    -- insert (nil on PostgreSQL, where `RETURNING id` with `query` does the
-    -- same job).
+    -- insert or the rowid of an SQLite insert (nil on PostgreSQL, where
+    -- `RETURNING id` with `query` does the same job). Without params,
+    -- SQLite runs every `;`-separated statement in the text.
     function connection.execute(self: Connection, statement: string, params: {any}?): (number, number?)
         checkOpen()
         checkString(statement, "statement")
@@ -105,7 +111,8 @@ function sql.connect(target: string | ConnectOptions): Connection
         error(result)
     end
 
-    -- Whether the server still answers on this connection.
+    -- Whether the server still answers on this connection (always true for
+    -- an open SQLite database, which lives in this process).
     function connection.ping(self: Connection): boolean
         checkOpen()
         return __sql_ping(id)

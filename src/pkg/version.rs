@@ -37,13 +37,39 @@ impl Ord for Version {
                         (None, None) => Ordering::Equal,
                         (Some(_), None) => Ordering::Less, // pre-release is lower precedence
                         (None, Some(_)) => Ordering::Greater,
-                        (Some(a), Some(b)) => a.cmp(b),
+                        (Some(a), Some(b)) => compare_pre(a, b),
                     },
                     other_ord => other_ord,
                 },
                 other_ord => other_ord,
             },
             other_ord => other_ord,
+        }
+    }
+}
+
+/// Semver precedence of two prerelease strings: dot-separated identifiers,
+/// numeric ones compared as numbers and ranked below alphanumeric ones, and
+/// a shorter list ranked first when it is a prefix of the longer one.
+fn compare_pre(a: &str, b: &str) -> Ordering {
+    let mut left = a.split('.');
+    let mut right = b.split('.');
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let order = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(nx), Ok(ny)) => nx.cmp(&ny),
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => x.cmp(y),
+                };
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
         }
     }
 }
@@ -114,7 +140,11 @@ pub enum VersionReq {
     Caret(Version),
     Tilde(Version),
     GreaterOrEqual(Version),
+    Greater(Version),
+    LessOrEqual(Version),
     LessThan(Version),
+    /// Comma-separated requirements that must all hold: `>=1.2, <2`.
+    All(Vec<VersionReq>),
 }
 
 impl VersionReq {
@@ -122,6 +152,14 @@ impl VersionReq {
         let trimmed = s.trim();
         if trimmed == "*" || trimmed.is_empty() {
             return Ok(Self::Any);
+        }
+
+        if trimmed.contains(',') {
+            let parts = trimmed
+                .split(',')
+                .map(Self::parse)
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(Self::All(parts));
         }
 
         if let Some(rest) = trimmed.strip_prefix('^') {
@@ -139,6 +177,16 @@ impl VersionReq {
             return Ok(Self::GreaterOrEqual(ver));
         }
 
+        if let Some(rest) = trimmed.strip_prefix("<=") {
+            let ver = Version::from_str(rest)?;
+            return Ok(Self::LessOrEqual(ver));
+        }
+
+        if let Some(rest) = trimmed.strip_prefix('>') {
+            let ver = Version::from_str(rest)?;
+            return Ok(Self::Greater(ver));
+        }
+
         if let Some(rest) = trimmed.strip_prefix('<') {
             let ver = Version::from_str(rest)?;
             return Ok(Self::LessThan(ver));
@@ -154,12 +202,42 @@ impl VersionReq {
         Ok(Self::Caret(ver))
     }
 
+    /// Whether `ver` satisfies the requirement. As in Cargo and npm, a
+    /// prerelease only satisfies a requirement that names a prerelease of
+    /// the same `major.minor.patch`, so `^1.0.0` never picks `1.1.0-beta`.
     pub fn matches(&self, ver: &Version) -> bool {
+        if ver.pre.is_some() && !self.allows_pre_of(ver) {
+            return false;
+        }
+        self.matches_ignoring_pre(ver)
+    }
+
+    fn allows_pre_of(&self, ver: &Version) -> bool {
+        let same = |v: &Version| {
+            v.pre.is_some() && v.major == ver.major && v.minor == ver.minor && v.patch == ver.patch
+        };
+        match self {
+            Self::Any => false,
+            Self::Exact(v)
+            | Self::Caret(v)
+            | Self::Tilde(v)
+            | Self::GreaterOrEqual(v)
+            | Self::Greater(v)
+            | Self::LessOrEqual(v)
+            | Self::LessThan(v) => same(v),
+            Self::All(parts) => parts.iter().any(|part| part.allows_pre_of(ver)),
+        }
+    }
+
+    fn matches_ignoring_pre(&self, ver: &Version) -> bool {
         match self {
             Self::Any => true,
             Self::Exact(v) => ver == v,
             Self::GreaterOrEqual(v) => ver >= v,
+            Self::Greater(v) => ver > v,
+            Self::LessOrEqual(v) => ver <= v,
             Self::LessThan(v) => ver < v,
+            Self::All(parts) => parts.iter().all(|part| part.matches_ignoring_pre(ver)),
             Self::Caret(v) => {
                 if ver < v {
                     return false;
@@ -190,7 +268,13 @@ impl fmt::Display for VersionReq {
             Self::Caret(v) => write!(f, "^{}", v),
             Self::Tilde(v) => write!(f, "~{}", v),
             Self::GreaterOrEqual(v) => write!(f, ">={}", v),
+            Self::Greater(v) => write!(f, ">{}", v),
+            Self::LessOrEqual(v) => write!(f, "<={}", v),
             Self::LessThan(v) => write!(f, "<{}", v),
+            Self::All(parts) => {
+                let parts: Vec<String> = parts.iter().map(ToString::to_string).collect();
+                write!(f, "{}", parts.join(", "))
+            }
         }
     }
 }

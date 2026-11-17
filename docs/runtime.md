@@ -73,11 +73,53 @@ Diagnostics are the checks of `neyuki lint`, published with the codes and severi
 
 - the standard libraries by name: `require("json")`, also available as globals;
 - bundled modules by `@neyuki/` name: `require("@neyuki/http")`;
+- registry packages: `require("@pkg/user/package")` from the project's `neyuki_packages/` (outside a project, from the global packages), and `require("@user/package")` from the global packages that `neyuki pkg install -g` installs. Without a module path the package's `entry` file loads; `require("@pkg/user/package/lib/util")` loads `lib/util.nyk` inside it;
 - anything else as a file from the entry script's directory, then the working directory: `name.nyk`, `name/init.nyk`, then the same under `modules/`, `packages/` and `neyuki_packages/` (where `neyuki pkg` keeps packages, entered through `init.nyk` or `main.nyk`). Every name for the same file (`ui/button`, `ui.button`, `ui/button.nyk`) loads it once.
 
 Paths in `require` may not contain `..` or be absolute.
 
-`neyuki pkg init` creates a `neyuki.toml` manifest, `pkg add <name> [version]` records a dependency, `pkg check` validates the manifest and `pkg list` shows what is in `neyuki_packages/`. Packages are placed in that directory by hand for now; there is no registry to download from yet.
+### The package registry
+
+Packages are published to [neyuki.cc/packages](https://neyuki.cc/packages) under their author's username, as `@user/package`. A published version never changes; its author can only yank it, which hides it from new installs while lockfiles that already name it keep working.
+
+```text
+neyuki pkg init [name]              create neyuki.toml (entry = "init.nyk")
+neyuki pkg add <pkg>[@req] ...      add dependencies and install them
+neyuki pkg remove <pkg> ...         remove dependencies
+neyuki pkg install [--frozen]       install what neyuki.toml and neyuki.lock list
+neyuki pkg update                   move every dependency to its newest matching version
+neyuki pkg list                     show installed packages
+neyuki pkg install -g <pkg> ...     install for your user, for require("@user/package")
+neyuki pkg remove -g <pkg> | list -g
+neyuki pkg search <words> | info <pkg>
+neyuki pkg login [token] | logout | whoami
+neyuki pkg publish [--dry-run]      upload this project as a new version
+neyuki pkg yank <version> [--undo]  hide a version from new installs
+```
+
+Dependencies go in `neyuki.toml` with quoted keys, and requirements use `^`, `~`, `=`, `>`, `>=`, `<`, `<=`, `*` or a comma-separated range such as `">=1.2, <2"`. A bare version means `^`. A prerelease only matches a requirement that names a prerelease of the same version.
+
+```toml
+[package]
+name = "@yuki/router"
+version = "1.0.0"
+description = "Small URL router for @neyuki/http"
+entry = "init.nyk"
+license = "MIT"
+repository = "https://github.com/yuki/router"
+keywords = ["http", "router"]
+
+[dependencies]
+"@yuki/colors" = "^2.1.0"
+```
+
+Every package installs once, flat, into `neyuki_packages/<user>/<package>/`, so all requirements on a package must agree on one version. `neyuki.lock` records the exact version and SHA-256 checksum of each one. Installs keep the locked versions while they still fit the manifest, download only what changed, refuse an archive whose checksum differs from the lockfile, and remove packages that are no longer needed. `--frozen` fails instead of changing the lockfile, for CI.
+
+To publish, create an account at neyuki.cc, confirm your email, create an API token on the account page and run `neyuki pkg login`. `publish` uploads every file in the project except hidden files, `neyuki_packages/`, `target/`, `node_modules/`, `neyuki.lock` and what `.neyukiignore` lists (one glob per line), up to 10 MB compressed; a `README.md` becomes the package page.
+
+`NEYUKI_REGISTRY` points `neyuki pkg` at another registry, `NEYUKI_TOKEN` supplies a token (for CI), `NEYUKI_PATH` moves the global packages (default `~/.neyuki/packages`) and `NEYUKI_HOME` moves `~/.neyuki`, where `neyuki pkg login` keeps its token.
+
+Directories placed by hand in `neyuki_packages/<name>/` still load with `require("<name>")`.
 
 ## Memory and limits
 

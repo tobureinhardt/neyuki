@@ -373,9 +373,16 @@ pub fn builtin_require(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
     if let Some(dir) = &vm.script_dir {
         loader = loader.with_base_dir(dir.clone());
     }
-    let located = loader
-        .locate_module(pkg)
-        .map_err(|_| format!("cannot find module '{}'", pkg))?;
+    // `@pkg/user/name` (project) and `@user/name` (global) are registry
+    // packages; everything else is a file next to the script.
+    let located = match crate::module_loader::packages::parse(pkg) {
+        Some(request) => {
+            crate::module_loader::packages::locate(&request?, vm.script_dir.as_deref())?
+        }
+        None => loader
+            .locate_module(pkg)
+            .map_err(|_| format!("cannot find module '{}'", pkg))?,
+    };
     let key = located.cache_key();
     if let Some(cached) = vm.modules.get(&key).cloned() {
         return Ok(vec![cached]);

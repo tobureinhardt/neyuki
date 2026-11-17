@@ -891,10 +891,24 @@ fn is_plain_module_path(module: &str) -> bool {
 /// project (where `neyuki_packages` lives). The working directory, which the
 /// runtime falls back to, is not searched. Only source files are returned.
 pub fn resolve_module_file(requester: &Path, module: &str) -> Option<PathBuf> {
+    let dir = requester.parent()?;
+    // Registry packages: `@pkg/user/name` and `@user/name`.
+    if let Some(request) = crate::module_loader::packages::parse(module) {
+        if module.contains("..") || module.contains('\0') || module.contains('\\') {
+            return None;
+        }
+        return match crate::module_loader::packages::locate(&request.ok()?, Some(dir)) {
+            Ok(crate::module_loader::Located::Disk(path))
+                if path.extension().is_some_and(|ext| ext == "nyk") =>
+            {
+                Some(path)
+            }
+            _ => None,
+        };
+    }
     if !is_plain_module_path(module) {
         return None;
     }
-    let dir = requester.parent()?;
     let mut bases = vec![dir.to_path_buf()];
     if let Some(root) = project_root(dir)
         && root != dir
@@ -1272,6 +1286,11 @@ impl MemberSource for ProjectSource<'_> {
             return libraries;
         };
         for name in dependency_names(requester) {
+            // Registry packages are required as `@pkg/user/name`.
+            let name = match name.parse::<crate::pkg::PackageName>() {
+                Ok(package) => format!("@pkg/{}/{}", package.scope, package.name),
+                Err(_) => name,
+            };
             libraries.push(Library {
                 page: name.clone(),
                 title: name.clone(),

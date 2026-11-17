@@ -319,7 +319,8 @@ fn check_entry(project: &Project) -> Result<(), String> {
 }
 
 /// Bundle path → file on disk: every `.nyk` and `.nykb` file in the project
-/// (so `require` finds local modules) plus the assets. Hidden entries,
+/// (so `require` finds local modules), the manifests of installed registry
+/// packages, plus the assets. Hidden entries,
 /// `target`, `dist` and the output itself are skipped.
 fn collect_files(
     project: &Project,
@@ -333,7 +334,11 @@ fn collect_files(
     let mut scripts = Vec::new();
     walk(root, root, &mut scripts, true)?;
     for (bundle_path, disk_path) in scripts {
-        if bundle_path.ends_with(".nyk") || bundle_path.ends_with(".nykb") {
+        // A registry package's neyuki.toml names its entry file, which
+        // `require("@pkg/user/name")` reads inside the app too.
+        let package_manifest =
+            bundle_path.starts_with("neyuki_packages/") && bundle_path.ends_with("/neyuki.toml");
+        if bundle_path.ends_with(".nyk") || bundle_path.ends_with(".nykb") || package_manifest {
             files.insert(bundle_path, disk_path);
         }
     }

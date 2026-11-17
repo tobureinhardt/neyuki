@@ -67,8 +67,8 @@ When `require(path)` is invoked, the runtime resolves the target in the followin
 2. **Standard and Bundled Libraries (`@neyuki/`)**:
    Paths matching `@neyuki/<name>` or `<name>` (where `<name>` is one of the built-in libraries: `bit`, `bit32`, `buffer`, `coroutine`, `crypto`, `csv`, `debug`, `fs`, `hid`, `html`, `http`, `io`, `json`, `math`, `net`, `os`, `sql`, `string`, `table`, `task`, `toml`, `ui`, `utf8`) are served directly from the embedded standard library distribution.
 
-3. **Package Manager Dependencies (`@pkg/`)**:
-   Paths starting with `@pkg/<package_name>` resolve against packages installed in the local `neyuki_packages/` directory or global cache configured via `NEYUKI_PATH`.
+3. **Registry Packages (`@pkg/` and `@<user>/`)**:
+   `@pkg/<user>/<package>[/<module>]` resolves against the project's `neyuki_packages/<user>/<package>/` (the project is the nearest directory above the entry script with a `neyuki.toml` or `neyuki_packages`; inside a built app, the bundle). Outside a project it falls back to the global packages, so a library that requires its dependencies this way works installed either way. `@<user>/<package>[/<module>]` resolves only against the global packages (`$NEYUKI_PATH`, else `~/.neyuki/packages`). Without a module, the `entry` named in the package's `neyuki.toml` loads, else `init.nyk`, else `main.nyk`; with one, `<module>.nyk`, `<module>.nykb` or `<module>/init.nyk`.
 
 4. **Relative and Filesystem Paths**:
    Paths ending in `.nyk` or `.nykb`, or relative module identifiers (e.g., `./utils`, `components/parser`, `components.parser`) resolve against the directory of the entry script (the file passed to `neyuki run`, or the entry of a built app), whichever directory the process runs in. Modules requiring other modules use the same base, so `require("kit/input")` names the same file from the entry script and from `app/rail.nyk`. If nothing matches there, the working directory is searched next (inside a built app: the bundle root).
