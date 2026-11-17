@@ -361,6 +361,9 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             vm.current_co = caller_co;
             vm.unpark_upvalues(caller_open_upvalues);
             restore_caller();
+            if vm.limits.is_tripped() {
+                return Err(err);
+            }
             vm.error_trace = None;
 
             Ok(vec![Value::Bool(false), Value::string(err)])

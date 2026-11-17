@@ -567,6 +567,7 @@ fn builtin_connect(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let host = string_arg(args, 0, "host")?;
     let port = port_arg(args, 1)?;
     let timeout = timeout_arg(args, 2)?;
+    vm.permissions.check_net(&format!("{}:{}", host, port))?;
     crate::vm::libs::background::run(
         vm,
         move || tcp_conn(tcp_connect(&host, port, timeout)?),
@@ -579,12 +580,14 @@ fn builtin_connect(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn builtin_connect_pipe(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let name = string_arg(args, 0, "name")?;
     let timeout = timeout_arg(args, 1)?;
+    vm.permissions.check_net(&name)?;
     crate::vm::libs::background::run(vm, move || connect_pipe(&name, timeout), finish_conn)
 }
 
 /// `__net_connect_unix(path)`.
 fn builtin_connect_unix(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let path = string_arg(args, 0, "path")?;
+    vm.permissions.check_net(&path)?;
     crate::vm::libs::background::run(vm, move || connect_unix(&path), finish_conn)
 }
 
@@ -1172,6 +1175,7 @@ fn next_frame(pending: &mut Vec<u8>) -> Result<Option<Frame>, String> {
 /// `__net_websocket(url, options?)`.
 fn builtin_websocket(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let url = string_arg(args, 0, "url")?;
+    vm.permissions.check_net(&url)?;
     let mut headers = Vec::new();
     let mut timeout = DEFAULT_TIMEOUT;
     match args.get(1) {
@@ -1342,9 +1346,10 @@ fn listener_arg(args: &[Value]) -> Result<Arc<Listener>, String> {
 
 /// `__net_ws_listen(host, port)`: binds a WebSocket server (port 0 picks a
 /// free one) and returns `{ host, port, url, accept, close, isOpen }`.
-fn builtin_ws_listen(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn builtin_ws_listen(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let host = string_arg(args, 0, "host")?;
     let port = port_arg(args, 1)?;
+    vm.permissions.check_net(&format!("{}:{}", host, port))?;
     let socket = TcpListener::bind((host.as_str(), port))
         .map_err(|err| format!("cannot listen on {}:{}: {}", host, port, err))?;
     let bound = socket
@@ -1616,9 +1621,10 @@ fn udp_parts(args: &[Value]) -> Result<(Arc<Shared>, Arc<UdpSocket>), String> {
 /// `__net_udp(host, port, broadcast)`: binds a UDP socket (port 0 picks a
 /// free one) and returns `{ host, port, send, sendTo, receive, connect,
 /// joinMulticast, leaveMulticast, close, isOpen }`.
-fn builtin_udp(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn builtin_udp(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let host = string_arg(args, 0, "host")?;
     let port = port_arg(args, 1)?;
+    vm.permissions.check_net(&format!("{}:{}", host, port))?;
     let broadcast = matches!(args.get(2), Some(Value::Bool(true)));
     let socket = UdpSocket::bind((host.as_str(), port))
         .map_err(|err| format!("cannot bind {}:{}: {}", host, port, err))?;
@@ -1909,9 +1915,10 @@ fn stdio_mode(options: &VmTable, name: &str) -> Result<Stdio, String> {
 /// `cwd`, `env` and `stdin`, `stdout`, `stderr` (each `"pipe"`, `"inherit"`
 /// (default) or `"null"`). Returns `{ pid, stdin, stdout, stderr, wait,
 /// kill, isRunning }`; the piped streams are connections.
-pub(crate) fn os_spawn(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+pub(crate) fn os_spawn(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let mut command = match args.first() {
         Some(Value::String(line)) => {
+            vm.permissions.check_run(line)?;
             let mut command = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
             command
                 .arg(if cfg!(windows) { "/C" } else { "-c" })
@@ -1934,6 +1941,7 @@ pub(crate) fn os_spawn(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Strin
                 }
             }
             let (program, rest) = parts.split_first().ok_or("command must not be empty")?;
+            vm.permissions.check_run(program)?;
             let mut command = Command::new(program);
             command.args(rest);
             command

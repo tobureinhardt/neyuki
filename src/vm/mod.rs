@@ -6,15 +6,19 @@ pub mod gc;
 pub mod hash;
 pub mod interp;
 pub mod libs;
+pub mod limits;
 pub mod machine;
 pub mod metamethod;
 pub mod ops;
+pub mod permissions;
 pub mod table;
 pub mod traceback;
 pub mod upvalue;
 pub mod value;
 
+pub use limits::{ExecutionLimits, LimitViolation};
 pub use machine::VM;
+pub use permissions::{PermissionScope, Permissions};
 use std::fs;
 pub use table::TableKey;
 pub use value::Value;
@@ -43,8 +47,23 @@ fn script_dir(path: &str) -> Option<std::path::PathBuf> {
 }
 
 pub fn run_file_with_options(path: &str, options: crate::compiler::Options) -> Result<(), String> {
+    run_file_with_config(
+        path,
+        options,
+        ExecutionLimits::default(),
+        Permissions::default(),
+    )
+}
+
+/// Runs a script or bytecode file under explicit execution limits and sandbox permissions.
+pub fn run_file_with_config(
+    path: &str,
+    options: crate::compiler::Options,
+    limits: ExecutionLimits,
+    permissions: Permissions,
+) -> Result<(), String> {
     let bytes = fs::read(path).map_err(|e| format!("failed to read {}: {}", path, e))?;
-    run_bytes(path, bytes, options)
+    run_bytes_with_config(path, bytes, options, limits, permissions)
 }
 
 /// Runs a script's source or bytecode that was read from `path` (a file on
@@ -54,14 +73,34 @@ pub fn run_bytes(
     bytes: Vec<u8>,
     options: crate::compiler::Options,
 ) -> Result<(), String> {
-    if bytes.starts_with(crate::bytecode::MAGIC) {
-        return execute_bytecode_at(&bytes, Some(path)).map(|_| ());
-    }
-    let source = String::from_utf8(bytes)
-        .map_err(|_| format!("failed to read {}: file is not valid UTF-8", path))?;
-    let proto = crate::compiler::compile_program(&source, path, options)?;
+    run_bytes_with_config(
+        path,
+        bytes,
+        options,
+        ExecutionLimits::default(),
+        Permissions::default(),
+    )
+}
+
+/// Runs a script's source or bytecode with explicit execution limits and sandbox permissions.
+pub fn run_bytes_with_config(
+    path: &str,
+    bytes: Vec<u8>,
+    options: crate::compiler::Options,
+    limits: ExecutionLimits,
+    permissions: Permissions,
+) -> Result<(), String> {
+    let proto = if bytes.starts_with(crate::bytecode::MAGIC) {
+        deserialize(&bytes)?
+    } else {
+        let source = String::from_utf8(bytes)
+            .map_err(|_| format!("failed to read {}: file is not valid UTF-8", path))?;
+        crate::compiler::compile_program(&source, path, options)?
+    };
     let mut vm = VM::new();
     vm.script_dir = script_dir(path);
+    vm.set_limits(limits);
+    vm.set_permissions(permissions);
     vm.execute_program(proto)
         .map(|_| ())
         .map_err(|err| vm.describe_error(&err))

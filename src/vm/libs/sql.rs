@@ -392,8 +392,14 @@ fn open_mysql(options: &OpenOptions) -> Result<mysql::Conn, String> {
 /// its driver name. `options` holds `driver` and/or `url` plus optional
 /// `host`, `port`, `user`, `password`, `database`, `ssl` and `timeout`
 /// fields, which override what the URL says.
-fn builtin_open(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn builtin_open(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let options = options_arg(args, 0)?;
+    let target = options
+        .url
+        .as_deref()
+        .or(options.host.as_deref())
+        .unwrap_or("localhost");
+    vm.permissions.check_net(target)?;
     let driver = driver_name(&options)?;
     let connection = match driver {
         "postgres" => Connection::Postgres(Box::new(open_postgres(&options)?)),

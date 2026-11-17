@@ -219,6 +219,7 @@ fn os_run(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
     let mut command = match args.first() {
         Some(Value::String(line)) => {
+            vm.permissions.check_run(line)?;
             let mut command = if cfg!(windows) {
                 Command::new("cmd")
             } else {
@@ -245,6 +246,7 @@ fn os_run(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 }
             }
             let (program, rest) = parts.split_first().ok_or("command must not be empty")?;
+            vm.permissions.check_run(program)?;
             let mut command = Command::new(program);
             command.args(rest);
             command
@@ -397,7 +399,7 @@ fn os_exit(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
 /// The value of an environment variable, or nil when it is unset or not
 /// valid Unicode.
-fn os_getenv(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn os_getenv(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let varname = match args
         .first()
         .ok_or_else(|| "os.getenv expects variable name".to_string())?
@@ -405,6 +407,7 @@ fn os_getenv(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         Value::String(s) => s,
         _ => return Err("os.getenv expects string".to_string()),
     };
+    vm.permissions.check_env(varname)?;
     match std::env::var(&**varname) {
         Ok(v) => Ok(vec![Value::string(v)]),
         Err(_) => Ok(vec![Value::Nil]),

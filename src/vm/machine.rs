@@ -12,6 +12,8 @@ use crate::vm::libs::{
     create_math_lib, create_os_lib, create_string_lib, create_table_lib, create_task_lib,
     create_utf8_lib,
 };
+use crate::vm::limits::ExecutionLimits;
+use crate::vm::permissions::Permissions;
 use crate::vm::value::{NativeDef, StrRef, Value, VmClosure, VmTable};
 
 pub use crate::vm::traceback::TraceFrame;
@@ -149,6 +151,10 @@ pub struct VM {
     pub max_call_depth: usize,
     /// Tasks queued by the `task` library.
     pub tasks: crate::vm::libs::task::Scheduler,
+    /// Configurable execution budgets, deadline, and interrupt handle.
+    pub limits: ExecutionLimits,
+    /// Capability-based sandbox permissions.
+    pub permissions: Permissions,
 }
 
 impl Default for VM {
@@ -191,9 +197,20 @@ impl VM {
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_MAX_CALL_DEPTH),
             tasks: Default::default(),
+            limits: ExecutionLimits::new(),
+            permissions: Permissions::allow_all(),
         };
         vm.register_builtins();
         vm
+    }
+
+    pub fn set_limits(&mut self, limits: ExecutionLimits) {
+        self.limits = limits;
+        self.update_trap();
+    }
+
+    pub fn set_permissions(&mut self, permissions: Permissions) {
+        self.permissions = permissions;
     }
 
     pub fn max_call_depth(&self) -> usize {
@@ -316,11 +333,11 @@ impl VM {
         self.stack[idx] = val;
     }
 
-    /// Recomputes `trap` after a hook or debugger setting changed.
+    /// Recomputes `trap` after a hook, debugger, or limit setting changed.
     pub fn update_trap(&mut self) {
         let hook_wants = self.hook.as_ref().is_some_and(|h| h.on_line || h.count > 0);
         let debugger_wants = self.dap.as_ref().is_some_and(|d| d.wants_lines());
-        self.trap = hook_wants || debugger_wants;
+        self.trap = hook_wants || debugger_wants || self.limits.is_active();
     }
 
     /// Full collection with finalizers: mark, extract the finalizer queue,
@@ -401,6 +418,12 @@ impl VM {
             return Ok(());
         }
         if !self.gc.should_collect() {
+            if let Some(limit) = self.limits.heap_limit_bytes
+                && self.gc.bytes_allocated > limit
+            {
+                self.gc_collect()?;
+                self.limits.check_heap(self.gc.bytes_allocated)?;
+            }
             return Ok(());
         }
         let crate::vm::gc::SweepPlan {
@@ -1281,5 +1304,104 @@ return path .. \" \" .. params.name .. \" \" .. http.encode(\"a b\")";
         end
         return sum == 150 and count == 5";
         assert_eq!(run_code(code).to_string(), "true");
+    }
+
+    fn compile_src(src: &str) -> Proto {
+        let mut parser = Parser::new(src);
+        let (stmts, _pool) = parser.parse_program().expect("parse failed");
+        compile_to_proto(&stmts)
+    }
+
+    #[test]
+    fn test_vm_limits_instruction_budget_survives_pcall() {
+        let proto = compile_src("pcall(function() while true do end end)");
+        let mut vm = VM::new();
+        vm.set_limits(ExecutionLimits::new().with_instruction_budget(500));
+        let err = vm.execute(proto).unwrap_err();
+        assert!(
+            err.contains("instruction budget of 500 exhausted"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_vm_limits_heap_limit_trips_on_allocation() {
+        let proto = compile_src(
+            "local t = {}
+            for i = 1, 5000 do
+                t[i] = { a = i, b = i + 1, c = i + 2 }
+            end",
+        );
+        let mut vm = VM::new();
+        vm.set_limits(ExecutionLimits::new().with_heap_limit(8192));
+        let err = vm.execute(proto).unwrap_err();
+        assert!(
+            err.contains("heap limit of 8192 bytes exceeded"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_vm_limits_deadline_terminates_loop() {
+        let proto = compile_src("while true do end");
+        let mut vm = VM::new();
+        vm.set_limits(ExecutionLimits::new().with_timeout(std::time::Duration::from_millis(20)));
+        let err = vm.execute(proto).unwrap_err();
+        assert!(err.contains("deadline exceeded"), "got: {err}");
+    }
+
+    #[test]
+    fn test_vm_limits_interrupt_from_background_thread() {
+        let proto = compile_src("while true do end");
+        let mut vm = VM::new();
+        let handle = vm.limits.interrupt_handle();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            handle.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let err = vm.execute(proto).unwrap_err();
+        t.join().unwrap();
+        assert_eq!(err, "execution interrupted");
+    }
+
+    #[test]
+    fn test_vm_permissions_sandbox_blocks_privileged_calls() {
+        let mut vm = VM::new();
+        vm.set_permissions(Permissions::deny_all());
+
+        let env_proto = compile_src("return os.getenv('PATH')");
+        let err = vm.execute(env_proto).unwrap_err();
+        assert!(
+            err.contains("permission denied: environment access"),
+            "got: {err}"
+        );
+
+        let run_proto = compile_src("return os.run('echo hi')");
+        let err = vm.execute(run_proto).unwrap_err();
+        assert!(
+            err.contains("permission denied: subprocess execution"),
+            "got: {err}"
+        );
+
+        let fs_proto =
+            compile_src("local fs = require('@neyuki/fs'); return fs.exists('Cargo.toml')");
+        let err = vm.execute(fs_proto).unwrap_err();
+        assert!(err.contains("permission denied: read access"), "got: {err}");
+
+        let net_proto = compile_src(
+            "local http = require('@neyuki/http'); return http.get('http://example.com')",
+        );
+        let err = vm.execute(net_proto).unwrap_err();
+        assert!(
+            err.contains("permission denied: network access"),
+            "got: {err}"
+        );
+
+        // Granting specific env var succeeds while others remain blocked
+        vm.set_permissions(Permissions::deny_all().with_env(
+            crate::vm::permissions::PermissionScope::AllowList(vec!["PATH".into()]),
+        ));
+        let allowed_env = compile_src("return type(os.getenv('PATH'))");
+        assert!(vm.execute(allowed_env).is_ok());
     }
 }

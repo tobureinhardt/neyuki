@@ -34,6 +34,14 @@ impl VM {
     /// Line and count events for the instruction at `ip` of the running
     /// frame, and the debugger's line breakpoints and stepping.
     fn instruction_hook(&mut self, ip: usize) -> Result<(), String> {
+        if !self.in_eval {
+            if let Some(limit) = self.limits.heap_limit_bytes
+                && self.gc.bytes_allocated > limit
+            {
+                self.gc_collect()?;
+            }
+            self.limits.step(self.gc.bytes_allocated)?;
+        }
         if self.in_hook || self.in_eval {
             return Ok(());
         }
@@ -1055,7 +1063,12 @@ impl VM {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::Jump { offset } => jump!(offset),
+                Instruction::Jump { offset } => {
+                    if !TRAP && offset < 0 {
+                        attempt!(self.limits.check_interrupt());
+                    }
+                    jump!(offset);
+                }
                 Instruction::ForPrep { base: b, jump } => {
                     let step = &reg!(b + 2);
                     match step {
