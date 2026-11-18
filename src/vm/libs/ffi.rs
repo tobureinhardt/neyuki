@@ -375,7 +375,7 @@ fn builtin_open(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 .map_err(|_| format!("symbol name '{}' contains NUL byte", name.0.str))?;
             // SAFETY: `lib` stays alive inside `LIBRARIES` for the lifetime of
             // every `BoundSymbol` until `__ffi_close` removes the entry.
-            let raw_ptr = unsafe {
+            let raw_ptr: *const c_void = unsafe {
                 lib.get::<*const c_void>(c_name.as_bytes_with_nul())
                     .map_err(|err| {
                         format!(
@@ -384,7 +384,7 @@ fn builtin_open(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                         )
                     })?
                     .into_raw()
-                    .into_raw()
+                    .as_raw_ptr()
             };
             let sym_idx = symbols.len();
             symbols.push(BoundSymbol {
