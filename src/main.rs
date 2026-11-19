@@ -49,19 +49,22 @@ Commands:
     --max-instructions=N  Stop after executing N VM instructions
     --max-memory=BYTES    Cap live GC heap (supports K, M, G suffixes)
     --timeout=DUR         Stop after duration (e.g. 500ms, 5s, 1m)
+    -O0, -O1              Set optimization level (default: -O1)
   <file> [args...]        Same as run
   fmt [--check] <path>    Format .nyk source files
   lint [--json] [--stdin] <file>
                           Report errors and warnings without running
   lsp                     Serve the Language Server Protocol on stdio
-  compile <file> [out]    Compile to .nykb bytecode
+  compile [-O0|-O1] <file> [out]
+                          Compile to .nykb bytecode
   build [project]         Build a standalone app executable
   test                    Run every script in tests/
   repl                    Start an interactive session
   pkg <command>           Manage packages
   dap                     Serve the Debug Adapter Protocol on stdio
-  disasm <file>           Print the bytecode the compiler emits
-  dump-ir <file>          Print the IR before and after optimization
+  disasm [-O0|-O1] <file> Print the bytecode the compiler emits
+  dump-ir [-O0|-O1] <file>
+                          Print the IR before and after optimization
   assemble <file> [out]   Assemble bytecode from its text form
   bench                   Run the built-in benchmarks
   fuzz [target] [--seconds N]
@@ -90,6 +93,9 @@ fn run_cli() {
         || args[1].ends_with(".nykb")
         || args[1] == "--sandbox"
         || args[1] == "-A"
+        || args[1] == "-O0"
+        || args[1] == "-O1"
+        || args[1].starts_with("--opt-level=")
         || args[1].starts_with("--allow-")
         || args[1].starts_with("--max-")
         || args[1].starts_with("--instruction-budget")
@@ -121,13 +127,30 @@ fn run_cli() {
             process::exit(1);
         }
     } else if action == "compile" {
-        let Some(path) = args.get(2) else {
-            eprintln!("Usage: {} compile <path> [output]", args[0]);
+        let (opt_level, rest) = match parse_opt_level_prefix(&args[2..]) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                eprintln!("{}", err);
+                process::exit(1);
+            }
+        };
+        let Some(path) = rest.first() else {
+            eprintln!("Usage: {} compile [-O0|-O1] <path> [output]", args[0]);
             process::exit(1);
         };
-        match compiler::compile_file_to_bytecode(path) {
+        let compiled = std::fs::read_to_string(path)
+            .map_err(|err| format!("failed to read {}: {}", path, err))
+            .and_then(|source| {
+                compiler::compile_program(
+                    &source,
+                    path,
+                    compiler::Options::RUN.with_opt_level(opt_level),
+                )
+            })
+            .map(|proto| bytecode::serialize(&proto));
+        match compiled {
             Ok(bytecode) => {
-                let out_path = args.get(3).cloned().unwrap_or_else(|| format!("{}b", path));
+                let out_path = rest.get(1).cloned().unwrap_or_else(|| format!("{}b", path));
                 if let Err(err) = std::fs::write(&out_path, &bytecode) {
                     eprintln!("failed to write bytecode to {}: {}", out_path, err);
                     process::exit(1);
@@ -161,17 +184,21 @@ fn run_cli() {
             process::exit(1);
         }
     } else if action == "run" {
-        let (path, script_args, limits, permissions) = match parse_run_args(&args[2..]) {
+        let parsed = match parse_run_args(&args[2..]) {
             Ok(parsed) => parsed,
             Err(err) => {
                 eprintln!("{}", err);
                 process::exit(1);
             }
         };
-        vm::libs::os::set_script_args(script_args);
-        if let Err(err) =
-            vm::run_file_with_config(&path, compiler::Options::RUN, limits, permissions)
-        {
+        vm::libs::os::set_script_args(parsed.script_args);
+        let compile_opts = compiler::Options::RUN.with_opt_level(parsed.opt_level);
+        if let Err(err) = vm::run_file_with_config(
+            &parsed.path,
+            compile_opts,
+            parsed.limits,
+            parsed.permissions,
+        ) {
             if err.starts_with("error[") || err.starts_with("runtime error") {
                 eprint!("{}", err);
                 if !err.ends_with('\n') {
@@ -184,20 +211,40 @@ fn run_cli() {
         }
     } else if action == "dump-ir" {
         // Prints the IR of every function before and after optimization.
-        let Some(path) = args.get(2) else {
-            eprintln!("Usage: {} dump-ir <path>", args[0]);
+        let (opt_level, rest) = match parse_opt_level_prefix(&args[2..]) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                eprintln!("{}", err);
+                process::exit(1);
+            }
+        };
+        let Some(path) = rest.first() else {
+            eprintln!("Usage: {} dump-ir [-O0|-O1] <path>", args[0]);
             process::exit(1);
         };
         match compiler::compile_file(path) {
-            Ok(stmts) => print!("{}", compiler::dump_ir(&stmts)),
+            Ok(stmts) => print!(
+                "{}",
+                compiler::dump_ir_with_options(
+                    &stmts,
+                    compiler::Options::RUN.with_opt_level(opt_level)
+                )
+            ),
             Err(err) => {
                 eprintln!("{}: {}", path, err);
                 process::exit(1);
             }
         }
     } else if action == "disasm" {
-        let Some(path) = args.get(2) else {
-            eprintln!("Usage: {} disasm <path>", args[0]);
+        let (opt_level, rest) = match parse_opt_level_prefix(&args[2..]) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                eprintln!("{}", err);
+                process::exit(1);
+            }
+        };
+        let Some(path) = rest.first() else {
+            eprintln!("Usage: {} disasm [-O0|-O1] <path>", args[0]);
             process::exit(1);
         };
         // A debugging aid: shows what the compiler emits even for sources
@@ -205,7 +252,11 @@ fn run_cli() {
         let compiled = std::fs::read_to_string(path)
             .map_err(|err| format!("failed to read {}: {}", path, err))
             .and_then(|source| {
-                compiler::compile_program(&source, path, compiler::Options::UNCHECKED)
+                compiler::compile_program(
+                    &source,
+                    path,
+                    compiler::Options::UNCHECKED.with_opt_level(opt_level),
+                )
             });
         match compiled {
             Ok(proto) => print!("{}", bytecode::disasm::disassemble_proto(&proto, 0)),
@@ -363,11 +414,47 @@ fn parse_duration(raw: &str) -> Result<std::time::Duration, String> {
     }
 }
 
-fn parse_run_args(
-    args: &[String],
-) -> Result<(String, Vec<String>, vm::ExecutionLimits, vm::Permissions), String> {
+struct RunCliArgs {
+    path: String,
+    script_args: Vec<String>,
+    limits: vm::ExecutionLimits,
+    permissions: vm::Permissions,
+    opt_level: compiler::OptLevel,
+}
+
+fn parse_opt_level_flag(arg: &str) -> Option<Result<compiler::OptLevel, String>> {
+    match arg {
+        "-O0" => Some(Ok(compiler::OptLevel::O0)),
+        "-O1" => Some(Ok(compiler::OptLevel::O1)),
+        _ => arg.strip_prefix("--opt-level=").map(|val| match val {
+            "0" | "O0" | "o0" => Ok(compiler::OptLevel::O0),
+            "1" | "O1" | "o1" => Ok(compiler::OptLevel::O1),
+            other => Err(format!(
+                "invalid optimization level '{}' (expected 0, 1, O0, or O1)",
+                other
+            )),
+        }),
+    }
+}
+
+fn parse_opt_level_prefix(args: &[String]) -> Result<(compiler::OptLevel, &[String]), String> {
+    let mut opt_level = compiler::OptLevel::O1;
+    let mut idx = 0;
+    while idx < args.len() {
+        if let Some(res) = parse_opt_level_flag(&args[idx]) {
+            opt_level = res?;
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    Ok((opt_level, &args[idx..]))
+}
+
+fn parse_run_args(args: &[String]) -> Result<RunCliArgs, String> {
     let mut sandboxed = false;
     let mut allow_all = false;
+    let mut opt_level = compiler::OptLevel::O1;
     let mut read_scope: Option<vm::PermissionScope> = None;
     let mut write_scope: Option<vm::PermissionScope> = None;
     let mut net_scope: Option<vm::PermissionScope> = None;
@@ -386,7 +473,9 @@ fn parse_run_args(
         if !arg.starts_with('-') {
             break;
         }
-        if arg == "--sandbox" {
+        if let Some(res) = parse_opt_level_flag(arg) {
+            opt_level = res?;
+        } else if arg == "--sandbox" {
             sandboxed = true;
         } else if arg == "--allow-all" || arg == "-A" {
             allow_all = true;
@@ -490,7 +579,13 @@ fn parse_run_args(
         perms
     };
 
-    Ok((path, script_args, limits, permissions))
+    Ok(RunCliArgs {
+        path,
+        script_args,
+        limits,
+        permissions,
+        opt_level,
+    })
 }
 
 #[cfg(test)]
@@ -500,16 +595,18 @@ mod cli_tests {
     #[test]
     fn test_parse_run_args_defaults_unrestricted() {
         let args = vec!["script.nyk".into(), "arg1".into()];
-        let (path, script_args, limits, perms) = parse_run_args(&args).unwrap();
-        assert_eq!(path, "script.nyk");
-        assert_eq!(script_args, vec!["arg1"]);
-        assert!(!limits.is_active());
-        assert_eq!(perms, vm::Permissions::allow_all());
+        let parsed = parse_run_args(&args).unwrap();
+        assert_eq!(parsed.path, "script.nyk");
+        assert_eq!(parsed.script_args, vec!["arg1"]);
+        assert!(!parsed.limits.is_active());
+        assert_eq!(parsed.permissions, vm::Permissions::allow_all());
+        assert_eq!(parsed.opt_level, compiler::OptLevel::O1);
     }
 
     #[test]
     fn test_parse_run_args_sandbox_and_limits() {
         let args = vec![
+            "-O0".into(),
             "--sandbox".into(),
             "--allow-net=api.example.com,localhost:8080".into(),
             "--max-instructions=50000".into(),
@@ -518,14 +615,20 @@ mod cli_tests {
             "plugin.nyk".into(),
             "--flag".into(),
         ];
-        let (path, script_args, limits, perms) = parse_run_args(&args).unwrap();
-        assert_eq!(path, "plugin.nyk");
-        assert_eq!(script_args, vec!["--flag"]);
-        assert_eq!(limits.instruction_budget, Some(50000));
-        assert_eq!(limits.heap_limit_bytes, Some(16 * 1024 * 1024));
-        assert!(limits.deadline.is_some());
-        assert_eq!(perms.read, vm::PermissionScope::DenyAll);
-        assert!(perms.check_net("https://api.example.com/v1").is_ok());
-        assert!(perms.check_net("https://evil.com").is_err());
+        let parsed = parse_run_args(&args).unwrap();
+        assert_eq!(parsed.path, "plugin.nyk");
+        assert_eq!(parsed.script_args, vec!["--flag"]);
+        assert_eq!(parsed.opt_level, compiler::OptLevel::O0);
+        assert_eq!(parsed.limits.instruction_budget, Some(50000));
+        assert_eq!(parsed.limits.heap_limit_bytes, Some(16 * 1024 * 1024));
+        assert!(parsed.limits.deadline.is_some());
+        assert_eq!(parsed.permissions.read, vm::PermissionScope::DenyAll);
+        assert!(
+            parsed
+                .permissions
+                .check_net("https://api.example.com/v1")
+                .is_ok()
+        );
+        assert!(parsed.permissions.check_net("https://evil.com").is_err());
     }
 }

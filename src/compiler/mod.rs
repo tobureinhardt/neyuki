@@ -25,6 +25,16 @@ pub struct Parsed {
     pub spans: crate::ast::span::SpanPool,
 }
 
+/// Compiler optimization level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OptLevel {
+    /// Unoptimized: skips AST constant folding, inlining, and optimization passes.
+    O0,
+    /// Standard optimizations: AST folding, inlining (when enabled), and full CFG opt passes.
+    #[default]
+    O1,
+}
+
 /// How a program is compiled.
 #[derive(Clone, Copy)]
 pub struct Options {
@@ -35,6 +45,8 @@ pub struct Options {
     /// Keep locals in their registers until their scope ends, so a debugger
     /// can read them after their last use.
     pub keep_locals: bool,
+    /// Optimization level (`-O0` or `-O1`).
+    pub opt_level: OptLevel,
 }
 
 impl Options {
@@ -43,19 +55,28 @@ impl Options {
         check: true,
         inline: true,
         keep_locals: false,
+        opt_level: OptLevel::O1,
     };
     /// For the debugger: every call keeps its frame, every local its value.
     pub const DEBUG: Options = Options {
         check: true,
         inline: false,
         keep_locals: true,
+        opt_level: OptLevel::O0,
     };
     /// For the bundled libraries and REPL chunks, which are not checked.
     pub const UNCHECKED: Options = Options {
         check: false,
         inline: true,
         keep_locals: false,
+        opt_level: OptLevel::O1,
     };
+
+    /// Returns a copy of `self` with the requested optimization level.
+    pub const fn with_opt_level(mut self, opt_level: OptLevel) -> Self {
+        self.opt_level = opt_level;
+        self
+    }
 }
 
 /// Parses source, keeping the line of each statement.
@@ -184,12 +205,16 @@ fn lower(
     lines: Option<Rc<HashMap<NodeId, u32>>>,
     options: Options,
 ) -> Result<Proto, String> {
-    let optimized_stmts = fold_program(statements.to_vec());
-    let mut ir_module = ir::ast_to_ir_with(&optimized_stmts, lines, options.keep_locals);
-    if options.inline {
+    let stmts = if options.opt_level == OptLevel::O1 {
+        fold_program(statements.to_vec())
+    } else {
+        statements.to_vec()
+    };
+    let mut ir_module = ir::ast_to_ir_with(&stmts, lines, options.keep_locals);
+    if options.inline && options.opt_level == OptLevel::O1 {
         ir::inline_functions(&mut ir_module);
     }
-    optimize_ir_function(&mut ir_module.main);
+    optimize_ir_function(&mut ir_module.main, options.opt_level);
     ir::verify_module(&ir_module)
         .map_err(|errs| format!("IR verification error: {}", errs.join(", ")))?;
     ir::ir_to_bytecode(&ir_module)
@@ -198,15 +223,26 @@ fn lower(
 /// The IR of a program before and after optimization, for debugging the
 /// pipeline.
 pub fn dump_ir(statements: &[Stmt]) -> String {
-    let optimized_stmts = fold_program(statements.to_vec());
-    let mut ir_module = ir::ast_to_ir(&optimized_stmts);
+    dump_ir_with_options(statements, Options::RUN)
+}
+
+/// The IR of a program before and after optimization under explicit `options`.
+pub fn dump_ir_with_options(statements: &[Stmt], options: Options) -> String {
+    let stmts = if options.opt_level == OptLevel::O1 {
+        fold_program(statements.to_vec())
+    } else {
+        statements.to_vec()
+    };
+    let mut ir_module = ir::ast_to_ir(&stmts);
     let mut out = String::from("=== before optimization ===\n");
     out.push_str(&ir::pretty::print_module(&ir_module));
     if let Err(errs) = ir::verify_module(&ir_module) {
         out.push_str(&format!("\n[verification warnings: {}]\n", errs.join(", ")));
     }
-    ir::inline_functions(&mut ir_module);
-    optimize_ir_function(&mut ir_module.main);
+    if options.inline && options.opt_level == OptLevel::O1 {
+        ir::inline_functions(&mut ir_module);
+    }
+    optimize_ir_function(&mut ir_module.main, options.opt_level);
     out.push_str("\n=== after optimization ===\n");
     out.push_str(&ir::pretty::print_module(&ir_module));
     if let Err(errs) = ir::verify_module(&ir_module) {
@@ -216,13 +252,13 @@ pub fn dump_ir(statements: &[Stmt]) -> String {
 }
 
 /// Runs the CFG optimizer over a function and every function nested in it.
-fn optimize_ir_function(func: &mut ir::IrFunction) {
+fn optimize_ir_function(func: &mut ir::IrFunction, opt_level: OptLevel) {
     let mut cfg = ir::build_cfg(&func.instructions);
-    ir::optimize_cfg(&mut cfg);
+    ir::optimize_cfg_with_level(&mut cfg, opt_level);
     func.instructions = cfg.to_flat_instructions();
     func.cfg = Some(cfg);
     for child in &mut func.protos {
-        optimize_ir_function(child);
+        optimize_ir_function(child, opt_level);
     }
 }
 
@@ -328,6 +364,40 @@ mod tests {
         let mut vm = crate::vm::machine::VM::new();
         let res = vm.execute(proto).expect("exec failed");
         assert_eq!(res.to_string(), "30");
+    }
+
+    #[test]
+    fn test_opt_levels_o0_and_o1_produce_same_result_and_respect_inlining() {
+        let code =
+            "local function add(x, y) return x + y end\nlocal a = 2 + 3\nreturn a + add(4, 5)";
+        let proto_o0 = compile_program(code, "test", Options::RUN.with_opt_level(OptLevel::O0))
+            .expect("O0 compile failed");
+        let proto_o1 = compile_program(code, "test", Options::RUN.with_opt_level(OptLevel::O1))
+            .expect("O1 compile failed");
+
+        assert!(
+            proto_o0
+                .instructions
+                .iter()
+                .any(|i| matches!(i, crate::bytecode::instruction::Instruction::Call { .. })),
+            "O0 must not inline calls"
+        );
+        assert!(
+            !proto_o1
+                .instructions
+                .iter()
+                .any(|i| matches!(i, crate::bytecode::instruction::Instruction::Call { .. })),
+            "O1 should inline leaf calls"
+        );
+
+        let r0 = crate::vm::machine::VM::new()
+            .execute(proto_o0)
+            .expect("O0 exec failed");
+        let r1 = crate::vm::machine::VM::new()
+            .execute(proto_o1)
+            .expect("O1 exec failed");
+        assert_eq!(r0.to_string(), "14");
+        assert_eq!(r1.to_string(), "14");
     }
 
     #[test]
