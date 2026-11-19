@@ -6,6 +6,7 @@ pub mod constant_fold;
 pub mod cost_model;
 pub mod hir;
 pub mod ir;
+pub mod thir;
 pub mod value_tracking;
 
 use crate::ast::node_id::NodeId;
@@ -243,6 +244,19 @@ pub fn dump_hir_source_with_options(source: &str, options: Options) -> Result<St
     };
     let hir_module = hir::lower_ast(&stmts, Some(parsed.lines.as_ref()), options.opt_level);
     Ok(hir::dump_hir(&hir_module))
+}
+
+/// Parses `source` and dumps its typed HIR (THIR) with bindings and inferred types.
+pub fn dump_thir_source_with_options(source: &str, options: Options) -> Result<String, String> {
+    let parsed = parse(source)?;
+    let stmts = if options.opt_level == OptLevel::O1 {
+        fold_program(parsed.stmts)
+    } else {
+        parsed.stmts
+    };
+    let hir_module = hir::lower_ast(&stmts, Some(parsed.lines.as_ref()), options.opt_level);
+    let thir_module = thir::lower_hir_to_thir(&hir_module);
+    Ok(thir::dump_thir(&thir_module))
 }
 
 /// The IR of a program before and after optimization, for debugging the
