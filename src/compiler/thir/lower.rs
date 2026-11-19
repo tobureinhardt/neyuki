@@ -409,7 +409,7 @@ impl ThirLowerer {
             HirExprKind::Call { callee, args } => {
                 let c = self.lower_expr(callee);
                 let a: Vec<ThirExpr> = args.iter().map(|arg| self.lower_expr(arg)).collect();
-                let ty = infer_call_type(&c);
+                let ty = infer_call_type(&c, &a);
                 (
                     ty,
                     ThirExprKind::Call {

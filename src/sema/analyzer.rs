@@ -1,25 +1,19 @@
-//! Walks the syntax tree, builds symbol tables and reports diagnostics.
+//! Walks the syntax tree, builds symbol tables and coordinates semantic passes.
 
 use std::collections::HashSet;
 
 use crate::ast::expr::{Expr, Param};
-use crate::ast::literal::Literal;
-use crate::ast::op::{BinOp, UnOp};
 use crate::ast::pattern::AssignTarget;
-use crate::ast::span::{Span as AstSpan, SpanPool};
+use crate::ast::span::SpanPool;
 use crate::ast::stmt::Stmt;
-use crate::ast::ty::TypeExpr;
 use crate::diagnostics::diagnostic::Diagnostic;
 use crate::diagnostics::error_code::ErrorCode;
 use crate::diagnostics::span::Span;
-use crate::sema::scope::{ScopeKind, ScopeManager, TypeAlias};
+use crate::sema::infer::resolve_local_many_slot;
+use crate::sema::scope::{ScopeKind, ScopeManager};
 use crate::sema::symbol::{Symbol, SymbolKind};
+use crate::sema::type_env::required_params;
 use crate::sema::types::NeyukiType;
-
-/// How many alias names one annotation may expand to. Aliases that nest
-/// aliases can multiply (`type A = {B, B}`, `type B = {C, C}`, ...), so the
-/// expansion is cut off, leaving `any`, instead of growing without bound.
-const ALIAS_EXPANSION_BUDGET: usize = 512;
 
 pub struct SemanticAnalyzer<'a> {
     pub source: &'a str,
@@ -27,9 +21,9 @@ pub struct SemanticAnalyzer<'a> {
     pub diagnostics: Vec<Diagnostic>,
     pub known_globals: HashSet<String>,
     pub undeclared: HashSet<String>,
-    current_return_type: Option<NeyukiType>,
-    current_line: u32,
-    spans: Option<&'a SpanPool>,
+    pub(super) current_return_type: Option<NeyukiType>,
+    pub(super) current_line: u32,
+    pub(super) spans: Option<&'a SpanPool>,
 }
 
 impl<'a> SemanticAnalyzer<'a> {
@@ -105,64 +99,16 @@ impl<'a> SemanticAnalyzer<'a> {
         self
     }
 
-    /// Moves `current_line` to where `stmt` starts.
-    fn enter_stmt(&mut self, stmt: &Stmt) {
-        if let Some(span) = self.spans.and_then(|pool| pool.get(stmt.node_id()))
-            && span.start.line > 0
-        {
-            self.current_line = span.start.line;
-        }
-    }
-
-    /// Converts a parser span to a diagnostic span on its first line, with
-    /// trailing whitespace trimmed (a parser span ends at the next token).
-    fn diagnostic_span(&self, span: crate::ast::span::Span) -> Span {
-        let line = span.start.line;
-        let text = self
-            .source
-            .lines()
-            .nth(line.saturating_sub(1) as usize)
-            .unwrap_or("");
-        let start = span.start.column.max(1);
-        let mut end = if span.end.line == line && span.end.column > start {
-            span.end.column
-        } else {
-            text.len() as u32 + 1
-        };
-        while end > start + 1
-            && text
-                .as_bytes()
-                .get(end as usize - 2)
-                .is_some_and(|b| b.is_ascii_whitespace())
-        {
-            end -= 1;
-        }
-        Span::single_line(line, start, end)
-    }
-
     fn is_known_global(&self, name: &str) -> bool {
         self.known_globals.contains(name) || name.starts_with("__")
     }
 
     pub fn analyze_program(&mut self, statements: &[Stmt]) {
         self.analyze_block(statements);
-        // Flush all scope symbols
-        let remaining = self.scope_mgr.flush_all();
-        for sym in remaining {
-            if !sym.used && !sym.name.starts_with('_') && sym.kind == SymbolKind::Variable {
-                let diag = Diagnostic::warning(format!("unused variable '{}'", sym.name))
-                    .with_code(ErrorCode::W0001)
-                    .with_label(sym.span, "variable declared here but never used")
-                    .with_help(format!(
-                        "if this is intentional, prefix with an underscore: '_{}'",
-                        sym.name
-                    ));
-                self.diagnostics.push(diag);
-            }
-        }
+        self.flush_remaining_unused();
     }
 
-    fn analyze_block(&mut self, statements: &[Stmt]) {
+    pub(super) fn analyze_block(&mut self, statements: &[Stmt]) {
         // Pre-pass: declare type aliases first, so annotations may name an
         // alias declared further down (and aliases may refer to each other).
         for stmt in statements {
@@ -184,11 +130,19 @@ impl<'a> SemanticAnalyzer<'a> {
                 is_const,
                 params,
                 return_type,
+                body,
                 ..
             } = stmt
                 && !fn_name.contains('.')
             {
-                self.hoist_function(stmt, fn_name, *is_const, params, return_type.as_deref());
+                self.hoist_function(
+                    stmt,
+                    fn_name,
+                    *is_const,
+                    params,
+                    return_type.as_deref(),
+                    body,
+                );
             }
         }
 
@@ -210,116 +164,6 @@ impl<'a> SemanticAnalyzer<'a> {
         }
     }
 
-    /// Resolves an annotation to a type, expanding the local type aliases it
-    /// names. Names no alias declares stay unchecked `Custom` types.
-    fn parse_ty(&self, text: &str) -> NeyukiType {
-        if !self.scope_mgr.has_types() {
-            return NeyukiType::parse(text);
-        }
-        let mut active = Vec::new();
-        let mut budget = ALIAS_EXPANSION_BUDGET;
-        let expanded = self.expand_aliases(&TypeExpr::parse(text), &mut active, &mut budget);
-        NeyukiType::from_ast_type(&expanded)
-    }
-
-    /// Replaces each alias name in `ty` with the type it stands for. A
-    /// reference back to an alias that is being expanded (a recursive type)
-    /// becomes `any`, as does anything past the expansion budget, so
-    /// expansion always ends and stays cheap.
-    fn expand_aliases(
-        &self,
-        ty: &TypeExpr,
-        active: &mut Vec<String>,
-        budget: &mut usize,
-    ) -> TypeExpr {
-        match ty {
-            TypeExpr::Named(name) => {
-                let Some(alias) = self.scope_mgr.lookup_type(name) else {
-                    return ty.clone();
-                };
-                if active.contains(name) || *budget == 0 {
-                    return TypeExpr::Any;
-                }
-                *budget -= 1;
-                active.push(name.clone());
-                let expanded = self.expand_aliases(&alias.ty, active, budget);
-                active.pop();
-                expanded
-            }
-            TypeExpr::Optional(inner) => {
-                TypeExpr::Optional(Box::new(self.expand_aliases(inner, active, budget)))
-            }
-            TypeExpr::Array(inner) => {
-                TypeExpr::Array(Box::new(self.expand_aliases(inner, active, budget)))
-            }
-            TypeExpr::Tuple(elems) => TypeExpr::Tuple(
-                elems
-                    .iter()
-                    .map(|e| self.expand_aliases(e, active, budget))
-                    .collect(),
-            ),
-            TypeExpr::Record(fields) => TypeExpr::Record(
-                fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), self.expand_aliases(v, active, budget)))
-                    .collect(),
-            ),
-            TypeExpr::Table { key, val } => TypeExpr::Table {
-                key: Box::new(self.expand_aliases(key, active, budget)),
-                val: Box::new(self.expand_aliases(val, active, budget)),
-            },
-            TypeExpr::Function { params, ret } => TypeExpr::Function {
-                params: params
-                    .iter()
-                    .map(|e| self.expand_aliases(e, active, budget))
-                    .collect(),
-                ret: Box::new(self.expand_aliases(ret, active, budget)),
-            },
-            TypeExpr::Union(variants) => TypeExpr::Union(
-                variants
-                    .iter()
-                    .map(|e| self.expand_aliases(e, active, budget))
-                    .collect(),
-            ),
-            TypeExpr::Nil | TypeExpr::Never | TypeExpr::Any => ty.clone(),
-        }
-    }
-
-    /// Records `type name = ...` in the current scope.
-    fn declare_type_alias(&mut self, stmt: &Stmt, name: &str, ty: &str, name_span: AstSpan) {
-        self.enter_stmt(stmt);
-        let span = if name_span.start.line > 0 {
-            Span::single_line(
-                name_span.start.line,
-                name_span.start.column,
-                name_span.end.column,
-            )
-        } else {
-            self.find_ident_span(name)
-        };
-        if !matches!(
-            NeyukiType::from_ast_type(&TypeExpr::Named(name.to_string())),
-            NeyukiType::Custom(_)
-        ) {
-            let diag = Diagnostic::error(format!("cannot redefine the built-in type '{}'", name))
-                .with_code(ErrorCode::E0005)
-                .with_label(span, "this name is already a built-in type");
-            self.diagnostics.push(diag);
-            return;
-        }
-        let alias = TypeAlias {
-            ty: TypeExpr::parse(ty),
-            span,
-        };
-        if let Err(orig_span) = self.scope_mgr.define_type(name, alias) {
-            let diag = Diagnostic::error(format!("duplicate type '{}' in the same scope", name))
-                .with_code(ErrorCode::E0005)
-                .with_label(span, "redefined here")
-                .with_secondary_label(orig_span, "previous definition was here");
-            self.diagnostics.push(diag);
-        }
-    }
-
     #[inline(never)]
     fn hoist_function(
         &mut self,
@@ -328,25 +172,12 @@ impl<'a> SemanticAnalyzer<'a> {
         is_const: bool,
         params: &[Param],
         return_type: Option<&str>,
+        body: &[Stmt],
     ) {
         self.enter_stmt(stmt);
         let span = self.find_ident_span(fn_name);
-        let param_types: Vec<NeyukiType> = params
-            .iter()
-            .map(|p| {
-                p.type_name
-                    .as_deref()
-                    .map(|t| self.parse_ty(t))
-                    .unwrap_or(NeyukiType::Any)
-            })
-            .collect();
-        let is_vararg = params.iter().any(|p| p.variadic);
         let ret_ty = return_type.map(|t| self.parse_ty(t));
-        let fn_type = NeyukiType::Function {
-            params: param_types,
-            return_type: Box::new(ret_ty.unwrap_or(NeyukiType::Any)),
-            is_vararg,
-        };
+        let fn_type = self.build_function_type(params, body, ret_ty);
         let mut sym = Symbol::new(
             fn_name.to_string(),
             SymbolKind::Function,
@@ -356,18 +187,8 @@ impl<'a> SemanticAnalyzer<'a> {
         );
         sym.num_params = Some(params.iter().filter(|p| !p.variadic).count());
         sym.min_params = Some(required_params(params, |t| self.parse_ty(t)));
-        sym.is_vararg = is_vararg;
+        sym.is_vararg = params.iter().any(|p| p.variadic);
         let _ = self.scope_mgr.define(sym);
-    }
-
-    #[inline(never)]
-    fn warn_unreachable(&mut self, stmt: &Stmt) {
-        self.enter_stmt(stmt);
-        let span = self.find_stmt_span(stmt);
-        let diag = Diagnostic::warning("unreachable code")
-            .with_code(ErrorCode::W0004)
-            .with_label(span, "unreachable statement follows terminal control flow");
-        self.diagnostics.push(diag);
     }
 
     fn analyze_stmt(&mut self, stmt: &Stmt) {
@@ -427,23 +248,7 @@ impl<'a> SemanticAnalyzer<'a> {
                     let span = self.find_ident_span(fn_name);
                     self.check_shadowing(fn_name, span);
 
-                    let param_types: Vec<NeyukiType> = params
-                        .iter()
-                        .map(|p| {
-                            p.type_name
-                                .as_deref()
-                                .map(|t| self.parse_ty(t))
-                                .unwrap_or(NeyukiType::Any)
-                        })
-                        .collect();
-
-                    let is_vararg = params.iter().any(|p| p.variadic);
-                    let fn_type = NeyukiType::Function {
-                        params: param_types,
-                        return_type: Box::new(ret_ty.clone().unwrap_or(NeyukiType::Any)),
-                        is_vararg,
-                    };
-
+                    let fn_type = self.build_function_type(params, body, ret_ty.clone());
                     let mut sym = Symbol::new(
                         fn_name.clone(),
                         SymbolKind::Function,
@@ -453,7 +258,7 @@ impl<'a> SemanticAnalyzer<'a> {
                     );
                     sym.num_params = Some(params.iter().filter(|p| !p.variadic).count());
                     sym.min_params = Some(required_params(params, |t| self.parse_ty(t)));
-                    sym.is_vararg = is_vararg;
+                    sym.is_vararg = params.iter().any(|p| p.variadic);
                     let _ = self.scope_mgr.define(sym);
                 }
 
@@ -481,23 +286,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 self.current_return_type = prev_ret;
             }
             Stmt::If { data, .. } => {
-                self.analyze_expr(&data.condition);
-                self.scope_mgr.enter_scope(ScopeKind::Block);
-                self.analyze_block(&data.then_branch);
-                self.check_unused_symbols();
-
-                for (cond, branch) in &data.else_if_branches {
-                    self.analyze_expr(cond);
-                    self.scope_mgr.enter_scope(ScopeKind::Block);
-                    self.analyze_block(branch);
-                    self.check_unused_symbols();
-                }
-
-                if let Some(branch) = &data.else_branch {
-                    self.scope_mgr.enter_scope(ScopeKind::Block);
-                    self.analyze_block(branch);
-                    self.check_unused_symbols();
-                }
+                self.analyze_if_stmt(data);
             }
             Stmt::While {
                 condition, body, ..
@@ -606,12 +395,19 @@ impl<'a> SemanticAnalyzer<'a> {
                         // next assignment. Branches are not merged, so this
                         // only ever removes diagnostics.
                         let non_nil = decl_type.narrow_non_nil();
-                        sym.inferred_type =
-                            if val_type != NeyukiType::Any && val_type.is_assignable_to(&non_nil) {
-                                non_nil
-                            } else {
-                                decl_type.clone()
-                            };
+                        sym.inferred_type = if val_type != NeyukiType::Any
+                            && matches!(non_nil, NeyukiType::Union(_))
+                            && val_type.is_assignable_to(&non_nil)
+                        {
+                            val_type
+                        } else if val_type != NeyukiType::Any && val_type.is_assignable_to(&non_nil)
+                        {
+                            non_nil
+                        } else {
+                            decl_type.clone()
+                        };
+                    } else {
+                        sym.inferred_type = val_type;
                     }
                 } else if !self.is_known_global(name) {
                     self.undeclared.insert(name.to_string());
@@ -651,7 +447,7 @@ impl<'a> SemanticAnalyzer<'a> {
         }
     }
 
-    fn analyze_expr(&mut self, expr: &Expr) {
+    pub(super) fn analyze_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Variable { name, .. } => self.read_variable(name),
             Expr::Call { callee, args, .. } => {
@@ -659,25 +455,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 for a in args {
                     self.analyze_expr(a);
                 }
-                // Arity check if callee is a known local function
-                if let Expr::Variable { name: fn_name, .. } = callee.as_ref()
-                    && let Some(sym) = self.scope_mgr.lookup(fn_name)
-                    && let Some(expected) = sym.num_params
-                    && !sym.is_vararg
-                    && (args.len() > expected || args.len() < sym.min_params.unwrap_or(expected))
-                {
-                    let span = self.find_ident_span(fn_name);
-                    let diag = Diagnostic::warning(format!(
-                        "function '{}' takes {} argument(s) but {} were supplied",
-                        fn_name,
-                        expected,
-                        args.len()
-                    ))
-                    .with_code(ErrorCode::E0004)
-                    .with_label(span, format!("takes {} arguments", expected))
-                    .with_secondary_label(sym.span, "defined here");
-                    self.diagnostics.push(diag);
-                }
+                self.check_call_site(callee, args);
             }
             Expr::MethodCall { object, args, .. } => {
                 self.analyze_expr(object);
@@ -739,197 +517,6 @@ impl<'a> SemanticAnalyzer<'a> {
                 self.scope_mgr.mark_used("...");
             }
             Expr::Literal { .. } => {}
-        }
-    }
-
-    fn infer_expr_type(&self, expr: &Expr) -> NeyukiType {
-        match expr {
-            Expr::Literal { value: val, .. } => match val {
-                Literal::Nil => NeyukiType::Nil,
-                Literal::Bool(_) => NeyukiType::Boolean,
-                Literal::Int(_) => NeyukiType::Int,
-                Literal::Float(_) => NeyukiType::Float,
-                Literal::String(_) => NeyukiType::String,
-            },
-            Expr::Table { entries, .. } => {
-                if entries.is_empty() {
-                    NeyukiType::Table
-                } else if entries.iter().all(|e| e.is_array_element()) {
-                    let elem_ty = entries.iter().fold(NeyukiType::Never, |acc, e| {
-                        acc.lub(&self.infer_expr_type(&e.value))
-                    });
-                    NeyukiType::Array(Box::new(elem_ty))
-                } else {
-                    NeyukiType::Table
-                }
-            }
-            Expr::Function { params, .. } => NeyukiType::Function {
-                params: params
-                    .iter()
-                    .filter(|p| !p.variadic)
-                    .map(|p| {
-                        p.type_name
-                            .as_deref()
-                            .map(|t| self.parse_ty(t))
-                            .unwrap_or(NeyukiType::Any)
-                    })
-                    .collect(),
-                return_type: Box::new(NeyukiType::Any),
-                is_vararg: params.iter().any(|p| p.variadic),
-            },
-            Expr::Variable { name, .. } => {
-                if let Some(sym) = self.scope_mgr.lookup(name) {
-                    sym.inferred_type.clone()
-                } else {
-                    NeyukiType::Any
-                }
-            }
-            Expr::Unary {
-                op, expr: inner, ..
-            } => match op {
-                UnOp::Not => NeyukiType::Boolean,
-                UnOp::Len => NeyukiType::Int,
-                UnOp::BitNot => NeyukiType::Int,
-                UnOp::Neg => {
-                    let inner_ty = self.infer_expr_type(inner);
-                    if inner_ty == NeyukiType::Int {
-                        NeyukiType::Int
-                    } else if inner_ty == NeyukiType::Float {
-                        NeyukiType::Float
-                    } else {
-                        NeyukiType::Number
-                    }
-                }
-            },
-            Expr::Binary {
-                left, op, right, ..
-            } => match op {
-                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                    NeyukiType::Boolean
-                }
-                BinOp::Concat => NeyukiType::String,
-                BinOp::Coalesce => {
-                    let l_ty = self.infer_expr_type(left).narrow_non_nil();
-                    let r_ty = self.infer_expr_type(right);
-                    l_ty.lub(&r_ty)
-                }
-                BinOp::And | BinOp::Or => {
-                    let r_ty = self.infer_expr_type(right);
-                    let l_ty = self.infer_expr_type(left);
-                    l_ty.lub(&r_ty)
-                }
-                BinOp::BitAnd
-                | BinOp::BitOr
-                | BinOp::BitXor
-                | BinOp::Shl
-                | BinOp::Shr
-                | BinOp::IDiv
-                | BinOp::Mod => NeyukiType::Int,
-                BinOp::Div => NeyukiType::Float,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Pow => {
-                    let l_ty = self.infer_expr_type(left);
-                    let r_ty = self.infer_expr_type(right);
-                    // An operand of unknown type (a call, a table field)
-                    // could be an integer or a float, or have metamethods.
-                    if l_ty == NeyukiType::Any || r_ty == NeyukiType::Any {
-                        NeyukiType::Any
-                    } else if l_ty == NeyukiType::Int && r_ty == NeyukiType::Int {
-                        NeyukiType::Int
-                    } else if l_ty == NeyukiType::Float || r_ty == NeyukiType::Float {
-                        NeyukiType::Float
-                    } else {
-                        NeyukiType::Number
-                    }
-                }
-                _ => NeyukiType::Number,
-            },
-            _ => NeyukiType::Any,
-        }
-    }
-
-    fn check_shadowing(&mut self, name: &str, span: Span) {
-        if let Some(outer) = self.scope_mgr.find_outer(name) {
-            let diag = Diagnostic::warning(format!(
-                "declaration of '{}' shadows a variable in an outer scope",
-                name
-            ))
-            .with_code(ErrorCode::W0003)
-            .with_label(span, "shadows previous declaration")
-            .with_secondary_label(outer.span, "outer variable was declared here");
-            self.diagnostics.push(diag);
-        }
-    }
-
-    fn check_unused_symbols(&mut self) {
-        let symbols = self.scope_mgr.exit_scope();
-        for sym in symbols {
-            // `self` is part of the method calling convention, even in a
-            // method that doesn't read it.
-            let is_self = sym.kind == SymbolKind::Parameter && sym.name == "self";
-            if !sym.used && !sym.name.starts_with('_') && !is_self {
-                let (code, msg, label_msg) = if sym.kind == SymbolKind::Parameter {
-                    (
-                        ErrorCode::W0002,
-                        format!("unused parameter '{}'", sym.name),
-                        "parameter never used",
-                    )
-                } else {
-                    (
-                        ErrorCode::W0001,
-                        format!("unused variable '{}'", sym.name),
-                        "variable never used",
-                    )
-                };
-                let diag = Diagnostic::warning(msg)
-                    .with_code(code)
-                    .with_label(sym.span, label_msg)
-                    .with_help(format!(
-                        "if this is intentional, prefix with an underscore: '_{}'",
-                        sym.name
-                    ));
-                self.diagnostics.push(diag);
-            }
-        }
-    }
-
-    /// The first whole-word occurrence of `ident` on the current line.
-    fn find_ident_span(&self, ident: &str) -> Span {
-        let line = self.current_line;
-        let text = self
-            .source
-            .lines()
-            .nth(line.saturating_sub(1) as usize)
-            .unwrap_or("");
-        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-        let bytes = text.as_bytes();
-        let mut from = 0;
-        while let Some(found) = text[from..].find(ident) {
-            let col = from + found;
-            let after = col + ident.len();
-            if (col == 0 || !is_word(bytes[col - 1]))
-                && bytes.get(after).is_none_or(|b| !is_word(*b))
-            {
-                // Columns count characters, as the tokenizer's do; `col` and
-                // `after` are byte offsets.
-                let start = text[..col].chars().count() as u32 + 1;
-                return Span::single_line(line, start, start + ident.chars().count() as u32);
-            }
-            from = col + 1;
-        }
-        Span::line(line)
-    }
-
-    fn find_stmt_span(&self, stmt: &Stmt) -> Span {
-        match self.spans.and_then(|pool| pool.get(stmt.node_id())) {
-            Some(span) if span.start.line > 0 => self.diagnostic_span(span),
-            _ => Span::line(self.current_line),
-        }
-    }
-
-    fn find_expr_span(&self, expr: &Expr) -> Span {
-        match self.spans.and_then(|pool| pool.get(expr.node_id())) {
-            Some(span) if span.start.line > 0 => self.diagnostic_span(span),
-            _ => Span::line(self.current_line),
         }
     }
 
@@ -1018,6 +605,10 @@ impl<'a> SemanticAnalyzer<'a> {
         is_global: bool,
         initializers: &[Expr],
     ) {
+        let inferred_inits: Vec<NeyukiType> = initializers
+            .iter()
+            .map(|e| self.infer_expr_type(e))
+            .collect();
         for (i, name) in names.iter().enumerate() {
             let span = self.find_ident_span(name);
             if !is_global {
@@ -1025,8 +616,8 @@ impl<'a> SemanticAnalyzer<'a> {
             }
 
             let mut sym = Symbol::new(name.clone(), SymbolKind::Variable, is_const, None, span);
-            if let Some(init) = initializers.get(i) {
-                sym.inferred_type = self.infer_expr_type(init);
+            if let Some(init_ty) = resolve_local_many_slot(&inferred_inits, i) {
+                sym.inferred_type = init_ty;
             }
             if is_global {
                 if let Err(orig_span) = self.scope_mgr.define_global(sym) {
@@ -1168,18 +759,4 @@ impl<'a> SemanticAnalyzer<'a> {
             }
         }
     }
-}
-
-/// How many arguments a call must pass: the fixed parameters up to the last
-/// one that doesn't accept nil, since trailing optional ones may be left out.
-fn required_params(params: &[Param], parse: impl Fn(&str) -> NeyukiType) -> usize {
-    let fixed: Vec<&Param> = params.iter().filter(|p| !p.variadic).collect();
-    fixed
-        .iter()
-        .rposition(|p| match p.type_name.as_deref().map(&parse) {
-            Some(NeyukiType::Any) => true,
-            Some(ty) => !NeyukiType::Nil.is_assignable_to(&ty),
-            None => true,
-        })
-        .map_or(0, |i| i + 1)
 }

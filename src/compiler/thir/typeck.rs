@@ -189,8 +189,14 @@ pub(crate) fn infer_index_type(object: &ThirExpr) -> NeyukiType {
     }
 }
 
-pub(crate) fn infer_call_type(callee: &ThirExpr) -> NeyukiType {
+pub(crate) fn infer_call_type(callee: &ThirExpr, args: &[ThirExpr]) -> NeyukiType {
     match &callee.ty {
+        NeyukiType::Generic { .. } => {
+            let arg_tys: Vec<NeyukiType> = args.iter().map(|a| a.ty.clone()).collect();
+            crate::sema::generics::instantiate_call(&callee.ty, &arg_tys)
+                .map(|(ret, _)| ret)
+                .unwrap_or(NeyukiType::Any)
+        }
         NeyukiType::Function { return_type, .. } => (**return_type).clone(),
         _ => NeyukiType::Any,
     }
