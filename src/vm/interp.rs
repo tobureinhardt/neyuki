@@ -1352,7 +1352,7 @@ impl VM {
                     let res = match (ra, rb) {
                         (Value::Int(x), Value::Int(y)) => {
                             if *y < 0 {
-                                attempt!(ops::eval_shl(ra, rb))
+                                attempt!(ops::eval_shr(ra, rb))
                             } else if *y >= 64 {
                                 Value::Int(if *x < 0 { -1 } else { 0 })
                             } else {

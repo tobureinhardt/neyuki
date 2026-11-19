@@ -563,6 +563,12 @@ mod tests {
     }
 
     #[test]
+    fn test_vm_shr_negative_runtime() {
+        let res = run_code("local x = 4\nlocal s = -2\nreturn x >> s");
+        assert_eq!(res.to_string(), "16");
+    }
+
+    #[test]
     fn test_vm_mod_edge_cases() {
         let res = run_code("return (17 % 5) + (-17 % 5) + (7.5 % 2)");
         // Floored modulo: 2 + 3 + 1.5 = 6.5 (verified against Lua 5.4).
