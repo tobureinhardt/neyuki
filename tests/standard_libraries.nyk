@@ -80,12 +80,13 @@ assert(not try(function() os.exit("x") end), "exit takes a boolean or an integer
 
 -- os.date formats times and os.time reads date tables back
 assert(os.date("!%Y-%m-%dT%H:%M:%SZ", 0) == "1970-01-01T00:00:00Z", "UTC formatting")
+assert(os.date("!%c", 0) == "Thu Jan  1 00:00:00 1970", "%c uses the C locale layout")
 local fields = os.date("!*t", 86400 * 365)
 assert(fields.year == 1971 and fields.month == 1 and fields.day == 1 and fields.wday == 6 and fields.yday == 1, "date tables")
 local now = os.time()
 assert(os.time(os.date("*t", now)) == now, "time and date round-trip in local time")
 assert(os.time({ year = 2024, month = 13, day = 1 }) == os.time({ year = 2025, month = 1, day = 1 }), "fields carry over")
-assert(not try(os.date, "%Q"), "unknown format codes are errors")
+assert(not try(os.date, "%K"), "unknown format codes are errors")
 assert(not try(os.time, { year = 2024 }), "date tables need a month and day")
 
 -- os.run waits for a program and captures its output

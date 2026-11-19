@@ -6,8 +6,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::format::{Item, StrftimeItems};
-use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, TimeDelta, TimeZone, Timelike, Utc};
+use jiff::fmt::strtime::{BrokenDownTime, Config, PosixCustom};
+use jiff::tz::{AmbiguousOffset, TimeZone};
+use jiff::{SignedDuration, Timestamp, Zoned, civil};
 
 use crate::vm::machine::VM;
 use crate::vm::value::{Value, VmTable};
@@ -62,27 +63,33 @@ fn os_time(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         .checked_mul(12)
         .and_then(|m| m.checked_add(month - 1))
         .ok_or("date is out of range")?;
-    let first = i32::try_from(months.div_euclid(12))
+    let first = i16::try_from(months.div_euclid(12))
         .ok()
-        .and_then(|y| NaiveDate::from_ymd_opt(y, months.rem_euclid(12) as u32 + 1, 1))
+        .and_then(|y| civil::Date::new(y, months.rem_euclid(12) as i8 + 1, 1).ok())
         .ok_or("date is out of range")?;
-    let offset = TimeDelta::try_days(day - 1)
-        .zip(TimeDelta::try_hours(hour))
-        .zip(TimeDelta::try_minutes(min))
-        .zip(TimeDelta::try_seconds(sec))
-        .and_then(|(((d, h), m), s)| d.checked_add(&h)?.checked_add(&m)?.checked_add(&s));
+    let offset = (day - 1)
+        .checked_mul(86400)
+        .zip(hour.checked_mul(3600))
+        .zip(min.checked_mul(60))
+        .and_then(|((d, h), m)| d.checked_add(h)?.checked_add(m)?.checked_add(sec));
     let naive = offset
-        .and_then(|offset| first.and_time(NaiveTime::MIN).checked_add_signed(offset))
+        .and_then(|offset| {
+            first
+                .to_datetime(civil::Time::midnight())
+                .checked_add(SignedDuration::from_secs(offset))
+                .ok()
+        })
         .ok_or("date is out of range")?;
-    let local = Local
-        .from_local_datetime(&naive)
-        .earliest()
-        .ok_or("that local time does not exist")?;
-    Ok(vec![Value::Int(local.timestamp())])
+    let local = TimeZone::system().to_ambiguous_timestamp(naive);
+    if matches!(local.offset(), AmbiguousOffset::Gap { .. }) {
+        return Err("that local time does not exist".to_string());
+    }
+    let local = local.earlier().map_err(|_| "date is out of range")?;
+    Ok(vec![Value::Int(local.as_second())])
 }
 
 /// A time as the table `date("*t")` returns.
-fn date_table<Tz: TimeZone>(time: &DateTime<Tz>) -> Value {
+fn date_table(time: &Zoned) -> Value {
     let mut table = VmTable::new();
     table.set_str("year", Value::Int(time.year() as i64));
     table.set_str("month", Value::Int(time.month() as i64));
@@ -93,27 +100,19 @@ fn date_table<Tz: TimeZone>(time: &DateTime<Tz>) -> Value {
     // Lua counts weekdays from Sunday = 1.
     table.set_str(
         "wday",
-        Value::Int(time.weekday().num_days_from_sunday() as i64 + 1),
+        Value::Int(time.weekday().to_sunday_one_offset() as i64),
     );
-    table.set_str("yday", Value::Int(time.ordinal() as i64));
+    table.set_str("yday", Value::Int(time.day_of_year() as i64));
     Value::Table(Rc::new(RefCell::new(table)))
 }
 
-/// Formats a time with strftime codes, rejecting unknown ones instead of
-/// letting the formatter fail.
-fn format_time<Tz: TimeZone>(time: &DateTime<Tz>, format: &str) -> Result<String, String>
-where
-    Tz::Offset: std::fmt::Display,
-{
-    let items: Vec<Item> = StrftimeItems::new(format).collect();
-    if items.iter().any(|item| matches!(item, Item::Error)) {
-        return Err(format!("invalid date format `{}`", format));
-    }
-    let mut out = String::new();
-    use std::fmt::Write;
-    write!(out, "{}", time.format_with_items(items.into_iter()))
-        .map_err(|_| format!("invalid date format `{}`", format))?;
-    Ok(out)
+/// Formats a time with strftime codes, with `%c`, `%x` and `%X` laid out as
+/// in the C locale. Unknown codes are errors.
+fn format_time(time: &Zoned, format: &str) -> Result<String, String> {
+    let config = Config::new().custom(PosixCustom::new());
+    BrokenDownTime::from(time)
+        .to_string_with_config(&config, format)
+        .map_err(|_| format!("invalid date format `{}`", format))
 }
 
 /// `date(format?, time?)`: formats `time` (default now, in seconds since the
@@ -137,12 +136,13 @@ fn os_date(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 .map_err(|_| format!("time must be a number, got {}", value.type_name()))?,
         ),
     };
-    let utc_time = match seconds {
-        None => Utc::now(),
+    let timestamp = match seconds {
+        None => Timestamp::now(),
         Some(seconds) => {
             let whole = seconds.floor();
-            DateTime::from_timestamp(whole as i64, ((seconds - whole) * 1e9) as u32)
-                .filter(|_| seconds.is_finite())
+            Some(seconds)
+                .filter(|s| s.is_finite())
+                .and_then(|_| Timestamp::new(whole as i64, ((seconds - whole) * 1e9) as i32).ok())
                 .ok_or("time is out of range")?
         }
     };
@@ -150,11 +150,15 @@ fn os_date(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         Some(rest) => (true, rest),
         None => (false, format),
     };
-    let value = match (utc, format) {
-        (true, "*t") => date_table(&utc_time),
-        (false, "*t") => date_table(&utc_time.with_timezone(&Local)),
-        (true, _) => Value::string(format_time(&utc_time, format)?),
-        (false, _) => Value::string(format_time(&utc_time.with_timezone(&Local), format)?),
+    let zone = if utc {
+        TimeZone::UTC
+    } else {
+        TimeZone::system()
+    };
+    let time = timestamp.to_zoned(zone);
+    let value = match format {
+        "*t" => date_table(&time),
+        _ => Value::string(format_time(&time, format)?),
     };
     Ok(vec![value])
 }
