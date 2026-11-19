@@ -1,4 +1,4 @@
-//! Lowers the syntax tree to IR, resolving scopes and variables.
+//! Lowers HIR (and AST via HIR) to three-address IR, resolving scopes and variables.
 
 use num_bigint::BigInt;
 use std::collections::HashMap;
@@ -6,8 +6,12 @@ use std::str::FromStr;
 
 use crate::ast::node_id::NodeId;
 use crate::ast::op::{BinOp, UnOp};
-use crate::ast::pattern::AssignTarget;
-use crate::ast::{Expr, InterpPart, Literal, Param, Stmt};
+use crate::ast::{Literal, Param, Stmt};
+use crate::bytecode::proto::UpvalueDesc;
+use crate::compiler::OptLevel;
+use crate::compiler::hir::{
+    HirExpr, HirExprKind, HirLValue, HirModule, HirStmt, HirStmtKind, lower_ast,
+};
 use crate::compiler::ir::block::{IrFunction, IrModule, UpvalSource};
 use crate::compiler::ir::inst::{IrInst, SpreadSink, SpreadSource};
 use crate::compiler::ir::types::{IrBinaryOp, IrConstant, IrLabel, IrUnaryOp, IrVar};
@@ -21,11 +25,7 @@ struct IrLoopContext {
     continue_label: IrLabel,
 }
 
-use crate::bytecode::proto::UpvalueDesc;
-
 pub struct IrBuilder {
-    /// Source line of each statement, by node id.
-    lines: Option<std::rc::Rc<HashMap<NodeId, u32>>>,
     current_line: u32,
     /// Keep locals alive until their scope ends, for the debugger.
     keep_locals: bool,
@@ -53,7 +53,6 @@ impl Default for IrBuilder {
 impl IrBuilder {
     pub fn new() -> Self {
         Self {
-            lines: None,
             current_line: 0,
             keep_locals: false,
             scope_vars: vec![Vec::new()],
@@ -123,14 +122,9 @@ impl IrBuilder {
         self.emit(IrInst::DebugLocal { name, var });
     }
 
-    /// Emits a line marker for `stmt` when it starts on a new line.
-    fn mark_line(&mut self, id: NodeId) {
-        let Some(lines) = &self.lines else {
-            return;
-        };
-        if let Some(&line) = lines.get(&id)
-            && line != self.current_line
-        {
+    /// Emits a line marker when a statement starts on a non-zero new line.
+    fn mark_line(&mut self, line: u32) {
+        if line > 0 && line != self.current_line {
             self.current_line = line;
             self.emit(IrInst::Line(line));
         }
@@ -157,8 +151,6 @@ impl IrBuilder {
 
     fn resolve_upvalue(&mut self, name: &str) -> Option<u8> {
         let num_parents = self.parent_scopes.len();
-        // Innermost enclosing function first; `p` counts down through the
-        // ancestors, so the variable's distance is how far below the top it is.
         for p in (0..num_parents).rev() {
             for scope in self.parent_scopes[p].iter().rev() {
                 if let Some(&var) = scope.get(name) {
@@ -170,12 +162,6 @@ impl IrBuilder {
         None
     }
 
-    /// Records that this function captures `var`, which lives `levels_up`
-    /// functions above the immediately enclosing one (0 means in it), and
-    /// returns its upvalue slot. A variable further out has to be captured by
-    /// the enclosing function too, which is settled once this one is attached
-    /// to it. Each descriptor's `index` is filled in then, or at lowering for
-    /// a parent's register.
     fn capture(&mut self, var: IrVar, levels_up: usize, name: &str) -> u8 {
         let wanted = if levels_up == 0 {
             UpvalSource::ParentLocal(var)
@@ -196,22 +182,20 @@ impl IrBuilder {
     }
 
     /// True when `expr` can yield more than one value at runtime.
-    fn is_multi_value(expr: &Expr) -> bool {
+    fn is_multi_value(expr: &HirExpr) -> bool {
         matches!(
-            expr,
-            Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Vararg { .. }
+            expr.kind,
+            HirExprKind::Call { .. } | HirExprKind::MethodCall { .. } | HirExprKind::Vararg
         )
     }
 
-    fn last_spreads(args: &[Expr]) -> bool {
+    fn last_spreads(args: &[HirExpr]) -> bool {
         args.last().is_some_and(Self::is_multi_value)
     }
 
-    /// Compiles `expr` as the producer of a run of values. Only called for an
-    /// expression `is_multi_value` accepted.
-    fn spread_source(&mut self, expr: &Expr) -> SpreadSource {
-        match expr {
-            Expr::Call { callee, args, .. } => {
+    fn spread_source(&mut self, expr: &HirExpr) -> SpreadSource {
+        match &expr.kind {
+            HirExprKind::Call { callee, args } => {
                 let callee_var = self.compile_expr(callee, None);
                 let spreads = Self::last_spreads(args);
                 let fixed = if spreads {
@@ -230,11 +214,10 @@ impl IrBuilder {
                     trailing,
                 }
             }
-            Expr::MethodCall {
+            HirExprKind::MethodCall {
                 object,
                 method,
                 args,
-                ..
             } => {
                 let tbl = self.compile_expr(object, None);
                 let key = self.alloc_var();
@@ -269,17 +252,13 @@ impl IrBuilder {
         }
     }
 
-    /// Compiles `expr` as a call asked for `count` results, one variable each.
-    /// Returns `None` when `expr` is not a call, so the caller falls back to
-    /// evaluating it as a single value.
-    fn compile_call_results(&mut self, expr: &Expr, count: usize) -> Option<Vec<IrVar>> {
-        let (callee, receiver, args) = match expr {
-            Expr::Call { callee, args, .. } => (self.compile_expr(callee, None), None, args),
-            Expr::MethodCall {
+    fn compile_call_results(&mut self, expr: &HirExpr, count: usize) -> Option<Vec<IrVar>> {
+        let (callee, receiver, args) = match &expr.kind {
+            HirExprKind::Call { callee, args } => (self.compile_expr(callee, None), None, args),
+            HirExprKind::MethodCall {
                 object,
                 method,
                 args,
-                ..
             } => {
                 let tbl = self.compile_expr(object, None);
                 let key = self.alloc_var();
@@ -331,7 +310,6 @@ impl IrBuilder {
         Some(dsts)
     }
 
-    /// The parent variables a freshly compiled nested prototype captures.
     fn captures_of(&self, proto_idx: u16) -> Vec<Option<IrVar>> {
         self.child_protos
             .get(proto_idx as usize)
@@ -352,11 +330,6 @@ impl IrBuilder {
         self.instructions.push(inst);
     }
 
-    /// A close of every variable created since `first_var` that a closure
-    /// emitted since instruction `from` captures, if there are any. Run where
-    /// each loop iteration starts, it gives every iteration fresh copies of
-    /// the loop's locals, so closures made in different iterations don't
-    /// share them.
     fn loop_close(&self, from: usize, first_var: u32) -> Option<IrInst> {
         let mut vars: Vec<IrVar> = self.instructions[from..]
             .iter()
@@ -377,97 +350,49 @@ impl IrBuilder {
         Some(IrInst::CloseUpvals { vars })
     }
 
-    /// Inserts `loop_close(at, first_var)` at instruction `at`.
     fn insert_loop_close(&mut self, at: usize, first_var: u32) {
         if let Some(close) = self.loop_close(at, first_var) {
             self.instructions.insert(at, close);
         }
     }
 
-    pub fn compile_expr(&mut self, expr: &Expr, target: Option<IrVar>) -> IrVar {
+    pub fn compile_expr(&mut self, expr: &HirExpr, target: Option<IrVar>) -> IrVar {
         let dst = target.unwrap_or_else(|| self.alloc_var());
 
-        match expr {
-            Expr::Literal { value: lit, .. } => match lit {
-                crate::ast::Literal::Nil => {
+        match &expr.kind {
+            HirExprKind::Literal(lit) => match lit {
+                Literal::Nil => {
                     self.emit(IrInst::LoadNil { dst });
                 }
-                crate::ast::Literal::Bool(b) => {
+                Literal::Bool(b) => {
                     self.emit(IrInst::LoadConst {
                         dst,
                         val: IrConstant::Bool(*b),
                     });
                 }
-                crate::ast::Literal::Int(bi) => {
+                Literal::Int(bi) => {
                     self.emit(IrInst::LoadConst {
                         dst,
                         val: IrConstant::Int(bi.clone()),
                     });
                 }
-                crate::ast::Literal::Float(f) => {
+                Literal::Float(f) => {
                     self.emit(IrInst::LoadConst {
                         dst,
                         val: IrConstant::Float(*f),
                     });
                 }
-                crate::ast::Literal::String(s) => {
+                Literal::String(s) => {
                     self.emit(IrInst::LoadConst {
                         dst,
                         val: IrConstant::String(s.clone()),
                     });
                 }
             },
-            Expr::Interp { parts, .. } => {
-                if parts.is_empty() {
-                    self.emit(IrInst::LoadConst {
-                        dst,
-                        val: IrConstant::String(String::new()),
-                    });
-                } else {
-                    let mut prev_var: Option<IrVar> = None;
-                    // Concatenating onto "" makes `{n}` alone a string too.
-                    if matches!(parts.first(), Some(InterpPart::Expr(_))) {
-                        let empty = self.alloc_var();
-                        self.emit(IrInst::LoadConst {
-                            dst: empty,
-                            val: IrConstant::String(String::new()),
-                        });
-                        prev_var = Some(empty);
-                    }
-                    for part in parts {
-                        let part_var = match part {
-                            InterpPart::Literal(lit) => {
-                                let v = self.alloc_var();
-                                self.emit(IrInst::LoadConst {
-                                    dst: v,
-                                    val: IrConstant::String(lit.clone()),
-                                });
-                                v
-                            }
-                            InterpPart::Expr(e) => self.compile_expr(e, None),
-                        };
-                        if let Some(prev) = prev_var {
-                            let next = self.alloc_var();
-                            self.emit(IrInst::BinOp {
-                                dst: next,
-                                op: IrBinaryOp::Concat,
-                                lhs: prev,
-                                rhs: part_var,
-                            });
-                            prev_var = Some(next);
-                        } else {
-                            prev_var = Some(part_var);
-                        }
-                    }
-                    if let Some(res) = prev_var {
-                        self.emit(IrInst::Move { dst, src: res });
-                    }
-                }
-            }
-            Expr::Vararg { .. } => {
+            HirExprKind::Vararg => {
                 self.emit(IrInst::Vararg { dst, count: 1 });
             }
-            Expr::Variable { name, .. } => {
+            HirExprKind::Variable(name) => {
                 let (_, upval, local_var) = self.resolve_variable(name);
                 if let Some(src) = local_var {
                     self.emit(IrInst::Move { dst, src });
@@ -483,9 +408,11 @@ impl IrBuilder {
                     });
                 }
             }
-            Expr::Binary {
-                left, op, right, ..
-            } if *op == BinOp::And => {
+            HirExprKind::Binary {
+                left,
+                op: BinOp::And,
+                right,
+            } => {
                 let l_var = self.compile_expr(left, Some(dst));
                 if l_var != dst {
                     self.emit(IrInst::Move { dst, src: l_var });
@@ -501,9 +428,11 @@ impl IrBuilder {
                 }
                 self.emit(IrInst::Label(end_label));
             }
-            Expr::Binary {
-                left, op, right, ..
-            } if *op == BinOp::Or => {
+            HirExprKind::Binary {
+                left,
+                op: BinOp::Or,
+                right,
+            } => {
                 let l_var = self.compile_expr(left, Some(dst));
                 if l_var != dst {
                     self.emit(IrInst::Move { dst, src: l_var });
@@ -522,12 +451,11 @@ impl IrBuilder {
                 }
                 self.emit(IrInst::Label(end_label));
             }
-            Expr::Binary {
-                left, op, right, ..
-            } if *op == BinOp::Coalesce => {
-                // Short-circuits like `or`, but tests for nil rather than
-                // falsiness: the right side runs only when the left is nil.
-                // The Eq feeding the branch fuses into one compare-and-jump.
+            HirExprKind::Binary {
+                left,
+                op: BinOp::Coalesce,
+                right,
+            } => {
                 let l_var = self.compile_expr(left, Some(dst));
                 if l_var != dst {
                     self.emit(IrInst::Move { dst, src: l_var });
@@ -552,9 +480,7 @@ impl IrBuilder {
                 }
                 self.emit(IrInst::Label(end_label));
             }
-            Expr::Binary {
-                left, op, right, ..
-            } => {
+            HirExprKind::Binary { left, op, right } => {
                 let lhs = self.compile_expr(left, None);
                 let rhs = self.compile_expr(right, None);
                 let ir_op = match op {
@@ -588,7 +514,7 @@ impl IrBuilder {
                     rhs,
                 });
             }
-            Expr::Unary { op, expr, .. } => {
+            HirExprKind::Unary { op, expr } => {
                 let src = self.compile_expr(expr, None);
                 let ir_op = match op {
                     UnOp::Neg => IrUnaryOp::Neg,
@@ -602,7 +528,7 @@ impl IrBuilder {
                     src,
                 });
             }
-            Expr::Call { callee, args, .. } => {
+            HirExprKind::Call { callee, args } => {
                 let callee_var = self.compile_expr(callee, None);
                 if Self::last_spreads(args) {
                     let fixed = args[..args.len() - 1]
@@ -632,11 +558,10 @@ impl IrBuilder {
                     retc: 1,
                 });
             }
-            Expr::MethodCall {
+            HirExprKind::MethodCall {
                 object,
                 method,
                 args,
-                ..
             } => {
                 let tbl = self.compile_expr(object, None);
                 let key = self.alloc_var();
@@ -679,7 +604,7 @@ impl IrBuilder {
                     retc: 1,
                 });
             }
-            Expr::Table { entries, .. } => {
+            HirExprKind::Table(entries) => {
                 let mut array_cap: usize = 0;
                 let mut fields_cap: usize = 0;
                 for entry in entries {
@@ -696,8 +621,6 @@ impl IrBuilder {
                     array_cap,
                     fields_cap,
                 });
-                // A trailing call or `...` contributes every value it yields,
-                // so it is appended as a run rather than as one element.
                 let trailing = entries
                     .last()
                     .filter(|e| e.is_array_element())
@@ -732,8 +655,6 @@ impl IrBuilder {
                             val: val_var,
                         });
                     } else if has_computed {
-                        // A computed key may already have claimed this
-                        // index, so positional entries say theirs.
                         position += 1;
                         let key_var = self.alloc_var();
                         self.emit(IrInst::LoadConst {
@@ -762,7 +683,7 @@ impl IrBuilder {
                     });
                 }
             }
-            Expr::Index { object, index, .. } => {
+            HirExprKind::Index { object, index } => {
                 let tbl = self.compile_expr(object, None);
                 let key = self.compile_expr(index, None);
                 self.emit(IrInst::GetTable {
@@ -771,10 +692,8 @@ impl IrBuilder {
                     key,
                 });
             }
-            Expr::Member { object, field, .. } => {
-                // `module.field` on a global resolves through the import
-                // cache; anything else keeps the dynamic table read.
-                if let Expr::Variable { name, .. } = object.as_ref() {
+            HirExprKind::Member { object, field } => {
+                if let HirExprKind::Variable(name) = &object.kind {
                     let (is_local, upval, _) = self.resolve_variable(name);
                     if !is_local && upval.is_none() {
                         self.emit(IrInst::GetImport {
@@ -797,7 +716,7 @@ impl IrBuilder {
                     key,
                 });
             }
-            Expr::Function { params, body, .. } => {
+            HirExprKind::Function { params, body } => {
                 let proto_idx = self.compile_sub_function(None, params, body);
                 let captures = self.captures_of(proto_idx);
                 self.emit(IrInst::Closure {
@@ -814,13 +733,12 @@ impl IrBuilder {
         &mut self,
         name: Option<String>,
         params: &[Param],
-        body: &[Stmt],
+        body: &[HirStmt],
     ) -> u16 {
         let is_vararg = params.iter().any(|p| p.variadic);
         let num_params = params.iter().filter(|p| !p.variadic).count() as u8;
 
         let mut sub_builder = IrBuilder::new();
-        sub_builder.lines = self.lines.clone();
         sub_builder.keep_locals = self.keep_locals;
         if self.current_line > 0 {
             sub_builder.current_line = self.current_line;
@@ -840,13 +758,8 @@ impl IrBuilder {
         }
         sub_builder.exit_scope();
 
-        // A variable the nested function reaches past this one for has to be
-        // captured here as well, so it can read it from this function's
-        // upvalues rather than from a register that does not hold it.
         for slot in 0..sub_builder.upvalue_vars.len() {
             if let UpvalSource::Pending { var, levels_up } = sub_builder.upvalue_vars[slot] {
-                // One level closer from here: the child's grandparent is this
-                // function's parent.
                 let name = sub_builder.upvalue_names[slot].clone();
                 sub_builder.upvalues[slot].index = self.capture(var, levels_up - 1, &name);
                 sub_builder.upvalue_vars[slot] = UpvalSource::ParentUpvalue;
@@ -876,10 +789,10 @@ impl IrBuilder {
         proto_idx
     }
 
-    pub fn compile_stmt(&mut self, stmt: &Stmt) {
-        self.mark_line(stmt.node_id());
-        match stmt {
-            Stmt::Local {
+    pub fn compile_stmt(&mut self, stmt: &HirStmt) {
+        self.mark_line(stmt.line);
+        match &stmt.kind {
+            HirStmtKind::Local {
                 name,
                 is_global,
                 initializer,
@@ -900,14 +813,12 @@ impl IrBuilder {
                     self.add_local(name.clone(), var);
                 }
             }
-            Stmt::LocalMany {
+            HirStmtKind::LocalMany {
                 names,
                 is_global,
                 initializers,
                 ..
             } => {
-                // `local a, b = f()` takes one value per name from the call
-                // rather than giving only the first name a value.
                 if initializers.len() == 1
                     && names.len() > 1
                     && let Some(vars) = self.compile_call_results(&initializers[0], names.len())
@@ -941,13 +852,11 @@ impl IrBuilder {
                     }
                 }
             }
-            Stmt::Assign { target, value, .. } => {
+            HirStmtKind::Assign { target, value, .. } => {
                 let val_var = self.compile_expr(value, None);
                 self.compile_assign(target, val_var);
             }
-            Stmt::AssignMany {
-                targets, values, ..
-            } => {
+            HirStmtKind::AssignMany { targets, values } => {
                 if values.len() == 1
                     && targets.len() > 1
                     && let Some(vars) = self.compile_call_results(&values[0], targets.len())
@@ -970,37 +879,98 @@ impl IrBuilder {
                     self.compile_assign(target, *val_var);
                 }
             }
-            Stmt::Increment { target, amount, .. } => {
-                let target_expr = target.to_expr();
-                let current = self.compile_expr(&target_expr, None);
+            HirStmtKind::Increment { target, amount } => {
                 let amount_var = self.alloc_var();
                 self.emit(IrInst::LoadConst {
                     dst: amount_var,
                     val: IrConstant::Int(BigInt::from(*amount)),
                 });
-                let result = self.alloc_var();
-                self.emit(IrInst::BinOp {
-                    dst: result,
-                    op: IrBinaryOp::Add,
-                    lhs: current,
-                    rhs: amount_var,
-                });
-                self.compile_assign(target, result);
+                match target {
+                    HirLValue::Variable(name) => {
+                        let (_, upval, local_var) = self.resolve_variable(name);
+                        let cur = self.alloc_var();
+                        if let Some(src) = local_var {
+                            self.emit(IrInst::Move { dst: cur, src });
+                        } else if let Some(idx) = upval {
+                            self.emit(IrInst::GetUpval {
+                                dst: cur,
+                                index: idx,
+                            });
+                        } else {
+                            self.emit(IrInst::GetGlobal {
+                                dst: cur,
+                                name: name.clone(),
+                            });
+                        }
+                        let res = self.alloc_var();
+                        self.emit(IrInst::BinOp {
+                            dst: res,
+                            op: IrBinaryOp::Add,
+                            lhs: cur,
+                            rhs: amount_var,
+                        });
+                        self.compile_assign(target, res);
+                    }
+                    HirLValue::Member { object, field } => {
+                        let tbl = self.compile_expr(object, None);
+                        let key = self.alloc_var();
+                        self.emit(IrInst::LoadConst {
+                            dst: key,
+                            val: IrConstant::String(field.clone()),
+                        });
+                        let cur = self.alloc_var();
+                        self.emit(IrInst::GetTable {
+                            dst: cur,
+                            table: tbl,
+                            key,
+                        });
+                        let res = self.alloc_var();
+                        self.emit(IrInst::BinOp {
+                            dst: res,
+                            op: IrBinaryOp::Add,
+                            lhs: cur,
+                            rhs: amount_var,
+                        });
+                        self.emit(IrInst::SetTable {
+                            table: tbl,
+                            key,
+                            val: res,
+                        });
+                    }
+                    HirLValue::Index { object, index } => {
+                        let tbl = self.compile_expr(object, None);
+                        let key = self.compile_expr(index, None);
+                        let cur = self.alloc_var();
+                        self.emit(IrInst::GetTable {
+                            dst: cur,
+                            table: tbl,
+                            key,
+                        });
+                        let res = self.alloc_var();
+                        self.emit(IrInst::BinOp {
+                            dst: res,
+                            op: IrBinaryOp::Add,
+                            lhs: cur,
+                            rhs: amount_var,
+                        });
+                        self.emit(IrInst::SetTable {
+                            table: tbl,
+                            key,
+                            val: res,
+                        });
+                    }
+                }
             }
-            Stmt::Function {
+            HirStmtKind::Function {
                 name, params, body, ..
             } => {
                 let local_var = if let Some(func_name) = name {
-                    if !func_name.contains('.') {
-                        if let Some(lv) = self.resolve_local(func_name) {
-                            Some(lv)
-                        } else {
-                            let lv = self.alloc_var();
-                            self.add_local(func_name.clone(), lv);
-                            Some(lv)
-                        }
+                    if let Some(lv) = self.resolve_local(func_name) {
+                        Some(lv)
                     } else {
-                        None
+                        let lv = self.alloc_var();
+                        self.add_local(func_name.clone(), lv);
+                        Some(lv)
                     }
                 } else {
                     None
@@ -1019,72 +989,25 @@ impl IrBuilder {
                         src: closure_var,
                     });
                 } else if let Some(func_name) = name {
-                    if let Some((path, field)) = func_name.rsplit_once('.') {
-                        // `function a.b.c()` stores the closure in field `c`
-                        // of the table `a.b` evaluates to.
-                        let mut table = self.compile_expr(
-                            &Expr::Variable {
-                                id: NodeId::next(),
-                                name: path
-                                    .split('.')
-                                    .next()
-                                    .expect("split yields at least one piece")
-                                    .to_string(),
-                            },
-                            None,
-                        );
-                        for segment in path.split('.').skip(1) {
-                            let key = self.alloc_var();
-                            self.emit(IrInst::LoadConst {
-                                dst: key,
-                                val: IrConstant::String(segment.to_string()),
-                            });
-                            let next = self.alloc_var();
-                            self.emit(IrInst::GetTable {
-                                dst: next,
-                                table,
-                                key,
-                            });
-                            table = next;
-                        }
-                        let key = self.alloc_var();
-                        self.emit(IrInst::LoadConst {
-                            dst: key,
-                            val: IrConstant::String(field.to_string()),
-                        });
-                        self.emit(IrInst::SetTable {
-                            table,
-                            key,
-                            val: closure_var,
-                        });
-                    } else {
-                        self.emit(IrInst::SetGlobal {
-                            name: func_name.clone(),
-                            src: closure_var,
-                        });
-                    }
+                    self.emit(IrInst::SetGlobal {
+                        name: func_name.clone(),
+                        src: closure_var,
+                    });
                 }
             }
-            Stmt::If { data, .. } => {
-                if data.else_if_branches.is_empty()
-                    && data.else_branch.is_none()
-                    && matches!(
-                        data.condition,
-                        Expr::Literal {
-                            value: Literal::Bool(true),
-                            ..
-                        }
-                    )
-                {
-                    self.enter_scope();
-                    for s in &data.then_branch {
-                        self.compile_stmt(s);
-                    }
-                    self.exit_scope();
-                    return;
+            HirStmtKind::Block(body) => {
+                self.enter_scope();
+                for s in body {
+                    self.compile_stmt(s);
                 }
-
-                let cond_var = self.compile_expr(&data.condition, None);
+                self.exit_scope();
+            }
+            HirStmtKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let cond_var = self.compile_expr(condition, None);
                 let else_label = self.alloc_label();
                 let end_label = self.alloc_label();
 
@@ -1094,30 +1017,14 @@ impl IrBuilder {
                 });
 
                 self.enter_scope();
-                for s in &data.then_branch {
+                for s in then_branch {
                     self.compile_stmt(s);
                 }
                 self.exit_scope();
                 self.emit(IrInst::Jump(end_label));
 
                 self.emit(IrInst::Label(else_label));
-                for (elif_cond, elif_body) in &data.else_if_branches {
-                    let next_elif_label = self.alloc_label();
-                    let elif_var = self.compile_expr(elif_cond, None);
-                    self.emit(IrInst::JumpIfFalse {
-                        cond: elif_var,
-                        target: next_elif_label,
-                    });
-                    self.enter_scope();
-                    for s in elif_body {
-                        self.compile_stmt(s);
-                    }
-                    self.exit_scope();
-                    self.emit(IrInst::Jump(end_label));
-                    self.emit(IrInst::Label(next_elif_label));
-                }
-
-                if let Some(else_stmts) = &data.else_branch {
+                if let Some(else_stmts) = else_branch {
                     self.enter_scope();
                     for s in else_stmts {
                         self.compile_stmt(s);
@@ -1127,9 +1034,7 @@ impl IrBuilder {
 
                 self.emit(IrInst::Label(end_label));
             }
-            Stmt::While {
-                condition, body, ..
-            } => {
+            HirStmtKind::While { condition, body } => {
                 let start_label = self.alloc_label();
                 let exit_label = self.alloc_label();
 
@@ -1159,9 +1064,7 @@ impl IrBuilder {
 
                 self.loops.pop();
             }
-            Stmt::Repeat {
-                body, condition, ..
-            } => {
+            HirStmtKind::Repeat { body, condition } => {
                 let start_label = self.alloc_label();
                 let exit_label = self.alloc_label();
                 let cond_label = self.alloc_label();
@@ -1180,7 +1083,6 @@ impl IrBuilder {
                     self.compile_stmt(s);
                 }
 
-                // The condition can see the body's locals, as in Lua.
                 self.emit(IrInst::Label(cond_label));
                 let cond_var = self.compile_expr(condition, None);
                 self.emit(IrInst::JumpIfFalse {
@@ -1193,25 +1095,24 @@ impl IrBuilder {
 
                 self.loops.pop();
             }
-            Stmt::NumericFor { data, .. } => {
+            HirStmtKind::NumericFor {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => {
                 self.enter_scope();
                 let first_var = self.next_var;
                 let base = self.alloc_var();
-                self.compile_expr(&data.start, Some(base));
+                self.compile_expr(start, Some(base));
                 let limit = self.alloc_var();
-                self.compile_expr(&data.end, Some(limit));
+                self.compile_expr(end, Some(limit));
                 let step_var = self.alloc_var();
-                if let Some(s) = &data.step {
-                    self.compile_expr(s, Some(step_var));
-                } else {
-                    self.emit(IrInst::LoadConst {
-                        dst: step_var,
-                        val: IrConstant::Int(BigInt::from(1)),
-                    });
-                };
+                self.compile_expr(step, Some(step_var));
 
                 let loop_var = self.alloc_var();
-                self.add_local(data.var.clone(), loop_var);
+                self.add_local(var.clone(), loop_var);
 
                 let body_label = self.alloc_label();
                 let test_label = self.alloc_label();
@@ -1233,14 +1134,12 @@ impl IrBuilder {
                 self.emit(IrInst::Label(body_label));
                 let body_start = self.instructions.len();
                 self.enter_scope();
-                for s in &data.body {
+                for s in body {
                     self.compile_stmt(s);
                 }
                 self.exit_scope();
 
                 self.emit(IrInst::Label(test_label));
-                // ForLoop writes the next value into the loop variable, so
-                // whatever captured this iteration's has to let go first.
                 if let Some(close) = self.loop_close(body_start, first_var) {
                     self.emit(close);
                 }
@@ -1253,17 +1152,15 @@ impl IrBuilder {
                 self.loops.pop();
                 self.exit_scope();
             }
-            Stmt::For {
-                vars, source, body, ..
-            } => {
+            HirStmtKind::For { vars, source, body } => {
                 self.enter_scope();
                 let first_var = self.next_var;
                 let base = self.alloc_var();
                 let state_var = self.alloc_var();
                 let ctrl_var = self.alloc_var();
 
-                match source {
-                    Expr::Call { callee, args, .. } => {
+                match &source.kind {
+                    HirExprKind::Call { callee, args } => {
                         let callee_var = self.compile_expr(callee, Some(base));
                         let mut arg_vars = Vec::new();
                         for arg in args {
@@ -1323,7 +1220,6 @@ impl IrBuilder {
                 }
                 self.exit_scope();
 
-                // TForCall writes the loop variables, so close them before it.
                 self.insert_loop_close(iteration_start, first_var);
                 self.emit(IrInst::Jump(call_label));
                 self.emit(IrInst::Label(exit_label));
@@ -1331,18 +1227,17 @@ impl IrBuilder {
                 self.loops.pop();
                 self.exit_scope();
             }
-            Stmt::Break { .. } => {
+            HirStmtKind::Break => {
                 if let Some(lp) = self.loops.last() {
                     self.emit(IrInst::Jump(lp.break_label));
                 }
             }
-            Stmt::Continue { .. } => {
+            HirStmtKind::Continue => {
                 if let Some(lp) = self.loops.last() {
                     self.emit(IrInst::Jump(lp.continue_label));
                 }
             }
-            Stmt::Return { values: exprs, .. } => {
-                // `return f()` hands back every value f produced.
+            HirStmtKind::Return(exprs) => {
                 if exprs.len() == 1 && Self::is_multi_value(&exprs[0]) {
                     let source = self.spread_source(&exprs[0]);
                     self.emit(IrInst::Spread {
@@ -1357,25 +1252,23 @@ impl IrBuilder {
                 }
                 self.emit(IrInst::Return(ret_vars));
             }
-            Stmt::Expr { expr, .. } => {
+            HirStmtKind::Expr(expr) => {
                 self.compile_expr(expr, None);
             }
-            Stmt::Goto { label: lbl, .. } => {
+            HirStmtKind::Goto(lbl) => {
                 let target = self.get_or_alloc_label(lbl);
                 self.emit(IrInst::Jump(target));
             }
-            Stmt::Label { name: lbl, .. } => {
+            HirStmtKind::Label(lbl) => {
                 let target = self.get_or_alloc_label(lbl);
                 self.emit(IrInst::Label(target));
             }
-            // Type declarations are erased: they produce no code.
-            Stmt::TypeAlias { .. } => {}
         }
     }
 
-    fn compile_assign(&mut self, target: &AssignTarget, val_var: IrVar) {
+    fn compile_assign(&mut self, target: &HirLValue, val_var: IrVar) {
         match target {
-            AssignTarget::Variable(name) => {
+            HirLValue::Variable(name) => {
                 let (_, upval, local_var) = self.resolve_variable(name);
                 if let Some(dst) = local_var {
                     self.emit(IrInst::Move { dst, src: val_var });
@@ -1391,7 +1284,7 @@ impl IrBuilder {
                     });
                 }
             }
-            AssignTarget::Member { object, field } => {
+            HirLValue::Member { object, field } => {
                 let tbl = self.compile_expr(object, None);
                 let key = self.alloc_var();
                 self.emit(IrInst::LoadConst {
@@ -1404,7 +1297,7 @@ impl IrBuilder {
                     val: val_var,
                 });
             }
-            AssignTarget::Index { object, index } => {
+            HirLValue::Index { object, index } => {
                 let tbl = self.compile_expr(object, None);
                 let key = self.compile_expr(index, None);
                 self.emit(IrInst::SetTable {
@@ -1421,22 +1314,26 @@ pub fn ast_to_ir(stmts: &[Stmt]) -> IrModule {
     ast_to_ir_with(stmts, None, false)
 }
 
-/// Builds the IR with line markers from `lines` (statement id to line) and,
-/// with `keep_locals`, locals kept alive to the end of their scope.
+/// Builds the IR via HIR with line markers from `lines` (statement id to line)
+/// and, with `keep_locals`, locals kept alive to the end of their scope.
 pub fn ast_to_ir_with(
     stmts: &[Stmt],
     lines: Option<std::rc::Rc<HashMap<NodeId, u32>>>,
     keep_locals: bool,
 ) -> IrModule {
+    let hir = lower_ast(stmts, lines.as_deref(), OptLevel::O0);
+    hir_to_ir_with(&hir, keep_locals)
+}
+
+/// Lowers an [`HirModule`] into a three-address [`IrModule`].
+pub fn hir_to_ir_with(hir: &HirModule, keep_locals: bool) -> IrModule {
     let mut builder = IrBuilder::new();
-    builder.lines = lines;
     builder.keep_locals = keep_locals;
-    for stmt in stmts {
+    for stmt in &hir.items {
         builder.compile_stmt(stmt);
     }
     let has_terminal = matches!(builder.instructions.last(), Some(IrInst::Return(_)));
     if !has_terminal {
-        // The chunk's own locals end with it.
         let vars = std::mem::take(&mut builder.scope_vars[0]);
         if !vars.is_empty() {
             builder.emit(IrInst::DebugScopeEnd {

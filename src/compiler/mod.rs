@@ -4,6 +4,7 @@
 pub mod builtins_folding;
 pub mod constant_fold;
 pub mod cost_model;
+pub mod hir;
 pub mod ir;
 pub mod value_tracking;
 
@@ -210,7 +211,8 @@ fn lower(
     } else {
         statements.to_vec()
     };
-    let mut ir_module = ir::ast_to_ir_with(&stmts, lines, options.keep_locals);
+    let hir_module = hir::lower_ast(&stmts, lines.as_deref(), options.opt_level);
+    let mut ir_module = ir::hir_to_ir_with(&hir_module, options.keep_locals);
     if options.inline && options.opt_level == OptLevel::O1 {
         ir::inline_functions(&mut ir_module);
     }
@@ -218,6 +220,29 @@ fn lower(
     ir::verify_module(&ir_module)
         .map_err(|errs| format!("IR verification error: {}", errs.join(", ")))?;
     ir::ir_to_bytecode(&ir_module)
+}
+
+/// Dumps the HIR representation of `statements` under explicit `options`.
+pub fn dump_hir_with_options(statements: &[Stmt], options: Options) -> String {
+    let stmts = if options.opt_level == OptLevel::O1 {
+        fold_program(statements.to_vec())
+    } else {
+        statements.to_vec()
+    };
+    let hir_module = hir::lower_ast(&stmts, None, options.opt_level);
+    hir::dump_hir(&hir_module)
+}
+
+/// Parses `source` and dumps its HIR with resolved source line numbers.
+pub fn dump_hir_source_with_options(source: &str, options: Options) -> Result<String, String> {
+    let parsed = parse(source)?;
+    let stmts = if options.opt_level == OptLevel::O1 {
+        fold_program(parsed.stmts)
+    } else {
+        parsed.stmts
+    };
+    let hir_module = hir::lower_ast(&stmts, Some(parsed.lines.as_ref()), options.opt_level);
+    Ok(hir::dump_hir(&hir_module))
 }
 
 /// The IR of a program before and after optimization, for debugging the
@@ -233,7 +258,8 @@ pub fn dump_ir_with_options(statements: &[Stmt], options: Options) -> String {
     } else {
         statements.to_vec()
     };
-    let mut ir_module = ir::ast_to_ir(&stmts);
+    let hir_module = hir::lower_ast(&stmts, None, options.opt_level);
+    let mut ir_module = ir::hir_to_ir_with(&hir_module, options.keep_locals);
     let mut out = String::from("=== before optimization ===\n");
     out.push_str(&ir::pretty::print_module(&ir_module));
     if let Err(errs) = ir::verify_module(&ir_module) {
