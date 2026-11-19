@@ -190,7 +190,7 @@ impl NeyukiType {
                         if !src_ty.is_assignable_to(dst_ty) {
                             return false;
                         }
-                    } else {
+                    } else if !NeyukiType::Nil.is_assignable_to(dst_ty) {
                         return false;
                     }
                 }
@@ -417,6 +417,18 @@ mod tests {
         assert!(NeyukiType::Int.is_assignable_to(&t_union));
         assert!(NeyukiType::String.is_assignable_to(&t_union));
         assert!(!NeyukiType::Boolean.is_assignable_to(&t_union));
+
+        let cfg_ty = NeyukiType::Record(vec![
+            (
+                "name".to_string(),
+                NeyukiType::Optional(Box::new(NeyukiType::String)),
+            ),
+            ("retries".to_string(), NeyukiType::Number),
+        ]);
+        let omitted_opt = NeyukiType::Record(vec![("retries".to_string(), NeyukiType::Int)]);
+        let omitted_req = NeyukiType::Record(vec![("name".to_string(), NeyukiType::String)]);
+        assert!(omitted_opt.is_assignable_to(&cfg_ty));
+        assert!(!omitted_req.is_assignable_to(&cfg_ty));
     }
 
     #[test]
