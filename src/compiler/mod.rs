@@ -6,6 +6,7 @@ pub mod constant_fold;
 pub mod cost_model;
 pub mod hir;
 pub mod ir;
+pub mod mir;
 pub mod thir;
 pub mod value_tracking;
 
@@ -213,7 +214,10 @@ fn lower(
         statements.to_vec()
     };
     let hir_module = hir::lower_ast(&stmts, lines.as_deref(), options.opt_level);
-    let mut ir_module = ir::hir_to_ir_with(&hir_module, options.keep_locals);
+    let thir_module = thir::lower_hir_to_thir(&hir_module);
+    let mut mir_program = mir::lower_thir_to_mir(&thir_module, options.keep_locals);
+    mir::optimize_mir(&mut mir_program, options.opt_level);
+    let mut ir_module = mir::mir_to_ir(&mir_program);
     if options.inline && options.opt_level == OptLevel::O1 {
         ir::inline_functions(&mut ir_module);
     }
@@ -259,6 +263,21 @@ pub fn dump_thir_source_with_options(source: &str, options: Options) -> Result<S
     Ok(thir::dump_thir(&thir_module))
 }
 
+/// Parses `source` and dumps its CFG-based MIR after MIR optimization for `options.opt_level`.
+pub fn dump_mir_source_with_options(source: &str, options: Options) -> Result<String, String> {
+    let parsed = parse(source)?;
+    let stmts = if options.opt_level == OptLevel::O1 {
+        fold_program(parsed.stmts)
+    } else {
+        parsed.stmts
+    };
+    let hir_module = hir::lower_ast(&stmts, Some(parsed.lines.as_ref()), options.opt_level);
+    let thir_module = thir::lower_hir_to_thir(&hir_module);
+    let mut mir_program = mir::lower_thir_to_mir(&thir_module, options.keep_locals);
+    mir::optimize_mir(&mut mir_program, options.opt_level);
+    Ok(mir::dump_mir(&mir_program))
+}
+
 /// The IR of a program before and after optimization, for debugging the
 /// pipeline.
 pub fn dump_ir(statements: &[Stmt]) -> String {
@@ -273,7 +292,10 @@ pub fn dump_ir_with_options(statements: &[Stmt], options: Options) -> String {
         statements.to_vec()
     };
     let hir_module = hir::lower_ast(&stmts, None, options.opt_level);
-    let mut ir_module = ir::hir_to_ir_with(&hir_module, options.keep_locals);
+    let thir_module = thir::lower_hir_to_thir(&hir_module);
+    let mut mir_program = mir::lower_thir_to_mir(&thir_module, options.keep_locals);
+    mir::optimize_mir(&mut mir_program, options.opt_level);
+    let mut ir_module = mir::mir_to_ir(&mir_program);
     let mut out = String::from("=== before optimization ===\n");
     out.push_str(&ir::pretty::print_module(&ir_module));
     if let Err(errs) = ir::verify_module(&ir_module) {

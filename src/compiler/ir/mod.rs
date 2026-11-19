@@ -15,7 +15,7 @@ pub mod types;
 pub mod verify;
 
 pub use block::{BasicBlock, ControlFlowGraph, IrFunction, IrModule, UpvalSource};
-pub use builder::{IrBuilder, ast_to_ir, ast_to_ir_with, hir_to_ir_with};
+pub use builder::{ast_to_ir, ast_to_ir_with, hir_to_ir_with};
 pub use cfg_builder::build_cfg;
 pub use codegen::ir_to_bytecode;
 pub use dom::DominatorTree;

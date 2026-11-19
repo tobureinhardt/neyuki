@@ -5,7 +5,6 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::compiler::ir::block::ControlFlowGraph;
 use crate::compiler::ir::inst::IrInst;
-use crate::compiler::ir::types::IrLabel;
 
 pub fn simplify_cfg(cfg: &mut ControlFlowGraph) -> bool {
     let mut changed = false;
@@ -58,24 +57,32 @@ pub fn remove_unreachable_blocks(cfg: &mut ControlFlowGraph) -> bool {
 // 2. Collapse blocks containing only an unconditional Jump
 pub fn eliminate_empty_jump_blocks(cfg: &mut ControlFlowGraph) -> bool {
     let mut changed = false;
+    let mut skipped = HashSet::new();
 
-    // Find candidates: non-entry blocks whose only instruction is Jump(target)
-    let candidates: Vec<(IrLabel, IrLabel)> = cfg
-        .blocks
-        .iter()
-        .filter(|b| b.label != cfg.entry_label)
-        .filter_map(|b| {
-            let mut code = b.instructions.iter().filter(|i| !i.is_debug_marker());
-            match (code.next(), code.next()) {
-                (Some(IrInst::Jump(target)), None) if *target != b.label => {
-                    Some((b.label, *target))
+    loop {
+        // Pick one fresh candidate per iteration so chained empty blocks
+        // (`A -> B -> C`) never use a stale `target_label` that was already
+        // deleted earlier in the same sweep.
+        let candidate = cfg
+            .blocks
+            .iter()
+            .filter(|b| b.label != cfg.entry_label && !skipped.contains(&b.label))
+            .find_map(|b| {
+                let mut code = b.instructions.iter().filter(|i| !i.is_debug_marker());
+                match (code.next(), code.next()) {
+                    (Some(IrInst::Jump(target)), None)
+                        if *target != b.label && cfg.find_block(*target).is_some() =>
+                    {
+                        Some((b.label, *target))
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        })
-        .collect();
+            });
 
-    for (empty_label, target_label) in candidates {
+        let Some((empty_label, target_label)) = candidate else {
+            break;
+        };
+
         let empty_preds = cfg
             .find_block(empty_label)
             .map(|b| b.predecessors.clone())
@@ -131,6 +138,8 @@ pub fn eliminate_empty_jump_blocks(cfg: &mut ControlFlowGraph) -> bool {
             }
             cfg.blocks.retain(|b| b.label != empty_label);
             changed = true;
+        } else {
+            skipped.insert(empty_label);
         }
     }
 

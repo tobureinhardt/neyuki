@@ -67,6 +67,8 @@ Commands:
                           Print the High-level IR (HIR)
   dump-thir [-O0|-O1] <file>
                           Print the Typed HIR (THIR)
+  dump-mir [-O0|-O1] <file>
+                          Print the Mid-level IR (MIR)
   dump-ir [-O0|-O1] <file>
                           Print the IR before and after optimization
   assemble <file> [out]   Assemble bytecode from its text form
@@ -256,6 +258,33 @@ fn run_cli() {
             .map_err(|err| format!("failed to read {}: {}", path, err))
             .and_then(|source| {
                 compiler::dump_thir_source_with_options(
+                    &source,
+                    compiler::Options::RUN.with_opt_level(opt_level),
+                )
+            });
+        match dumped {
+            Ok(text) => print!("{}", text),
+            Err(err) => {
+                eprintln!("{}: {}", path, err);
+                process::exit(1);
+            }
+        }
+    } else if action == "dump-mir" {
+        let (opt_level, rest) = match parse_opt_level_prefix(&args[2..]) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                eprintln!("{}", err);
+                process::exit(1);
+            }
+        };
+        let Some(path) = rest.first() else {
+            eprintln!("Usage: {} dump-mir [-O0|-O1] <path>", args[0]);
+            process::exit(1);
+        };
+        let dumped = std::fs::read_to_string(path)
+            .map_err(|err| format!("failed to read {}: {}", path, err))
+            .and_then(|source| {
+                compiler::dump_mir_source_with_options(
                     &source,
                     compiler::Options::RUN.with_opt_level(opt_level),
                 )
