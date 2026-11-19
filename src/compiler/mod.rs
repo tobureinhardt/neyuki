@@ -6,6 +6,7 @@ pub mod constant_fold;
 pub mod cost_model;
 pub mod hir;
 pub mod ir;
+pub mod llvm;
 pub mod mir;
 pub mod thir;
 pub mod value_tracking;
@@ -276,6 +277,35 @@ pub fn dump_mir_source_with_options(source: &str, options: Options) -> Result<St
     let mut mir_program = mir::lower_thir_to_mir(&thir_module, options.keep_locals);
     mir::optimize_mir(&mut mir_program, options.opt_level);
     Ok(mir::dump_mir(&mir_program))
+}
+
+/// Parses, checks (when `options.check`), and compiles `source` through
+/// `AST -> HIR -> THIR -> MIR -> LLVM IR`, returning textual `.ll` output.
+pub fn compile_source_to_llvm_ir(
+    source: &str,
+    chunk: &str,
+    options: Options,
+) -> Result<String, String> {
+    let parsed = match parse(source) {
+        Ok(p) => p,
+        Err(err) => {
+            let diag = crate::lint::syntax_error(&err);
+            return Err(crate::diagnostics::render_report(chunk, source, &[diag]));
+        }
+    };
+    if options.check {
+        check(&parsed.stmts, source, chunk, Some(&parsed.spans))?;
+    }
+    let stmts = if options.opt_level == OptLevel::O1 {
+        fold_program(parsed.stmts)
+    } else {
+        parsed.stmts
+    };
+    let hir_module = hir::lower_ast(&stmts, Some(parsed.lines.as_ref()), options.opt_level);
+    let thir_module = thir::lower_hir_to_thir(&hir_module);
+    let mut mir_program = mir::lower_thir_to_mir(&thir_module, options.keep_locals);
+    mir::optimize_mir(&mut mir_program, options.opt_level);
+    Ok(llvm::emit_llvm_ir(&mir_program, options.opt_level))
 }
 
 /// The IR of a program before and after optimization, for debugging the
