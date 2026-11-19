@@ -580,14 +580,14 @@ fn builtin_connect(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn builtin_connect_pipe(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let name = string_arg(args, 0, "name")?;
     let timeout = timeout_arg(args, 1)?;
-    vm.permissions.check_net(&name)?;
+    vm.permissions.check_net_pipe(&name)?;
     crate::vm::libs::background::run(vm, move || connect_pipe(&name, timeout), finish_conn)
 }
 
 /// `__net_connect_unix(path)`.
 fn builtin_connect_unix(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let path = string_arg(args, 0, "path")?;
-    vm.permissions.check_net(&path)?;
+    vm.permissions.check_net_unix(&path)?;
     crate::vm::libs::background::run(vm, move || connect_unix(&path), finish_conn)
 }
 
@@ -1918,7 +1918,7 @@ fn stdio_mode(options: &VmTable, name: &str) -> Result<Stdio, String> {
 pub(crate) fn os_spawn(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let mut command = match args.first() {
         Some(Value::String(line)) => {
-            vm.permissions.check_run(line)?;
+            vm.permissions.check_run_shell(line)?;
             let mut command = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
             command
                 .arg(if cfg!(windows) { "/C" } else { "-c" })

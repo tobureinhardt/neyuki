@@ -72,6 +72,26 @@ function ffi.readCString(ptr: int?, maxLen: int?): string?
     return __ffi_read_cstring(ptr, maxLen)
 end
 
+function ffi.readUnsafe(ptr: int, ty: string, offset: int?): any
+    if (type(ptr) != "number") then error("ptr must be a number") end
+    if (type(ty) != "string") then error("type must be a string") end
+    if (offset != nil and type(offset) != "number") then error("offset must be a number") end
+    return __ffi_read_unsafe(ptr, ty, offset)
+end
+
+function ffi.writeUnsafe(ptr: int, ty: string, value: any, offset: int?): ()
+    if (type(ptr) != "number") then error("ptr must be a number") end
+    if (type(ty) != "string") then error("type must be a string") end
+    if (offset != nil and type(offset) != "number") then error("offset must be a number") end
+    __ffi_write_unsafe(ptr, ty, value, offset)
+end
+
+function ffi.readCStringUnsafe(ptr: int?, maxLen: int?): string?
+    if (ptr != nil and type(ptr) != "number") then error("ptr must be a number or nil") end
+    if (maxLen != nil and type(maxLen) != "number") then error("maxLen must be a number") end
+    return __ffi_read_cstring_unsafe(ptr, maxLen)
+end
+
 function ffi.sizeof(ty: string): int
     if (type(ty) != "string") then error("type must be a string") end
     return __ffi_sizeof(ty)

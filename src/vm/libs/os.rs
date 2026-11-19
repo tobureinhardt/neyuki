@@ -219,7 +219,7 @@ fn os_run(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
     let mut command = match args.first() {
         Some(Value::String(line)) => {
-            vm.permissions.check_run(line)?;
+            vm.permissions.check_run_shell(line)?;
             let mut command = if cfg!(windows) {
                 Command::new("cmd")
             } else {

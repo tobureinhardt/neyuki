@@ -127,6 +127,16 @@ Memory is managed by reference counting with a cycle collector, so most values a
 
 A few limits keep one script from exhausting the machine: integers are capped at 2^20 bits, `string.rep` at 100 MiB, `json.encode`, `toml.encode`, `csv.encode` and `html.render` at 64 MiB of output, nesting at 120 levels, and a table passed to a native library function at a million values.
 
+### Sandbox permissions and limits
+
+Running with `--sandbox` denies host capabilities by default; individual `--allow-*` flags grant scoped access:
+
+- **`--allow-read` / `--allow-write`**: Existing directory prefixes and symlinks are canonicalized before prefix checks so symlinks inside an allow-listed directory cannot escape to paths outside it.
+- **`--allow-run`**: When restricted to an allow-list, shell command strings (`os.run("...")` / `os.spawn("...")` routed through `sh -c` or `cmd /C`) are rejected to prevent shell metacharacter injection; scripts must pass the array form (`{ program, arg1, ... }`). Allow-list entries containing paths compare canonicalized full paths rather than basenames. Subprocesses spawned under `--allow-run` still inherit the host environment (plus any `options.env` overrides); `--allow-env` only gates `os.getenv`.
+- **`--allow-net`**: Hostname allow-lists are checked against the unresolved hostname/URL before DNS resolution (an allow-listed hostname resolves to whatever IP address DNS returns). Non-host targets must match explicit rules when restricted: `unix:<path>` (or an explicit socket path) for Unix domain sockets, `pipe:<name>` (or pipe name) for Windows named pipes, and the bind address (such as `0.0.0.0:8080`) for local listeners.
+- **`--allow-ffi`**: Controls native library loading (`ffi.open`, `ffi.loadExtension`); any non-denied FFI policy permits in-process `ffi.alloc` / `ffi.free` / `ffi.read` / `ffi.write`, and `ffi.alloc` counts toward `--max-memory`.
+- **`--timeout` / `--max-instructions` / `--max-memory`**: Execution deadlines and instruction budgets are **best-effort**, polled at bytecode dispatch / trap intervals and backward jumps, and do not preempt inside long-running native calls (such as `string.rep` or blocking network/SQL calls).
+
 ## Platform notes
 
 The runtime is a single executable with nothing else to install, apart from OpenSSL (`libssl`) on Linux. `@neyuki/ui` and `@neyuki/hid` need a desktop session (on Linux, X11 or Wayland); everything else runs headless. On Linux, `ui.mediaSession` publishes over MPRIS and so needs a D-Bus session bus. TLS for `@neyuki/http` and `@neyuki/sql` uses the operating system's own library (SChannel, Secure Transport or OpenSSL).

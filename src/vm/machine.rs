@@ -1500,4 +1500,52 @@ return path .. \" \" .. params.name .. \" \" .. http.encode(\"a b\")";
         let res = vm.execute(decoded).expect("execute failed");
         assert_eq!(res.to_string(), "11");
     }
+
+    #[test]
+    fn test_vm_limits_deadline_terminates_call_heavy_loop() {
+        let proto = compile_src(
+            "local function spin(n)
+                return spin(n + 1)
+            end
+            return spin(0)",
+        );
+        let mut vm = VM::new();
+        vm.set_limits(ExecutionLimits::new().with_timeout(std::time::Duration::from_millis(20)));
+        let err = vm.execute(proto).unwrap_err();
+        assert!(err.contains("deadline exceeded"), "got: {err}");
+    }
+
+    #[test]
+    fn test_inline_cache_table_deopt_and_global_redefine() {
+        let code = "
+        global gval = 10
+        local function read_field(tbl)
+            return tbl.x
+        end
+        local function read_global()
+            return gval
+        end
+
+        local a = { x = 1, y = 2 }
+        local b = { y = 9, x = 42 }
+        assert(read_field(a) == 1)
+        assert(read_field(a) == 1)
+        -- Mutate shape: delete cached field, then attach __index metatable while IC is hot
+        a.x = nil
+        assert(read_field(a) == nil)
+        setmetatable(a, { __index = { x = 77 } })
+        assert(read_field(a) == 77)
+        -- Different shape / different table instance at same callsite
+        assert(read_field(b) == 42)
+
+        -- Redefine global while GetGlobal inline cache is hot
+        assert(read_global() == 10)
+        assert(read_global() == 10)
+        gval = 'redefined'
+        assert(read_global() == 'redefined')
+        gval = nil
+        assert(read_global() == nil)
+        return true";
+        assert_eq!(run_code(code).to_string(), "true");
+    }
 }

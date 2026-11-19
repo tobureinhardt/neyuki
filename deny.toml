@@ -49,9 +49,11 @@ ignore = [
     { id = "RUSTSEC-2024-0370", reason = "unmaintained proc macro helper used by gtk-rs 0.18 macros under wry; compile-time only" },
     # `chrono` is soft-deprecated / unmaintained upstream (`chronotope/chrono#1768`),
     # with `jiff` and `time` listed as alternatives. `os.date` still uses it
-    # for strftime formatting and local time zones. Remove once `os.date`
-    # migrates off `chrono`.
-    { id = "RUSTSEC-2026-0543", reason = "chrono marked unmaintained upstream; used by os.date until migrated to jiff or time" },
+    # for strftime formatting and local time zones.
+    # Tracking follow-up: migrate `os.date` in `src/vm/libs/os.rs` from `chrono`
+    # to `jiff` or `time` (tracked under neyuki-lang/neyuki os.date migration)
+    # and remove this ignore once completed.
+    { id = "RUSTSEC-2026-0543", reason = "chrono marked unmaintained upstream; used by os.date until migrated to jiff or time (tracked for os.date migration)" },
 ]
 
 [licenses]

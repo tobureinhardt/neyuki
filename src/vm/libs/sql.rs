@@ -409,11 +409,7 @@ fn open_mysql(options: &OpenOptions) -> Result<mysql::Conn, String> {
     mysql::Conn::new(builder).map_err(my_error)
 }
 
-/// Opens (creating if needed) the database file named by `database` or the
-/// URL. `:memory:` gives a private in-memory database, and `file:` URIs pass
-/// through to SQLite, so `file:app.db?mode=ro` opens read-only. `timeout` is
-/// how long a statement waits for another process's lock before failing.
-fn open_sqlite(options: &OpenOptions) -> Result<rusqlite::Connection, String> {
+fn sqlite_target_path(options: &OpenOptions) -> Result<&str, String> {
     let path = match (&options.database, &options.url) {
         (Some(database), _) => database.as_str(),
         (None, Some(url)) => sqlite_url_path(url).unwrap_or(""),
@@ -426,6 +422,35 @@ fn open_sqlite(options: &OpenOptions) -> Result<rusqlite::Connection, String> {
                 .to_string(),
         );
     }
+    Ok(path)
+}
+
+fn sqlite_fs_path(raw: &str) -> Option<&str> {
+    if raw == ":memory:" {
+        return None;
+    }
+    if let Some(after_scheme) = raw.strip_prefix("file:") {
+        let core = after_scheme.split('?').next().unwrap_or(after_scheme);
+        if core.eq_ignore_ascii_case(":memory:") {
+            return None;
+        }
+        if let Some(after_slashes) = core.strip_prefix("//") {
+            if after_slashes.starts_with("localhost/") {
+                return Some(&after_slashes["localhost".len()..]);
+            }
+            return Some(after_slashes);
+        }
+        return Some(core);
+    }
+    Some(raw)
+}
+
+/// Opens (creating if needed) the database file named by `database` or the
+/// URL. `:memory:` gives a private in-memory database, and `file:` URIs pass
+/// through to SQLite, so `file:app.db?mode=ro` opens read-only. `timeout` is
+/// how long a statement waits for another process's lock before failing.
+fn open_sqlite(options: &OpenOptions) -> Result<rusqlite::Connection, String> {
+    let path = sqlite_target_path(options)?;
     let conn = rusqlite::Connection::open(path).map_err(lite_error)?;
     if let Some(timeout) = options.timeout {
         conn.busy_timeout(timeout).map_err(lite_error)?;
@@ -439,13 +464,21 @@ fn open_sqlite(options: &OpenOptions) -> Result<rusqlite::Connection, String> {
 /// fields, which override what the URL says.
 fn builtin_open(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let options = options_arg(args, 0)?;
-    let target = options
-        .url
-        .as_deref()
-        .or(options.host.as_deref())
-        .unwrap_or("localhost");
-    vm.permissions.check_net(target)?;
     let driver = driver_name(&options)?;
+    if driver == "sqlite" {
+        let target = sqlite_target_path(&options)?;
+        if let Some(fs_path) = sqlite_fs_path(target) {
+            vm.permissions.check_read(fs_path)?;
+            vm.permissions.check_write(fs_path)?;
+        }
+    } else {
+        let target = options
+            .url
+            .as_deref()
+            .or(options.host.as_deref())
+            .unwrap_or("localhost");
+        vm.permissions.check_net(target)?;
+    }
     let connection = match driver {
         "postgres" => Connection::Postgres(Box::new(open_postgres(&options)?)),
         "mysql" => Connection::MySql(open_mysql(&options)?),
@@ -1397,5 +1430,63 @@ mod tests {
         ] {
             assert!(!is_local_host(host), "{} should be remote", host);
         }
+    }
+
+    #[test]
+    fn sqlite_enforces_read_write_permissions_and_allows_memory() {
+        use crate::vm::permissions::{PermissionScope, Permissions};
+
+        let dir = std::env::temp_dir().join(format!("neyuki_sql_perm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("app.db");
+        let db_url = format!("sqlite://{}", db_path.display());
+
+        let make_opts = |url: &str| {
+            let mut tbl = crate::vm::value::VmTable::new();
+            tbl.set_str("url", Value::str(url));
+            Value::Table(std::rc::Rc::new(std::cell::RefCell::new(tbl)))
+        };
+
+        // 1. `:memory:` succeeds even with all permissions denied.
+        let mut vm_mem = VM::new();
+        vm_mem.set_permissions(Permissions::deny_all());
+        let opened = builtin_open(&mut vm_mem, &[make_opts("sqlite::memory:")]).unwrap();
+        let conn_id = opened[0].clone();
+        builtin_close(&mut vm_mem, &[conn_id]).unwrap();
+
+        // 2. File-backed sqlite:// URL must NOT check_net; instead requires read+write.
+        let mut vm_deny = VM::new();
+        vm_deny.set_permissions(Permissions::deny_all());
+        let err = builtin_open(&mut vm_deny, &[make_opts(&db_url)]).unwrap_err();
+        assert!(
+            err.contains("read access"),
+            "expected read check, got: {err}"
+        );
+
+        let mut vm_ro = VM::new();
+        vm_ro.set_permissions(
+            Permissions::deny_all().with_read(PermissionScope::AllowList(vec![
+                dir.to_string_lossy().into_owned(),
+            ])),
+        );
+        let err = builtin_open(&mut vm_ro, &[make_opts(&db_url)]).unwrap_err();
+        assert!(
+            err.contains("write access"),
+            "expected write check, got: {err}"
+        );
+
+        let mut vm_rw = VM::new();
+        let dir_str = dir.to_string_lossy().into_owned();
+        vm_rw.set_permissions(
+            Permissions::deny_all()
+                .with_read(PermissionScope::AllowList(vec![dir_str.clone()]))
+                .with_write(PermissionScope::AllowList(vec![dir_str])),
+        );
+        let opened = builtin_open(&mut vm_rw, &[make_opts(&db_url)]).unwrap();
+        let conn_id = opened[0].clone();
+        builtin_close(&mut vm_rw, &[conn_id]).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

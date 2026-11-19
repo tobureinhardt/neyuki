@@ -384,6 +384,9 @@ pub fn builtin_require(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
             .map_err(|_| format!("cannot find module '{}'", pkg))?,
     };
     let key = located.cache_key();
+    // Soundness invariant: `vm.modules` starts empty, `vm.permissions` is fixed
+    // for the lifetime of the VM, and entries are only cached below after passing
+    // `Located::Disk` `check_read` (or coming from bundled/trusted memory modules).
     if let Some(cached) = vm.modules.get(&key).cloned() {
         return Ok(vec![cached]);
     }
