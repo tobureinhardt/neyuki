@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 
-use crate::compiler::ir::block::ControlFlowGraph;
+use crate::compiler::ir::block::{BasicBlock, ControlFlowGraph};
 use crate::compiler::ir::inst::IrInst;
 use crate::compiler::ir::types::IrLabel;
 use crate::vm::hash::{FxHashMap, set_with_capacity, with_capacity};
@@ -65,31 +65,64 @@ pub fn remove_unreachable_blocks(cfg: &mut ControlFlowGraph) -> bool {
     cfg.blocks.len() != initial_len
 }
 
+/// Returns `Some(target)` when `block`'s only non-debug instruction is a
+/// non-self unconditional `Jump(target)`.
+fn empty_jump_target(block: &BasicBlock) -> Option<IrLabel> {
+    let mut code = block.instructions.iter().filter(|i| !i.is_debug_marker());
+    match (code.next(), code.next()) {
+        (Some(IrInst::Jump(target)), None) if *target != block.label => Some(*target),
+        _ => None,
+    }
+}
+
+/// Replaces occurrences of `old_lbl` with `new_lbl` in `labels` without
+/// introducing duplicate entries when `new_lbl` is already present.
+fn replace_edge_label(labels: &mut Vec<IrLabel>, old_lbl: IrLabel, new_lbl: IrLabel) -> bool {
+    let mut has_new = labels.contains(&new_lbl);
+    let mut replaced = false;
+    labels.retain_mut(|lbl| {
+        if *lbl == old_lbl {
+            replaced = true;
+            if has_new {
+                return false;
+            }
+            *lbl = new_lbl;
+            has_new = true;
+        }
+        true
+    });
+    replaced
+}
+
 // 2. Collapse blocks containing only an unconditional Jump
 pub fn eliminate_empty_jump_blocks(cfg: &mut ControlFlowGraph) -> bool {
     let mut changed = false;
 
-    // Find candidates: non-entry blocks whose only instruction is Jump(target)
-    let candidates: Vec<(IrLabel, IrLabel)> = cfg
+    // Collect candidate labels only; each block's current target is re-read
+    // below because earlier eliminations in a chain (`A -> B -> C`) update
+    // `A`'s jump target and delete `B`, and collapsing a 2-block empty cycle
+    // (`A -> B -> A`) turns `B` into a self-loop that must remain.
+    let candidates: Vec<IrLabel> = cfg
         .blocks
         .iter()
-        .filter(|b| b.label != cfg.entry_label)
-        .filter_map(|b| {
-            let mut code = b.instructions.iter().filter(|i| !i.is_debug_marker());
-            match (code.next(), code.next()) {
-                (Some(IrInst::Jump(target)), None) if *target != b.label => {
-                    Some((b.label, *target))
-                }
-                _ => None,
-            }
-        })
+        .filter(|b| b.label != cfg.entry_label && empty_jump_target(b).is_some())
+        .map(|b| b.label)
         .collect();
 
-    for (empty_label, target_label) in candidates {
-        let empty_preds = cfg
-            .find_block(empty_label)
-            .map(|b| b.predecessors.clone())
-            .unwrap_or_default();
+    for empty_label in candidates {
+        let Some(empty_blk) = cfg.find_block(empty_label) else {
+            continue;
+        };
+        if empty_blk.label == cfg.entry_label {
+            continue;
+        }
+        let Some(target_label) = empty_jump_target(empty_blk) else {
+            continue;
+        };
+        if cfg.find_block(target_label).is_none() {
+            continue;
+        }
+        let empty_preds = empty_blk.predecessors.clone();
 
         // Bypass empty_label in all other blocks
         let mut bypassed = false;
@@ -121,11 +154,8 @@ pub fn eliminate_empty_jump_blocks(cfg: &mut ControlFlowGraph) -> bool {
                 }
             }
 
-            for succ in &mut block.successors {
-                if *succ == empty_label {
-                    *succ = target_label;
-                    bypassed = true;
-                }
+            if replace_edge_label(&mut block.successors, empty_label, target_label) {
+                bypassed = true;
             }
         }
 
@@ -134,7 +164,7 @@ pub fn eliminate_empty_jump_blocks(cfg: &mut ControlFlowGraph) -> bool {
             if let Some(target_blk) = cfg.find_block_mut(target_label) {
                 target_blk.predecessors.retain(|&p| p != empty_label);
                 for p in &empty_preds {
-                    if !target_blk.predecessors.contains(p) {
+                    if *p != empty_label && !target_blk.predecessors.contains(p) {
                         target_blk.predecessors.push(*p);
                     }
                 }
@@ -163,10 +193,32 @@ pub fn merge_single_edge_blocks(cfg: &mut ControlFlowGraph) -> bool {
         let Some(b_idx) = cfg.block_index(b_label) else {
             continue;
         };
-        if cfg.blocks[b_idx].predecessors.as_slice() == [a_label] {
-            to_merge = Some((i, b_idx, a_label, b_label));
-            break;
+        if cfg.blocks[b_idx].predecessors.as_slice() != [a_label] {
+            continue;
         }
+        // Only merge when control transfers from A to B solely via a trailing
+        // unconditional jump (or fall-through). If an earlier branch in A
+        // (such as `JumpIfFalse { target: B }` or `ForLoop { jump: B }`) also
+        // targets B, removing B would leave that jump dangling (or turn it
+        // into a loop back to A if remapped).
+        let a_insts = &cfg.blocks[i].instructions;
+        let prefix = if matches!(a_insts.last(), Some(IrInst::Jump(j)) if *j == b_label) {
+            &a_insts[..a_insts.len() - 1]
+        } else {
+            a_insts.as_slice()
+        };
+        if prefix
+            .iter()
+            .any(|inst| inst.jump_target() == Some(b_label))
+            || cfg.blocks[b_idx]
+                .instructions
+                .iter()
+                .any(|inst| inst.jump_target() == Some(b_label))
+        {
+            continue;
+        }
+        to_merge = Some((i, b_idx, a_label, b_label));
+        break;
     }
 
     if let Some((a_idx, b_idx, a_label, b_label)) = to_merge {
@@ -184,29 +236,7 @@ pub fn merge_single_edge_blocks(cfg: &mut ControlFlowGraph) -> bool {
         // Update successors of B: replace predecessor B with A
         for succ_lbl in b_succs {
             if let Some(succ_blk) = cfg.find_block_mut(succ_lbl) {
-                for p in &mut succ_blk.predecessors {
-                    if *p == b_label {
-                        *p = a_label;
-                    }
-                }
-            }
-        }
-
-        // Remap any instructions referencing b_label across the CFG to a_label
-        for blk in &mut cfg.blocks {
-            for inst in &mut blk.instructions {
-                match inst {
-                    IrInst::Jump(j) if *j == b_label => *j = a_label,
-                    IrInst::JumpIfFalse { target, .. } if *target == b_label => *target = a_label,
-                    IrInst::ForPrep { jump, .. }
-                    | IrInst::ForLoop { jump, .. }
-                    | IrInst::TForLoop { jump, .. }
-                        if *jump == b_label =>
-                    {
-                        *jump = a_label;
-                    }
-                    _ => {}
-                }
+                replace_edge_label(&mut succ_blk.predecessors, b_label, a_label);
             }
         }
 

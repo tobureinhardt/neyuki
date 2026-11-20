@@ -170,12 +170,13 @@ impl LivenessInfo {
                 if !visited.insert(lbl) {
                     continue;
                 }
+                let Some(&idx) = label_to_idx.get(&lbl) else {
+                    continue;
+                };
                 stack.push((lbl, true));
-                if let Some(&idx) = label_to_idx.get(&lbl) {
-                    for succ in &cfg.blocks[idx].successors {
-                        if !visited.contains(succ) {
-                            stack.push((*succ, false));
-                        }
+                for succ in &cfg.blocks[idx].successors {
+                    if !visited.contains(succ) {
+                        stack.push((*succ, false));
                     }
                 }
             }

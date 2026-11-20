@@ -731,4 +731,146 @@ return #collected * 100 + total(table.unpack(collected))";
         let val = vm.execute(proto).expect("exec failed");
         assert_eq!(val.to_string(), "100");
     }
+
+    #[test]
+    fn test_simplify_cfg_fuzz_repro_seed_698491900() {
+        // Reproduces the `fuzz tree --seed 698491900` crash where LICM + DCE
+        // left a chain of empty jump blocks whose later target sat earlier in
+        // `cfg.blocks`, causing `eliminate_empty_jump_blocks` to rewrite a
+        // predecessor to a deleted block and panic in `LivenessInfo::compute`.
+        let code = "local i = 0\n\
+while true do\n\
+  i += 1\n\
+  if i > 5 then break end\n\
+  if i % 2 == 0 then continue end\n\
+1e-400end\n\
+repeat i -= 1 until i <= 0\n\
+return i\n";
+        let debug = crate::compiler::Options {
+            check: false,
+            ..crate::compiler::Options::DEBUG
+        };
+        for options in [crate::compiler::Options::UNCHECKED, debug] {
+            let proto =
+                crate::compiler::compile_program(code, "fuzz_repro", options).expect("compile");
+            let bytes = crate::bytecode::serialize(&proto);
+            let loaded = crate::bytecode::deserialize(&bytes).expect("valid bytecode");
+            let mut vm = VM::new();
+            assert_eq!(vm.execute(loaded).expect("run").to_string(), "0");
+        }
+    }
+
+    #[test]
+    fn test_simplify_cfg_chained_empty_jump_blocks_reverse_order() {
+        // `L2 -> L3` sits before `L1 -> L2` in `cfg.blocks`. Eliminating `L2`
+        // first updates `L1` to jump to `L3` and deletes `L2`; eliminating `L1`
+        // next must follow `L1`'s updated target `L3` instead of the deleted `L2`.
+        let mut cfg = ControlFlowGraph::new(IrLabel(0));
+
+        let mut b0 = BasicBlock::new(IrLabel(0));
+        b0.instructions.push(IrInst::LoadConst {
+            dst: IrVar(0),
+            val: IrConstant::Int(BigInt::from(7)),
+        });
+        b0.instructions.push(IrInst::Jump(IrLabel(1)));
+        b0.successors = vec![IrLabel(1)];
+
+        let mut b2 = BasicBlock::new(IrLabel(2));
+        b2.instructions.push(IrInst::Jump(IrLabel(3)));
+        b2.predecessors = vec![IrLabel(1)];
+        b2.successors = vec![IrLabel(3)];
+
+        let mut b1 = BasicBlock::new(IrLabel(1));
+        b1.instructions.push(IrInst::Jump(IrLabel(2)));
+        b1.predecessors = vec![IrLabel(0)];
+        b1.successors = vec![IrLabel(2)];
+
+        let mut b3 = BasicBlock::new(IrLabel(3));
+        b3.instructions.push(IrInst::Return(vec![IrVar(0)]));
+        b3.predecessors = vec![IrLabel(2)];
+
+        cfg.blocks = vec![b0, b2, b1, b3];
+        assert!(verify_cfg(&cfg).is_ok());
+
+        simplify_cfg(&mut cfg);
+        assert_eq!(verify_cfg(&cfg), Ok(()));
+        assert!(cfg.find_block(IrLabel(1)).is_none());
+        assert!(cfg.find_block(IrLabel(2)).is_none());
+        assert_eq!(cfg.blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_simplify_cfg_empty_jump_cycle_preserved() {
+        // A 2-block empty cycle `L1 -> L2 -> L1` collapses to a single
+        // self-loop block; the second block must not bypass itself to deleted `L1`.
+        let mut cfg = ControlFlowGraph::new(IrLabel(0));
+
+        let mut b0 = BasicBlock::new(IrLabel(0));
+        b0.instructions.push(IrInst::Jump(IrLabel(1)));
+        b0.successors = vec![IrLabel(1)];
+
+        let mut b1 = BasicBlock::new(IrLabel(1));
+        b1.instructions.push(IrInst::Jump(IrLabel(2)));
+        b1.predecessors = vec![IrLabel(0), IrLabel(2)];
+        b1.successors = vec![IrLabel(2)];
+
+        let mut b2 = BasicBlock::new(IrLabel(2));
+        b2.instructions.push(IrInst::Jump(IrLabel(1)));
+        b2.predecessors = vec![IrLabel(1)];
+        b2.successors = vec![IrLabel(1)];
+
+        cfg.blocks = vec![b0, b1, b2];
+        assert!(verify_cfg(&cfg).is_ok());
+
+        simplify_cfg(&mut cfg);
+        assert_eq!(verify_cfg(&cfg), Ok(()));
+        assert!(
+            cfg.blocks.iter().any(|b| b.successors.contains(&b.label)),
+            "cycle must remain a valid self-loop"
+        );
+    }
+
+    #[test]
+    fn test_simplify_cfg_conditional_both_branches_same_target_does_not_mismerge() {
+        // Bypassing an empty `then` block leaves `JumpIfFalse(cond, L2); Jump(L2)`.
+        // Deduplicating successors must not cause `merge_single_edge_blocks` to
+        // merge `L0` and `L2` and turn `JumpIfFalse` into a loop back to `L0`.
+        let mut cfg = ControlFlowGraph::new(IrLabel(0));
+
+        let mut b0 = BasicBlock::new(IrLabel(0));
+        b0.instructions.push(IrInst::JumpIfFalse {
+            cond: IrVar(0),
+            target: IrLabel(2),
+        });
+        b0.instructions.push(IrInst::Jump(IrLabel(1)));
+        b0.successors = vec![IrLabel(2), IrLabel(1)];
+
+        let mut b1 = BasicBlock::new(IrLabel(1));
+        b1.instructions.push(IrInst::Jump(IrLabel(2)));
+        b1.predecessors = vec![IrLabel(0)];
+        b1.successors = vec![IrLabel(2)];
+
+        let mut b2 = BasicBlock::new(IrLabel(2));
+        b2.instructions.push(IrInst::Return(vec![IrVar(0)]));
+        b2.predecessors = vec![IrLabel(0), IrLabel(1)];
+
+        cfg.blocks = vec![b0, b1, b2];
+        assert!(verify_cfg(&cfg).is_ok());
+
+        simplify_cfg(&mut cfg);
+        assert_eq!(verify_cfg(&cfg), Ok(()));
+        let entry = cfg.find_block(IrLabel(0)).expect("entry exists");
+        assert_eq!(entry.successors, vec![IrLabel(2)]);
+
+        // End-to-end execution must terminate and return the right value for both arms.
+        let code = "local function f(x)\n  local n = 0\n  if x then end\n  n += 1\n  return n\nend\nreturn f(false) + f(true)";
+        assert_eq!(run_via_ir(code), "2");
+    }
+
+    #[test]
+    fn test_liveness_empty_cfg_does_not_panic() {
+        let cfg = ControlFlowGraph::new(IrLabel(0));
+        let liveness = LivenessInfo::compute(&cfg);
+        assert!(liveness.blocks.is_empty());
+    }
 }
