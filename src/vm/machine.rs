@@ -1328,6 +1328,86 @@ impl VM {
                 }};
             }
 
+        // Immediate binary arithmetic: `i64` fast path, then `f64`, then
+        // metamethod / generic evaluator with `Value::Int(imm as i64)`.
+        macro_rules! arith_imm {
+            ($dst:expr, $a:expr, $imm:expr, $checked:ident, $fop:tt, $slow:path, $event:literal) => {{
+                let ra = &reg!($a);
+                let imm_i64 = $imm as i64;
+                match ra {
+                    Value::Int(x) => match x.$checked(imm_i64) {
+                        Some(r) => {
+                            let slot = slot_mut(&mut self.stack, base + $dst as usize);
+                            if let Value::Int(old) = slot {
+                                *old = r;
+                            } else {
+                                *slot = Value::Int(r);
+                            }
+                        }
+                        None => {
+                            let rb = Value::Int(imm_i64);
+                            let res = attempt!($slow(ra, &rb));
+                            set!($dst, res);
+                        }
+                    },
+                    Value::Float(x) => {
+                        let r = *x $fop (imm_i64 as f64);
+                        let slot = slot_mut(&mut self.stack, base + $dst as usize);
+                        if let Value::Float(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Float(r);
+                        }
+                    }
+                    Value::Table(_) => {
+                        let rb = Value::Int(imm_i64);
+                        if let Some(mm) = self.get_binop_metamethod(ra, &rb, $event) {
+                            let va = ra.clone();
+                            sync_ip!();
+                            self.call_binop_mm(mm, va, rb, base, $dst)?;
+                            continue;
+                        }
+                        let res = attempt!($slow(ra, &rb));
+                        set!($dst, res);
+                    }
+                    _ => {
+                        let rb = Value::Int(imm_i64);
+                        let res = attempt!($slow(ra, &rb));
+                        set!($dst, res);
+                    }
+                }
+            }};
+        }
+        // Ordered comparison with an `i16` immediate and conditional jump.
+        macro_rules! compare_imm {
+            ($a:expr, $imm:expr, $jump:expr, $op:tt, $slow:path, $event:literal, $mm_swap:expr) => {{
+                let ra = &reg!($a);
+                let imm_i64 = $imm as i64;
+                let holds = match ra {
+                    Value::Int(x) => *x $op imm_i64,
+                    Value::Float(x) => *x $op (imm_i64 as f64),
+                    Value::Table(_) => {
+                        let rb = Value::Int(imm_i64);
+                        let (l, r) = if $mm_swap { (&rb, ra) } else { (ra, &rb) };
+                        if let Some(mm) = self.get_binop_metamethod(l, r, $event) {
+                            let (vl, vr) = (l.clone(), r.clone());
+                            sync_ip!();
+                            self.call_cmp_mm(mm, vl, vr)?
+                        } else {
+                            attempt!($slow(ra, &rb))
+                        }
+                    }
+                    _ => {
+                        let rb = Value::Int(imm_i64);
+                        attempt!($slow(ra, &rb))
+                    }
+                };
+                if !holds {
+                    jump!($jump);
+                }
+            }};
+        }
+
         loop {
             let Some(&inst) = code.get(ip) else {
                 // Fell off the end without a `Return`: treat as returning nothing.
@@ -1762,6 +1842,9 @@ impl VM {
                         into ops::eval_add_into
                     )
                 }
+                Instruction::AddI { dst, a, imm } => {
+                    arith_imm!(dst, a, imm, checked_add, +, ops::eval_add, "__add")
+                }
                 Instruction::Sub { dst, a, b } => {
                     arith!(
                         dst,
@@ -1774,8 +1857,14 @@ impl VM {
                         into ops::eval_sub_into
                     )
                 }
+                Instruction::SubI { dst, a, imm } => {
+                    arith_imm!(dst, a, imm, checked_sub, -, ops::eval_sub, "__sub")
+                }
                 Instruction::Mul { dst, a, b } => {
                     arith!(dst, a, b, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                Instruction::MulI { dst, a, imm } => {
+                    arith_imm!(dst, a, imm, checked_mul, *, ops::eval_mul, "__mul")
                 }
                 Instruction::Div { dst, a, b } => {
                     arith_slow!(dst, a, b, ops::eval_div, "__div")
@@ -1945,6 +2034,78 @@ impl VM {
                     }
                 }
 
+                Instruction::ShlI { dst, a, imm } => {
+                    let ra = &reg!(a);
+                    match ra {
+                        Value::Int(x) if *x >= 0 => {
+                            let res = if *x == 0 {
+                                Value::Int(0)
+                            } else {
+                                let shift = imm as u32;
+                                let headroom = x.leading_zeros().saturating_sub(1);
+                                let headroom128 = (64 + x.leading_zeros()).saturating_sub(1);
+                                if shift <= headroom {
+                                    Value::Int(x << shift)
+                                } else if shift <= headroom128 {
+                                    Value::from_i128((*x as i128) << shift)
+                                } else {
+                                    let x_bits = 64 - x.leading_zeros() as u64;
+                                    if (shift as u64) <= ops::MAX_INT_BITS
+                                        && x_bits.saturating_add(shift as u64) <= ops::MAX_INT_BITS
+                                    {
+                                        Value::BigInt(std::rc::Rc::new(
+                                            num_bigint::BigInt::from(*x) << (imm as usize),
+                                        ))
+                                    } else {
+                                        let rb = Value::Int(imm as i64);
+                                        attempt!(ops::eval_shl(ra, &rb))
+                                    }
+                                }
+                            };
+                            set!(dst, res);
+                        }
+                        Value::BigInt(_) => {
+                            attempt!(ops::eval_shl_bigint_into(
+                                &mut self.stack,
+                                base + dst as usize,
+                                base + a as usize,
+                                imm as u64,
+                            ));
+                        }
+                        _ => {
+                            let rb = Value::Int(imm as i64);
+                            let res = attempt!(ops::eval_shl(ra, &rb));
+                            set!(dst, res);
+                        }
+                    }
+                }
+                Instruction::ShrI { dst, a, imm } => {
+                    let ra = &reg!(a);
+                    match ra {
+                        Value::Int(x) => {
+                            let res = if imm >= 64 {
+                                Value::Int(if *x < 0 { -1 } else { 0 })
+                            } else {
+                                Value::Int(x >> imm)
+                            };
+                            set!(dst, res);
+                        }
+                        Value::BigInt(_) => {
+                            ops::eval_shr_bigint_into(
+                                &mut self.stack,
+                                base + dst as usize,
+                                base + a as usize,
+                                imm as u64,
+                            );
+                        }
+                        _ => {
+                            let rb = Value::Int(imm as i64);
+                            let res = attempt!(ops::eval_shr(ra, &rb));
+                            set!(dst, res);
+                        }
+                    }
+                }
+
                 Instruction::LShl { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
@@ -2102,6 +2263,62 @@ impl VM {
                 } => {
                     compare!(a, b, jump_if_false, >=, ops::eval_ge, "__le", true)
                 }
+                Instruction::EqI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    let is_eq = match &reg!(a) {
+                        Value::Int(x) => *x == imm as i64,
+                        Value::Float(x) => *x == imm as f64,
+                        _ => false,
+                    };
+                    if !is_eq {
+                        jump!(jump_if_false);
+                    }
+                }
+                Instruction::NeI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    let is_eq = match &reg!(a) {
+                        Value::Int(x) => *x == imm as i64,
+                        Value::Float(x) => *x == imm as f64,
+                        _ => false,
+                    };
+                    if is_eq {
+                        jump!(jump_if_false);
+                    }
+                }
+                Instruction::LtI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    compare_imm!(a, imm, jump_if_false, <, ops::eval_lt, "__lt", false)
+                }
+                Instruction::LeI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    compare_imm!(a, imm, jump_if_false, <=, ops::eval_le, "__le", false)
+                }
+                Instruction::GtI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    compare_imm!(a, imm, jump_if_false, >, ops::eval_gt, "__lt", true)
+                }
+                Instruction::GeI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    compare_imm!(a, imm, jump_if_false, >=, ops::eval_ge, "__le", true)
+                }
                 Instruction::Test { reg, jump_if_false } => {
                     if !reg!(reg).is_truthy() {
                         jump!(jump_if_false);
@@ -2251,8 +2468,27 @@ impl VM {
                                     self.max_call_depth
                                 );
                             }
-                            let callee_closure = callee_closure.clone();
-                            let proto = &callee_closure.proto;
+                            let same_closure = Rc::ptr_eq(&current_closure, callee_closure);
+                            let (max_registers, num_params, is_vararg) = {
+                                let proto = &callee_closure.proto;
+                                (
+                                    proto.max_registers as usize,
+                                    proto.num_params as usize,
+                                    proto.is_vararg,
+                                )
+                            };
+                            // On recursive calls (`same_closure`), `current_closure`
+                            // already owns the active reference so only the frame
+                            // needs a clone (1 bump instead of 2). On ordinary
+                            // calls, `next_closure` is moved into `current_closure`
+                            // after pushing a clone into the frame (2 bumps total,
+                            // zero extra refcount churn, and DAP borrows its name
+                            // without allocating).
+                            let mut next_closure = if same_closure {
+                                None
+                            } else {
+                                Some(Rc::clone(callee_closure))
+                            };
                             // For a tail call the callee window slides
                             // down one slot so it sits exactly where a
                             // call from our caller would put it, and the
@@ -2285,23 +2521,25 @@ impl VM {
                             } else {
                                 (args_start, retc)
                             };
-                            let needed = new_base + proto.max_registers as usize;
+                            let needed = new_base + max_registers;
                             if needed >= self.stack.len() {
                                 self.stack.resize(needed + 1, Value::Nil);
                             }
-                            let num_params = proto.num_params as usize;
                             for i in argc..num_params {
                                 self.stack[new_base + i] = Value::Nil;
                             }
-                            let varargs = if proto.is_vararg && argc > num_params {
-                                self.stack[new_base + num_params..new_base + argc].to_vec()
-                            } else {
-                                Vec::new()
+                            let frame_closure = match &next_closure {
+                                Some(c) => Rc::clone(c),
+                                None => Rc::clone(&current_closure),
                             };
-                            let same_closure = Rc::ptr_eq(&current_closure, &callee_closure);
-                            let new_frame =
-                                CallFrame::with_varargs(callee_closure.clone(), new_base, varargs)
-                                    .wanting(want_ret);
+                            let new_frame = if is_vararg && argc > num_params {
+                                let varargs =
+                                    self.stack[new_base + num_params..new_base + argc].to_vec();
+                                CallFrame::with_varargs(frame_closure, new_base, varargs)
+                            } else {
+                                CallFrame::new(frame_closure, new_base)
+                            }
+                            .wanting(want_ret);
                             self.frames.push(new_frame);
                             if self.hook.is_some() {
                                 let event = if tail {
@@ -2315,23 +2553,23 @@ impl VM {
                                     return Err(err);
                                 }
                             }
-                            if self.dap.is_some()
-                                && let Err(err) = crate::dap::check_break(
-                                    self,
-                                    proto.name.as_deref().unwrap_or("<anonymous>"),
-                                )
-                            {
-                                self.frames.pop();
-                                sync_ip!();
-                                return Err(err);
+                            if self.dap.is_some() {
+                                let active = next_closure.as_ref().unwrap_or(&current_closure);
+                                let func_name =
+                                    active.proto.name.as_deref().unwrap_or("<anonymous>");
+                                if let Err(err) = crate::dap::check_break(self, func_name) {
+                                    self.frames.pop();
+                                    sync_ip!();
+                                    return Err(err);
+                                }
                             }
-                            if !callee_closure.proto.is_verified() {
-                                crate::bytecode::verify_proto(&callee_closure.proto)
-                                    .map_err(|e| e.to_string())?;
-                                callee_closure.proto.mark_verified();
-                            }
-                            if !same_closure {
-                                current_closure = callee_closure;
+                            if let Some(next) = next_closure.take() {
+                                if !next.proto.is_verified() {
+                                    crate::bytecode::verify_proto(&next.proto)
+                                        .map_err(|e| e.to_string())?;
+                                    next.proto.mark_verified();
+                                }
+                                current_closure = next;
                                 code = &current_closure.proto.instructions;
                                 consts = current_closure.proto.values();
                             }
@@ -2341,17 +2579,31 @@ impl VM {
                         }
                         Value::Native(def) => {
                             let func = def.func;
-                            // Natives take a slice of owned values; copying
-                            // the argument window is cheaper than exposing
-                            // the stack to code that may resize it.
-                            let args: Vec<Value> = self.stack[args_start..args_end].to_vec();
+                            // Natives take a slice of owned values; copy small
+                            // argument lists onto the stack to avoid a heap
+                            // allocation on every native call.
+                            const INLINE_NATIVE_ARGS: usize = 8;
+                            let mut inline_args = [const { Value::Nil }; INLINE_NATIVE_ARGS];
+                            let heap_args: Vec<Value>;
+                            let args: &[Value] = if argc <= INLINE_NATIVE_ARGS {
+                                for (dst, src) in inline_args[..argc]
+                                    .iter_mut()
+                                    .zip(&self.stack[args_start..args_end])
+                                {
+                                    *dst = src.clone();
+                                }
+                                &inline_args[..argc]
+                            } else {
+                                heap_args = self.stack[args_start..args_end].to_vec();
+                                &heap_args
+                            };
                             if self.hook.is_some()
                                 && let Err(err) = self.fire_hook(HookEvent::Call)
                             {
                                 sync_ip!();
                                 return Err(err);
                             }
-                            match func(self, &args) {
+                            match func(self, args) {
                                 Ok(results) => {
                                     if self.hook.is_some()
                                         && let Err(err) = self.fire_hook(HookEvent::Return)
@@ -2401,8 +2653,8 @@ impl VM {
                     }
                 }
                 Instruction::Return { base: ret, count } => {
-                    sync_ip!();
                     if self.hook.is_some() {
+                        sync_ip!();
                         self.fire_hook(HookEvent::Return)?;
                     }
                     let frame = self.frames.pop().expect(RUNNING_FRAME);
@@ -2519,7 +2771,7 @@ impl VM {
                     let all = count == 0 || count == MULTRET;
                     let frame = self.frames.last().expect(RUNNING_FRAME);
                     let cnt = if all {
-                        frame.varargs.len()
+                        frame.varargs().len()
                     } else {
                         count as usize
                     };
@@ -2528,8 +2780,9 @@ impl VM {
                         self.stack.resize(dest + cnt, Value::Nil);
                     }
                     let frame = self.frames.last().expect(RUNNING_FRAME);
+                    let varargs = frame.varargs();
                     for i in 0..cnt {
-                        let val = frame.varargs.get(i).cloned().unwrap_or(Value::Nil);
+                        let val = varargs.get(i).cloned().unwrap_or(Value::Nil);
                         self.stack[dest + i] = val;
                     }
                     if all {
@@ -3800,5 +4053,178 @@ return path .. \" \" .. params.name .. \" \" .. http.encode(\"a b\")";
             .clone();
         assert_eq!(sep2, "/");
         assert_eq!(tag2, Value::Int(1));
+    }
+
+    #[test]
+    fn test_immediate_ops_overflow_floats_and_metamethods() {
+        let code = r#"
+            -- Overflow to BigInt via AddI, SubI, MulI, ShlI
+            local max64 = 9223372036854775807
+            local min64 = -9223372036854775807 - 1
+            assert(max64 + 1 == 9223372036854775808)
+            assert(min64 - 1 == -9223372036854775809)
+            assert(max64 * 2 == 18446744073709551614)
+            assert((max64 << 2) == max64 * 4)
+            assert(((1 << 62) << 4) == (1 << 66))
+            assert(((-8) >> 1) == -4)
+            assert(((1 << 70) >> 60) == 1024)
+
+            -- Float operands with immediate opcodes
+            local f = 2.5
+            assert(f + 2 == 4.5)
+            assert(f - 1 == 1.5)
+            assert(f * 4 == 10.0)
+            local two_f = 2.0
+            assert(two_f == 2 and not (two_f != 2))
+            assert(two_f < 3 and two_f <= 2 and two_f > 1 and two_f >= 2)
+            local nan = 0.0 / 0.0
+            assert(not (nan == 0) and (nan != 0))
+            assert(not (nan < 0) and not (nan <= 0) and not (nan > 0) and not (nan >= 0))
+
+            -- Flipped comparisons with LHS immediate
+            local n = 5
+            assert(3 < n and 5 <= n and 7 > n and 5 >= n and 5 == n and 4 != n)
+            assert(not (6 < n) and not (6 <= n) and not (4 > n) and not (4 >= n))
+
+            -- Metamethods preserve exact operand order (including 1 + tbl and 10 < tbl)
+            local order = {}
+            local mt = {
+                __add = function(a, b)
+                    if type(a) == "table" then
+                        order[#order + 1] = "add:t," .. tostring(b)
+                        return a.v + b
+                    else
+                        order[#order + 1] = "add:" .. tostring(a) .. ",t"
+                        return a - b.v
+                    end
+                end,
+                __sub = function(a, b) return a.v - b end,
+                __mul = function(a, b) return a.v * b end,
+                __lt = function(a, b)
+                    if type(a) == "table" then
+                        order[#order + 1] = "lt:t," .. tostring(b)
+                        return a.v < b
+                    else
+                        order[#order + 1] = "lt:" .. tostring(a) .. ",t"
+                        return a < b.v
+                    end
+                end,
+                __le = function(a, b)
+                    if type(a) == "table" then
+                        order[#order + 1] = "le:t," .. tostring(b)
+                        return a.v <= b
+                    else
+                        order[#order + 1] = "le:" .. tostring(a) .. ",t"
+                        return a <= b.v
+                    end
+                end,
+            }
+            local t = setmetatable({ v = 10 }, mt)
+            assert(t + 5 == 15)
+            assert(5 + t == -5)
+            assert(t - 3 == 7)
+            assert(t * 4 == 40)
+            assert(t < 20 and not (t < 5))
+            assert(5 < t and not (20 < t))
+            assert(t <= 10 and 10 <= t)
+            assert(order[1] == "add:t,5")
+            assert(order[2] == "add:5,t")
+            assert(order[3] == "lt:t,20")
+            assert(order[5] == "lt:5,t")
+            return true
+        "#;
+        assert_eq!(run_code(code).to_string(), "true");
+    }
+
+    #[test]
+    fn test_codegen_immediate_ops_and_coalescing() {
+        let loop_code = r#"
+            local sum = 0
+            local i = 0
+            while i < 10000 do
+                sum = sum + (i * 3 - (i >> 1))
+                i = i + 1
+            end
+            return sum
+        "#;
+        let stmts = crate::compiler::compile_source(loop_code).expect("parse");
+        let proto = crate::compiler::try_compile_to_proto(&stmts).expect("compile");
+        assert!(
+            proto
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::LtI { imm: 10000, .. }))
+        );
+        assert!(
+            proto
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::MulI { imm: 3, .. }))
+        );
+        assert!(
+            proto
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::ShrI { imm: 1, .. }))
+        );
+        assert!(
+            proto
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::AddI { imm: 1, .. }))
+        );
+        assert!(
+            !proto
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Move { .. })),
+            "expected self-update Move elimination in loop, got:\n{}",
+            crate::bytecode::disasm::disassemble_proto(&proto, 0)
+        );
+        let mut vm = VM::new();
+        assert_eq!(vm.execute(proto).expect("exec").to_string(), "124990000");
+
+        let fib_code = r#"
+            function fib(n)
+                if n <= 1 then return n end
+                return fib(n - 1) + fib(n - 2)
+            end
+            return fib(18)
+        "#;
+        let stmts = crate::compiler::compile_source(fib_code).expect("parse");
+        let proto = crate::compiler::try_compile_to_proto(&stmts).expect("compile");
+        let fib_proto = &proto.protos[0];
+        assert!(
+            fib_proto
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::LeI { imm: 1, .. }))
+        );
+        assert!(
+            fib_proto
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::SubI { imm: 1, .. }))
+        );
+        assert!(
+            fib_proto
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::SubI { imm: 2, .. }))
+        );
+        // Only the 1st recursive call needs to save its result out of the call window.
+        let move_count = fib_proto
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Move { .. }))
+            .count();
+        assert_eq!(
+            move_count,
+            1,
+            "expected 2nd call result coalesced without MOVE, got:\n{}",
+            crate::bytecode::disasm::disassemble_proto(fib_proto, 0)
+        );
+        let mut vm = VM::new();
+        assert_eq!(vm.execute(proto).expect("exec").to_string(), "2584");
     }
 }

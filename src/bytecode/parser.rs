@@ -685,6 +685,93 @@ fn parse_instruction_line(line: &str) -> Result<Option<Instruction>, String> {
             let reg = parse_reg(parts.get(1).ok_or("CLOSEUPVAL missing reg")?)?;
             Ok(Some(Instruction::CloseUpval { reg }))
         }
+        "ADDI" | "SUBI" | "MULI" => {
+            let dst = parse_reg(parts.get(1).ok_or_else(|| format!("{} missing dst", op))?)?;
+            let a = parse_reg(parts.get(2).ok_or_else(|| format!("{} missing a", op))?)?;
+            let imm = parts
+                .get(3)
+                .ok_or_else(|| format!("{} missing imm", op))?
+                .trim_end_matches(',')
+                .parse::<i16>()
+                .map_err(|e| e.to_string())?;
+            let inst = match op {
+                "ADDI" => Instruction::AddI { dst, a, imm },
+                "SUBI" => Instruction::SubI { dst, a, imm },
+                "MULI" => Instruction::MulI { dst, a, imm },
+                _ => unreachable!("the outer match only lets immediate arithmetic names through"),
+            };
+            Ok(Some(inst))
+        }
+        "SHLI" | "SHRI" => {
+            let dst = parse_reg(parts.get(1).ok_or_else(|| format!("{} missing dst", op))?)?;
+            let a = parse_reg(parts.get(2).ok_or_else(|| format!("{} missing a", op))?)?;
+            let imm = parts
+                .get(3)
+                .ok_or_else(|| format!("{} missing imm", op))?
+                .trim_end_matches(',')
+                .parse::<u8>()
+                .map_err(|e| e.to_string())?;
+            let inst = match op {
+                "SHLI" => Instruction::ShlI { dst, a, imm },
+                "SHRI" => Instruction::ShrI { dst, a, imm },
+                _ => unreachable!("the outer match only lets immediate shift names through"),
+            };
+            Ok(Some(inst))
+        }
+        "EQI" | "NEI" | "LTI" | "LEI" | "GTI" | "GEI" => {
+            let a = parse_reg(parts.get(1).ok_or_else(|| format!("{} missing a", op))?)?;
+            let imm = parts
+                .get(2)
+                .ok_or_else(|| format!("{} missing imm", op))?
+                .trim_end_matches(',')
+                .parse::<i16>()
+                .map_err(|e| e.to_string())?;
+            let offset_token = if parts.len() >= 5 && parts[3] == "offset" {
+                parts[4]
+            } else {
+                parts
+                    .get(3)
+                    .ok_or_else(|| format!("{} missing offset", op))?
+            };
+            let jump_if_false = offset_token
+                .trim_end_matches(',')
+                .parse::<i16>()
+                .map_err(|e| e.to_string())?;
+            let inst = match op {
+                "EQI" => Instruction::EqI {
+                    a,
+                    imm,
+                    jump_if_false,
+                },
+                "NEI" => Instruction::NeI {
+                    a,
+                    imm,
+                    jump_if_false,
+                },
+                "LTI" => Instruction::LtI {
+                    a,
+                    imm,
+                    jump_if_false,
+                },
+                "LEI" => Instruction::LeI {
+                    a,
+                    imm,
+                    jump_if_false,
+                },
+                "GTI" => Instruction::GtI {
+                    a,
+                    imm,
+                    jump_if_false,
+                },
+                "GEI" => Instruction::GeI {
+                    a,
+                    imm,
+                    jump_if_false,
+                },
+                _ => unreachable!("the outer match only lets immediate comparison names through"),
+            };
+            Ok(Some(inst))
+        }
         _ => Err(format!(
             "unknown or unsupported instruction mnemonic: '{}'",
             op
@@ -932,6 +1019,61 @@ mod tests {
             .instructions
             .push(Instruction::TForLoop { base: 0, jump: 5 });
         proto.instructions.push(Instruction::CloseUpval { reg: 4 });
+        proto.instructions.push(Instruction::AddI {
+            dst: 0,
+            a: 1,
+            imm: 7,
+        });
+        proto.instructions.push(Instruction::SubI {
+            dst: 0,
+            a: 1,
+            imm: -3,
+        });
+        proto.instructions.push(Instruction::MulI {
+            dst: 0,
+            a: 1,
+            imm: 10,
+        });
+        proto.instructions.push(Instruction::ShlI {
+            dst: 0,
+            a: 1,
+            imm: 4,
+        });
+        proto.instructions.push(Instruction::ShrI {
+            dst: 0,
+            a: 1,
+            imm: 2,
+        });
+        proto.instructions.push(Instruction::EqI {
+            a: 0,
+            imm: 0,
+            jump_if_false: 1,
+        });
+        proto.instructions.push(Instruction::NeI {
+            a: 0,
+            imm: 1,
+            jump_if_false: 1,
+        });
+        proto.instructions.push(Instruction::LtI {
+            a: 0,
+            imm: 100,
+            jump_if_false: 1,
+        });
+        proto.instructions.push(Instruction::LeI {
+            a: 0,
+            imm: 1,
+            jump_if_false: 1,
+        });
+        proto.instructions.push(Instruction::GtI {
+            a: 0,
+            imm: -5,
+            jump_if_false: 1,
+        });
+        proto.instructions.push(Instruction::GeI {
+            a: 0,
+            imm: 10,
+            jump_if_false: 1,
+        });
         proto
             .instructions
             .push(Instruction::Return { base: 0, count: 1 });
@@ -940,5 +1082,71 @@ mod tests {
         let parsed = parse_assembly(&asm).expect("failed to parse all instructions");
         assert_eq!(parsed.instructions.len(), proto.instructions.len());
         assert_eq!(parsed.instructions, proto.instructions);
+
+        // Verify binary serialize -> deserialize roundtrip preserves immediate ops too.
+        let mut ser_proto = Proto::new(Some("imm_roundtrip".to_string()), 1, false);
+        ser_proto.max_registers = 4;
+        ser_proto.instructions = vec![
+            Instruction::AddI {
+                dst: 1,
+                a: 0,
+                imm: 5,
+            },
+            Instruction::SubI {
+                dst: 1,
+                a: 1,
+                imm: 2,
+            },
+            Instruction::MulI {
+                dst: 1,
+                a: 1,
+                imm: 3,
+            },
+            Instruction::ShlI {
+                dst: 2,
+                a: 1,
+                imm: 2,
+            },
+            Instruction::ShrI {
+                dst: 2,
+                a: 2,
+                imm: 1,
+            },
+            Instruction::EqI {
+                a: 2,
+                imm: 0,
+                jump_if_false: 0,
+            },
+            Instruction::NeI {
+                a: 2,
+                imm: 0,
+                jump_if_false: 0,
+            },
+            Instruction::LtI {
+                a: 2,
+                imm: 10,
+                jump_if_false: 0,
+            },
+            Instruction::LeI {
+                a: 2,
+                imm: 10,
+                jump_if_false: 0,
+            },
+            Instruction::GtI {
+                a: 2,
+                imm: -10,
+                jump_if_false: 0,
+            },
+            Instruction::GeI {
+                a: 2,
+                imm: -10,
+                jump_if_false: 0,
+            },
+            Instruction::Return { base: 2, count: 1 },
+        ];
+        let encoded = crate::bytecode::serialize::serialize(&ser_proto);
+        let decoded =
+            crate::bytecode::deserialize::deserialize(&encoded).expect("imm roundtrip failed");
+        assert_eq!(decoded.instructions, ser_proto.instructions);
     }
 }

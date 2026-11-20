@@ -190,5 +190,40 @@ fn format_instruction(inst: &Instruction) -> String {
         Instruction::TForCall { base, retc } => format!("TFORCALL     R{}, {}", base, retc),
         Instruction::TForLoop { base, jump } => format!("TFORLOOP     R{}, {}", base, jump),
         Instruction::CloseUpval { reg } => format!("CLOSEUPVAL   R{}", reg),
+        Instruction::AddI { dst, a, imm } => format!("ADDI         R{}, R{}, {}", dst, a, imm),
+        Instruction::SubI { dst, a, imm } => format!("SUBI         R{}, R{}, {}", dst, a, imm),
+        Instruction::MulI { dst, a, imm } => format!("MULI         R{}, R{}, {}", dst, a, imm),
+        Instruction::ShlI { dst, a, imm } => format!("SHLI         R{}, R{}, {}", dst, a, imm),
+        Instruction::ShrI { dst, a, imm } => format!("SHRI         R{}, R{}, {}", dst, a, imm),
+        Instruction::EqI {
+            a,
+            imm,
+            jump_if_false,
+        } => format!("EQI          R{}, {}, offset {}", a, imm, jump_if_false),
+        Instruction::NeI {
+            a,
+            imm,
+            jump_if_false,
+        } => format!("NEI          R{}, {}, offset {}", a, imm, jump_if_false),
+        Instruction::LtI {
+            a,
+            imm,
+            jump_if_false,
+        } => format!("LTI          R{}, {}, offset {}", a, imm, jump_if_false),
+        Instruction::LeI {
+            a,
+            imm,
+            jump_if_false,
+        } => format!("LEI          R{}, {}, offset {}", a, imm, jump_if_false),
+        Instruction::GtI {
+            a,
+            imm,
+            jump_if_false,
+        } => format!("GTI          R{}, {}, offset {}", a, imm, jump_if_false),
+        Instruction::GeI {
+            a,
+            imm,
+            jump_if_false,
+        } => format!("GEI          R{}, {}, offset {}", a, imm, jump_if_false),
     }
 }

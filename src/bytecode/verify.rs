@@ -399,6 +399,35 @@ fn verify_proto_depth(proto: &Proto, depth: usize) -> Result<(), BytecodeVerifyE
             Instruction::CloseUpval { reg } => {
                 check_reg(*reg, pc)?;
             }
+            Instruction::AddI { dst, a, .. }
+            | Instruction::SubI { dst, a, .. }
+            | Instruction::MulI { dst, a, .. }
+            | Instruction::ShlI { dst, a, .. }
+            | Instruction::ShrI { dst, a, .. } => {
+                check_reg(*dst, pc)?;
+                check_reg(*a, pc)?;
+            }
+            Instruction::EqI {
+                a, jump_if_false, ..
+            }
+            | Instruction::NeI {
+                a, jump_if_false, ..
+            }
+            | Instruction::LtI {
+                a, jump_if_false, ..
+            }
+            | Instruction::LeI {
+                a, jump_if_false, ..
+            }
+            | Instruction::GtI {
+                a, jump_if_false, ..
+            }
+            | Instruction::GeI {
+                a, jump_if_false, ..
+            } => {
+                check_reg(*a, pc)?;
+                check_jump(*jump_if_false, pc)?;
+            }
         }
     }
 

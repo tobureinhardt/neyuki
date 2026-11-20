@@ -2,7 +2,16 @@
 
 // Magic bytes at the start of compiled bytecode binary
 pub const MAGIC: &[u8; 7] = b"neyuki!";
-pub const BYTECODE_VERSION: u8 = 6;
+/// Oldest bytecode format version this VM still decodes. Format 7 only appends
+/// new immediate opcodes (tags 55..=65) without altering any v6 opcode or
+/// prototype layout, so v6 `.nykb` files stay directly loadable.
+pub const MIN_SUPPORTED_BYTECODE_VERSION: u8 = 6;
+pub const BYTECODE_VERSION: u8 = 7;
+
+#[inline]
+pub fn is_supported_version(version: u8) -> bool {
+    (MIN_SUPPORTED_BYTECODE_VERSION..=BYTECODE_VERSION).contains(&version)
+}
 
 // IEEE 802.3 CRC-32 checksum calculation for bytecode integrity verification
 pub fn compute_crc32(data: &[u8]) -> u32 {
@@ -50,10 +59,10 @@ impl BytecodeHeader {
             return Err("invalid bytecode magic bytes: expected 'neyuki!'".to_string());
         }
         let version = bytes[7];
-        if version != BYTECODE_VERSION {
+        if !is_supported_version(version) {
             return Err(format!(
-                "unsupported bytecode version: {} (expected {})",
-                version, BYTECODE_VERSION
+                "unsupported bytecode version: {} (expected {}..={})",
+                version, MIN_SUPPORTED_BYTECODE_VERSION, BYTECODE_VERSION
             ));
         }
         let checksum = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);

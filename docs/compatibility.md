@@ -35,14 +35,14 @@ Language features and APIs are organized into three distinct stability tiers:
 
 Bytecode artifacts (`.nykb`) carry an explicit version byte in the 12-byte header (`BYTECODE_VERSION`):
 
-1. **Current Version**: Bytecode Version 4 (`0x04`).
+1. **Current Version**: Bytecode Version 7 (`0x07`), which adds immediate integer opcodes (`AddI`..`GeI`, tags `55..=65`) without altering any Version 6 opcode or prototype layout. The VM continues to decode Version 6 (`0x06`) `.nykb` files directly (`MIN_SUPPORTED_BYTECODE_VERSION = 6`).
 2. **Forward Compatibility**: The VM strictly rejects bytecode with a version byte greater than its supported `BYTECODE_VERSION` with a clean diagnostic:
    ```text
-   bytecode was compiled by a newer Neyuki (format X, this one reads format 6); recompile the source with `neyuki compile`
+   bytecode was compiled by a newer Neyuki (format X, this one reads formats 6..=7); recompile the source with `neyuki compile`
    ```
-   Older bytecode is rejected the same way ("an older Neyuki"). When `require` loads such a `.nykb` and its `.nyk` source sits next to it, the source is compiled instead.
+   Bytecode older than `MIN_SUPPORTED_BYTECODE_VERSION` is rejected the same way ("an older Neyuki"). When `require` loads such a `.nykb` and its `.nyk` source sits next to it, the source is compiled instead.
 3. **Backward Compatibility**: Production releases of the VM must provide decoding pathways for the immediately preceding bytecode version or provide an automated bytecode migrator in `neyuki pkg upgrade-bytecode`.
-4. **Bytecode Freeze**: Once Version 1.0 of Neyuki is tagged, Bytecode Version 4 enters Long-Term Support (LTS) status.
+4. **Bytecode Freeze**: Once Version 1.0 of Neyuki is tagged, the current bytecode format enters Long-Term Support (LTS) status.
 
 ---
 

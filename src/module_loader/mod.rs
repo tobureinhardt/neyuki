@@ -271,7 +271,7 @@ mod tests {
     fn test_stale_bytecode_recompiles_from_source() {
         let dir = scratch_dir("stale_with_source");
         let compiled = dir.join("mod.nykb");
-        let old = crate::bytecode::BYTECODE_VERSION - 1;
+        let old = crate::bytecode::MIN_SUPPORTED_BYTECODE_VERSION - 1;
         std::fs::write(&compiled, bytecode_with_version("return 1", old)).unwrap();
         std::fs::write(dir.join("mod.nyk"), "return 2").unwrap();
 
@@ -291,7 +291,7 @@ mod tests {
     fn test_stale_bytecode_without_source_names_the_file() {
         let dir = scratch_dir("stale_alone");
         let compiled = dir.join("mod.nykb");
-        let old = crate::bytecode::BYTECODE_VERSION - 1;
+        let old = crate::bytecode::MIN_SUPPORTED_BYTECODE_VERSION - 1;
         std::fs::write(&compiled, bytecode_with_version("return 1", old)).unwrap();
 
         let mut loader = ModuleLoader::new();

@@ -208,7 +208,7 @@ fn debug_getlocal(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     };
     if n < 0 {
         let index = (-n - 1) as usize;
-        return Ok(match frame.varargs.get(index) {
+        return Ok(match frame.varargs().get(index) {
             Some(v) => vec![Value::str("(vararg)"), v.clone()],
             None => vec![Value::Nil],
         });
@@ -237,7 +237,7 @@ fn debug_setlocal(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     if n < 0 {
         let index = (-n - 1) as usize;
         let at = vm.frames.len() - level as usize;
-        return Ok(match vm.frames[at].varargs.get_mut(index) {
+        return Ok(match vm.frames[at].varargs_mut().get_mut(index) {
             Some(slot) => {
                 *slot = value;
                 vec![Value::str("(vararg)")]

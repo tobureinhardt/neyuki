@@ -9,7 +9,9 @@ pub mod verify;
 
 pub use deserialize::deserialize;
 pub use disasm::disassemble_proto;
-pub use format::{BYTECODE_VERSION, BytecodeHeader, MAGIC};
+pub use format::{
+    BYTECODE_VERSION, BytecodeHeader, MAGIC, MIN_SUPPORTED_BYTECODE_VERSION, is_supported_version,
+};
 pub use instruction::Instruction;
 pub use parser::parse_assembly;
 pub use proto::{Constant, Proto, UpvalueDesc};

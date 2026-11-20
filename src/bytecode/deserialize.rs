@@ -1,30 +1,32 @@
 //! Reads `.nyc` bytecode files and verifies what it loads.
 
-use crate::bytecode::format::{BYTECODE_VERSION, BytecodeHeader, MAGIC};
+use crate::bytecode::format::{
+    BYTECODE_VERSION, BytecodeHeader, MAGIC, MIN_SUPPORTED_BYTECODE_VERSION, is_supported_version,
+};
 use crate::bytecode::instruction::Instruction;
 use crate::bytecode::proto::{Constant, Proto, UpvalueDesc};
 use crate::bytecode::verify::verify_proto;
 use num_bigint::{BigInt, Sign};
 
-/// The format version of bytecode written for a different Neyuki, or `None`
-/// when `bytes` is current (or not bytecode at all).
+/// The format version of bytecode written for an incompatible Neyuki, or
+/// `None` when `bytes` is a supported format (or not bytecode at all).
 pub fn stale_version(bytes: &[u8]) -> Option<u8> {
     if bytes.len() < BytecodeHeader::HEADER_SIZE || !bytes.starts_with(MAGIC) {
         return None;
     }
-    Some(bytes[MAGIC.len()]).filter(|&v| v != BYTECODE_VERSION)
+    Some(bytes[MAGIC.len()]).filter(|&v| !is_supported_version(v))
 }
 
 /// Why bytecode in format `version` cannot be loaded, and what to do about it.
 pub fn version_error(version: u8) -> String {
-    let made_by = if version < BYTECODE_VERSION {
+    let made_by = if version < MIN_SUPPORTED_BYTECODE_VERSION {
         "an older"
     } else {
         "a newer"
     };
     format!(
-        "bytecode was compiled by {} Neyuki (format {}, this one reads format {}); recompile the source with `neyuki compile`",
-        made_by, version, BYTECODE_VERSION
+        "bytecode was compiled by {} Neyuki (format {}, this one reads formats {}..={}); recompile the source with `neyuki compile`",
+        made_by, version, MIN_SUPPORTED_BYTECODE_VERSION, BYTECODE_VERSION
     )
 }
 
@@ -41,7 +43,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<Proto, String> {
             header.checksum, actual_checksum
         ));
     }
-    let proto = read_proto(bytes, &mut cursor, 0, None)?;
+    let proto = read_proto(bytes, &mut cursor, 0, None, header.version)?;
     // Verify bytecode integrity before allowing execution
     verify_proto(&proto).map_err(|e| e.to_string())?;
     Ok(proto)
@@ -165,8 +167,14 @@ fn read_constant(bytes: &[u8], cursor: &mut usize) -> Result<Constant, String> {
     }
 }
 
-fn read_instruction(bytes: &[u8], cursor: &mut usize) -> Result<Instruction, String> {
+fn read_instruction(bytes: &[u8], cursor: &mut usize, version: u8) -> Result<Instruction, String> {
     let tag = read_u8(bytes, cursor)?;
+    if tag >= 55 && version < 7 {
+        return Err(format!(
+            "instruction tag {} requires bytecode format 7 (file is format {})",
+            tag, version
+        ));
+    }
     match tag {
         1 => Ok(Instruction::LoadNil {
             dst: read_u8(bytes, cursor)?,
@@ -412,6 +420,61 @@ fn read_instruction(bytes: &[u8], cursor: &mut usize) -> Result<Instruction, Str
         54 => Ok(Instruction::CloseUpval {
             reg: read_u8(bytes, cursor)?,
         }),
+        55 => Ok(Instruction::AddI {
+            dst: read_u8(bytes, cursor)?,
+            a: read_u8(bytes, cursor)?,
+            imm: read_i16(bytes, cursor)?,
+        }),
+        56 => Ok(Instruction::SubI {
+            dst: read_u8(bytes, cursor)?,
+            a: read_u8(bytes, cursor)?,
+            imm: read_i16(bytes, cursor)?,
+        }),
+        57 => Ok(Instruction::MulI {
+            dst: read_u8(bytes, cursor)?,
+            a: read_u8(bytes, cursor)?,
+            imm: read_i16(bytes, cursor)?,
+        }),
+        58 => Ok(Instruction::ShlI {
+            dst: read_u8(bytes, cursor)?,
+            a: read_u8(bytes, cursor)?,
+            imm: read_u8(bytes, cursor)?,
+        }),
+        59 => Ok(Instruction::ShrI {
+            dst: read_u8(bytes, cursor)?,
+            a: read_u8(bytes, cursor)?,
+            imm: read_u8(bytes, cursor)?,
+        }),
+        60 => Ok(Instruction::EqI {
+            a: read_u8(bytes, cursor)?,
+            imm: read_i16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        61 => Ok(Instruction::NeI {
+            a: read_u8(bytes, cursor)?,
+            imm: read_i16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        62 => Ok(Instruction::LtI {
+            a: read_u8(bytes, cursor)?,
+            imm: read_i16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        63 => Ok(Instruction::LeI {
+            a: read_u8(bytes, cursor)?,
+            imm: read_i16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        64 => Ok(Instruction::GtI {
+            a: read_u8(bytes, cursor)?,
+            imm: read_i16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        65 => Ok(Instruction::GeI {
+            a: read_u8(bytes, cursor)?,
+            imm: read_i16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
         _ => Err(format!("unknown instruction tag: {}", tag)),
     }
 }
@@ -421,6 +484,7 @@ fn read_proto(
     cursor: &mut usize,
     depth: usize,
     parent_source: Option<std::rc::Rc<str>>,
+    version: u8,
 ) -> Result<Proto, String> {
     const MAX_PROTO_DEPTH: usize = 64;
     if depth > MAX_PROTO_DEPTH {
@@ -467,7 +531,7 @@ fn read_proto(
     }
     let mut instructions = Vec::with_capacity(num_instructions);
     for _ in 0..num_instructions {
-        instructions.push(read_instruction(bytes, cursor)?);
+        instructions.push(read_instruction(bytes, cursor, version)?);
     }
 
     let num_protos = read_u32(bytes, cursor)? as usize;
@@ -484,6 +548,7 @@ fn read_proto(
             cursor,
             depth + 1,
             source.clone(),
+            version,
         )?));
     }
 
@@ -568,23 +633,60 @@ mod tests {
     }
 
     #[test]
-    fn test_current_bytecode_is_not_stale() {
+    fn test_current_and_previous_bytecode_are_not_stale() {
         assert_eq!(stale_version(&with_version(BYTECODE_VERSION)), None);
+        assert_eq!(
+            stale_version(&with_version(MIN_SUPPORTED_BYTECODE_VERSION)),
+            None
+        );
         assert_eq!(stale_version(b"local x = 1"), None);
         assert_eq!(stale_version(MAGIC), None);
     }
 
     #[test]
+    fn test_v6_bytecode_deserializes_and_runs_but_rejects_v7_opcodes() {
+        let mut proto = Proto::new(Some("v6_compat".to_string()), 0, false);
+        proto.max_registers = 2;
+        proto.emit(Instruction::LoadInt { dst: 0, val: 40 }, 1);
+        proto.emit(Instruction::LoadInt { dst: 1, val: 2 }, 1);
+        proto.emit(Instruction::Add { dst: 0, a: 0, b: 1 }, 1);
+        proto.emit(Instruction::Return { base: 0, count: 1 }, 1);
+
+        let mut bytes = serialize(&proto);
+        bytes[MAGIC.len()] = 6;
+        let loaded = deserialize(&bytes).expect("v6 bytecode must still load");
+        let mut vm = crate::vm::machine::VM::new();
+        assert_eq!(vm.execute(loaded).expect("exec v6").to_string(), "42");
+
+        // A v6 header claiming a v7-only opcode tag (AddI) must be rejected.
+        let mut v7_only = Proto::new(Some("v7_only".to_string()), 0, false);
+        v7_only.max_registers = 1;
+        v7_only.emit(
+            Instruction::AddI {
+                dst: 0,
+                a: 0,
+                imm: 1,
+            },
+            1,
+        );
+        v7_only.emit(Instruction::Return { base: 0, count: 1 }, 1);
+        let mut bad_v6 = serialize(&v7_only);
+        bad_v6[MAGIC.len()] = 6;
+        let err = deserialize(&bad_v6).unwrap_err();
+        assert!(err.contains("requires bytecode format 7"), "{}", err);
+    }
+
+    #[test]
     fn test_older_bytecode_names_both_versions() {
-        let old = BYTECODE_VERSION - 1;
+        let old = MIN_SUPPORTED_BYTECODE_VERSION - 1;
         let bytes = with_version(old);
         assert_eq!(stale_version(&bytes), Some(old));
         let err = deserialize(&bytes).unwrap_err();
         assert!(err.contains("an older Neyuki"), "{}", err);
         assert!(
             err.contains(&format!(
-                "format {}, this one reads format {}",
-                old, BYTECODE_VERSION
+                "format {}, this one reads formats {}..={}",
+                old, MIN_SUPPORTED_BYTECODE_VERSION, BYTECODE_VERSION
             )),
             "{}",
             err
@@ -601,7 +703,7 @@ mod tests {
     #[test]
     fn test_version_is_checked_before_the_checksum() {
         // Older formats may checksum differently; the version is what to report.
-        let mut bytes = with_version(BYTECODE_VERSION - 1);
+        let mut bytes = with_version(MIN_SUPPORTED_BYTECODE_VERSION - 1);
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
         let err = deserialize(&bytes).unwrap_err();

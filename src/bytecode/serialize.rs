@@ -415,6 +415,96 @@ fn write_instruction(buf: &mut Vec<u8>, inst: &Instruction) {
             write_u8(buf, 54);
             write_u8(buf, *reg);
         }
+        Instruction::AddI { dst, a, imm } => {
+            write_u8(buf, 55);
+            write_u8(buf, *dst);
+            write_u8(buf, *a);
+            write_i16(buf, *imm);
+        }
+        Instruction::SubI { dst, a, imm } => {
+            write_u8(buf, 56);
+            write_u8(buf, *dst);
+            write_u8(buf, *a);
+            write_i16(buf, *imm);
+        }
+        Instruction::MulI { dst, a, imm } => {
+            write_u8(buf, 57);
+            write_u8(buf, *dst);
+            write_u8(buf, *a);
+            write_i16(buf, *imm);
+        }
+        Instruction::ShlI { dst, a, imm } => {
+            write_u8(buf, 58);
+            write_u8(buf, *dst);
+            write_u8(buf, *a);
+            write_u8(buf, *imm);
+        }
+        Instruction::ShrI { dst, a, imm } => {
+            write_u8(buf, 59);
+            write_u8(buf, *dst);
+            write_u8(buf, *a);
+            write_u8(buf, *imm);
+        }
+        Instruction::EqI {
+            a,
+            imm,
+            jump_if_false,
+        } => {
+            write_u8(buf, 60);
+            write_u8(buf, *a);
+            write_i16(buf, *imm);
+            write_i16(buf, *jump_if_false);
+        }
+        Instruction::NeI {
+            a,
+            imm,
+            jump_if_false,
+        } => {
+            write_u8(buf, 61);
+            write_u8(buf, *a);
+            write_i16(buf, *imm);
+            write_i16(buf, *jump_if_false);
+        }
+        Instruction::LtI {
+            a,
+            imm,
+            jump_if_false,
+        } => {
+            write_u8(buf, 62);
+            write_u8(buf, *a);
+            write_i16(buf, *imm);
+            write_i16(buf, *jump_if_false);
+        }
+        Instruction::LeI {
+            a,
+            imm,
+            jump_if_false,
+        } => {
+            write_u8(buf, 63);
+            write_u8(buf, *a);
+            write_i16(buf, *imm);
+            write_i16(buf, *jump_if_false);
+        }
+        Instruction::GtI {
+            a,
+            imm,
+            jump_if_false,
+        } => {
+            write_u8(buf, 64);
+            write_u8(buf, *a);
+            write_i16(buf, *imm);
+            write_i16(buf, *jump_if_false);
+        }
+        Instruction::GeI {
+            a,
+            imm,
+            jump_if_false,
+        } => {
+            write_u8(buf, 65);
+            write_u8(buf, *a);
+            write_i16(buf, *imm);
+            write_i16(buf, *jump_if_false);
+        }
     }
 }
 

@@ -295,4 +295,162 @@ pub enum Instruction {
     CloseUpval {
         reg: u8,
     },
+
+    // Immediate integer arithmetic and shift operators: dst = a OP imm
+    AddI {
+        dst: u8,
+        a: u8,
+        imm: i16,
+    },
+    SubI {
+        dst: u8,
+        a: u8,
+        imm: i16,
+    },
+    MulI {
+        dst: u8,
+        a: u8,
+        imm: i16,
+    },
+    ShlI {
+        dst: u8,
+        a: u8,
+        imm: u8,
+    },
+    ShrI {
+        dst: u8,
+        a: u8,
+        imm: u8,
+    },
+
+    // Immediate integer comparisons with conditional jumps
+    EqI {
+        a: u8,
+        imm: i16,
+        jump_if_false: i16,
+    },
+    NeI {
+        a: u8,
+        imm: i16,
+        jump_if_false: i16,
+    },
+    LtI {
+        a: u8,
+        imm: i16,
+        jump_if_false: i16,
+    },
+    LeI {
+        a: u8,
+        imm: i16,
+        jump_if_false: i16,
+    },
+    GtI {
+        a: u8,
+        imm: i16,
+        jump_if_false: i16,
+    },
+    GeI {
+        a: u8,
+        imm: i16,
+        jump_if_false: i16,
+    },
+}
+
+// Keep instruction fetch compact so hot interpreter loops stay in L1 cache.
+const _: () = assert!(std::mem::size_of::<Instruction>() == 8);
+
+impl Instruction {
+    /// Mutable reference to the `jump_if_false` offset for conditional test
+    /// and comparison instructions (`Test`, `Eq`..`Ge`, `EqI`..`GeI`).
+    #[inline]
+    pub fn jump_if_false_mut(&mut self) -> Option<&mut i16> {
+        match self {
+            Instruction::Test { jump_if_false, .. }
+            | Instruction::Eq { jump_if_false, .. }
+            | Instruction::Ne { jump_if_false, .. }
+            | Instruction::Lt { jump_if_false, .. }
+            | Instruction::Le { jump_if_false, .. }
+            | Instruction::Gt { jump_if_false, .. }
+            | Instruction::Ge { jump_if_false, .. }
+            | Instruction::EqI { jump_if_false, .. }
+            | Instruction::NeI { jump_if_false, .. }
+            | Instruction::LtI { jump_if_false, .. }
+            | Instruction::LeI { jump_if_false, .. }
+            | Instruction::GtI { jump_if_false, .. }
+            | Instruction::GeI { jump_if_false, .. } => Some(jump_if_false),
+            _ => None,
+        }
+    }
+
+    /// Relative jump offset for unconditional and conditional branch
+    /// instructions (`Jump`, `Test`, `Eq`..`Ge`, `EqI`..`GeI`).
+    #[inline]
+    pub fn branch_offset(&self) -> Option<i16> {
+        match *self {
+            Instruction::Jump { offset }
+            | Instruction::Test {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::Eq {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::Ne {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::Lt {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::Le {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::Gt {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::Ge {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::EqI {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::NeI {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::LtI {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::LeI {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::GtI {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::GeI {
+                jump_if_false: offset,
+                ..
+            } => Some(offset),
+            _ => None,
+        }
+    }
+
+    /// Mutable reference to the relative offset of `Jump` or any conditional
+    /// branch (`jump_if_false`).
+    #[inline]
+    pub fn branch_offset_mut(&mut self) -> Option<&mut i16> {
+        match self {
+            Instruction::Jump { offset } => Some(offset),
+            other => other.jump_if_false_mut(),
+        }
+    }
 }
