@@ -420,6 +420,7 @@ fn builtin_request(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         max_body: max_body_arg(args, 6)?,
         stream: bool_arg(args, 7, "stream", false)?,
     };
+    vm.permissions.check_net(&spec.url)?;
     crate::vm::libs::background::run(vm, move || perform_request(spec), finish_request)
 }
 
@@ -527,7 +528,7 @@ fn builtin_end(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// followed by the bound port (port 0 asks the OS for a free one). Requests
 /// with a body over `maxBody` bytes are answered with 413 and never reach
 /// `__http_accept`.
-fn builtin_listen(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn builtin_listen(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let host = string_arg(args, 0, "host")?;
     let port = integer_arg(args, 1, "port")?;
     let max_body = max_body_arg(args, 2)?;
@@ -535,6 +536,7 @@ fn builtin_listen(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         return Err(format!("port {} is out of range (0-65535)", port));
     }
     let address = format!("{}:{}", host, port);
+    vm.permissions.check_net(&address)?;
     let server = tiny_http::Server::http(&address)
         .map_err(|err| format!("cannot listen on `{}`: {}", address, err))?;
     let bound_port = server
@@ -800,10 +802,11 @@ const HOP_BY_HOP_RESPONSE: &[&str] = &[
 /// headers and raw body back. Redirects are passed through rather than
 /// followed. If the upstream cannot be reached the request is answered with
 /// a 502 and the error is raised, so the caller learns what went wrong.
-fn builtin_proxy(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn builtin_proxy(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let id = integer_arg(args, 0, "request")?;
     let base = string_arg(args, 1, "target")?;
     let timeout = timeout_arg(args, 2, "timeout")?;
+    vm.permissions.check_net(&base)?;
 
     let (request, body) = PENDING
         .with(|pending| pending.borrow_mut().remove(&id))
@@ -936,11 +939,14 @@ fn relay(client: TcpStream, target: &str) {
 /// on background threads. Returns the forward's id and the bound port (0
 /// asks the OS for a free one). Nothing is checked about the target until a
 /// connection arrives, so a forward can be set up before the target starts.
-fn builtin_forward(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn builtin_forward(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let host = string_arg(args, 0, "host")?;
     let port = integer_arg(args, 1, "port")?;
     let target_host = string_arg(args, 2, "target host")?;
     let target_port = integer_arg(args, 3, "target port")?;
+    vm.permissions.check_net(&format!("{}:{}", host, port))?;
+    vm.permissions
+        .check_net(&format!("{}:{}", target_host, target_port))?;
     if port > u64::from(u16::MAX) {
         return Err(format!("port {} is out of range (0-65535)", port));
     }

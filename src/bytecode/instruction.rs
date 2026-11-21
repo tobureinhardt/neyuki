@@ -98,15 +98,30 @@ pub enum Instruction {
         a: u8,
         b: u8,
     },
+    AddK {
+        dst: u8,
+        a: u8,
+        k: u16,
+    },
     Sub {
         dst: u8,
         a: u8,
         b: u8,
     },
+    SubK {
+        dst: u8,
+        a: u8,
+        k: u16,
+    },
     Mul {
         dst: u8,
         a: u8,
         b: u8,
+    },
+    MulK {
+        dst: u8,
+        a: u8,
+        k: u16,
     },
     Div {
         dst: u8,
@@ -227,6 +242,36 @@ pub enum Instruction {
     Ge {
         a: u8,
         b: u8,
+        jump_if_false: i16,
+    },
+    EqK {
+        a: u8,
+        k: u16,
+        jump_if_false: i16,
+    },
+    NeK {
+        a: u8,
+        k: u16,
+        jump_if_false: i16,
+    },
+    LtK {
+        a: u8,
+        k: u16,
+        jump_if_false: i16,
+    },
+    LeK {
+        a: u8,
+        k: u16,
+        jump_if_false: i16,
+    },
+    GtK {
+        a: u8,
+        k: u16,
+        jump_if_false: i16,
+    },
+    GeK {
+        a: u8,
+        k: u16,
         jump_if_false: i16,
     },
 
@@ -377,7 +422,13 @@ impl Instruction {
             | Instruction::LtI { jump_if_false, .. }
             | Instruction::LeI { jump_if_false, .. }
             | Instruction::GtI { jump_if_false, .. }
-            | Instruction::GeI { jump_if_false, .. } => Some(jump_if_false),
+            | Instruction::GeI { jump_if_false, .. }
+            | Instruction::EqK { jump_if_false, .. }
+            | Instruction::NeK { jump_if_false, .. }
+            | Instruction::LtK { jump_if_false, .. }
+            | Instruction::LeK { jump_if_false, .. }
+            | Instruction::GtK { jump_if_false, .. }
+            | Instruction::GeK { jump_if_false, .. } => Some(jump_if_false),
             _ => None,
         }
     }
@@ -437,6 +488,30 @@ impl Instruction {
                 ..
             }
             | Instruction::GeI {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::EqK {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::NeK {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::LtK {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::LeK {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::GtK {
+                jump_if_false: offset,
+                ..
+            }
+            | Instruction::GeK {
                 jump_if_false: offset,
                 ..
             } => Some(offset),

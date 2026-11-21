@@ -13,6 +13,7 @@ pub mod coroutine;
 pub mod crypto;
 pub mod csv;
 pub mod debug;
+pub mod ffi;
 pub mod fs;
 pub mod gpu;
 pub mod hid;
@@ -63,6 +64,7 @@ pub fn register_natives(vm: &mut VM) {
     for natives in [
         crypto::NATIVES,
         csv::NATIVES,
+        ffi::NATIVES,
         fs::NATIVES,
         audio::NATIVES,
         gpu::NATIVES,

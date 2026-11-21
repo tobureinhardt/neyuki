@@ -3388,6 +3388,7 @@ dependencies = [
  "image",
  "jiff",
  "keyring",
+ "libloading",
  "md-5 0.10.6",
  "mimalloc",
  "mysql",

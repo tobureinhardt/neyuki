@@ -29,6 +29,11 @@ pub enum NeyukiType {
     Union(Vec<NeyukiType>),
     Optional(Box<NeyukiType>),
     Custom(String),
+    TypeVar(String),
+    Generic {
+        params: Vec<String>,
+        inner: Box<NeyukiType>,
+    },
 }
 
 impl NeyukiType {
@@ -135,6 +140,11 @@ impl NeyukiType {
             return variants.iter().any(|v| self.is_assignable_to(v));
         }
 
+        // Optional source to Optional target: S? is assignable to T? if S fits T?
+        if let (NeyukiType::Optional(source_inner), NeyukiType::Optional(_)) = (self, target) {
+            return source_inner.is_assignable_to(target);
+        }
+
         // Optional target: T? accepts T or Nil
         if let NeyukiType::Optional(target_inner) = target {
             if *self == NeyukiType::Nil {
@@ -163,6 +173,15 @@ impl NeyukiType {
             (NeyukiType::Array(_), NeyukiType::Table) => true,
             (NeyukiType::Record(_), NeyukiType::Table) => true,
             (NeyukiType::TableMap { .. }, NeyukiType::Table) => true,
+            (NeyukiType::Record(_) | NeyukiType::TableMap { .. }, NeyukiType::Array(b))
+                if **b == NeyukiType::Any =>
+            {
+                true
+            }
+            (NeyukiType::Record(fields), NeyukiType::TableMap { key, val }) => {
+                NeyukiType::String.is_assignable_to(key)
+                    && fields.iter().all(|(_, f_ty)| f_ty.is_assignable_to(val))
+            }
             (NeyukiType::Array(a), NeyukiType::Array(b)) => a.is_assignable_to(b),
             (NeyukiType::Record(src_fields), NeyukiType::Record(dst_fields)) => {
                 for (dst_name, dst_ty) in dst_fields {
@@ -171,7 +190,7 @@ impl NeyukiType {
                         if !src_ty.is_assignable_to(dst_ty) {
                             return false;
                         }
-                    } else {
+                    } else if !NeyukiType::Nil.is_assignable_to(dst_ty) {
                         return false;
                     }
                 }
@@ -212,6 +231,30 @@ impl NeyukiType {
                     }
                 }
                 r1.is_assignable_to(r2)
+            }
+            (NeyukiType::TypeVar(a), NeyukiType::TypeVar(b)) => a == b,
+            (
+                NeyukiType::Generic {
+                    params: p1,
+                    inner: i1,
+                },
+                NeyukiType::Generic {
+                    params: p2,
+                    inner: i2,
+                },
+            ) => {
+                if p1.len() != p2.len() {
+                    return false;
+                }
+                let mut rename = crate::sema::generics::Substitution::new();
+                for (a, b) in p1.iter().zip(p2.iter()) {
+                    rename.insert(a.clone(), NeyukiType::TypeVar(b.clone()));
+                }
+                let renamed = crate::sema::generics::substitute(i1, &rename);
+                renamed.is_assignable_to(i2)
+            }
+            (NeyukiType::Generic { params, inner }, _) => {
+                crate::sema::generics::instantiate_to_target(params, inner, target)
             }
             _ => false,
         }
@@ -343,6 +386,10 @@ impl NeyukiType {
             }
             NeyukiType::Optional(inner) => format!("{}?", inner.display_name()),
             NeyukiType::Custom(name) => name.clone(),
+            NeyukiType::TypeVar(name) => name.clone(),
+            NeyukiType::Generic { params, inner } => {
+                format!("<{}>{}", params.join(", "), inner.display_name())
+            }
         }
     }
 }
@@ -370,6 +417,18 @@ mod tests {
         assert!(NeyukiType::Int.is_assignable_to(&t_union));
         assert!(NeyukiType::String.is_assignable_to(&t_union));
         assert!(!NeyukiType::Boolean.is_assignable_to(&t_union));
+
+        let cfg_ty = NeyukiType::Record(vec![
+            (
+                "name".to_string(),
+                NeyukiType::Optional(Box::new(NeyukiType::String)),
+            ),
+            ("retries".to_string(), NeyukiType::Number),
+        ]);
+        let omitted_opt = NeyukiType::Record(vec![("retries".to_string(), NeyukiType::Int)]);
+        let omitted_req = NeyukiType::Record(vec![("name".to_string(), NeyukiType::String)]);
+        assert!(omitted_opt.is_assignable_to(&cfg_ty));
+        assert!(!omitted_req.is_assignable_to(&cfg_ty));
     }
 
     #[test]

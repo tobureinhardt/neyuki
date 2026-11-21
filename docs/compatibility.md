@@ -35,7 +35,7 @@ Language features and APIs are organized into three distinct stability tiers:
 
 Bytecode artifacts (`.nykb`) carry an explicit version byte in the 12-byte header (`BYTECODE_VERSION`):
 
-1. **Current Version**: Bytecode Version 7 (`0x07`), which adds immediate integer opcodes (`AddI`..`GeI`, tags `55..=65`) without altering any Version 6 opcode or prototype layout. The VM continues to decode Version 6 (`0x06`) `.nykb` files directly (`MIN_SUPPORTED_BYTECODE_VERSION = 6`).
+1. **Current Version**: Bytecode Version 8 (`0x08`), which adds constant-operand super-instructions (`AddK`, `SubK`, `MulK`, `EqK`..`GeK`, tags `66..=74`) on top of Version 7's immediate integer opcodes (`AddI`..`GeI`, tags `55..=65`) without altering any older opcode or prototype layout. The VM continues to decode Version 6 and 7 `.nykb` files directly (`MIN_SUPPORTED_BYTECODE_VERSION = 6`); the loader rejects an instruction tag newer than the file's declared version.
 2. **Forward Compatibility**: The VM strictly rejects bytecode with a version byte greater than its supported `BYTECODE_VERSION` with a clean diagnostic:
    ```text
    bytecode was compiled by a newer Neyuki (format X, this one reads formats 6..=7); recompile the source with `neyuki compile`

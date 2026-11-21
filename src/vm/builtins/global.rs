@@ -266,6 +266,9 @@ pub fn builtin_pcall(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> 
             Ok(res)
         }
         Err(err) => {
+            if vm.limits.is_tripped() {
+                return Err(err);
+            }
             vm.error_trace = None;
             Ok(vec![Value::Bool(false), Value::string(err)])
         }
@@ -284,6 +287,9 @@ pub fn builtin_try(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             Ok(res)
         }
         Err(err) => {
+            if vm.limits.is_tripped() {
+                return Err(err);
+            }
             vm.error_trace = None;
             Ok(vec![Value::Bool(false), Value::string(err)])
         }
@@ -304,6 +310,9 @@ pub fn builtin_xpcall(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String>
             Ok(res)
         }
         Err(err) => {
+            if vm.limits.is_tripped() {
+                return Err(err);
+            }
             vm.error_trace = None;
             let err_val = Value::string(err);
             match vm.call_function(err_handler.clone(), std::slice::from_ref(&err_val)) {
@@ -311,10 +320,15 @@ pub fn builtin_xpcall(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String>
                     let ret = h_res.into_iter().next().unwrap_or(err_val);
                     Ok(vec![Value::Bool(false), ret])
                 }
-                Err(h_err) => Ok(vec![
-                    Value::Bool(false),
-                    Value::String((format!("error in error handling: {}", h_err)).into()),
-                ]),
+                Err(h_err) => {
+                    if vm.limits.is_tripped() {
+                        return Err(h_err);
+                    }
+                    Ok(vec![
+                        Value::Bool(false),
+                        Value::String((format!("error in error handling: {}", h_err)).into()),
+                    ])
+                }
             }
         }
     }
@@ -410,8 +424,14 @@ pub fn builtin_require(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
             .map_err(|_| format!("cannot find module '{}'", pkg))?,
     };
     let key = located.cache_key();
+    // Soundness invariant: `vm.modules` starts empty, `vm.permissions` is fixed
+    // for the lifetime of the VM, and entries are only cached below after passing
+    // `Located::Disk` `check_read` (or coming from bundled/trusted memory modules).
     if let Some(cached) = vm.modules.get(&key).cloned() {
         return Ok(vec![cached]);
+    }
+    if let crate::module_loader::Located::Disk(path) = &located {
+        vm.permissions.check_read(&path.to_string_lossy())?;
     }
     let (resolved_path, bytes) = loader.read_located(&located)?;
     let proto = loader.compile_bytes(&resolved_path, &bytes, pkg)?;

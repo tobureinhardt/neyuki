@@ -1,0 +1,101 @@
+local table = require("@neyuki/table")
+
+local ffi = {}
+
+-- Dynamic C-ABI FFI and native extension loading (src/vm/libs/ffi.rs).
+
+function ffi.open(path: string?, signatures: {[string]: any}): any
+    if (path != nil and type(path) != "string") then
+        error("path must be a string or nil")
+    end
+    if (type(signatures) != "table") then
+        error("signatures must be a table")
+    end
+    local libId, symMap = __ffi_open(path, signatures)
+    local api = {}
+    for name, symId in symMap do
+        api[name] = function(...: any): any
+            return __ffi_call(libId, symId, ...)
+        end
+    end
+    function api.close(self: any): boolean
+        return __ffi_close(libId)
+    end
+    return table.freeze(api)
+end
+
+function ffi.loadExtension(path: string): any
+    if (type(path) != "string") then
+        error("path must be a string")
+    end
+    local libId, fnMap = __ffi_load_extension(path)
+    local api = {}
+    for name, fnId in fnMap do
+        api[name] = function(...: any): any
+            return __ffi_ext_call(libId, fnId, ...)
+        end
+    end
+    function api.close(self: any): boolean
+        return __ffi_close(libId)
+    end
+    return table.freeze(api)
+end
+
+function ffi.alloc(size: int): int
+    if (type(size) != "number") then error("size must be a number") end
+    return __ffi_alloc(size)
+end
+
+function ffi.free(ptr: int): ()
+    if (ptr == nil) then return end
+    if (type(ptr) != "number") then error("ptr must be a number") end
+    __ffi_free(ptr)
+end
+
+function ffi.read(ptr: int, ty: string, offset: int?): any
+    if (type(ptr) != "number") then error("ptr must be a number") end
+    if (type(ty) != "string") then error("type must be a string") end
+    if (offset != nil and type(offset) != "number") then error("offset must be a number") end
+    return __ffi_read(ptr, ty, offset)
+end
+
+function ffi.write(ptr: int, ty: string, value: any, offset: int?): ()
+    if (type(ptr) != "number") then error("ptr must be a number") end
+    if (type(ty) != "string") then error("type must be a string") end
+    if (offset != nil and type(offset) != "number") then error("offset must be a number") end
+    __ffi_write(ptr, ty, value, offset)
+end
+
+function ffi.readCString(ptr: int?, maxLen: int?): string?
+    if (ptr != nil and type(ptr) != "number") then error("ptr must be a number or nil") end
+    if (maxLen != nil and type(maxLen) != "number") then error("maxLen must be a number") end
+    return __ffi_read_cstring(ptr, maxLen)
+end
+
+-- The Unsafe variants take raw foreign pointers and need unrestricted --allow-ffi.
+function ffi.readUnsafe(ptr: int, ty: string, offset: int?): any
+    if (type(ptr) != "number") then error("ptr must be a number") end
+    if (type(ty) != "string") then error("type must be a string") end
+    if (offset != nil and type(offset) != "number") then error("offset must be a number") end
+    return __ffi_read_unsafe(ptr, ty, offset)
+end
+
+function ffi.writeUnsafe(ptr: int, ty: string, value: any, offset: int?): ()
+    if (type(ptr) != "number") then error("ptr must be a number") end
+    if (type(ty) != "string") then error("type must be a string") end
+    if (offset != nil and type(offset) != "number") then error("offset must be a number") end
+    __ffi_write_unsafe(ptr, ty, value, offset)
+end
+
+function ffi.readCStringUnsafe(ptr: int?, maxLen: int?): string?
+    if (ptr != nil and type(ptr) != "number") then error("ptr must be a number or nil") end
+    if (maxLen != nil and type(maxLen) != "number") then error("maxLen must be a number") end
+    return __ffi_read_cstring_unsafe(ptr, maxLen)
+end
+
+function ffi.sizeof(ty: string): int
+    if (type(ty) != "string") then error("type must be a string") end
+    return __ffi_sizeof(ty)
+end
+
+return table.freeze(ffi)

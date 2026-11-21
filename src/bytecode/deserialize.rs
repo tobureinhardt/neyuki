@@ -169,6 +169,12 @@ fn read_constant(bytes: &[u8], cursor: &mut usize) -> Result<Constant, String> {
 
 fn read_instruction(bytes: &[u8], cursor: &mut usize, version: u8) -> Result<Instruction, String> {
     let tag = read_u8(bytes, cursor)?;
+    if tag >= 66 && version < 8 {
+        return Err(format!(
+            "instruction tag {} requires bytecode format 8 (file is format {})",
+            tag, version
+        ));
+    }
     if tag >= 55 && version < 7 {
         return Err(format!(
             "instruction tag {} requires bytecode format 7 (file is format {})",
@@ -473,6 +479,51 @@ fn read_instruction(bytes: &[u8], cursor: &mut usize, version: u8) -> Result<Ins
         65 => Ok(Instruction::GeI {
             a: read_u8(bytes, cursor)?,
             imm: read_i16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        66 => Ok(Instruction::AddK {
+            dst: read_u8(bytes, cursor)?,
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+        }),
+        67 => Ok(Instruction::SubK {
+            dst: read_u8(bytes, cursor)?,
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+        }),
+        68 => Ok(Instruction::MulK {
+            dst: read_u8(bytes, cursor)?,
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+        }),
+        69 => Ok(Instruction::EqK {
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        70 => Ok(Instruction::NeK {
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        71 => Ok(Instruction::LtK {
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        72 => Ok(Instruction::LeK {
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        73 => Ok(Instruction::GtK {
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+            jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        74 => Ok(Instruction::GeK {
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
             jump_if_false: read_i16(bytes, cursor)?,
         }),
         _ => Err(format!("unknown instruction tag: {}", tag)),

@@ -223,6 +223,7 @@ fn os_run(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
     let mut command = match args.first() {
         Some(Value::String(line)) => {
+            vm.permissions.check_run_shell(line)?;
             let mut command = if cfg!(windows) {
                 Command::new("cmd")
             } else {
@@ -249,6 +250,7 @@ fn os_run(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 }
             }
             let (program, rest) = parts.split_first().ok_or("command must not be empty")?;
+            let program = vm.permissions.resolve_run_program(program)?;
             let mut command = Command::new(program);
             command.args(rest);
             command
@@ -401,7 +403,7 @@ fn os_exit(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
 /// The value of an environment variable, or nil when it is unset or not
 /// valid Unicode.
-fn os_getenv(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn os_getenv(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let varname = match args
         .first()
         .ok_or_else(|| "os.getenv expects variable name".to_string())?
@@ -409,6 +411,7 @@ fn os_getenv(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         Value::String(s) => s,
         _ => return Err("os.getenv expects string".to_string()),
     };
+    vm.permissions.check_env(varname)?;
     match std::env::var(&**varname) {
         Ok(v) => Ok(vec![Value::string(v)]),
         Err(_) => Ok(vec![Value::Nil]),
@@ -467,4 +470,89 @@ pub fn create_os_lib() -> Value {
     );
     table.frozen = true;
     Value::Table(Rc::new(RefCell::new(table)))
+}
+
+#[cfg(all(test, unix))]
+mod run_sandbox_tests {
+    use super::*;
+    use crate::vm::permissions::{PermissionScope, Permissions};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn script(path: &Path, marker: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn call(vm: &mut VM, cmd: &[&str], opts: &[(&str, Value)]) -> Result<Vec<Value>, String> {
+        let mut list = VmTable::new();
+        for c in cmd {
+            list.array.push(Value::str(c));
+        }
+        let mut o = VmTable::new();
+        for (k, v) in opts {
+            o.set_str(k, v.clone());
+        }
+        let wrap = |t: VmTable| Value::Table(std::rc::Rc::new(std::cell::RefCell::new(t)));
+        os_run(vm, &[wrap(list), wrap(o)])
+    }
+
+    fn table(pairs: &[(&str, &str)]) -> Value {
+        let mut t = VmTable::new();
+        for (k, v) in pairs {
+            t.set_str(k, Value::str(v));
+        }
+        Value::Table(std::rc::Rc::new(std::cell::RefCell::new(t)))
+    }
+
+    fn vm_with_run(list: &[&str]) -> VM {
+        let mut vm = VM::new();
+        vm.set_permissions(
+            Permissions::allow_all().with_run(PermissionScope::AllowList(
+                list.iter().map(|s| s.to_string()).collect(),
+            )),
+        );
+        vm
+    }
+
+    #[test]
+    fn allow_list_bare_name_ignores_child_path_override() {
+        let base = std::env::temp_dir().join(format!("neyuki_run_path_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let marker = base.join("evil_ran");
+        script(&base.join("bin/true"), &marker);
+        let mut vm = vm_with_run(&["true"]);
+        let env = table(&[("PATH", &base.join("bin").to_string_lossy())]);
+        let _ = call(&mut vm, &["true"], &[("env", env)]);
+        assert!(
+            !marker.exists(),
+            "child PATH override ran an unlisted binary"
+        );
+        // The legitimate binary still runs.
+        let res = call(&mut vm, &["true"], &[]).unwrap();
+        assert!(matches!(&res[0], Value::Table(_)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn allow_list_relative_path_ignores_child_cwd() {
+        let id = std::process::id();
+        let rel = format!("target/neyuki_run_cwd_{id}/prog");
+        let good_marker = std::env::temp_dir().join(format!("neyuki_good_{id}"));
+        let evil_root = std::env::temp_dir().join(format!("neyuki_evil_{id}"));
+        let evil_marker = std::env::temp_dir().join(format!("neyuki_evil_ran_{id}"));
+        let _ = std::fs::remove_file(&good_marker);
+        let _ = std::fs::remove_file(&evil_marker);
+        script(Path::new(&rel), &good_marker);
+        script(&evil_root.join(&rel), &evil_marker);
+        let mut vm = vm_with_run(&[&format!("./{rel}")]);
+        let cwd = Value::str(&evil_root.to_string_lossy());
+        let _ = call(&mut vm, &[&format!("./{rel}")], &[("cwd", cwd)]);
+        assert!(!evil_marker.exists(), "child cwd redirected the program");
+        assert!(good_marker.exists(), "allowed program did not run");
+        let _ = std::fs::remove_dir_all(format!("target/neyuki_run_cwd_{id}"));
+        let _ = std::fs::remove_dir_all(&evil_root);
+        let _ = std::fs::remove_file(&good_marker);
+    }
 }

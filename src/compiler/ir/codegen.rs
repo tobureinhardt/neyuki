@@ -290,6 +290,71 @@ fn compare_instruction(op: IrBinaryOp, a: u8, b: u8) -> Instruction {
     }
 }
 
+/// The conditional-jump instruction comparing register `a` with constant `k`,
+/// with its offset unset.
+fn compare_const_instruction(op: IrBinaryOp, a: u8, k: u16) -> Instruction {
+    let jump_if_false = 0;
+    match op {
+        IrBinaryOp::Eq => Instruction::EqK {
+            a,
+            k,
+            jump_if_false,
+        },
+        IrBinaryOp::Ne => Instruction::NeK {
+            a,
+            k,
+            jump_if_false,
+        },
+        IrBinaryOp::Lt => Instruction::LtK {
+            a,
+            k,
+            jump_if_false,
+        },
+        IrBinaryOp::Le => Instruction::LeK {
+            a,
+            k,
+            jump_if_false,
+        },
+        IrBinaryOp::Gt => Instruction::GtK {
+            a,
+            k,
+            jump_if_false,
+        },
+        IrBinaryOp::Ge => Instruction::GeK {
+            a,
+            k,
+            jump_if_false,
+        },
+        _ => unreachable!("not a comparison"),
+    }
+}
+
+fn ir_const_to_bytecode(proto: &mut Proto, val: &IrConstant) -> u16 {
+    match val {
+        IrConstant::Nil => proto.add_constant(Constant::Nil),
+        IrConstant::Bool(b) => proto.add_constant(Constant::Bool(*b)),
+        IrConstant::Int(i) => proto.add_constant(Constant::Int(i.clone())),
+        IrConstant::Float(f) => proto.add_constant(Constant::Float(*f)),
+        IrConstant::String(s) => proto.add_constant(Constant::String(s.clone())),
+    }
+}
+
+/// Whether `op` has a constant-operand form (`AddK`..`GeK`).
+fn has_const_form(op: IrBinaryOp) -> bool {
+    matches!(
+        op,
+        IrBinaryOp::Add
+            | IrBinaryOp::Sub
+            | IrBinaryOp::Mul
+            | IrBinaryOp::Eq
+            | IrBinaryOp::Ne
+            | IrBinaryOp::Lt
+            | IrBinaryOp::Le
+            | IrBinaryOp::Gt
+            | IrBinaryOp::Ge
+    )
+}
+
 pub fn ir_to_bytecode(module: &IrModule) -> Result<Proto, String> {
     ir_function_to_proto(&module.main, 0)
 }
@@ -446,6 +511,9 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
     let mut def_count: FxHashMap<IrVar, usize> = new_map();
     let mut const_keys: FxHashMap<IrVar, &str> = new_map();
     let mut const_ints: FxHashMap<IrVar, i16> = new_map();
+    // Any other constant used only as the right operand of `Add`/`Sub`/`Mul`
+    // or a comparison is read from the constant pool (`AddK`..`GeK`).
+    let mut const_vals: FxHashMap<IrVar, &IrConstant> = new_map();
     for inst in &func.instructions {
         inst.for_each_use(|var| {
             *use_count.entry(var).or_insert(0) += 1;
@@ -453,6 +521,9 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
         inst.for_each_def(|var| {
             *def_count.entry(var).or_insert(0) += 1;
         });
+        if let IrInst::LoadConst { dst, val } = inst {
+            const_vals.insert(*dst, val);
+        }
         match inst {
             IrInst::LoadConst {
                 dst,
@@ -475,9 +546,11 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
 
     const_keys.retain(|var, _| def_count.get(var) == Some(&1));
     const_ints.retain(|var, _| def_count.get(var) == Some(&1) && !pinned_vars.contains(var));
+    const_vals.retain(|var, _| def_count.get(var) == Some(&1) && !pinned_vars.contains(var));
     let mut key_uses: FxHashMap<IrVar, usize> = new_map();
     let mut imm_uses: FxHashMap<IrVar, usize> = new_map();
-    if !const_keys.is_empty() || !const_ints.is_empty() {
+    let mut k_uses: FxHashMap<IrVar, usize> = new_map();
+    if !const_keys.is_empty() || !const_ints.is_empty() || !const_vals.is_empty() {
         for inst in &func.instructions {
             match inst {
                 IrInst::GetTable { table, key, .. } if table != key => {
@@ -490,14 +563,19 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                         *key_uses.entry(*key).or_insert(0) += 1;
                     }
                 }
-                IrInst::BinOp { op, lhs, rhs, .. } if !const_ints.is_empty() => {
+                IrInst::BinOp { op, lhs, rhs, .. } => {
                     if let Some((_, imm_var, _)) = select_binop_imm(*op, *lhs, *rhs, &const_ints) {
                         *imm_uses.entry(imm_var).or_insert(0) += 1;
+                    } else if lhs != rhs && has_const_form(*op) && const_vals.contains_key(rhs) {
+                        *k_uses.entry(*rhs).or_insert(0) += 1;
                     }
                 }
                 IrInst::DebugLocal { var, .. } => {
                     key_uses.remove(var);
                     const_keys.remove(var);
+                    imm_uses.remove(var);
+                    k_uses.remove(var);
+                    const_vals.remove(var);
                 }
                 _ => {}
             }
@@ -512,6 +590,12 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
     let imm_only = |var: &IrVar| {
         const_ints.contains_key(var)
             && imm_uses
+                .get(var)
+                .is_some_and(|n| Some(n) == use_count.get(var))
+    };
+    let k_only = |var: &IrVar| {
+        const_vals.contains_key(var)
+            && k_uses
                 .get(var)
                 .is_some_and(|n| Some(n) == use_count.get(var))
     };
@@ -668,7 +752,7 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
             IrInst::Label(l) => {
                 label_positions.insert(*l, proto.instructions.len());
             }
-            IrInst::LoadConst { dst, .. } if key_only(dst) || imm_only(dst) => {}
+            IrInst::LoadConst { dst, .. } if key_only(dst) || imm_only(dst) || k_only(dst) => {}
             IrInst::LoadConst { dst, val } => {
                 let r = regs.get(*dst, &mut proto);
                 match val {
@@ -818,6 +902,31 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                                 1,
                             );
                         }
+                    }
+                } else if *lhs != *rhs && has_const_form(*op) && k_only(rhs) {
+                    let rd = regs.get(*dst, &mut proto);
+                    let ra = regs.get(*lhs, &mut proto);
+                    let k = ir_const_to_bytecode(&mut proto, const_vals[rhs]);
+                    match op {
+                        IrBinaryOp::Add => {
+                            proto.emit(Instruction::AddK { dst: rd, a: ra, k }, 1);
+                        }
+                        IrBinaryOp::Sub => {
+                            proto.emit(Instruction::SubK { dst: rd, a: ra, k }, 1);
+                        }
+                        IrBinaryOp::Mul => {
+                            proto.emit(Instruction::MulK { dst: rd, a: ra, k }, 1);
+                        }
+                        _ => emit_comparison(
+                            &mut proto,
+                            compare_const_instruction(*op, ra, k),
+                            *dst,
+                            next_non_debug,
+                            single_use(*dst),
+                            &mut regs,
+                            &mut jump_patches,
+                            &mut skipped_indices,
+                        ),
                     }
                 } else {
                     let rd = regs.get(*dst, &mut proto);

@@ -2,11 +2,13 @@
 
 // Magic bytes at the start of compiled bytecode binary
 pub const MAGIC: &[u8; 7] = b"neyuki!";
-/// Oldest bytecode format version this VM still decodes. Format 7 only appends
-/// new immediate opcodes (tags 55..=65) without altering any v6 opcode or
-/// prototype layout, so v6 `.nykb` files stay directly loadable.
+/// Oldest bytecode format version this VM still decodes. Formats 7 and 8 only
+/// append opcodes (7: immediate integer ops, tags 55..=65; 8: constant-operand
+/// super-instructions `AddK`..`GeK`, tags 66..=74) without altering any older
+/// opcode or prototype layout, so v6 and v7 `.nykb` files stay loadable. The
+/// deserializer rejects a tag newer than the file's declared version.
 pub const MIN_SUPPORTED_BYTECODE_VERSION: u8 = 6;
-pub const BYTECODE_VERSION: u8 = 7;
+pub const BYTECODE_VERSION: u8 = 8;
 
 #[inline]
 pub fn is_supported_version(version: u8) -> bool {

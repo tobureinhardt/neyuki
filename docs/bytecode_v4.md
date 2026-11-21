@@ -1,6 +1,6 @@
 # Neyuki Bytecode Specification (Format 7)
 
-This document specifies the binary format, encoding scheme, constant pool structure, prototype hierarchy, and instruction set for Neyuki Bytecode Format 7 (`BYTECODE_VERSION = 7`, with loader backward compatibility for format 6 via `MIN_SUPPORTED_BYTECODE_VERSION = 6`).
+This document specifies the binary format, encoding scheme, constant pool structure, prototype hierarchy, and instruction set for Neyuki Bytecode Format 8 (`BYTECODE_VERSION = 8`, with loader backward compatibility for formats 6 and 7 via `MIN_SUPPORTED_BYTECODE_VERSION = 6`).
 
 ## 1. File Structure and Header
 
@@ -167,6 +167,8 @@ All instructions are serialized as a 1-byte opcode tag followed by operand field
 | `0x34` | `Vararg` | `dst: u8, count: u8` | Copy `count` vararg values into `R(dst)..` |
 
 ### 4.7 Immediate Integer Instructions (Format 7+)
+Constant-operand ops `AddK`/`SubK`/`MulK` (tags `66..=68`, `dst, a, k:u16`) and `EqK`/`NeK`/`LtK`/`LeK`/`GtK`/`GeK` (tags `69..=74`, `a, k:u16, jump_if_false:i16`) were added in `BYTECODE_VERSION = 8`; `k` indexes the constant pool.
+
 Added in `BYTECODE_VERSION = 7` (wire tags `55..=65` / `0x37..=0x41`; format 6 files continue to load without these tags). All immediate operands preserve full dynamic/metamethod semantics by falling back to `Value::Int(imm)` for non-primitive or table operands.
 
 | Wire Tag | Mnemonic | Operands | Operational Semantics |

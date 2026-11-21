@@ -1,11 +1,16 @@
 //! Semantic checks: scopes, `const`, types, arity and dead code.
 
 pub mod analyzer;
+pub mod diagnostics;
+pub mod generics;
+pub mod infer;
 pub mod scope;
 pub mod symbol;
+pub mod type_env;
 pub mod types;
 
 pub use analyzer::SemanticAnalyzer;
+pub use generics::Substitution;
 pub use scope::ScopeManager;
 pub use symbol::{Symbol, SymbolKind};
 pub use types::NeyukiType;
@@ -293,5 +298,106 @@ mod tests {
         .expect("compile failed");
         let without = compile_program("return 1", "t", Options::RUN).expect("compile failed");
         assert_eq!(with.instructions.len(), without.instructions.len());
+    }
+
+    #[test]
+    fn test_sema_record_and_index_inference() {
+        let ok_code = r#"
+local pt = { x = 1, label = "origin" }
+local px: int = pt.x
+local lbl: string = pt.label
+local nums = { 10, 20, 30 }
+local n: int = nums[1]
+return px, lbl, n
+"#;
+        let ok_stmts = compile_source(ok_code).unwrap();
+        let ok_diags = analyze(&ok_stmts, ok_code);
+        assert!(
+            ok_diags.is_empty(),
+            "unexpected diagnostics: {:?}",
+            ok_diags
+        );
+
+        let bad_code = r#"
+local pt = { x = 1, label = "origin" }
+local bad_field: int = pt.label
+local nums = { 10, 20, 30 }
+local bad_elem: string = nums[1]
+return bad_field, bad_elem
+"#;
+        let bad_stmts = compile_source(bad_code).unwrap();
+        let bad_diags = analyze(&bad_stmts, bad_code);
+        let type_errors: Vec<_> = bad_diags
+            .iter()
+            .filter(|d| d.code == Some(crate::diagnostics::error_code::ErrorCode::E0003))
+            .collect();
+        assert_eq!(
+            type_errors.len(),
+            2,
+            "expected 2 E0003 errors: {:?}",
+            bad_diags
+        );
+    }
+
+    #[test]
+    fn test_sema_unannotated_return_and_narrowing_inference() {
+        let code = r#"
+local function add_one(x: int)
+    return x + 1
+end
+local function need_str(s: string)
+    return s
+end
+local ok: int = add_one(4)
+local bad_ret: string = add_one(4)
+local maybe: string? = "hi"
+if maybe != nil then
+    local narrowed: string = need_str(maybe)
+    local bad_narrow: int = narrowed
+    local _keep = bad_narrow
+end
+return ok, bad_ret
+"#;
+        let stmts = compile_source(code).unwrap();
+        let diags = analyze(&stmts, code);
+        let e0003: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(crate::diagnostics::error_code::ErrorCode::E0003))
+            .collect();
+        assert_eq!(
+            e0003.len(),
+            2,
+            "expected bad_ret + bad_narrow E0003 diagnostics: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_thir_and_generic_call_inference() {
+        use crate::compiler::hir::HirId;
+        use crate::compiler::thir::nodes::{ThirExpr, ThirExprKind, ThirId};
+        use crate::compiler::thir::typeck::infer_call_type;
+
+        let id_ty = generics::generalize_function(
+            vec![NeyukiType::TypeVar("T".to_string())],
+            NeyukiType::TypeVar("T".to_string()),
+            false,
+        );
+        let callee = ThirExpr {
+            thir_id: ThirId(0),
+            hir_id: HirId(0),
+            ty: id_ty,
+            kind: ThirExprKind::Variable {
+                name: "id".to_string(),
+                binding: None,
+            },
+        };
+        let arg = ThirExpr {
+            thir_id: ThirId(1),
+            hir_id: HirId(1),
+            ty: NeyukiType::String,
+            kind: ThirExprKind::Vararg,
+        };
+        assert_eq!(infer_call_type(&callee, &[arg]), NeyukiType::String);
     }
 }

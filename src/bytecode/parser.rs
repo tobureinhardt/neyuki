@@ -685,6 +685,67 @@ fn parse_instruction_line(line: &str) -> Result<Option<Instruction>, String> {
             let reg = parse_reg(parts.get(1).ok_or("CLOSEUPVAL missing reg")?)?;
             Ok(Some(Instruction::CloseUpval { reg }))
         }
+        "ADDK" | "SUBK" | "MULK" => {
+            let dst = parse_reg(parts.get(1).ok_or_else(|| format!("{} missing dst", op))?)?;
+            let a = parse_reg(parts.get(2).ok_or_else(|| format!("{} missing a", op))?)?;
+            let k = parse_const_idx(parts.get(3).ok_or_else(|| format!("{} missing k", op))?)?;
+            let inst = match op {
+                "ADDK" => Instruction::AddK { dst, a, k },
+                "SUBK" => Instruction::SubK { dst, a, k },
+                "MULK" => Instruction::MulK { dst, a, k },
+                _ => unreachable!("the outer match only lets constant arithmetic names through"),
+            };
+            Ok(Some(inst))
+        }
+        "EQK" | "NEK" | "LTK" | "LEK" | "GTK" | "GEK" => {
+            let a = parse_reg(parts.get(1).ok_or_else(|| format!("{} missing a", op))?)?;
+            let k = parse_const_idx(parts.get(2).ok_or_else(|| format!("{} missing k", op))?)?;
+            let offset_token = if parts.len() >= 5 && parts[3] == "offset" {
+                parts[4]
+            } else {
+                parts
+                    .get(3)
+                    .ok_or_else(|| format!("{} missing jump offset", op))?
+            };
+            let jump_if_false = offset_token
+                .trim_end_matches(',')
+                .parse::<i16>()
+                .map_err(|e| e.to_string())?;
+            let inst = match op {
+                "EQK" => Instruction::EqK {
+                    a,
+                    k,
+                    jump_if_false,
+                },
+                "NEK" => Instruction::NeK {
+                    a,
+                    k,
+                    jump_if_false,
+                },
+                "LTK" => Instruction::LtK {
+                    a,
+                    k,
+                    jump_if_false,
+                },
+                "LEK" => Instruction::LeK {
+                    a,
+                    k,
+                    jump_if_false,
+                },
+                "GTK" => Instruction::GtK {
+                    a,
+                    k,
+                    jump_if_false,
+                },
+                "GEK" => Instruction::GeK {
+                    a,
+                    k,
+                    jump_if_false,
+                },
+                _ => unreachable!("the outer match only lets constant comparison names through"),
+            };
+            Ok(Some(inst))
+        }
         "ADDI" | "SUBI" | "MULI" => {
             let dst = parse_reg(parts.get(1).ok_or_else(|| format!("{} missing dst", op))?)?;
             let a = parse_reg(parts.get(2).ok_or_else(|| format!("{} missing a", op))?)?;

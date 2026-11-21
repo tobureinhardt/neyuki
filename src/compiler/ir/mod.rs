@@ -15,7 +15,7 @@ pub mod types;
 pub mod verify;
 
 pub use block::{BasicBlock, ControlFlowGraph, IrFunction, IrModule, UpvalSource};
-pub use builder::{IrBuilder, ast_to_ir, ast_to_ir_with};
+pub use builder::{ast_to_ir, ast_to_ir_with, hir_to_ir_with};
 pub use cfg_builder::build_cfg;
 pub use codegen::ir_to_bytecode;
 pub use dom::{DominatorTree, ImmediateDominators};
@@ -24,7 +24,8 @@ pub use liveness::{LiveInterval, LivenessInfo};
 pub use opt::{
     common_subexpression_elimination, common_subexpression_elimination_cfg, constant_propagation,
     copy_propagation, copy_propagation_cfg, dead_code_elimination, dead_code_elimination_cfg,
-    inline_functions, loop_invariant_code_motion, optimize_cfg, simplify_cfg,
+    inline_functions, loop_invariant_code_motion, optimize_cfg, optimize_cfg_with_level,
+    peephole_cfg, simplify_cfg, strength_reduction_cfg,
 };
 pub use pretty::{format_inst, print_cfg, print_function, print_module};
 pub use regalloc::{RegisterAllocation, allocate_registers};

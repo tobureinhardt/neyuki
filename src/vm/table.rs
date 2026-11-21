@@ -496,6 +496,10 @@ enum FieldStorage {
 #[derive(Clone, Debug)]
 pub struct FieldMap {
     inner: FieldStorage,
+    /// Bumped on every structural change (key added or removed, storage
+    /// promoted or cleared) so inline caches holding a slot index can tell when
+    /// it may have moved. Overwriting an existing value never bumps it.
+    shape_version: u64,
 }
 
 impl Default for FieldMap {
@@ -544,6 +548,7 @@ impl FieldMap {
     pub fn new() -> Self {
         Self {
             inner: FieldStorage::Small(Vec::new()),
+            shape_version: 0,
         }
     }
 
@@ -556,7 +561,119 @@ impl FieldMap {
         } else {
             FieldStorage::Hash(Box::new(HashFieldMap::with_capacity(cap)))
         };
-        Self { inner }
+        Self {
+            inner,
+            shape_version: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn shape_version(&self) -> u64 {
+        self.shape_version
+    }
+
+    #[inline(always)]
+    fn bump_shape(&mut self) {
+        self.shape_version = self.shape_version.wrapping_add(1);
+    }
+
+    /// Storage slot holding `key`, valid while `shape_version` is unchanged.
+    #[inline]
+    pub fn find_index_by_strref(&self, key: &StrRef) -> Option<usize> {
+        match &self.inner {
+            FieldStorage::Small(entries) => {
+                let hash = key.0.hash;
+                entries
+                    .iter()
+                    .position(|e| entry_matches_strref(e, hash, key))
+            }
+            FieldStorage::Hash(map) => {
+                if map.count == 0 {
+                    return None;
+                }
+                let hash = key.0.hash;
+                map.find_slot(hash, |e| entry_matches_strref(e, hash, key))
+                    .ok()
+            }
+        }
+    }
+
+    #[inline]
+    pub fn find_index(&self, key: &str) -> Option<usize> {
+        match &self.inner {
+            FieldStorage::Small(entries) => {
+                let hash = crate::vm::hash::fx_hash_bytes(key.as_bytes());
+                entries
+                    .iter()
+                    .position(|e| e.hash == hash && e.key.0.str == key)
+            }
+            FieldStorage::Hash(map) => {
+                if map.count == 0 {
+                    return None;
+                }
+                let hash = crate::vm::hash::fx_hash_bytes(key.as_bytes());
+                map.find_slot(hash, |e| e.hash == hash && e.key.0.str == key)
+                    .ok()
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn get_slot(&self, idx: usize) -> Option<&Value> {
+        match &self.inner {
+            FieldStorage::Small(entries) => entries.get(idx).map(|e| &e.val),
+            FieldStorage::Hash(map) => map
+                .entries
+                .get(idx)
+                .and_then(|opt| opt.as_ref().map(|e| &e.val)),
+        }
+    }
+
+    /// `get_slot`, but only if the slot still holds `key`. Inline caches key on
+    /// the table address and `shape_version`, and both can repeat (a freed
+    /// table's address is reused by a new table whose version also starts at 0),
+    /// so a cache hit must confirm the key before trusting the slot.
+    #[inline(always)]
+    pub fn get_slot_keyed(&self, idx: usize, key: &StrRef) -> Option<&Value> {
+        let entry = match &self.inner {
+            FieldStorage::Small(entries) => entries.get(idx),
+            FieldStorage::Hash(map) => map.entries.get(idx).and_then(|opt| opt.as_ref()),
+        }?;
+        entry_matches_strref(entry, key.0.hash, key).then_some(&entry.val)
+    }
+
+    /// `set_slot`, but only if the slot still holds `key` (see `get_slot_keyed`).
+    #[inline(always)]
+    pub fn set_slot_keyed(&mut self, idx: usize, key: &StrRef, val: Value) -> bool {
+        let entry = match &mut self.inner {
+            FieldStorage::Small(entries) => entries.get_mut(idx),
+            FieldStorage::Hash(map) => map.entries.get_mut(idx).and_then(|opt| opt.as_mut()),
+        };
+        match entry {
+            Some(e) if entry_matches_strref(e, key.0.hash, key) => {
+                e.val = val;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[inline(always)]
+    pub fn set_slot(&mut self, idx: usize, val: Value) -> bool {
+        let slot = match &mut self.inner {
+            FieldStorage::Small(entries) => entries.get_mut(idx).map(|e| &mut e.val),
+            FieldStorage::Hash(map) => map
+                .entries
+                .get_mut(idx)
+                .and_then(|opt| opt.as_mut().map(|e| &mut e.val)),
+        };
+        match slot {
+            Some(v) => {
+                *v = val;
+                true
+            }
+            None => false,
+        }
     }
 
     #[inline(always)]
@@ -660,6 +777,15 @@ impl FieldMap {
     }
 
     pub fn insert(&mut self, key: StrRef, val: Value) -> Option<Value> {
+        let before = self.len();
+        let old = self.insert_inner(key, val);
+        if self.len() != before {
+            self.bump_shape();
+        }
+        old
+    }
+
+    fn insert_inner(&mut self, key: StrRef, val: Value) -> Option<Value> {
         match &mut self.inner {
             FieldStorage::Small(entries) => {
                 let hash = key.0.hash;
@@ -682,6 +808,15 @@ impl FieldMap {
     /// Updates primitive values in place on hit and only clones `key` on miss.
     #[inline]
     pub fn set_by_strref(&mut self, key: &StrRef, val: &Value) {
+        let before = self.len();
+        self.set_by_strref_inner(key, val);
+        if self.len() != before {
+            self.bump_shape();
+        }
+    }
+
+    #[inline]
+    fn set_by_strref_inner(&mut self, key: &StrRef, val: &Value) {
         match &mut self.inner {
             FieldStorage::Small(entries) => {
                 let hash = key.0.hash;
@@ -706,6 +841,14 @@ impl FieldMap {
     }
 
     pub fn remove(&mut self, key: &str) -> Option<Value> {
+        let old = self.remove_inner(key);
+        if old.is_some() {
+            self.bump_shape();
+        }
+        old
+    }
+
+    fn remove_inner(&mut self, key: &str) -> Option<Value> {
         match &mut self.inner {
             FieldStorage::Small(entries) => {
                 if entries.is_empty() {
@@ -722,6 +865,14 @@ impl FieldMap {
     }
 
     pub fn remove_by_strref(&mut self, key: &StrRef) -> Option<Value> {
+        let old = self.remove_by_strref_inner(key);
+        if old.is_some() {
+            self.bump_shape();
+        }
+        old
+    }
+
+    fn remove_by_strref_inner(&mut self, key: &StrRef) -> Option<Value> {
         match &mut self.inner {
             FieldStorage::Small(entries) => {
                 let hash = key.0.hash;
@@ -736,6 +887,7 @@ impl FieldMap {
 
     #[inline]
     pub fn clear(&mut self) {
+        self.bump_shape();
         match &mut self.inner {
             FieldStorage::Small(entries) => entries.clear(),
             FieldStorage::Hash(_) => self.inner = FieldStorage::Small(Vec::new()),
@@ -773,9 +925,13 @@ impl FieldMap {
     where
         F: FnMut(&StrRef, &mut Value) -> bool,
     {
+        let before = self.len();
         match &mut self.inner {
             FieldStorage::Small(entries) => entries.retain_mut(|e| f(&e.key, &mut e.val)),
             FieldStorage::Hash(map) => map.retain(f),
+        }
+        if self.len() != before {
+            self.bump_shape();
         }
     }
 }
@@ -783,6 +939,26 @@ impl FieldMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyed_slot_access_rejects_a_different_key_at_the_same_shape() {
+        // Two tables with the same shape_version but different key layouts, as
+        // when a freed table's address is reused: a cached slot index from one
+        // must not read or write the other's field.
+        let (a, b) = (StrRef::from("a"), StrRef::from("b"));
+        let mut first = FieldMap::new();
+        first.insert(a.clone(), Value::Int(1));
+        first.insert(b.clone(), Value::Int(2));
+        let mut second = FieldMap::new();
+        second.insert(b.clone(), Value::Int(20));
+        second.insert(a.clone(), Value::Int(10));
+        assert_eq!(first.shape_version(), second.shape_version());
+        let idx = first.find_index_by_strref(&a).unwrap();
+        assert!(matches!(first.get_slot_keyed(idx, &a), Some(Value::Int(1))));
+        assert!(second.get_slot_keyed(idx, &a).is_none());
+        assert!(!second.set_slot_keyed(idx, &a, Value::Int(99)));
+        assert!(matches!(second.get_slot(idx), Some(Value::Int(20))));
+    }
 
     #[test]
     fn test_table_key_conversions() {
