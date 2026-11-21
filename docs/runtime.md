@@ -52,6 +52,10 @@ The bytecode format changes between Neyuki versions. A `.nykb` written by anothe
 
 `neyuki dap` speaks the Debug Adapter Protocol on standard input and output, which the VS Code extension uses for breakpoints, stepping, the call stack and variables. Scripts can also inspect themselves with the [debug library](reference/debug.md) and time functions with [@neyuki/profile](reference/profile.md).
 
+### Tests
+
+A test file counts as failed when it raises an error. A file written with [@neyuki/test](reference/test.md) declares its tests with `describe` and `it`; they run once the main chunk returns, print a line each and a summary line, and raise an error when one fails. Snapshots are kept in a `__snapshots__/` folder next to each test file; set `NEYUKI_UPDATE_SNAPSHOTS=1` to replace the ones that changed.
+
 ### Editor support
 
 `neyuki lsp` speaks the Language Server Protocol on standard input and output, so any editor with an LSP client gets diagnostics (the same checks as `neyuki lint`), formatting (as `neyuki fmt`), hover, go to definition, the document outline, completion and signature help.

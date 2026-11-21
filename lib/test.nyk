@@ -1,0 +1,838 @@
+-- A test framework: describe/it blocks, hooks, expectations with diffs,
+-- snapshots and a summary line.
+
+local debug = require("@neyuki/debug")
+local fs = require("@neyuki/fs")
+local os = require("@neyuki/os")
+local string = require("@neyuki/string")
+local table = require("@neyuki/table")
+
+local test = {}
+
+-- The source this module was loaded from, so a failure points at the line
+-- of the test file instead of the line in here that raised it.
+local MODULE_SOURCE = debug.getinfo(1).source
+
+local SNAPSHOT_HEADER = "-- neyuki snapshot v1"
+
+local KEYWORDS = {
+    ["and"] = true, ["break"] = true, ["const"] = true, ["continue"] = true, ["do"] = true,
+    ["else"] = true, ["elseif"] = true, ["end"] = true, ["false"] = true, ["for"] = true,
+    ["function"] = true, ["global"] = true, ["if"] = true, ["in"] = true, ["local"] = true,
+    ["nil"] = true, ["not"] = true, ["or"] = true, ["repeat"] = true, ["return"] = true,
+    ["then"] = true, ["true"] = true, ["until"] = true, ["while"] = true,
+}
+
+-- ---- formatting values
+
+local function isIdentifier(key: any): boolean
+    return type(key) == "string" and string.match(key, "^[%a_][%w_]*$") != nil and not KEYWORDS[key]
+end
+
+local TYPE_ORDER = { number = 1, string = 2, boolean = 3 }
+
+local function keyBefore(a: any, b: any): boolean
+    local ta, tb = type(a), type(b)
+    if ta != tb then
+        return (TYPE_ORDER[ta] ?? 4) < (TYPE_ORDER[tb] ?? 4) or ((TYPE_ORDER[ta] ?? 4) == (TYPE_ORDER[tb] ?? 4) and ta < tb)
+    end
+    if ta == "number" or ta == "string" then return a < b end
+    return tostring(a) < tostring(b)
+end
+
+-- The length of the array part (1..n with no gap) and the other keys, sorted.
+local function tableKeys(t: table): (number, {any})
+    local count = 0
+    while rawget(t, count + 1) != nil do count += 1 end
+    local others = {}
+    local key = next(t)
+    while key != nil do
+        if not (type(key) == "number" and key >= 1 and key <= count and key == int(key)) then
+            others[#others + 1] = key
+        end
+        key = next(t, key)
+    end
+    table.sort(others, keyBefore)
+    return count, others
+end
+
+local inspectValue
+
+local function inspectKey(key: any): string
+    if isIdentifier(key) then return key end
+    return "[" .. inspectValue(key, "", {}) .. "]"
+end
+
+-- One line when short and flat, otherwise one entry per line.
+inspectValue = function(value: any, indent: string, seen: table): string
+    local kind = type(value)
+    if kind == "string" then return string.format("%q", value) end
+    if kind == "nil" or kind == "boolean" or kind == "number" then return tostring(value) end
+    if kind != "table" then return "<" .. kind .. ">" end
+    if seen[value] then return "<cycle>" end
+    local count, others = tableKeys(value)
+    if count == 0 and #others == 0 then return "{}" end
+    seen[value] = true
+    local inner = indent .. "  "
+    local parts = {}
+    local flat = true
+    for i = 1, count do
+        local item = rawget(value, i)
+        flat = flat and type(item) != "table"
+        parts[#parts + 1] = inspectValue(item, inner, seen)
+    end
+    for _, key in others do
+        local item = rawget(value, key)
+        flat = flat and type(item) != "table"
+        parts[#parts + 1] = inspectKey(key) .. " = " .. inspectValue(item, inner, seen)
+    end
+    seen[value] = nil
+    local line = "{ " .. table.concat(parts, ", ") .. " }"
+    if flat and #line <= 60 then return line end
+    return "{\n" .. inner .. table.concat(parts, ",\n" .. inner) .. ",\n" .. indent .. "}"
+end
+
+-- One line, cut short, for a failure message.
+local function short(value: any): string
+    local text = string.gsub(inspectValue(value, "", {}), "\n%s*", " ")
+    text = string.gsub(text, ", }", " }")
+    if #text > 60 then text = string.sub(text, 1, 57) .. "..." end
+    return text
+end
+
+-- Formats any value as stable, readable text: strings quoted, table keys
+-- sorted, nested tables indented, cycles marked `<cycle>`.
+function test.inspect(value: any): string
+    return inspectValue(value, "", {})
+end
+
+-- ---- deep equality
+
+local function pathTo(path: string, key: any): string
+    if isIdentifier(key) then return path .. "." .. key end
+    return path .. "[" .. test.inspect(key) .. "]"
+end
+
+-- Whether two values have the same content, and if not, the path of the
+-- first difference ("" for the values themselves).
+local function deepEqual(a: any, b: any, path: string, seen: table): (boolean, string?)
+    local ta = type(a)
+    if ta != type(b) then return false, path end
+    if ta == "number" then
+        if a == b or (a != a and b != b) then return true end
+        return false, path
+    end
+    if ta != "table" then
+        if rawequal(a, b) then return true end
+        return false, path
+    end
+    if rawequal(a, b) or seen[a] == b then return true end
+    seen[a] = b
+    local key = next(a)
+    while key != nil do
+        local same, at = deepEqual(rawget(a, key), rawget(b, key), pathTo(path, key), seen)
+        if not same then return false, at end
+        key = next(a, key)
+    end
+    key = next(b)
+    while key != nil do
+        if rawget(a, key) == nil then return false, pathTo(path, key) end
+        key = next(b, key)
+    end
+    return true
+end
+
+-- Whether two values have the same content, compared the way `toEqual` does.
+function test.equals(a: any, b: any): boolean
+    return (deepEqual(a, b, "", {}))
+end
+
+-- ---- diffs
+
+local function splitLines(text: string): {string}
+    local lines = {}
+    local start = 1
+    while true do
+        local at = string.find(text, "\n", start, true)
+        if at == nil then
+            lines[#lines + 1] = string.sub(text, start)
+            return lines
+        end
+        lines[#lines + 1] = string.sub(text, start, at - 1)
+        start = at + 1
+    end
+end
+
+-- A line diff of two texts (longest common subsequence), "-" for lines only
+-- in `expected` and "+" for lines only in `actual`. Long unchanged runs are
+-- cut down to the lines around a change.
+local function diffLines(expected: string, actual: string): string
+    local a, b = splitLines(expected), splitLines(actual)
+    local n, m = #a, #b
+    local lcs = {}
+    for i = n + 1, 1, -1 do
+        local row = {}
+        local below = lcs[i + 1]
+        for j = m + 1, 1, -1 do
+            if i > n or j > m then
+                row[j] = 0
+            elseif a[i] == b[j] then
+                row[j] = below[j + 1] + 1
+            else
+                local down, right = below[j], row[j + 1]
+                row[j] = down > right and down or right
+            end
+        end
+        lcs[i] = row
+    end
+    local out = {}
+    local i, j = 1, 1
+    while i <= n or j <= m do
+        if i <= n and j <= m and a[i] == b[j] then
+            out[#out + 1] = { " ", a[i] }
+            i += 1
+            j += 1
+        elseif i <= n and (j > m or lcs[i + 1][j] >= lcs[i][j + 1]) then
+            out[#out + 1] = { "-", a[i] }
+            i += 1
+        else
+            out[#out + 1] = { "+", b[j] }
+            j += 1
+        end
+    end
+    local keep = {}
+    for index, line in out do
+        if line[1] != " " then
+            for near = index - 2, index + 2 do keep[near] = true end
+        end
+    end
+    local lines = { "- expected", "+ actual", "" }
+    local index = 1
+    while index <= #out do
+        local stop = index
+        while stop <= #out and not keep[stop] do stop += 1 end
+        if stop - index >= 3 then
+            lines[#lines + 1] = "  ..."
+            index = stop
+        else
+            local line = out[index]
+            lines[#lines + 1] = line[1] .. " " .. line[2]
+            index += 1
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
+-- The diff `toEqual` shows for two values, or nil when they are equal.
+function test.diff(expected: any, actual: any): string?
+    local same, at = deepEqual(expected, actual, "", {})
+    if same then return nil end
+    local text = diffLines(test.inspect(expected), test.inspect(actual))
+    if at != "" then text = "first difference at " .. at .. "\n" .. text end
+    return text
+end
+
+-- ---- failures
+
+-- `error` passes a string through `try`, so the details of the assertion
+-- that failed last are kept here and matched up with its message.
+local lastFailure: table? = nil
+
+local function callerLocation(): string?
+    local level = 2
+    while true do
+        local info = debug.getinfo(level)
+        if info == nil then return nil end
+        if info.source != MODULE_SOURCE and info.what != "native" and (info.currentline ?? -1) > 0 then
+            return info.source .. ":" .. tostring(info.currentline)
+        end
+        level += 1
+    end
+end
+
+local function raise(message: string, detail: string?)
+    lastFailure = { message = message, detail = detail, where = callerLocation() }
+    error(message)
+end
+
+-- Fails the running test with `message`.
+function test.fail(message: string?)
+    raise(message ?? "test.fail() called")
+end
+
+local function failureFrom(err: any): table
+    local message = tostring(err)
+    local found = lastFailure
+    lastFailure = nil
+    if found != nil and found.message == message then return found end
+    return { message = message }
+end
+
+-- ---- suites
+
+local function newGroup(name: string, parent: table?, options: table): table
+    return {
+        kind = "group", name = name, parent = parent, children = {},
+        beforeAll = {}, afterAll = {}, beforeEach = {}, afterEach = {},
+        skip = options.skip == true or (parent != nil and parent.skip), only = options.only == true,
+    }
+end
+
+local function fullName(node: table, name: string): string
+    local parts = { name }
+    local group = node
+    while group != nil and group.parent != nil do
+        table.insert(parts, 1, group.name)
+        group = group.parent
+    end
+    return table.concat(parts, " > ")
+end
+
+local function checkOptions(options: any): table
+    if options == nil then return {} end
+    if type(options) != "table" then error("options must be a table") end
+    return options
+end
+
+local function checkName(name: any)
+    if type(name) != "string" then error("name must be a string") end
+end
+
+-- ---- snapshots
+
+local function snapshotFile(source: string): string
+    local dir = fs.dirname(source)
+    local base = fs.basename(source)
+    if dir == "" then return fs.join("__snapshots__", base .. ".snap") end
+    return fs.join(dir, "__snapshots__", base .. ".snap")
+end
+
+local function escapeName(name: string): string
+    local escaped = string.gsub(name, "\\", "\\\\")
+    return (string.gsub(escaped, "\n", "\\n"))
+end
+
+local function readSnapshots(path: string): table
+    local store = { path = path, entries = {}, dirty = false }
+    if not fs.exists(path) then return store end
+    local current = nil
+    for _, line in splitLines(fs.read(path)) do
+        if string.sub(line, 1, 3) == "== " then
+            current = {}
+            store.entries[string.sub(line, 4)] = current
+        elseif current != nil and string.sub(line, 1, 2) == "  " then
+            current[#current + 1] = string.sub(line, 3)
+        end
+    end
+    for name, lines in store.entries do
+        store.entries[name] = table.concat(lines, "\n")
+    end
+    return store
+end
+
+local function writeSnapshots(store: table)
+    local names = {}
+    for name, _ in store.entries do names[#names + 1] = name end
+    table.sort(names)
+    local out = { SNAPSHOT_HEADER }
+    for _, name in names do
+        out[#out + 1] = ""
+        out[#out + 1] = "== " .. name
+        for _, line in splitLines(store.entries[name]) do
+            out[#out + 1] = "  " .. line
+        end
+    end
+    fs.mkdir(fs.dirname(store.path), true)
+    fs.write(store.path, table.concat(out, "\n") .. "\n")
+end
+
+-- Strings are stored as they are, so a multi-line text reads naturally.
+local function snapshotText(value: any): string
+    if type(value) == "string" then return value end
+    return test.inspect(value)
+end
+
+-- ---- expectations
+
+local Expectation = {}
+
+local function newExpectation(suite: table, actual: any, negate: boolean): table
+    return setmetatable({ actual = actual, negate = negate, suite = suite }, Expectation)
+end
+
+Expectation.__index = function(self: table, key: any): any
+    if key == "never" then return newExpectation(rawget(self, "suite"), rawget(self, "actual"), not rawget(self, "negate")) end
+    return rawget(Expectation, key)
+end
+
+local function verify(e: table, pass: boolean, verb: string, expected: any?, detail: string?)
+    if e.negate then pass = not pass end
+    if pass then return end
+    local message = "expected " .. short(e.actual) .. (e.negate and " not " or " ") .. verb
+    if expected != nil then message = message .. " " .. short(expected) end
+    raise(message, not e.negate and detail or nil)
+end
+
+local function sameValue(a: any, b: any): boolean
+    if type(a) == "number" and type(b) == "number" then return a == b end
+    return rawequal(a, b)
+end
+
+-- `actual` is the same value as `expected` (the same table, not a copy).
+function Expectation:toBe(expected: any)
+    verify(self, sameValue(self.actual, expected), "to be", expected)
+end
+
+-- `actual` has the same content as `expected`, comparing tables key by key.
+function Expectation:toEqual(expected: any)
+    local diff = test.diff(expected, self.actual)
+    verify(self, diff == nil, "to equal", expected, diff)
+end
+
+function Expectation:toBeNil()
+    verify(self, self.actual == nil, "to be nil")
+end
+
+function Expectation:toBeTruthy()
+    verify(self, self.actual != nil and self.actual != false, "to be truthy")
+end
+
+function Expectation:toBeFalsy()
+    verify(self, self.actual == nil or self.actual == false, "to be falsy")
+end
+
+function Expectation:toBeType(name: string)
+    verify(self, type(self.actual) == name, "to be of type", name)
+end
+
+local function checkNumber(e: table, name: string)
+    if type(e.actual) != "number" then raise("expected a number for " .. name .. ", got " .. short(e.actual)) end
+end
+
+function Expectation:toBeCloseTo(expected: number, tolerance: number?)
+    checkNumber(self, "toBeCloseTo")
+    local diff = self.actual - expected
+    if diff < 0 then diff = -diff end
+    verify(self, diff <= (tolerance ?? 1e-9), "to be close to", expected)
+end
+
+function Expectation:toBeGreaterThan(limit: number)
+    checkNumber(self, "toBeGreaterThan")
+    verify(self, self.actual > limit, "to be greater than", limit)
+end
+
+function Expectation:toBeGreaterThanOrEqual(limit: number)
+    checkNumber(self, "toBeGreaterThanOrEqual")
+    verify(self, self.actual >= limit, "to be greater than or equal to", limit)
+end
+
+function Expectation:toBeLessThan(limit: number)
+    checkNumber(self, "toBeLessThan")
+    verify(self, self.actual < limit, "to be less than", limit)
+end
+
+function Expectation:toBeLessThanOrEqual(limit: number)
+    checkNumber(self, "toBeLessThanOrEqual")
+    verify(self, self.actual <= limit, "to be less than or equal to", limit)
+end
+
+-- A string holds `item` as plain text, or an array holds an element equal
+-- to `item`.
+function Expectation:toContain(item: any)
+    local actual = self.actual
+    local found = false
+    if type(actual) == "string" then
+        found = type(item) == "string" and string.find(actual, item, 1, true) != nil
+    elseif type(actual) == "table" then
+        for _, element in actual do
+            if test.equals(element, item) then
+                found = true
+                break
+            end
+        end
+    else
+        raise("expected a string or a table for toContain, got " .. short(actual))
+    end
+    verify(self, found, "to contain", item)
+end
+
+function Expectation:toHaveLength(length: number)
+    local kind = type(self.actual)
+    if kind != "string" and kind != "table" then
+        raise("expected a string or a table for toHaveLength, got " .. short(self.actual))
+    end
+    verify(self, #self.actual == length, "to have length", length, "actual length: " .. tostring(#self.actual))
+end
+
+-- A string matches the pattern (`string.find` rules).
+function Expectation:toMatch(pattern: string)
+    if type(self.actual) != "string" then raise("expected a string for toMatch, got " .. short(self.actual)) end
+    verify(self, string.find(self.actual, pattern) != nil, "to match", pattern)
+end
+
+-- Calling the function raises an error, whose message contains `expected`
+-- as plain text when given.
+function Expectation:toThrow(expected: string?)
+    if type(self.actual) != "function" then raise("expected a function for toThrow, got " .. short(self.actual)) end
+    local ok, err = try(self.actual)
+    if lastFailure != nil and lastFailure.message == tostring(err) then lastFailure = nil end
+    local pass = not ok and (expected == nil or string.find(tostring(err), expected, 1, true) != nil)
+    local message = "expected the function" .. (self.negate and " not " or " ") .. "to throw"
+    if expected != nil then message = message .. " " .. short(expected) end
+    if self.negate then pass = not pass end
+    if pass then return end
+    if ok then
+        raise(message .. ", but it returned")
+    end
+    raise(message .. ", but it threw " .. short(tostring(err)))
+end
+
+-- `actual` matches the snapshot stored for this test, or is stored as one
+-- when there is none yet.
+function Expectation:toMatchSnapshot(name: string?)
+    if self.negate then raise("toMatchSnapshot cannot be negated") end
+    local suite = self.suite
+    local current = suite.running
+    if current == nil then raise("toMatchSnapshot must be called inside a test") end
+    local key
+    if name != nil then
+        key = escapeName(current.fullName .. ": " .. name)
+    else
+        current.snapshotCount += 1
+        key = escapeName(current.fullName .. " " .. tostring(current.snapshotCount))
+    end
+    local store = suite.snapshotStore(current.source)
+    local received = snapshotText(self.actual)
+    local stored = store.entries[key]
+    if stored == nil then
+        store.entries[key] = received
+        store.dirty = true
+        suite.counts.written += 1
+    elseif stored != received then
+        if suite.updating then
+            store.entries[key] = received
+            store.dirty = true
+            suite.counts.updated += 1
+        else
+            suite.counts.mismatched += 1
+            raise("snapshot " .. test.inspect(key) .. " does not match", diffLines(stored, received))
+        end
+    end
+end
+
+-- ---- running
+
+-- Creates a suite of its own: the same functions as the module, which a
+-- package can run, test and report on separately. Unlike the module's own
+-- suite, it only runs when `run` is called.
+function test.new(): table
+    local suite = {}
+    local root = newGroup("", nil, {})
+    local current = root
+    local running = false
+    local scheduled = false
+    suite.ran = false
+
+    local function register(name: any, fn: any, options: any, mark: string?)
+        checkName(name)
+        local opts = checkOptions(options)
+        if running then error("tests cannot be added while tests are running") end
+        if fn != nil and type(fn) != "function" then error("test body must be a function") end
+        local source = (fn != nil and debug.getinfo(fn).source) or (callerLocation() ?? "?")
+        local node = {
+            kind = "test", name = name, fn = fn, parent = current,
+            skip = mark == "skip" or opts.skip == true or current.skip,
+            only = mark == "only" or opts.only == true,
+            todo = fn == nil,
+            source = string.match(source, "^(.*):%d+$") ?? source,
+        }
+        current.children[#current.children + 1] = node
+        if suite.autorun and not scheduled then
+            scheduled = true
+            task.defer(function()
+                if not suite.ran then suite.run() end
+            end)
+        end
+    end
+
+    -- Groups the tests `body` declares under `name`.
+    function suite.describe(name: string, body: function, options: table?)
+        checkName(name)
+        local opts = checkOptions(options)
+        if type(body) != "function" then error("describe body must be a function") end
+        if running then error("tests cannot be added while tests are running") end
+        local group = newGroup(name, current, opts)
+        current.children[#current.children + 1] = group
+        local outer = current
+        current = group
+        local ok, err = try(body)
+        current = outer
+        if not ok then error(err) end
+    end
+
+    function suite.it(name: string, fn: function, options: table?)
+        if type(fn) != "function" then error("test body must be a function") end
+        register(name, fn, options, nil)
+    end
+
+    function suite.skip(name: string, fn: function?)
+        register(name, fn, nil, "skip")
+    end
+
+    function suite.only(name: string, fn: function)
+        if type(fn) != "function" then error("test body must be a function") end
+        register(name, fn, nil, "only")
+    end
+
+    function suite.todo(name: string)
+        register(name, nil, nil, nil)
+    end
+
+    local function addHook(list: string, fn: any)
+        if type(fn) != "function" then error("hook must be a function") end
+        if running then error("hooks cannot be added while tests are running") end
+        local hooks = current[list]
+        hooks[#hooks + 1] = fn
+    end
+
+    function suite.beforeAll(fn: function) addHook("beforeAll", fn) end
+    function suite.afterAll(fn: function) addHook("afterAll", fn) end
+    function suite.beforeEach(fn: function) addHook("beforeEach", fn) end
+    function suite.afterEach(fn: function) addHook("afterEach", fn) end
+
+    function suite.expect(actual: any): table
+        return newExpectation(suite, actual, false)
+    end
+
+    -- Deep-equality assertion: fails with a diff unless `actual` has the
+    -- same content as `expected`.
+    function suite.equal(actual: any, expected: any, message: string?)
+        local diff = test.diff(expected, actual)
+        if diff != nil then
+            raise(message ?? ("expected " .. short(actual) .. " to equal " .. short(expected)), diff)
+        end
+    end
+
+    suite.fail = test.fail
+
+    local stores = {}
+    function suite.snapshotStore(source: string): table
+        local path = suite.snapshotDir != nil and fs.join(suite.snapshotDir, fs.basename(source) .. ".snap") or snapshotFile(source)
+        local store = stores[path]
+        if store == nil then
+            store = readSnapshots(path)
+            stores[path] = store
+        end
+        return store
+    end
+
+    -- Whether a group has a test that `only` or the filter leaves in.
+    local function hasOnly(node: table): boolean
+        if node.only then return true end
+        if node.kind == "group" then
+            for _, child in node.children do
+                if hasOnly(child) then return true end
+            end
+        end
+        return false
+    end
+
+    -- Runs every test and prints a line for each, the failures and a summary
+    -- line. Raises an error when a test failed, unless `options.raise` is
+    -- false. Returns the counts and the failures.
+    function suite.run(options: table?): table
+        local opts = checkOptions(options)
+        local output = opts.output ?? print
+        local filter = opts.filter
+        local updateEnv = os.getenv("NEYUKI_UPDATE_SNAPSHOTS")
+        suite.updating = opts.updateSnapshots ?? (updateEnv != nil and updateEnv != "" and updateEnv != "0")
+        suite.counts = { written = 0, updated = 0, mismatched = 0 }
+        suite.ran = true
+        running = true
+        stores = {}
+
+        local results = { passed = 0, failed = 0, skipped = 0, todo = 0, filtered = 0, failures = {}, tests = {} }
+        local onlyMode = hasOnly(root)
+        local started = os.clock()
+
+        local function record(name: string, status: string, failure: table?, ms: number?)
+            results.tests[#results.tests + 1] = { name = name, status = status }
+            if status == "ok" then
+                results.passed += 1
+                output("  ok    " .. name .. " (" .. tostring(ms) .. "ms)")
+            elseif status == "skip" then
+                results.skipped += 1
+                output("  skip  " .. name)
+            elseif status == "todo" then
+                results.todo += 1
+                output("  todo  " .. name)
+            else
+                results.failed += 1
+                failure.name = name
+                results.failures[#results.failures + 1] = failure
+                output("  FAIL  " .. name)
+            end
+        end
+
+        local function selected(node: table, name: string): boolean
+            if onlyMode then
+                local at = node
+                local marked = false
+                while at != nil do
+                    if at.only then marked = true end
+                    at = at.parent
+                end
+                if not marked then return false end
+            end
+            return filter == nil or string.find(name, filter, 1, true) != nil
+        end
+
+        local function runHooks(hooks: {function}, label: string): table?
+            for _, hook in hooks do
+                local ok, err = try(hook)
+                if not ok then
+                    local failure = failureFrom(err)
+                    failure.message = label .. " hook failed: " .. failure.message
+                    return failure
+                end
+            end
+            return nil
+        end
+
+        -- Every test under `node` that would run, failing for a reason given.
+        local function failAll(node: table, failure: table)
+            for _, child in node.children do
+                if child.kind == "group" then
+                    failAll(child, failure)
+                else
+                    local name = fullName(child.parent, child.name)
+                    if selected(child, name) and not child.skip and not child.todo then
+                        record(name, "FAIL", { message = failure.message, detail = failure.detail, where = failure.where })
+                    end
+                end
+            end
+        end
+
+        local function willRun(node: table): boolean
+            for _, child in node.children do
+                if child.kind == "group" then
+                    if willRun(child) then return true end
+                elseif not child.skip and not child.todo and selected(child, fullName(child.parent, child.name)) then
+                    return true
+                end
+            end
+            return false
+        end
+
+        local function runTest(node: table, before: {function}, after: {function})
+            local name = fullName(node.parent, node.name)
+            if not selected(node, name) then
+                results.filtered += 1
+                return
+            end
+            if node.todo then return record(name, "todo") end
+            if node.skip then return record(name, "skip") end
+            suite.running = { fullName = name, source = node.source, snapshotCount = 0 }
+            lastFailure = nil
+            local start = os.clock()
+            local failure = runHooks(before, "beforeEach")
+            if failure == nil then
+                local ok, err = try(node.fn)
+                if not ok then failure = failureFrom(err) end
+            end
+            local afterFailure = runHooks(after, "afterEach")
+            failure = failure ?? afterFailure
+            suite.running = nil
+            if failure != nil then
+                record(name, "FAIL", failure)
+            else
+                record(name, "ok", nil, int((os.clock() - start) * 1000))
+            end
+        end
+
+        local function runGroup(group: table, before: {function}, after: {function})
+            local eachBefore = {}
+            for _, hook in before do eachBefore[#eachBefore + 1] = hook end
+            for _, hook in group.beforeEach do eachBefore[#eachBefore + 1] = hook end
+            local eachAfter = {}
+            for _, hook in group.afterEach do eachAfter[#eachAfter + 1] = hook end
+            for _, hook in after do eachAfter[#eachAfter + 1] = hook end
+
+            local active = willRun(group)
+            if active then
+                local failure = runHooks(group.beforeAll, "beforeAll")
+                if failure != nil then
+                    failAll(group, failure)
+                    runHooks(group.afterAll, "afterAll")
+                    return
+                end
+            end
+            for _, child in group.children do
+                if child.kind == "group" then
+                    runGroup(child, eachBefore, eachAfter)
+                else
+                    runTest(child, eachBefore, eachAfter)
+                end
+            end
+            if active then
+                local failure = runHooks(group.afterAll, "afterAll")
+                if failure != nil then
+                    record(fullName(group, "afterAll"), "FAIL", failure)
+                end
+            end
+        end
+
+        runGroup(root, {}, {})
+        running = false
+        for _, store in stores do
+            if store.dirty then writeSnapshots(store) end
+        end
+
+        if #results.failures > 0 then
+            output("")
+            output("failures:")
+            for _, failure in results.failures do
+                output("")
+                output("  " .. failure.name)
+                output("    " .. failure.message)
+                if failure.where != nil then output("    at " .. failure.where) end
+                if failure.detail != nil then
+                    for _, line in splitLines(failure.detail) do
+                        output(line == "" and "" or "      " .. line)
+                    end
+                end
+            end
+        end
+
+        local parts = { tostring(results.passed) .. " passed", tostring(results.failed) .. " failed" }
+        if results.skipped > 0 then parts[#parts + 1] = tostring(results.skipped) .. " skipped" end
+        if results.todo > 0 then parts[#parts + 1] = tostring(results.todo) .. " todo" end
+        if results.filtered > 0 then parts[#parts + 1] = tostring(results.filtered) .. " filtered out" end
+        for _, kind in { "written", "updated" } do
+            local count = suite.counts[kind]
+            if count > 0 then
+                parts[#parts + 1] = tostring(count) .. (count == 1 and " snapshot " or " snapshots ") .. kind
+            end
+        end
+        results.snapshots = suite.counts
+        output("")
+        output("test result: " .. (results.failed == 0 and "ok" or "FAILED") .. ". " .. table.concat(parts, "; ")
+            .. "; finished in " .. string.format("%.2f", os.clock() - started) .. "s")
+
+        if results.failed > 0 and opts.raise != false then
+            error(tostring(results.failed) .. " of " .. tostring(results.failed + results.passed) .. " tests failed")
+        end
+        return results
+    end
+
+    return suite
+end
+
+-- The module's own suite, which runs by itself once the main chunk returns.
+local default = test.new()
+default.autorun = true
+for _, name in { "describe", "it", "skip", "only", "todo", "beforeAll", "afterAll", "beforeEach", "afterEach", "expect", "equal", "run" } do
+    test[name] = default[name]
+end
+
+return table.freeze(test)

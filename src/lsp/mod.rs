@@ -2181,7 +2181,7 @@ mod tests {
         // engine. `ui`, `hid` and `webview` need one, so what their pages
         // document is not compared with the runtime here.
         let headless = [
-            "crypto", "csv", "fs", "html", "http", "io", "net", "profile", "sql", "toml",
+            "crypto", "csv", "fs", "html", "http", "io", "net", "profile", "sql", "test", "toml",
         ];
         let modules: HashMap<&str, Value> = headless
             .iter()

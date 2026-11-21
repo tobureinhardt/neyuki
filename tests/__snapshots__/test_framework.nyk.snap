@@ -1,0 +1,12 @@
+-- neyuki snapshot v1
+
+== snapshots > match the committed snapshot file 1
+  {
+    name = "neyuki",
+    tags = { "lua", "family" },
+  }
+
+== snapshots > match the committed snapshot file: text
+  line one
+  line two
+  

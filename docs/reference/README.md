@@ -42,3 +42,4 @@ Load these with `require("@neyuki/name")`.
 | [@neyuki/audio](audio.md) | Playing sound files, tones and samples: volume, panning, speed, looping, fades and seeking |
 | [@neyuki/hid](hid.md) | Keyboard and mouse automation, screen size, clipboard |
 | [@neyuki/profile](profile.md) | Finding slow functions |
+| [@neyuki/test](test.md) | Tests with `describe`/`it`, hooks, expectations with diffs, snapshots and a summary line |

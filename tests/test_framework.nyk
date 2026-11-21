@@ -1,0 +1,295 @@
+-- test: describe/it, hooks, expectations, diffs, snapshots and the summary.
+
+local test = require("@neyuki/test")
+local fs = require("@neyuki/fs")
+local describe, it, expect = test.describe, test.it, test.expect
+
+-- Runs a separate suite that `declare` fills, capturing what it prints.
+local function runSuite(declare: function, options: table?)
+    local suite = test.new()
+    declare(suite)
+    local lines = {}
+    local opts = options ?? {}
+    opts.output = function(line) lines[#lines + 1] = line end
+    opts.raise = false
+    local results = suite.run(opts)
+    return results, table.concat(lines, "\n")
+end
+
+describe("inspect", function()
+    it("formats scalars", function()
+        expect(test.inspect(nil)):toBe("nil")
+        expect(test.inspect(true)):toBe("true")
+        expect(test.inspect(42)):toBe("42")
+        expect(test.inspect("a\nb")):toBe('"a\\nb"')
+        expect(test.inspect(print)):toBe("<function>")
+    end)
+
+    it("sorts keys after the array part", function()
+        expect(test.inspect({ 3, z = true, a = "x", [10] = 1 })):toBe('{ 3, [10] = 1, a = "x", z = true }')
+        expect(test.inspect({ ["not ok"] = 1, ["end"] = 2 })):toBe('{ ["end"] = 2, ["not ok"] = 1 }')
+        expect(test.inspect({})):toBe("{}")
+    end)
+
+    it("puts nested tables on their own lines", function()
+        expect(test.inspect({ a = { b = 1 } })):toBe("{\n  a = { b = 1 },\n}")
+    end)
+
+    it("marks cycles", function()
+        local t = { name = "loop" }
+        t.self = t
+        expect(test.inspect(t)):toBe('{\n  name = "loop",\n  self = <cycle>,\n}')
+    end)
+end)
+
+describe("equals", function()
+    it("compares tables deeply", function()
+        expect(test.equals({ 1, { x = 2 } }, { 1, { x = 2 } })):toBe(true)
+        expect(test.equals({ 1, { x = 2 } }, { 1, { x = 3 } })):toBe(false)
+        expect(test.equals({ a = 1 }, { a = 1, b = 2 })):toBe(false)
+        expect(test.equals(0 / 0, 0 / 0)):toBe(true)
+        expect(test.equals(1, "1")):toBe(false)
+    end)
+
+    it("handles cycles", function()
+        local a, b = {}, {}
+        a.next, b.next = a, b
+        expect(test.equals(a, b)):toBe(true)
+    end)
+end)
+
+describe("diff", function()
+    it("is nil for equal values", function()
+        expect(test.diff({ 1 }, { 1 })):toBeNil()
+    end)
+
+    it("names the first difference and marks lines", function()
+        local diff = test.diff({ a = { 1, 2 }, b = 1 }, { a = { 1, 3 }, b = 1 })
+        expect(diff):toContain("first difference at .a[2]")
+        expect(diff):toContain("-   a = { 1, 2 },")
+        expect(diff):toContain("+   a = { 1, 3 },")
+        expect(diff):toContain("    b = 1,")
+    end)
+
+    it("cuts long unchanged runs", function()
+        local expected, actual = {}, {}
+        for i = 1, 20 do
+            expected[i] = { i }
+            actual[i] = { i }
+        end
+        actual[20] = { 0 }
+        local diff = test.diff(expected, actual)
+        expect(diff):toContain("  ...")
+        expect(diff).never:toContain("{ 5 }")
+        expect(diff):toContain("-   { 20 },")
+    end)
+end)
+
+describe("matchers", function()
+    it("pass", function()
+        local t = {}
+        expect(t):toBe(t)
+        expect({ 1, { 2 } }):toEqual({ 1, { 2 } })
+        expect(nil):toBeNil()
+        expect(0):toBeTruthy()
+        expect(false):toBeFalsy()
+        expect("x"):toBeType("string")
+        expect(0.1 + 0.2):toBeCloseTo(0.3)
+        expect(2):toBeGreaterThan(1)
+        expect(2):toBeGreaterThanOrEqual(2)
+        expect(1):toBeLessThan(2)
+        expect(1):toBeLessThanOrEqual(1)
+        expect("hello world"):toContain("o w")
+        expect({ { id = 1 }, { id = 2 } }):toContain({ id = 2 })
+        expect("abc"):toHaveLength(3)
+        expect({ 1, 2 }):toHaveLength(2)
+        expect("v1.2.3"):toMatch("^v%d+%.%d+")
+        expect(function() error("bad input") end):toThrow("bad input")
+        expect(function() end).never:toThrow()
+        test.equal({ a = 1 }, { a = 1 })
+    end)
+
+    it("negate with never", function()
+        expect({}).never:toBe({})
+        expect(1).never:toEqual(2)
+        expect(1).never:toBeNil()
+        expect("abc").never:toContain("d")
+        expect(function() error("x") end).never:toThrow("y")
+    end)
+
+    it("fail with a message and the caller's line", function()
+        local ok, err = try(function() expect(1):toBe(2) end)
+        expect(ok):toBe(false)
+        expect(err):toBe("expected 1 to be 2")
+        ok, err = try(function() expect(1).never:toBe(1) end)
+        expect(err):toBe("expected 1 not to be 1")
+        ok, err = try(function() expect(nil):toBeGreaterThan(1) end)
+        expect(err):toBe("expected a number for toBeGreaterThan, got nil")
+        ok, err = try(function() expect(function() end):toThrow() end)
+        expect(err):toBe("expected the function to throw, but it returned")
+        ok, err = try(test.fail, "stop")
+        expect(err):toBe("stop")
+    end)
+end)
+
+describe("hooks", function()
+    local log = {}
+    test.beforeAll(function() log[#log + 1] = "all" end)
+    test.beforeEach(function() log[#log + 1] = "each" end)
+    test.afterEach(function() log[#log + 1] = "after" end)
+
+    it("run before the first test", function()
+        expect(log):toEqual({ "all", "each" })
+    end)
+
+    describe("nested", function()
+        test.beforeEach(function() log[#log + 1] = "inner" end)
+        test.afterEach(function() log[#log + 1] = "inner after" end)
+        it("run outer first", function()
+            expect(log):toEqual({ "all", "each", "after", "each", "inner" })
+        end)
+    end)
+
+    it("run inner after hooks first", function()
+        expect(log):toEqual({ "all", "each", "after", "each", "inner", "inner after", "after", "each" })
+    end)
+end)
+
+describe("running a suite", function()
+    it("counts results and prints a summary line", function()
+        local results, out = runSuite(function(s)
+            s.describe("group", function()
+                s.it("passes", function() s.expect(1):toBe(1) end)
+                s.it("fails", function() s.expect({ a = 1 }):toEqual({ a = 2 }) end)
+                s.skip("skipped", function() error("never runs") end)
+                s.todo("later")
+            end)
+            s.it("errors", function() error("boom") end)
+        end)
+        expect(results.passed):toBe(1)
+        expect(results.failed):toBe(2)
+        expect(results.skipped):toBe(1)
+        expect(results.todo):toBe(1)
+        expect(results.tests[1]):toEqual({ name = "group > passes", status = "ok" })
+        expect(results.failures[1].name):toBe("group > fails")
+        expect(results.failures[1].message):toBe("expected { a = 1 } to equal { a = 2 }")
+        expect(results.failures[1].where):toMatch("test_framework%.nyk:%d+$")
+        expect(results.failures[1].detail):toContain("first difference at .a")
+        expect(results.failures[2]):toEqual({ name = "errors", message = "boom" })
+        expect(out):toContain("  FAIL  group > fails")
+        expect(out):toContain("  skip  group > skipped")
+        expect(out):toContain("  todo  group > later")
+        expect(out):toContain("\nfailures:\n")
+        expect(out):toContain("      - { a = 2 }\n      + { a = 1 }")
+        expect(out):toMatch("\ntest result: FAILED%. 1 passed; 2 failed; 1 skipped; 1 todo; finished in [%d.]+s$")
+    end)
+
+    it("raises when a test failed", function()
+        local suite = test.new()
+        suite.it("fails", function() suite.fail("no") end)
+        local ok, err = try(suite.run, { output = function() end })
+        expect(ok):toBe(false)
+        expect(err):toBe("1 of 1 tests failed")
+    end)
+
+    it("reports ok when everything passes", function()
+        local _, out = runSuite(function(s) s.it("one", function() end) end)
+        expect(out):toMatch("\ntest result: ok%. 1 passed; 0 failed; finished in")
+    end)
+
+    it("runs only the tests marked only", function()
+        local results = runSuite(function(s)
+            s.it("a", function() end)
+            s.only("b", function() end)
+            s.describe("c", function() s.it("d", function() end) end, { only = true })
+        end)
+        expect(results.passed):toBe(2)
+        expect(results.filtered):toBe(1)
+    end)
+
+    it("filters by name", function()
+        local results = runSuite(function(s)
+            s.it("parse number", function() end)
+            s.it("parse string", function() end)
+            s.it("format", function() end)
+        end, { filter = "parse" })
+        expect(results.passed):toBe(2)
+        expect(results.filtered):toBe(1)
+    end)
+
+    it("fails the group when beforeAll fails, and still runs afterAll", function()
+        local cleaned = false
+        local results = runSuite(function(s)
+            s.describe("db", function()
+                s.beforeAll(function() error("no connection") end)
+                s.afterAll(function() cleaned = true end)
+                s.it("reads", function() end)
+                s.it("writes", function() end)
+            end)
+            s.it("outside", function() end)
+        end)
+        expect(results.failed):toBe(2)
+        expect(results.passed):toBe(1)
+        expect(results.failures[1].message):toBe("beforeAll hook failed: no connection")
+        expect(cleaned):toBe(true)
+    end)
+
+    it("runs afterEach even when the test fails", function()
+        local after = 0
+        local results = runSuite(function(s)
+            s.afterEach(function() after += 1 end)
+            s.it("fails", function() error("x") end)
+        end)
+        expect(results.failed):toBe(1)
+        expect(after):toBe(1)
+    end)
+
+    it("rejects bad declarations", function()
+        local suite = test.new()
+        expect(function() suite.it(1, function() end) end):toThrow("name must be a string")
+        expect(function() suite.it("x", 1) end):toThrow("test body must be a function")
+        expect(function() suite.beforeEach("x") end):toThrow("hook must be a function")
+        expect(function()
+            suite.it("adds", function() suite.it("inner", function() end) end)
+            local results = suite.run({ output = function() end, raise = false })
+            error(results.failures[1].message)
+        end):toThrow("tests cannot be added while tests are running")
+    end)
+end)
+
+describe("snapshots", function()
+    it("match the committed snapshot file", function()
+        expect({ name = "neyuki", tags = { "lua", "family" } }):toMatchSnapshot()
+        expect("line one\nline two\n"):toMatchSnapshot("text")
+    end)
+
+    it("are written, compared and updated", function()
+        local dir = fs.join(os.getenv("TMPDIR") ?? os.getenv("TEMP") ?? "/tmp", "neyuki_test_snapshots_" .. tostring(math.random(1, 1000000000)))
+        local value = { 1, 2 }
+        local function run(update)
+            local suite = test.new()
+            suite.snapshotDir = dir
+            suite.it("value", function() suite.expect(value):toMatchSnapshot() end)
+            return suite.run({ output = function() end, raise = false, updateSnapshots = update })
+        end
+
+        local first = run(false)
+        expect(first.snapshots.written):toBe(1)
+        local file = fs.join(dir, "test_framework.nyk.snap")
+        expect(fs.read(file)):toBe("-- neyuki snapshot v1\n\n== value 1\n  { 1, 2 }\n")
+
+        expect(run(false).passed):toBe(1)
+
+        value = { 1, 3 }
+        local changed = run(false)
+        expect(changed.failed):toBe(1)
+        expect(changed.failures[1].message):toBe('snapshot "value 1" does not match')
+        expect(changed.failures[1].detail):toContain("- { 1, 2 }\n+ { 1, 3 }")
+
+        local updated = run(true)
+        expect(updated.passed):toBe(1)
+        expect(updated.snapshots.updated):toBe(1)
+        expect(fs.read(file)):toContain("  { 1, 3 }")
+        fs.remove(dir, true)
+    end)
+end)
