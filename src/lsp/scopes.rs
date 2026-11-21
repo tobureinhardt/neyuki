@@ -392,6 +392,7 @@ impl Resolver<'_> {
             }
             Stmt::LocalMany {
                 names,
+                is_global,
                 initializers,
                 id,
                 ..
@@ -406,7 +407,7 @@ impl Resolver<'_> {
                         if let Some(at) = at {
                             cursor = at + name.len();
                         }
-                        self.declare(name, at, false, false);
+                        self.declare(name, at, *is_global, *is_global);
                     }
                 }
             }
@@ -436,6 +437,7 @@ impl Resolver<'_> {
             }
             Stmt::Function {
                 name,
+                is_global,
                 params,
                 body,
                 id,
@@ -457,13 +459,13 @@ impl Resolver<'_> {
                     if full.contains('.') {
                         let located = self.located(at, first);
                         self.use_name(first, located, false);
-                    } else if !is_local && self.lookup(first).is_some() {
+                    } else if !is_local && !*is_global && self.lookup(first).is_some() {
                         let located = self.located(at, first);
                         self.use_name(first, located, true);
                     } else {
                         // Declared before the body so that it can call itself.
-                        let root = self.scopes.len() == 1 && !is_local;
-                        self.declare(first, at, root, false);
+                        let root = (self.scopes.len() == 1 && !is_local) || *is_global;
+                        self.declare(first, at, root, *is_global);
                     }
                 }
                 self.enter_function(start, params, is_method);

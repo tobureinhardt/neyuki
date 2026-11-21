@@ -989,10 +989,14 @@ impl IrBuilder {
                 self.compile_assign(target, result);
             }
             Stmt::Function {
-                name, params, body, ..
+                name,
+                is_global,
+                params,
+                body,
+                ..
             } => {
                 let local_var = if let Some(func_name) = name {
-                    if !func_name.contains('.') {
+                    if !func_name.contains('.') && !*is_global {
                         if let Some(lv) = self.resolve_local(func_name) {
                             Some(lv)
                         } else {

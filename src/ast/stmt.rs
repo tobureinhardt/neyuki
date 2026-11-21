@@ -41,6 +41,7 @@ pub enum Stmt {
     Function {
         name: Option<String>,
         is_const: bool,
+        is_global: bool,
         params: Vec<Param>,
         return_type: Option<String>,
         body: Vec<Stmt>,
@@ -241,6 +242,7 @@ impl PartialEq for Stmt {
                 Stmt::Function {
                     name: na,
                     is_const: ca,
+                    is_global: ga,
                     params: pa,
                     return_type: ra,
                     body: ba,
@@ -249,12 +251,13 @@ impl PartialEq for Stmt {
                 Stmt::Function {
                     name: nb,
                     is_const: cb,
+                    is_global: gb,
                     params: pb,
                     return_type: rb,
                     body: bb,
                     ..
                 },
-            ) => na == nb && ca == cb && pa == pb && ra == rb && ba == bb,
+            ) => na == nb && ca == cb && ga == gb && pa == pb && ra == rb && ba == bb,
             (Stmt::If { data: da, .. }, Stmt::If { data: db, .. }) => da == db,
             (
                 Stmt::For {

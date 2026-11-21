@@ -478,6 +478,7 @@ mod tests {
                 id: NodeId::next(),
                 name: Some("math.random".to_string()),
                 is_const: false,
+                is_global: false,
                 params: vec![
                     Param {
                         name: "min".to_string(),

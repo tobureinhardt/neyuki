@@ -78,6 +78,7 @@ pub fn walk_fold_stmt<F: AstFolder + ?Sized>(folder: &mut F, stmt: Stmt) -> Stmt
         Stmt::Function {
             name,
             is_const,
+            is_global,
             params,
             return_type,
             body,
@@ -85,6 +86,7 @@ pub fn walk_fold_stmt<F: AstFolder + ?Sized>(folder: &mut F, stmt: Stmt) -> Stmt
         } => Stmt::Function {
             name,
             is_const,
+            is_global,
             params,
             return_type,
             body: body.into_iter().map(|s| folder.fold_stmt(s)).collect(),

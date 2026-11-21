@@ -715,6 +715,7 @@ fn fold_stmt_scoped(stmt: Stmt, shadowed: &mut HashSet<String>) -> Option<Stmt> 
         Stmt::Function {
             name,
             is_const,
+            is_global,
             params,
             return_type,
             body,
@@ -730,6 +731,7 @@ fn fold_stmt_scoped(stmt: Stmt, shadowed: &mut HashSet<String>) -> Option<Stmt> 
             Some(Stmt::Function {
                 name,
                 is_const,
+                is_global,
                 params,
                 return_type,
                 body: fold_block(body, &mut child_shadowed),

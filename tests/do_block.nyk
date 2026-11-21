@@ -29,11 +29,21 @@ do
     local temp = "secret_value"
     global const exported_secret = temp
     global exported_counter = 42
+    global function exported_add(a: number, b: number): number
+        return a + b + exported_counter
+    end
+    global const function exported_fact(n: number): number
+        if n <= 1 then return 1 end
+        return n * exported_fact(n - 1)
+    end
 end
 assert(exported_secret == "secret_value", "global const from block accessible outside")
 assert(exported_counter == 42, "global from block accessible outside")
+assert(exported_add(3, 5) == 50, "global function from block accessible outside")
+assert(exported_fact(5) == 120, "recursive global const function from block accessible outside")
 exported_counter = 100
 assert(exported_counter == 100, "global variable mutable outside")
+assert(exported_add(3, 5) == 108, "global function sees updated global")
 
 -- 5. Nested do blocks
 local sum = 0

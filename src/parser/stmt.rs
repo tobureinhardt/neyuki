@@ -171,7 +171,7 @@ pub fn parse_statement_inner(parser: &mut Parser) -> Result<Stmt, String> {
         return parse_binding(parser);
     }
     if parser.check_keyword("function") {
-        return parse_function(parser, false);
+        return parse_function(parser, false, false);
     }
     if parser.check_keyword("if") {
         return parse_if(parser);
@@ -327,7 +327,7 @@ pub fn parse_binding(parser: &mut Parser) -> Result<Stmt, String> {
     }
 
     if parser.check_keyword("function") {
-        return parse_function(parser, is_const);
+        return parse_function(parser, is_const, is_global);
     }
 
     let mut name = parser.expect_name()?;
@@ -402,7 +402,11 @@ pub fn parse_binding(parser: &mut Parser) -> Result<Stmt, String> {
     })
 }
 
-pub fn parse_function(parser: &mut Parser, is_const: bool) -> Result<Stmt, String> {
+pub fn parse_function(
+    parser: &mut Parser,
+    is_const: bool,
+    is_global: bool,
+) -> Result<Stmt, String> {
     parser.expect_keyword("function")?;
 
     let name = if parser.peek().kind == "name" {
@@ -458,6 +462,7 @@ pub fn parse_function(parser: &mut Parser, is_const: bool) -> Result<Stmt, Strin
         id: NodeId::next(),
         name,
         is_const,
+        is_global,
         params,
         return_type,
         body,

@@ -184,13 +184,21 @@ impl<'a> SemanticAnalyzer<'a> {
             if let Stmt::Function {
                 name: Some(fn_name),
                 is_const,
+                is_global,
                 params,
                 return_type,
                 ..
             } = stmt
                 && !fn_name.contains('.')
             {
-                self.hoist_function(stmt, fn_name, *is_const, params, return_type.as_deref());
+                self.hoist_function(
+                    stmt,
+                    fn_name,
+                    *is_const,
+                    *is_global,
+                    params,
+                    return_type.as_deref(),
+                );
             }
         }
 
@@ -328,6 +336,7 @@ impl<'a> SemanticAnalyzer<'a> {
         stmt: &Stmt,
         fn_name: &str,
         is_const: bool,
+        is_global: bool,
         params: &[Param],
         return_type: Option<&str>,
     ) {
@@ -359,7 +368,12 @@ impl<'a> SemanticAnalyzer<'a> {
         sym.num_params = Some(params.iter().filter(|p| !p.variadic).count());
         sym.min_params = Some(required_params(params, |t| self.parse_ty(t)));
         sym.is_vararg = is_vararg;
-        let _ = self.scope_mgr.define(sym);
+        if is_global {
+            let _ = self.scope_mgr.define_global(sym);
+            self.known_globals.insert(fn_name.to_string());
+        } else {
+            let _ = self.scope_mgr.define(sym);
+        }
     }
 
     #[inline(never)]
@@ -415,6 +429,7 @@ impl<'a> SemanticAnalyzer<'a> {
             Stmt::Function {
                 name,
                 is_const,
+                is_global,
                 params,
                 return_type,
                 body,
@@ -427,7 +442,9 @@ impl<'a> SemanticAnalyzer<'a> {
                     self.read_variable(object);
                 } else if let Some(fn_name) = name {
                     let span = self.find_ident_span(fn_name);
-                    self.check_shadowing(fn_name, span);
+                    if !*is_global {
+                        self.check_shadowing(fn_name, span);
+                    }
 
                     let param_types: Vec<NeyukiType> = params
                         .iter()
@@ -456,7 +473,12 @@ impl<'a> SemanticAnalyzer<'a> {
                     sym.num_params = Some(params.iter().filter(|p| !p.variadic).count());
                     sym.min_params = Some(required_params(params, |t| self.parse_ty(t)));
                     sym.is_vararg = is_vararg;
-                    let _ = self.scope_mgr.define(sym);
+                    if *is_global {
+                        let _ = self.scope_mgr.define_global(sym);
+                        self.known_globals.insert(fn_name.clone());
+                    } else {
+                        let _ = self.scope_mgr.define(sym);
+                    }
                 }
 
                 // Analyze function body with its own scope
