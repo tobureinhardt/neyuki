@@ -8,7 +8,7 @@ neyuki run <file> [args...]       run a .nyk script or .nykb bytecode file
 neyuki lint [--json] [--stdin] <file>
 neyuki compile <file> [out]       compile to bytecode (default: <file>b)
 neyuki repl                       interactive session
-neyuki test                       run every .nyk file in tests/
+neyuki test [filter|path...]      run .nyk test scripts (default: tests/)
 neyuki build [project]            build a standalone app executable
 neyuki pkg <command>              manage the project manifest and packages
 neyuki dap                        Debug Adapter Protocol server on stdio
