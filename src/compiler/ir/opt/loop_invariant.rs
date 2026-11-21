@@ -16,7 +16,8 @@ pub struct NaturalLoop {
 
 // Identifies all natural loops in the CFG using dominance information
 pub fn find_natural_loops(cfg: &ControlFlowGraph, dom: &ImmediateDominators) -> Vec<NaturalLoop> {
-    let mut loops = Vec::new();
+    let mut loops: Vec<NaturalLoop> = Vec::new();
+    let mut header_to_loop: FxHashMap<IrLabel, usize> = new_map();
     let label_to_idx: FxHashMap<IrLabel, usize> = cfg
         .blocks
         .iter()
@@ -29,11 +30,28 @@ pub fn find_natural_loops(cfg: &ControlFlowGraph, dom: &ImmediateDominators) -> 
         for &h in &block.successors {
             // If h dominates n, then (n -> h) is a back-edge
             if dom.dominates(h, n) {
-                let mut body = new_set();
-                body.insert(h);
-                body.insert(n);
-
-                if n != h {
+                // Natural loops sharing the same header (such as a loop with
+                // `continue` plus its normal back-edge) form one loop: keeping
+                // them separate treats one back-edge as an outside predecessor
+                // of the other's preheader and misses definitions made along
+                // sibling back-edges.
+                let loop_idx = match header_to_loop.get(&h).copied() {
+                    Some(idx) => idx,
+                    None => {
+                        let idx = loops.len();
+                        let mut body = new_set();
+                        body.insert(h);
+                        loops.push(NaturalLoop {
+                            header: h,
+                            back_edge_source: n,
+                            body,
+                        });
+                        header_to_loop.insert(h, idx);
+                        idx
+                    }
+                };
+                let body = &mut loops[loop_idx].body;
+                if body.insert(n) && n != h {
                     let mut stack = vec![n];
                     while let Some(current) = stack.pop() {
                         if let Some(&idx) = label_to_idx.get(&current) {
@@ -45,12 +63,6 @@ pub fn find_natural_loops(cfg: &ControlFlowGraph, dom: &ImmediateDominators) -> 
                         }
                     }
                 }
-
-                loops.push(NaturalLoop {
-                    header: h,
-                    back_edge_source: n,
-                    body,
-                });
             }
         }
     }

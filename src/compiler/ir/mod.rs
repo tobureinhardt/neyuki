@@ -873,4 +873,73 @@ return i\n";
         let liveness = LivenessInfo::compute(&cfg);
         assert!(liveness.blocks.is_empty());
     }
+
+    #[test]
+    fn test_licm_merges_shared_header_loops_with_continue() {
+        // A loop with `continue` has multiple back-edges to the same header.
+        // `find_natural_loops` must merge them into a single `NaturalLoop` so:
+        // 1. Constants hoisted to the preheader stay outside the loop rather
+        //    than being absorbed back into the header and ping-ponging across
+        //    all 16 fixpoint rounds.
+        // 2. Variables modified after a `continue` branch are included in the
+        //    merged loop's `loop_defs` and are never mis-hoisted.
+        let code = r#"
+            local x = 10
+            local i = 0
+            local sum = 0
+            while i < 4 do
+                i += 1
+                local y = x + 777
+                sum += y
+                if i % 2 == 0 then
+                    continue
+                end
+                x += 100
+            end
+            return sum
+        "#;
+        let stmts = compile_source(code).expect("parse");
+        let ir_module = ast_to_ir(&stmts);
+        let mut cfg = build_cfg(&ir_module.main.instructions);
+        let dom = ImmediateDominators::build(&cfg);
+        let initial_loops =
+            crate::compiler::ir::opt::loop_invariant::find_natural_loops(&cfg, &dom);
+        assert_eq!(
+            initial_loops.len(),
+            1,
+            "multiple back-edges to the same header must be merged into one NaturalLoop"
+        );
+
+        optimize_cfg(&mut cfg);
+        assert_eq!(verify_cfg(&cfg), Ok(()));
+
+        // After `optimize_cfg`, LICM must have truly converged (no further
+        // hoisting possible) and all loop-invariant `LoadConst` instructions
+        // must live outside the loop body.
+        let dom_after = ImmediateDominators::build(&cfg);
+        let loops_after =
+            crate::compiler::ir::opt::loop_invariant::find_natural_loops(&cfg, &dom_after);
+        assert_eq!(loops_after.len(), 1);
+        for lbl in &loops_after[0].body {
+            let blk = cfg.find_block(*lbl).expect("loop block exists");
+            assert!(
+                !blk.instructions
+                    .iter()
+                    .any(|i| matches!(i, IrInst::LoadConst { .. })),
+                "loop-invariant LoadConst remained inside loop block {:?}: {:?}",
+                lbl,
+                blk.instructions
+            );
+        }
+        assert!(
+            !loop_invariant_code_motion(&mut cfg, &dom_after),
+            "LICM must be at a fixpoint after optimize_cfg"
+        );
+
+        // Iter 1 (i=1): y = 10 + 777 = 787, sum = 787, i%2!=0 -> x = 110
+        // Iter 2 (i=2): y = 110 + 777 = 887, sum = 1674, i%2==0 -> continue (x stays 110)
+        // Iter 3 (i=3): y = 110 + 777 = 887, sum = 2561, i%2!=0 -> x = 210
+        // Iter 4 (i=4): y = 210 + 777 = 987, sum = 3548, i%2==0 -> continue
+        assert_eq!(run_via_ir(code), "3548");
+    }
 }
