@@ -216,16 +216,40 @@ mod tests {
 
     #[test]
     fn tasks_run_while_waiting_for_input() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static READY: AtomicBool = AtomicBool::new(false);
+        READY.store(false, Ordering::SeqCst);
+        fn mark_ready(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
+            READY.store(true, Ordering::SeqCst);
+            Ok(vec![Value::Nil])
+        }
+
         let mut vm = VM::new();
+        vm.globals.insert(
+            "repl_ready_xyz".into(),
+            crate::native!("repl_ready_xyz", mark_ready),
+        );
         eval_chunk(
             &mut vm,
-            "task.spawn(function()\nwhile task.wait(0.005) do\nrepl_ticks_xyz = (repl_ticks_xyz or 0) + 1\nend\nend)\n\
-             task.delay(0.01, function() repl_delayed_xyz = true end)",
+            "task.spawn(function()\n\
+               while task.wait(0.005) do\n\
+                 repl_ticks_xyz = (repl_ticks_xyz or 0) + 1\n\
+                 if repl_delayed_xyz and repl_ticks_xyz >= 3 then repl_ready_xyz() end\n\
+               end\n\
+             end)\n\
+             task.delay(0.01, function()\n\
+               repl_delayed_xyz = true\n\
+               if (repl_ticks_xyz or 0) >= 3 then repl_ready_xyz() end\n\
+             end)",
         )
         .expect("spawn");
         let (tx, rx) = mpsc::channel();
         let typist = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while !READY.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             tx.send(Ok("next\n".to_string())).unwrap();
         });
         let line = next_line(&mut vm, &rx).expect("line").expect("ok");
