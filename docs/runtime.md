@@ -20,6 +20,8 @@ neyuki help | --version
 
 Arguments after the script path reach the script through `os.args()`. A script that fails prints the error with a stack trace and exits with status 1; `os.exit(code)` chooses the status explicitly. When the main chunk returns while tasks from the [`task` library](reference/task.md) are still waiting, the script keeps running until none is left; if any task raised an error, it then exits with status 1. The REPL keeps running tasks while it waits for input, and leaves the ones still waiting when its input ends. A task that runs `ui.run` or polls with `ui.poll(timeout)` counts as waiting until its windows are closed, so the script stays alive for it, and the window is served whenever the main program calls `task.wait` or has finished (a main program that computes without waiting freezes the window; see [`task`](reference/task.md#windows-in-a-task)).
 
+`neyuki test` runs every `.nyk` file directly in `tests/` (subdirectories are not scanned). Arguments select a subset: an argument containing a path separator (such as `tests/json.nyk` or `./suite`) or naming a directory or `.nyk` file runs that target, while a bare name is matched as a case-sensitive substring against file names in `tests/`.
+
 ### Checking without running
 
 `neyuki lint` reports what the checker finds, the same checks `run` performs before executing: syntax errors, undefined names, assignments to `const` variables, values that do not match their type annotations, unused variables and parameters, shadowed names and unreachable code. Errors stop a script from running; warnings do not.
