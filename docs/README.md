@@ -7,7 +7,7 @@ This directory contains the formal specifications, guides, and technical referen
 - **[The Language](language.md)**: A tour of the syntax and semantics, from variables to objects and modules.
 - **[Library Reference](reference/README.md)**: Every built-in function and bundled module, one section per function.
 - **[Language Specification](spec.md)**: Formal EBNF grammar, lexical rules, expression precedence, and static type system.
-- **[Bytecode v4 Specification](bytecode_v4.md)**: Binary format, header layout, constant pool encoding, prototype structure, and complete opcode instruction reference.
+- **[Bytecode Specification](bytecode_v4.md)**: Binary format, header layout, constant pool encoding, prototype structure, and complete opcode instruction reference.
 - **[Module System Reference](modules.md)**: Module isolation, export conventions, `require` resolution algorithm, caching semantics, and security rules.
 - **[Versioning & Compatibility Policy](compatibility.md)**: Semantic Versioning enforcement, stability tiers, bytecode longevity, and deprecation lifecycle.
 - **[Tools and Runtime](runtime.md)**: The `neyuki` command, virtual machine architecture, linting, bytecode, packages, memory, and limits.

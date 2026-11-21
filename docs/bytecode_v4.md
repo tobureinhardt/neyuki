@@ -1,6 +1,6 @@
-# Neyuki Bytecode Version 4 Specification
+# Neyuki Bytecode Specification (Format 7)
 
-This document specifies the binary format, encoding scheme, constant pool structure, prototype hierarchy, and instruction set for Neyuki Bytecode Version 4 (`BYTECODE_VERSION = 4`).
+This document specifies the binary format, encoding scheme, constant pool structure, prototype hierarchy, and instruction set for Neyuki Bytecode Format 7 (`BYTECODE_VERSION = 7`, with loader backward compatibility for format 6 via `MIN_SUPPORTED_BYTECODE_VERSION = 6`).
 
 ## 1. File Structure and Header
 
@@ -9,14 +9,14 @@ A compiled `.nykb` binary file begins with a 12-byte header:
 ```text
 +-----------------------+---------+------------------------+-------------------+
 | Magic Bytes (7 bytes) | Ver (1) | CRC-32 Checksum (4 LE) | Serialized Protos |
-| 'n' 'e' 'y' 'u' 'k'   |  0x04   | Little-Endian u32      | (Variable length) |
+| 'n' 'e' 'y' 'u' 'k'   |  0x07   | Little-Endian u32      | (Variable length) |
 | 'i' '!'               |         |                        |                   |
 +-----------------------+---------+------------------------+-------------------+
 0                       7         8                        12
 ```
 
 - **Magic**: `b"neyuki!"` (ASCII `0x6E 0x65 0x79 0x75 0x6B 0x69 0x21`).
-- **Version**: Single byte `0x04`. Bytecode loaders reject any file with a differing version byte.
+- **Version**: Single byte `0x07` (`0x06` is also accepted by the deserializer for format 6 `.nykb` files; any version outside `6..=7` is rejected).
 - **Checksum**: 32-bit unsigned integer (Little-Endian) computed using standard IEEE 802.3 CRC-32 (`0xEDB88320`) polynomial over all serialized proto payload bytes following the header.
 
 ---

@@ -31,7 +31,7 @@ Load these with `require("@neyuki/name")`.
 | [@neyuki/io](io.md) | Reading from and writing to the terminal |
 | [@neyuki/http](http.md) | HTTP client and server, port forwarding |
 | [@neyuki/net](net.md) | Pipes, Unix sockets, TCP sockets, WebSocket clients and servers, UDP sockets |
-| [@neyuki/sql](sql.md) | PostgreSQL, MySQL and MariaDB |
+| [@neyuki/sql](sql.md) | PostgreSQL, MySQL, MariaDB and SQLite |
 | [@neyuki/crypto](crypto.md) | Hashes, passwords, encryption, signatures, secure random values |
 | [@neyuki/toml](toml.md) | Reading and writing TOML configuration files |
 | [@neyuki/csv](csv.md) | Reading and writing CSV, with or without a header line |
