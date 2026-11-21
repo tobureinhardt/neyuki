@@ -21,6 +21,13 @@ pub enum Located {
     /// A normalized path inside the running app's bundle.
     Bundled(String),
     Disk(PathBuf),
+    /// A package's native extension library for the running target
+    /// (`[native]` in its `neyuki.toml`); `file` is where the library is,
+    /// itself `Bundled` or `Disk`.
+    Native {
+        package: String,
+        file: Box<Located>,
+    },
 }
 
 impl Located {
@@ -34,6 +41,7 @@ impl Located {
                 let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
                 format!("file:{}", canonical.display())
             }
+            Located::Native { file, .. } => format!("native:{}", file.cache_key()),
         }
     }
 }
@@ -128,6 +136,10 @@ impl ModuleLoader {
                     .map_err(|e| format!("cannot read module '{}': {}", path.display(), e))?;
                 Ok((path.clone(), bytes))
             }
+            Located::Native { package, .. } => Err(format!(
+                "{}'s native library is not a module file; load it through require",
+                package
+            )),
         }
     }
 

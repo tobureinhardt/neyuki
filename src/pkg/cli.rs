@@ -146,6 +146,9 @@ fn report(result: &install::Report) {
     for pkg in &result.removed {
         println!("  - {}", pkg);
     }
+    for warning in &result.warnings {
+        eprintln!("warning: {}", warning);
+    }
     if result.installed.is_empty() && result.removed.is_empty() {
         println!(
             "Everything is up to date ({} package{}).",

@@ -319,8 +319,8 @@ fn check_entry(project: &Project) -> Result<(), String> {
 }
 
 /// Bundle path → file on disk: every `.nyk` and `.nykb` file in the project
-/// (so `require` finds local modules), the manifests of installed registry
-/// packages, plus the assets. Hidden entries,
+/// (so `require` finds local modules), the manifests and native libraries of
+/// installed registry packages, plus the assets. Hidden entries,
 /// `target`, `dist` and the output itself are skipped.
 fn collect_files(
     project: &Project,
@@ -338,6 +338,9 @@ fn collect_files(
         // `require("@pkg/user/name")` reads inside the app too.
         let package_manifest =
             bundle_path.starts_with("neyuki_packages/") && bundle_path.ends_with("/neyuki.toml");
+        if package_manifest {
+            add_native_libraries(&bundle_path, &disk_path, &mut files);
+        }
         if bundle_path.ends_with(".nyk") || bundle_path.ends_with(".nykb") || package_manifest {
             files.insert(bundle_path, disk_path);
         }
@@ -372,6 +375,35 @@ fn collect_files(
         files.retain(|_, disk| fs::canonicalize(disk).ok().as_ref() != Some(&skip));
     }
     Ok(files)
+}
+
+/// Bundles the native libraries a package's `[native]` section lists, for
+/// every target: the runtime the app is built on may be for another
+/// platform, and the app picks its own target's library when it runs.
+fn add_native_libraries(
+    manifest_bundle_path: &str,
+    manifest_disk_path: &Path,
+    files: &mut BTreeMap<String, PathBuf>,
+) {
+    let Some(native) = fs::read_to_string(manifest_disk_path)
+        .ok()
+        .and_then(|text| crate::pkg::PackageManifest::parse(&text).ok())
+        .and_then(|manifest| manifest.native)
+    else {
+        return;
+    };
+    let (Some(bundle_dir), Some(disk_dir)) = (
+        manifest_bundle_path.rsplit_once('/').map(|(dir, _)| dir),
+        manifest_disk_path.parent(),
+    ) else {
+        return;
+    };
+    for library in native.targets.values() {
+        let disk = crate::pkg::native::library_in(disk_dir, library);
+        if disk.is_file() {
+            files.insert(format!("{}/{}", bundle_dir, library), disk);
+        }
+    }
 }
 
 /// Collects the files under `dir` as (path relative to `root`, disk path).

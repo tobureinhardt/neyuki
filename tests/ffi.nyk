@@ -42,6 +42,20 @@ if (os.getenv("OS") == nil) then
     assert(c:close())
     local okClosed, _ = pcall(function() return c.abs(1) end)
     assert(not okClosed)
+
+    -- Mixed float/int arguments, and an f32 round trip (libm is linked into
+    -- the runtime on Unix).
+    local m = ffi.open(nil, {
+        ldexp = { args = { "f64", "i32" }, returns = "f64" },
+        fmaf = { args = { "f32", "f32", "f32" }, returns = "f32" },
+    })
+    assert(m.ldexp(0.75, 4) == 12.0)
+    assert(m.fmaf(1.5, 2.0, 0.25) == 3.25)
+    m:close()
 end
+
+-- Native package targets look like x86_64-linux / aarch64-macos.
+assert(string.find(ffi.target(), "-") != nil)
+assert(ffi.abiVersion == 1)
 
 print("[pass] ffi")

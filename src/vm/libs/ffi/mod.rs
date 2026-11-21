@@ -1,13 +1,17 @@
 //! Native FFI and extension API backing `@neyuki/ffi`.
 //!
 //! Provides:
-//! 1. Typed C-ABI dynamic library loading and invocation (`__ffi_open`, `__ffi_call`, `__ffi_close`)
-//!    via `libloading`.
-//! 2. Safe C-memory helpers (`__ffi_alloc`, `__ffi_free`, `__ffi_read`, `__ffi_write`,
-//!    `__ffi_read_cstring`, `__ffi_sizeof`).
-//! 3. Versioned Neyuki Native Extension ABI (`__ffi_load_extension`, `__ffi_ext_call`)
-//!    so external `cdylib` plugins can register functions without depending on
-//!    internal Rust `Value` layout.
+//! 1. Typed C-ABI dynamic library loading and invocation (`__ffi_open`,
+//!    `__ffi_call`, `__ffi_close`) via `libloading`; `call.rs` places the
+//!    arguments in registers.
+//! 2. Bounds-checked C-memory helpers (`__ffi_alloc`, `__ffi_free`,
+//!    `__ffi_read`, `__ffi_write`, `__ffi_read_cstring`, `__ffi_sizeof`).
+//! 3. The versioned Neyuki native extension ABI (`ext.rs`:
+//!    `__ffi_load_extension`, `__ffi_ext_call`), which native packages
+//!    (`[native]` in `neyuki.toml`) are loaded through as well.
+
+mod call;
+pub mod ext;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -16,6 +20,7 @@ use std::rc::Rc;
 
 use libloading::Library;
 
+use self::call::AbiArg;
 use crate::vm::libs::args::{int_arg, opt_int_arg, str_arg, table_arg};
 use crate::vm::machine::VM;
 use crate::vm::value::{NativeDef, Value, VmTable};
@@ -77,6 +82,10 @@ pub(crate) const NATIVES: &[NativeDef] = &[
         name: "__ffi_sizeof",
         func: builtin_sizeof,
     },
+    NativeDef {
+        name: "__ffi_target",
+        func: builtin_target,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -136,117 +145,7 @@ impl FfiType {
             Self::ISize | Self::USize | Self::Ptr | Self::CStr => Ok(std::mem::size_of::<usize>()),
         }
     }
-
-    fn abi_class(self) -> AbiClass {
-        match self {
-            Self::F32 => AbiClass::F32,
-            Self::F64 => AbiClass::F64,
-            _ => AbiClass::Int,
-        }
-    }
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AbiClass {
-    Int,
-    F32,
-    F64,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum AbiArg {
-    Int(u64),
-    F32(f32),
-    F64(f64),
-}
-
-// ---------------------------------------------------------------------------
-// Native Extension Plugin ABI (v1)
-// ---------------------------------------------------------------------------
-
-pub const NEYUKI_EXT_ABI_VERSION: u32 = 1;
-
-pub const EXT_TAG_NIL: u8 = 0;
-pub const EXT_TAG_BOOL: u8 = 1;
-pub const EXT_TAG_INT: u8 = 2;
-pub const EXT_TAG_FLOAT: u8 = 3;
-pub const EXT_TAG_STRING: u8 = 4;
-pub const EXT_TAG_ERROR: u8 = 5;
-
-/// Stable C-ABI value exchanged between Neyuki and native extension plugins.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct NeyukiExtValue {
-    pub tag: u8,
-    pub i: i64,
-    pub f: f64,
-    pub ptr: *const u8,
-    pub len: usize,
-}
-
-impl NeyukiExtValue {
-    pub fn nil() -> Self {
-        Self {
-            tag: EXT_TAG_NIL,
-            i: 0,
-            f: 0.0,
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-
-    pub fn from_bool(b: bool) -> Self {
-        Self {
-            tag: EXT_TAG_BOOL,
-            i: i64::from(b),
-            f: 0.0,
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-
-    pub fn from_int(i: i64) -> Self {
-        Self {
-            tag: EXT_TAG_INT,
-            i,
-            f: 0.0,
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-
-    pub fn from_float(f: f64) -> Self {
-        Self {
-            tag: EXT_TAG_FLOAT,
-            i: 0,
-            f,
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
-
-pub type NeyukiExtFn = unsafe extern "C" fn(
-    argc: usize,
-    argv: *const NeyukiExtValue,
-    user_data: *mut c_void,
-) -> NeyukiExtValue;
-
-pub type NeyukiExtRegisterFn = unsafe extern "C" fn(
-    ctx: *mut c_void,
-    name_ptr: *const u8,
-    name_len: usize,
-    func: NeyukiExtFn,
-    user_data: *mut c_void,
-) -> bool;
-
-#[repr(C)]
-pub struct NeyukiExtApi {
-    pub abi_version: u32,
-    pub register_fn: NeyukiExtRegisterFn,
-}
-
-pub type NeyukiExtInitFn = unsafe extern "C" fn(api: *const NeyukiExtApi, ctx: *mut c_void) -> i32;
 
 // ---------------------------------------------------------------------------
 // Registries for loaded libraries, bound symbols, and allocated buffers
@@ -258,15 +157,10 @@ struct BoundSymbol {
     ret: FfiType,
 }
 
-struct BoundExtFn {
-    func: NeyukiExtFn,
-    user_data: *mut c_void,
-}
-
-struct LoadedLibrary {
+pub(crate) struct LoadedLibrary {
     _lib: Option<Library>,
     symbols: Vec<BoundSymbol>,
-    ext_fns: Vec<BoundExtFn>,
+    ext_fns: Vec<ext::BoundExtFn>,
 }
 
 struct AllocEntry {
@@ -274,13 +168,13 @@ struct AllocEntry {
 }
 
 thread_local! {
-    static LIBRARIES: RefCell<HashMap<u64, LoadedLibrary>> = RefCell::new(HashMap::new());
+    pub(crate) static LIBRARIES: RefCell<HashMap<u64, LoadedLibrary>> = RefCell::new(HashMap::new());
     static NEXT_LIB_ID: Cell<u64> = const { Cell::new(1) };
     static ALLOCS: RefCell<BTreeMap<usize, AllocEntry>> = const { RefCell::new(BTreeMap::new()) };
     static FFI_ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
-fn next_lib_id() -> u64 {
+pub(crate) fn next_lib_id() -> u64 {
     NEXT_LIB_ID.with(|id| {
         let v = id.get();
         id.set(v + 1);
@@ -288,7 +182,7 @@ fn next_lib_id() -> u64 {
     })
 }
 
-fn open_library(path: &std::path::Path) -> Result<Library, String> {
+pub(crate) fn open_library(path: &std::path::Path) -> Result<Library, String> {
     if path.as_os_str().is_empty() {
         #[cfg(unix)]
         {
@@ -348,12 +242,7 @@ fn parse_signature(tbl: &VmTable) -> Result<(Vec<FfiType>, FfiType), String> {
             ));
         }
     }
-    if args.len() > 6 {
-        return Err(format!(
-            "FFI supports at most 6 arguments (got {})",
-            args.len()
-        ));
-    }
+    call::check_signature(&args)?;
     Ok((args, ret))
 }
 
@@ -517,184 +406,6 @@ fn val_to_f64(val: &Value, ty: &str) -> Result<f64, String> {
     }
 }
 
-macro_rules! invoke_c_ret {
-    ($fn_ptr:expr, $ret_ty:expr, ($($aty:ty),*), ($($aval:expr),*)) => {{
-        match $ret_ty {
-            FfiType::Void => {
-                let f: unsafe extern "C" fn($($aty),*) = std::mem::transmute($fn_ptr);
-                f($($aval),*);
-                Ok(Value::Nil)
-            }
-            FfiType::Bool => {
-                let f: unsafe extern "C" fn($($aty),*) -> bool = std::mem::transmute($fn_ptr);
-                Ok(Value::Bool(f($($aval),*)))
-            }
-            FfiType::I8 => {
-                let f: unsafe extern "C" fn($($aty),*) -> i8 = std::mem::transmute($fn_ptr);
-                Ok(Value::Int(i64::from(f($($aval),*))))
-            }
-            FfiType::U8 => {
-                let f: unsafe extern "C" fn($($aty),*) -> u8 = std::mem::transmute($fn_ptr);
-                Ok(Value::Int(i64::from(f($($aval),*))))
-            }
-            FfiType::I16 => {
-                let f: unsafe extern "C" fn($($aty),*) -> i16 = std::mem::transmute($fn_ptr);
-                Ok(Value::Int(i64::from(f($($aval),*))))
-            }
-            FfiType::U16 => {
-                let f: unsafe extern "C" fn($($aty),*) -> u16 = std::mem::transmute($fn_ptr);
-                Ok(Value::Int(i64::from(f($($aval),*))))
-            }
-            FfiType::I32 => {
-                let f: unsafe extern "C" fn($($aty),*) -> i32 = std::mem::transmute($fn_ptr);
-                Ok(Value::Int(i64::from(f($($aval),*))))
-            }
-            FfiType::U32 => {
-                let f: unsafe extern "C" fn($($aty),*) -> u32 = std::mem::transmute($fn_ptr);
-                Ok(Value::Int(i64::from(f($($aval),*))))
-            }
-            FfiType::I64 | FfiType::ISize => {
-                let f: unsafe extern "C" fn($($aty),*) -> i64 = std::mem::transmute($fn_ptr);
-                Ok(Value::Int(f($($aval),*)))
-            }
-            FfiType::U64 | FfiType::USize => {
-                let f: unsafe extern "C" fn($($aty),*) -> u64 = std::mem::transmute($fn_ptr);
-                let v = f($($aval),*);
-                if v <= i64::MAX as u64 {
-                    Ok(Value::Int(v as i64))
-                } else {
-                    Ok(Value::from_bigint(num_bigint::BigInt::from(v)))
-                }
-            }
-            FfiType::F32 => {
-                let f: unsafe extern "C" fn($($aty),*) -> f32 = std::mem::transmute($fn_ptr);
-                Ok(Value::Float(f64::from(f($($aval),*))))
-            }
-            FfiType::F64 => {
-                let f: unsafe extern "C" fn($($aty),*) -> f64 = std::mem::transmute($fn_ptr);
-                Ok(Value::Float(f($($aval),*)))
-            }
-            FfiType::Ptr => {
-                let f: unsafe extern "C" fn($($aty),*) -> usize = std::mem::transmute($fn_ptr);
-                let addr = f($($aval),*);
-                if addr == 0 {
-                    Ok(Value::Nil)
-                } else {
-                    Ok(Value::Int(addr as i64))
-                }
-            }
-            FfiType::CStr => {
-                let f: unsafe extern "C" fn($($aty),*) -> *const c_char =
-                    std::mem::transmute($fn_ptr);
-                let p = f($($aval),*);
-                if p.is_null() {
-                    Ok(Value::Nil)
-                } else {
-                    let s = CStr::from_ptr(p).to_string_lossy().into_owned();
-                    Ok(Value::string(s))
-                }
-            }
-        }
-    }};
-}
-
-unsafe fn dispatch_c_call(
-    ptr: *const c_void,
-    args: &[AbiArg],
-    ret_ty: FfiType,
-) -> Result<Value, String> {
-    unsafe {
-        match args {
-            [] => invoke_c_ret!(ptr, ret_ty, (), ()),
-            [AbiArg::Int(a0)] => invoke_c_ret!(ptr, ret_ty, (u64), (*a0)),
-            [AbiArg::F32(a0)] => invoke_c_ret!(ptr, ret_ty, (f32), (*a0)),
-            [AbiArg::F64(a0)] => invoke_c_ret!(ptr, ret_ty, (f64), (*a0)),
-            [AbiArg::Int(a0), AbiArg::Int(a1)] => {
-                invoke_c_ret!(ptr, ret_ty, (u64, u64), (*a0, *a1))
-            }
-            [AbiArg::Int(a0), AbiArg::F64(a1)] => {
-                invoke_c_ret!(ptr, ret_ty, (u64, f64), (*a0, *a1))
-            }
-            [AbiArg::F64(a0), AbiArg::Int(a1)] => {
-                invoke_c_ret!(ptr, ret_ty, (f64, u64), (*a0, *a1))
-            }
-            [AbiArg::F64(a0), AbiArg::F64(a1)] => {
-                invoke_c_ret!(ptr, ret_ty, (f64, f64), (*a0, *a1))
-            }
-            [AbiArg::F32(a0), AbiArg::F32(a1)] => {
-                invoke_c_ret!(ptr, ret_ty, (f32, f32), (*a0, *a1))
-            }
-            [AbiArg::Int(a0), AbiArg::Int(a1), AbiArg::Int(a2)] => {
-                invoke_c_ret!(ptr, ret_ty, (u64, u64, u64), (*a0, *a1, *a2))
-            }
-            [AbiArg::Int(a0), AbiArg::Int(a1), AbiArg::F64(a2)] => {
-                invoke_c_ret!(ptr, ret_ty, (u64, u64, f64), (*a0, *a1, *a2))
-            }
-            [AbiArg::Int(a0), AbiArg::F64(a1), AbiArg::Int(a2)] => {
-                invoke_c_ret!(ptr, ret_ty, (u64, f64, u64), (*a0, *a1, *a2))
-            }
-            [AbiArg::F64(a0), AbiArg::Int(a1), AbiArg::Int(a2)] => {
-                invoke_c_ret!(ptr, ret_ty, (f64, u64, u64), (*a0, *a1, *a2))
-            }
-            [AbiArg::F64(a0), AbiArg::F64(a1), AbiArg::F64(a2)] => {
-                invoke_c_ret!(ptr, ret_ty, (f64, f64, f64), (*a0, *a1, *a2))
-            }
-            [AbiArg::F32(a0), AbiArg::F32(a1), AbiArg::F32(a2)] => {
-                invoke_c_ret!(ptr, ret_ty, (f32, f32, f32), (*a0, *a1, *a2))
-            }
-            [
-                AbiArg::Int(a0),
-                AbiArg::Int(a1),
-                AbiArg::Int(a2),
-                AbiArg::Int(a3),
-            ] => {
-                invoke_c_ret!(ptr, ret_ty, (u64, u64, u64, u64), (*a0, *a1, *a2, *a3))
-            }
-            [
-                AbiArg::F64(a0),
-                AbiArg::F64(a1),
-                AbiArg::F64(a2),
-                AbiArg::F64(a3),
-            ] => {
-                invoke_c_ret!(ptr, ret_ty, (f64, f64, f64, f64), (*a0, *a1, *a2, *a3))
-            }
-            [
-                AbiArg::Int(a0),
-                AbiArg::Int(a1),
-                AbiArg::Int(a2),
-                AbiArg::Int(a3),
-                AbiArg::Int(a4),
-            ] => {
-                invoke_c_ret!(
-                    ptr,
-                    ret_ty,
-                    (u64, u64, u64, u64, u64),
-                    (*a0, *a1, *a2, *a3, *a4)
-                )
-            }
-            [
-                AbiArg::Int(a0),
-                AbiArg::Int(a1),
-                AbiArg::Int(a2),
-                AbiArg::Int(a3),
-                AbiArg::Int(a4),
-                AbiArg::Int(a5),
-            ] => {
-                invoke_c_ret!(
-                    ptr,
-                    ret_ty,
-                    (u64, u64, u64, u64, u64, u64),
-                    (*a0, *a1, *a2, *a3, *a4, *a5)
-                )
-            }
-            _ => Err(format!(
-                "unsupported FFI mixed argument combination for {} arguments",
-                args.len()
-            )),
-        }
-    }
-}
-
 fn builtin_call(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let lib_id = int_arg(args, 0, "library")? as u64;
     let sym_idx = int_arg(args, 1, "symbol")? as usize;
@@ -723,193 +434,48 @@ fn builtin_call(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let mut cstrings = Vec::new();
     let mut abi_args = Vec::with_capacity(arg_tys.len());
     for (val, ty) in call_args.iter().zip(arg_tys.iter()) {
-        let _ = ty.abi_class();
         abi_args.push(value_to_abi_arg(val, *ty, &mut cstrings)?);
     }
 
     // SAFETY: `ptr` is valid while `lib_id` is open in `LIBRARIES`, `cstrings`
-    // outlives the call, and argument/return types match the declared C-ABI signature.
-    let result = unsafe { dispatch_c_call(ptr, &abi_args, ret_ty)? };
+    // outlives the call, and argument/return types match the declared C-ABI
+    // signature, which `check_signature` accepted when it was bound.
+    let result = unsafe { call::call(ptr, &abi_args, ret_ty)? };
     Ok(vec![result])
 }
 
 fn builtin_close(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let lib_id = int_arg(args, 0, "library")? as u64;
-    let removed = LIBRARIES.with(|libs| libs.borrow_mut().remove(&lib_id).is_some());
-    Ok(vec![Value::Bool(removed)])
+    let removed = LIBRARIES.with(|libs| libs.borrow_mut().remove(&lib_id));
+    let closed = removed.is_some();
+    if let Some(lib) = removed {
+        ext::unload_when_idle(lib);
+    }
+    Ok(vec![Value::Bool(closed)])
 }
 
 // ---------------------------------------------------------------------------
-// Native Extension Plugin Loader
+// Native extensions (see ext.rs)
 // ---------------------------------------------------------------------------
-
-struct ExtRegisterContext {
-    exports: Vec<(String, NeyukiExtFn, *mut c_void)>,
-}
-
-unsafe extern "C" fn ext_register_callback(
-    ctx: *mut c_void,
-    name_ptr: *const u8,
-    name_len: usize,
-    func: NeyukiExtFn,
-    user_data: *mut c_void,
-) -> bool {
-    if ctx.is_null() || name_ptr.is_null() {
-        return false;
-    }
-    let slice = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
-    let Ok(name) = std::str::from_utf8(slice) else {
-        return false;
-    };
-    let ctx_ref = unsafe { &mut *(ctx as *mut ExtRegisterContext) };
-    ctx_ref.exports.push((name.to_string(), func, user_data));
-    true
-}
-
-/// Registers an in-process or loaded native extension via an already-resolved
-/// `NeyukiExtInitFn`. Used by both `builtin_load_extension` and unit tests.
-pub fn init_extension_with_fn(
-    init_fn: NeyukiExtInitFn,
-    lib: Option<Library>,
-) -> Result<(u64, VmTable), String> {
-    let api = NeyukiExtApi {
-        abi_version: NEYUKI_EXT_ABI_VERSION,
-        register_fn: ext_register_callback,
-    };
-    let mut ctx = ExtRegisterContext {
-        exports: Vec::new(),
-    };
-    let status = unsafe { init_fn(&api, (&mut ctx as *mut ExtRegisterContext).cast()) };
-    if status != 0 {
-        return Err(format!(
-            "native extension initialization failed with status {}",
-            status
-        ));
-    }
-
-    let mut ext_fns = Vec::with_capacity(ctx.exports.len());
-    let mut fn_map = VmTable::new();
-    for (name, func, user_data) in ctx.exports {
-        let idx = ext_fns.len();
-        ext_fns.push(BoundExtFn { func, user_data });
-        fn_map.set_str(&name, Value::from_usize(idx));
-    }
-
-    let id = next_lib_id();
-    LIBRARIES.with(|libs| {
-        libs.borrow_mut().insert(
-            id,
-            LoadedLibrary {
-                _lib: lib,
-                symbols: Vec::new(),
-                ext_fns,
-            },
-        );
-    });
-    Ok((id, fn_map))
-}
 
 fn builtin_load_extension(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let path = str_arg(args, 0, "path")?;
     let resolved = vm.permissions.resolve_ffi_library(path)?;
-    let lib = open_library(&resolved)?;
-    let init_fn: NeyukiExtInitFn = unsafe {
-        *lib.get::<NeyukiExtInitFn>(b"neyuki_extension_init\0")
-            .map_err(|err| format!("missing 'neyuki_extension_init' in '{}': {}", path, err))?
-    };
-    let (id, fn_map) = init_extension_with_fn(init_fn, Some(lib))?;
+    let (id, fn_map) = ext::load_extension(vm, &resolved, path)?;
     Ok(vec![
         Value::from_usize(id as usize),
         Value::Table(Rc::new(RefCell::new(fn_map))),
     ])
 }
 
-fn value_to_ext(val: &Value, owned_strings: &mut Vec<String>) -> NeyukiExtValue {
-    match val {
-        Value::Nil => NeyukiExtValue::nil(),
-        Value::Bool(b) => NeyukiExtValue::from_bool(*b),
-        Value::Int(i) => NeyukiExtValue::from_int(*i),
-        Value::Float(f) => NeyukiExtValue::from_float(*f),
-        Value::String(s) => {
-            let owned = s.to_string();
-            let ptr = owned.as_ptr();
-            let len = owned.len();
-            owned_strings.push(owned);
-            NeyukiExtValue {
-                tag: EXT_TAG_STRING,
-                i: 0,
-                f: 0.0,
-                ptr,
-                len,
-            }
-        }
-        other => {
-            let s = other.to_string();
-            let ptr = s.as_ptr();
-            let len = s.len();
-            owned_strings.push(s);
-            NeyukiExtValue {
-                tag: EXT_TAG_STRING,
-                i: 0,
-                f: 0.0,
-                ptr,
-                len,
-            }
-        }
-    }
-}
-
-unsafe fn ext_to_value(ext: NeyukiExtValue) -> Result<Value, String> {
-    match ext.tag {
-        EXT_TAG_NIL => Ok(Value::Nil),
-        EXT_TAG_BOOL => Ok(Value::Bool(ext.i != 0)),
-        EXT_TAG_INT => Ok(Value::Int(ext.i)),
-        EXT_TAG_FLOAT => Ok(Value::Float(ext.f)),
-        EXT_TAG_STRING => {
-            if ext.ptr.is_null() {
-                return Ok(Value::string(String::new()));
-            }
-            let bytes = unsafe { std::slice::from_raw_parts(ext.ptr, ext.len) };
-            Ok(Value::string(String::from_utf8_lossy(bytes).into_owned()))
-        }
-        EXT_TAG_ERROR => {
-            let msg = if ext.ptr.is_null() {
-                "extension error".to_string()
-            } else {
-                let bytes = unsafe { std::slice::from_raw_parts(ext.ptr, ext.len) };
-                String::from_utf8_lossy(bytes).into_owned()
-            };
-            Err(msg)
-        }
-        other => Err(format!("invalid extension return tag {}", other)),
-    }
-}
-
-fn builtin_ext_call(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn builtin_ext_call(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let lib_id = int_arg(args, 0, "extension")? as u64;
     let fn_idx = int_arg(args, 1, "function")? as usize;
-    let call_args = &args[2..];
+    ext::call_ext(vm, lib_id, fn_idx, &args[2..])
+}
 
-    let (func, user_data) = LIBRARIES.with(|libs| {
-        let libs = libs.borrow();
-        let lib = libs
-            .get(&lib_id)
-            .ok_or_else(|| "native extension is closed".to_string())?;
-        let bound = lib
-            .ext_fns
-            .get(fn_idx)
-            .ok_or_else(|| "invalid extension function".to_string())?;
-        Ok::<_, String>((bound.func, bound.user_data))
-    })?;
-
-    let mut owned_strings = Vec::new();
-    let mut ext_args = Vec::with_capacity(call_args.len());
-    for v in call_args {
-        ext_args.push(value_to_ext(v, &mut owned_strings));
-    }
-    let ret = unsafe { func(ext_args.len(), ext_args.as_ptr(), user_data) };
-    let val = unsafe { ext_to_value(ret)? };
-    Ok(vec![val])
+fn builtin_target(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
+    Ok(vec![Value::str(&crate::pkg::native::current_target())])
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,75 +840,6 @@ mod tests {
     #[cfg(unix)]
     use crate::vm::libs::args::array;
 
-    unsafe extern "C" fn test_ext_add(
-        argc: usize,
-        argv: *const NeyukiExtValue,
-        _user_data: *mut c_void,
-    ) -> NeyukiExtValue {
-        let args = unsafe { std::slice::from_raw_parts(argv, argc) };
-        if args.len() != 2 || args[0].tag != EXT_TAG_INT || args[1].tag != EXT_TAG_INT {
-            let msg = b"expected two integers";
-            return NeyukiExtValue {
-                tag: EXT_TAG_ERROR,
-                i: 0,
-                f: 0.0,
-                ptr: msg.as_ptr(),
-                len: msg.len(),
-            };
-        }
-        NeyukiExtValue::from_int(args[0].i + args[1].i)
-    }
-
-    unsafe extern "C" fn test_ext_init(api: *const NeyukiExtApi, ctx: *mut c_void) -> i32 {
-        let api = unsafe { &*api };
-        if api.abi_version != NEYUKI_EXT_ABI_VERSION {
-            return -1;
-        }
-        let name = b"add_ints";
-        let ok = unsafe {
-            (api.register_fn)(
-                ctx,
-                name.as_ptr(),
-                name.len(),
-                test_ext_add,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok { 0 } else { -2 }
-    }
-
-    #[test]
-    fn test_extension_api_roundtrip() {
-        let (lib_id, fn_map) = init_extension_with_fn(test_ext_init, None).unwrap();
-        let Value::Int(fn_idx) = fn_map.get_str("add_ints") else {
-            panic!("missing add_ints in extension table");
-        };
-        let mut vm = VM::new();
-        let res = builtin_ext_call(
-            &mut vm,
-            &[
-                Value::Int(lib_id as i64),
-                Value::Int(fn_idx),
-                Value::Int(19),
-                Value::Int(23),
-            ],
-        )
-        .unwrap();
-        assert_eq!(res[0].to_string(), "42");
-
-        let err = builtin_ext_call(
-            &mut vm,
-            &[Value::Int(lib_id as i64), Value::Int(fn_idx), Value::Int(1)],
-        )
-        .unwrap_err();
-        assert_eq!(err, "expected two integers");
-
-        assert_eq!(
-            builtin_close(&mut vm, &[Value::Int(lib_id as i64)]).unwrap()[0],
-            Value::Bool(true)
-        );
-    }
-
     #[test]
     fn test_ffi_alloc_read_write_bounds_and_double_free() {
         let mut vm = VM::new();
@@ -1581,5 +1078,203 @@ mod tests {
             "7"
         );
         builtin_free(&mut vm, &[ptr]).unwrap();
+    }
+
+    /// Compiles `tests/fixtures/native/<name>.c` into a shared library in
+    /// `dir`, or `None` (the test is skipped) when no C compiler is around.
+    #[cfg(unix)]
+    fn build_fixture(name: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/native")
+            .join(format!("{name}.c"));
+        let ext = if cfg!(target_os = "macos") {
+            "dylib"
+        } else {
+            "so"
+        };
+        let out = dir.join(format!("lib{name}.{ext}"));
+        let status =
+            std::process::Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
+                .args(["-shared", "-fPIC", "-O1", "-o"])
+                .arg(&out)
+                .arg(&src)
+                .status()
+                .ok()?;
+        if !status.success() {
+            eprintln!("skipping: could not compile {}", src.display());
+            return None;
+        }
+        Some(out)
+    }
+
+    #[cfg(unix)]
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("neyuki_ffi_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn run_script(vm: &mut VM, src: &str) -> Result<Value, String> {
+        let proto =
+            crate::compiler::compile_program(src, "ffi_test", crate::compiler::Options::RUN)
+                .map_err(|e| e.to_string())?;
+        vm.execute(proto)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_calls_mixed_int_and_float_signatures() {
+        let dir = scratch("open_mixed");
+        let Some(lib) = build_fixture("demo_c", &dir) else {
+            return;
+        };
+        let mut vm = VM::new();
+        let src = format!(
+            r#"
+            local ffi = require("@neyuki/ffi")
+            local c = ffi.open("{}", {{
+                mix = {{ args = {{ "i32", "f64", "i64", "f32", "u8", "f64" }}, returns = "f64" }},
+                scale = {{ args = {{ "f32", "i32" }}, returns = "f32" }},
+                sum8 = {{ args = {{ "i64", "i64", "i64", "i64", "i64", "i64" }}, returns = "i64" }},
+                fsum8 = {{ args = {{ "f64", "f64", "f64", "f64", "f64", "f64", "f64", "f64" }}, returns = "f64" }},
+                neg8 = {{ args = {{ "i8" }}, returns = "i8" }},
+                wrap16 = {{ args = {{ "u32" }}, returns = "u16" }},
+                minus_one = {{ returns = "i32" }},
+                is_even = {{ args = {{ "i32" }}, returns = "bool" }},
+            }})
+            assert(c.mix(1, 2.0, 3, 4.0, 5, 6.0) == 1 + 20 + 300 + 4000 + 50000 + 600000)
+            assert(c.scale(1.5, 4) == 6.0)
+            assert(c.sum8(1, 2, 3, 4, 5, 6) == 21)
+            assert(c.fsum8(1, 2, 3, 4, 5, 6, 7, 8) == 36)
+            assert(c.neg8(5) == -5)
+            assert(c.wrap16(65537) == 1)
+            assert(c.minus_one() == -1)
+            assert(c.is_even(4) == true and c.is_even(3) == false)
+            return true
+            "#,
+            lib.display()
+        );
+        assert_eq!(run_script(&mut vm, &src).unwrap(), Value::Bool(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_extension_round_trips_tables_callbacks_and_buffers() {
+        let dir = scratch("c_ext");
+        let Some(lib) = build_fixture("demo_ext", &dir) else {
+            return;
+        };
+        let mut vm = VM::new();
+        let src = format!(
+            r#"
+            local ffi = require("@neyuki/ffi")
+            local ext = ffi.loadExtension("{}")
+            assert(ext.greet("yuki") == "hello, yuki")
+            local lo, hi, sum = ext.stats({{ 4, 1.5, 9 }})
+            assert(lo == 1.5 and hi == 9 and sum == 14.5)
+            local doubled = ext.map({{ 1, 2, 3 }}, function(x) return x * 2 end)
+            assert(#doubled == 3 and doubled[3] == 6)
+            local ok, err = pcall(ext.map, {{ 1 }}, function() error("nope") end)
+            assert(not ok and string.find(tostring(err), "nope") != nil)
+            local buf = buffer.fromstring("abc")
+            assert(ext.reverse(buf) == buf and buffer.tostring(buf) == "cba")
+            assert(ext.readable("/etc/hosts") == true)
+            local ok2, err2 = pcall(ext.greet, 42)
+            assert(not ok2 and string.find(tostring(err2), "short string") != nil)
+            -- Closing the extension from a callback it is running must not
+            -- unload its code under it; later calls fail cleanly.
+            local again = ext.map({{ 5 }}, function(x) ext:close() return x end)
+            assert(again[1] == 5)
+            assert(not pcall(ext.greet, "late"))
+            return true
+            "#,
+            lib.display()
+        );
+        assert_eq!(run_script(&mut vm, &src).unwrap(), Value::Bool(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_package_loads_through_require_and_respects_the_sandbox() {
+        use crate::vm::permissions::{PermissionScope, Permissions};
+        let dir = scratch("native_pkg");
+        let Some(lib) = build_fixture("demo_ext", &dir) else {
+            return;
+        };
+        let target = crate::pkg::native::current_target();
+        let pkg = dir.join("neyuki_packages/demo/stats");
+        std::fs::create_dir_all(pkg.join("native")).unwrap();
+        std::fs::copy(&lib, pkg.join("native/libdemo.so")).unwrap();
+        std::fs::write(
+            pkg.join("neyuki.toml"),
+            format!(
+                "[package]\nname = \"@demo/stats\"\nversion = \"1.0.0\"\n\n[native]\nabi = 1\n{target} = \"native/libdemo.so\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("neyuki.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let script = r#"
+            local a = require("@pkg/demo/stats")
+            local b = require("@pkg/demo/stats/native")
+            assert(a == b, "both names load the same cached module")
+            return a.greet("pkg")
+        "#;
+        let mut vm = VM::new();
+        vm.script_dir = Some(dir.clone());
+        assert_eq!(
+            run_script(&mut vm, script).unwrap(),
+            Value::str("hello, pkg")
+        );
+
+        // Native code is unsandboxed, so a sandbox without --allow-ffi refuses it...
+        let mut vm = VM::new();
+        vm.script_dir = Some(dir.clone());
+        vm.set_permissions(Permissions::allow_all().with_ffi(PermissionScope::DenyAll));
+        let err = run_script(&mut vm, script).unwrap_err();
+        assert!(err.contains("permission denied"), "{err}");
+
+        // ...and an allow-list must contain the library.
+        let mut vm = VM::new();
+        vm.script_dir = Some(dir.clone());
+        vm.set_permissions(
+            Permissions::allow_all().with_ffi(PermissionScope::AllowList(vec![
+                pkg.to_string_lossy().into_owned(),
+            ])),
+        );
+        assert_eq!(
+            run_script(&mut vm, script).unwrap(),
+            Value::str("hello, pkg")
+        );
+
+        // An ABI the runtime does not speak is refused with a clear message.
+        std::fs::write(
+            pkg.join("neyuki.toml"),
+            format!("[package]\nname = \"@demo/stats\"\nversion = \"1.0.0\"\n\n[native]\nabi = 99\n{target} = \"native/libdemo.so\"\n"),
+        )
+        .unwrap();
+        let mut vm = VM::new();
+        vm.script_dir = Some(dir.clone());
+        let err = run_script(&mut vm, script).unwrap_err();
+        assert!(err.contains("ABI 99"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abi_layout_matches_the_c_header() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<ext::NeyukiExtValue>(), 40);
+        assert_eq!(offset_of!(ext::NeyukiExtValue, i), 8);
+        assert_eq!(offset_of!(ext::NeyukiExtValue, ptr), 24);
+        assert_eq!(offset_of!(ext::NeyukiExtApi, register_fn), 8);
+        assert_eq!(size_of::<ext::NeyukiExtApi>(), 8 + 14 * size_of::<usize>());
     }
 }

@@ -377,6 +377,53 @@ fn load_bundled_module(vm: &mut VM, name: &str) -> Result<Option<Value>, String>
     Ok(Some(value))
 }
 
+/// Loads a package's native extension library (`[native]` in its
+/// manifest) and wraps it like `ffi.loadExtension` does. Native code runs
+/// with the process's full rights, so this needs `--allow-ffi` (a
+/// restricted allow-list must contain the library) when sandboxed.
+fn load_native_package(
+    vm: &mut VM,
+    package: &str,
+    file: &crate::module_loader::Located,
+) -> Result<Value, String> {
+    use crate::module_loader::Located;
+    let path = match file {
+        Located::Disk(path) => path.clone(),
+        Located::Bundled(path) => {
+            // The OS loader cannot open a file inside the executable, so a
+            // built app writes its libraries out once (see pkg::native).
+            let bytes = crate::app::read(path)
+                .ok_or_else(|| format!("cannot find {}'s native library '{}'", package, path))?
+                .map_err(|e| format!("cannot read {}'s native library: {}", package, e))?;
+            crate::pkg::native::extract_bundled_library(
+                crate::pkg::native::file_name(path),
+                &bytes,
+            )?
+        }
+        Located::Native { .. } => return Err("nested native library".to_string()),
+    };
+    let shown = path.to_string_lossy().into_owned();
+    let resolved = vm
+        .permissions
+        .resolve_ffi_library(&shown)
+        .map_err(|e| format!("cannot load {}'s native library: {}", package, e))?;
+    let (id, fn_map) = crate::vm::libs::ffi::ext::load_extension(vm, &resolved, &shown)
+        .map_err(|e| format!("cannot load {}'s native library: {}", package, e))?;
+    let ffi = load_bundled_module(vm, "@neyuki/ffi")?
+        .ok_or_else(|| "@neyuki/ffi is not available".to_string())?;
+    let bind = match &ffi {
+        Value::Table(t) => t.borrow().get_str("_bindExtension"),
+        _ => Value::Nil,
+    };
+    let fn_map = Value::Table(std::rc::Rc::new(std::cell::RefCell::new(fn_map)));
+    let mut out = vm.call_function(bind, &[Value::from_usize(id as usize), fn_map])?;
+    Ok(if out.is_empty() {
+        Value::Nil
+    } else {
+        out.swap_remove(0)
+    })
+}
+
 pub fn builtin_require(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let pkg = match args
         .first()
@@ -429,6 +476,11 @@ pub fn builtin_require(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
     // `Located::Disk` `check_read` (or coming from bundled/trusted memory modules).
     if let Some(cached) = vm.modules.get(&key).cloned() {
         return Ok(vec![cached]);
+    }
+    if let crate::module_loader::Located::Native { package, file } = &located {
+        let value = load_native_package(vm, package, file)?;
+        vm.modules.insert(key, value.clone());
+        return Ok(vec![value]);
     }
     if let crate::module_loader::Located::Disk(path) = &located {
         vm.permissions.check_read(&path.to_string_lossy())?;

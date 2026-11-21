@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+use super::native::NativeManifest;
 use super::version::{Version, VersionReq};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +23,8 @@ pub struct PackageManifest {
     pub scripts: BTreeMap<String, String>,
     /// The `[app]` section read by `neyuki build`.
     pub app: AppManifest,
+    /// `[native]`: prebuilt extension libraries per target (see `pkg::native`).
+    pub native: Option<NativeManifest>,
 }
 
 /// `[app]`: how `neyuki build` packages the project as a desktop app.
@@ -88,6 +91,7 @@ impl Default for PackageManifest {
             dev_dependencies: BTreeMap::new(),
             scripts: BTreeMap::new(),
             app: AppManifest::default(),
+            native: None,
         }
     }
 }
@@ -123,6 +127,10 @@ impl PackageManifest {
                     "dev-dependencies" | "dev_dependencies" => "dev-dependencies",
                     "scripts" => "scripts",
                     "app" => "app",
+                    "native" | "native.targets" => {
+                        manifest.native.get_or_insert_with(NativeManifest::default);
+                        "native"
+                    }
                     _ => "unknown",
                 };
                 continue;
@@ -156,6 +164,12 @@ impl PackageManifest {
                 }
                 "scripts" => {
                     manifest.scripts.insert(key.to_string(), val.to_string());
+                }
+                "native" => {
+                    manifest
+                        .native
+                        .get_or_insert_with(NativeManifest::default)
+                        .parse_line(key, val)?;
                 }
                 "app" => {
                     let app = &mut manifest.app;
@@ -245,6 +259,10 @@ impl PackageManifest {
                 out.push_str("console = true\n");
             }
             out.push('\n');
+        }
+
+        if let Some(native) = &self.native {
+            native.serialize(&mut out);
         }
 
         out

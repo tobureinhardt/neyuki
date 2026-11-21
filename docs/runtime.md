@@ -127,6 +127,24 @@ To publish, create an account at neyuki.cc, confirm your email, create an API to
 
 Directories placed by hand in `neyuki_packages/<name>/` still load with `require("<name>")`.
 
+### Native packages
+
+A package can ship prebuilt [native extensions](reference/ffi.md#native-extensions), one library per target, listed under `[native]`:
+
+```toml
+[native]
+abi = 1                                         # extension ABI the libraries speak
+x86_64-linux   = "native/x86_64-linux/libzlib.so"
+aarch64-macos  = "native/aarch64-macos/libzlib.dylib"
+x86_64-windows = "native/x86_64-windows/zlib.dll"
+```
+
+Targets are `<arch>-<os>` as [`ffi.target()`](reference/ffi.md#ffitarget-string) reports them (`x86_64-linux`, `aarch64-linux`, `x86_64-macos`, `aarch64-macos`, `x86_64-windows`, …), with `-musl` for musl Linux; `<arch>-linux-gnu` also matches glibc Linux. `require("@pkg/user/package/native")` loads the library for the running target and returns its functions, as `ffi.loadExtension` does; `require("@pkg/user/package")` does the same when the package has no Neyuki entry file, so a package can be native only or wrap its library in Neyuki code. Loading fails with a clear message when the package was built for another `abi` or has no library for the target, and `neyuki pkg install` warns about both. `publish` refuses a `[native]` section whose libraries are missing from the package.
+
+All targets travel in one archive, so the lockfile checksum covers every library. `neyuki build` bundles them all (the runtime it builds on may be for another platform); a built app writes its target's library to `~/.neyuki/native-cache/<hash>/` the first time it loads it, because the OS cannot load a library from inside the executable.
+
+Native code runs with the process's full rights. Under `--sandbox`, loading a native package needs `--allow-ffi` like `ffi.loadExtension` does, and a restricted `--allow-ffi=<dir>` must contain the library.
+
 ## Memory and limits
 
 Memory is managed by reference counting with a cycle collector, so most values are freed the moment they become unreachable and cycles are reclaimed in the background. `collectgarbage` controls it, `__gc` runs finalizers and `__mode` makes tables weak.
@@ -140,7 +158,7 @@ Running with `--sandbox` denies host capabilities by default; individual `--allo
 - **`--allow-read` / `--allow-write`**: Existing directory prefixes and symlinks are canonicalized before prefix checks so symlinks inside an allow-listed directory cannot escape to paths outside it. SQLite file names are checked after SQLite's own `file:` URI decoding (percent-escapes, `localhost` authority, query and fragment dropped), and while either scope is restricted an authorizer limits `ATTACH DATABASE` to `:memory:`, temporary or allowed files and denies `VACUUM INTO`. SQLite extension loading stays disabled.
 - **`--allow-run`**: When restricted to an allow-list, shell command strings (`os.run("...")` / `os.spawn("...")` routed through `sh -c` or `cmd /C`) are rejected to prevent shell metacharacter injection; scripts must pass the array form (`{ program, arg1, ... }`). Allow-list entries containing paths compare canonicalized full paths rather than basenames. Under an allow-list the program is resolved before spawning (bare names on the parent's `PATH`, path specs against the current directory) and the absolute path is executed, so `options.env.PATH` and `options.cwd` cannot redirect an allowed name to another binary; a bare name not found on the parent's `PATH` is an error. Subprocesses spawned under `--allow-run` still inherit the host environment (plus any `options.env` overrides); `--allow-env` only gates `os.getenv`.
 - **`--allow-net`**: Hostname allow-lists are checked against the unresolved hostname/URL before DNS resolution (an allow-listed hostname resolves to whatever IP address DNS returns). Non-host targets must match explicit rules when restricted: `unix:<path>` (or an explicit socket path) for Unix domain sockets, `pipe:<name>` (or pipe name) for Windows named pipes, and the bind address (such as `0.0.0.0:8080`) for local listeners.
-- **`--allow-ffi`**: Controls native library loading (`ffi.open`, `ffi.loadExtension`). Under an allow-list a library must be an existing file inside it, given by path and loaded by its resolved absolute path; search-path names (`libc.so.6`) and `ffi.open(nil)` (the host process) need unrestricted `--allow-ffi`. Any non-denied policy permits the checked in-process `ffi.alloc` / `ffi.free` / `ffi.read` / `ffi.write` / `ffi.readCString`, and `ffi.alloc` counts toward `--max-memory`. The unchecked `ffi.readUnsafe` / `ffi.writeUnsafe` / `ffi.readCStringUnsafe` can touch any process memory (including the permission set), so they need unrestricted `--allow-ffi`.
+- **`--allow-ffi`**: Controls native library loading (`ffi.open`, `ffi.loadExtension`, and `require` of [native packages](#native-packages)). Under an allow-list a library must be an existing file inside it, given by path and loaded by its resolved absolute path; search-path names (`libc.so.6`) and `ffi.open(nil)` (the host process) need unrestricted `--allow-ffi`. Any non-denied policy permits the checked in-process `ffi.alloc` / `ffi.free` / `ffi.read` / `ffi.write` / `ffi.readCString`, and `ffi.alloc` counts toward `--max-memory`. The unchecked `ffi.readUnsafe` / `ffi.writeUnsafe` / `ffi.readCStringUnsafe` can touch any process memory (including the permission set), so they need unrestricted `--allow-ffi`.
 - **`--timeout` / `--max-instructions` / `--max-memory`**: Execution deadlines and instruction budgets are **best-effort**, polled at bytecode dispatch / trap intervals and backward jumps, and do not preempt inside long-running native calls (such as `string.rep` or blocking network/SQL calls).
 
 ## Platform notes

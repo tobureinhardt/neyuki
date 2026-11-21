@@ -6,6 +6,7 @@ pub mod credentials;
 pub mod install;
 pub mod lockfile;
 pub mod manifest;
+pub mod native;
 pub mod paths;
 pub mod publish;
 pub mod registry;

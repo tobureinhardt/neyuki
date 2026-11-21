@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use super::Located;
+use crate::pkg::native::{NATIVE_MODULE, NativeManifest};
 use crate::pkg::paths::{self, MANIFEST, PACKAGES_DIR, PackageName};
 
 pub struct PackageRequest {
@@ -82,36 +83,99 @@ fn candidates(module: &str, entry: Option<String>) -> Vec<String> {
     ]
 }
 
-fn find_on_disk(dir: &Path, module: &str) -> Option<PathBuf> {
+/// The package's `[native]` section, when it has one.
+fn manifest_native(text: Option<&str>) -> Option<NativeManifest> {
+    crate::pkg::PackageManifest::parse(text?).ok()?.native
+}
+
+/// What a request inside one package resolves to, given how to test for a
+/// file in it. `[native]` wins for the `native` module; a request for the
+/// package itself falls back to the native library when there is no Neyuki
+/// entry file.
+fn resolve_in_package(
+    name: &PackageName,
+    module: &str,
+    manifest: Option<String>,
+    exists: impl Fn(&str) -> bool,
+) -> Option<Result<Resolved, String>> {
+    let native = manifest_native(manifest.as_deref());
+    let wants_native = module == NATIVE_MODULE;
+    if let Some(native) = &native
+        && wants_native
+    {
+        return Some(native_file(name, native, &exists));
+    }
+    let entry = manifest.as_deref().and_then(manifest_entry);
+    if let Some(file) = candidates(module, entry).into_iter().find(|f| exists(f)) {
+        return Some(Ok(Resolved::Module(file)));
+    }
+    match &native {
+        Some(native) if module.is_empty() => Some(native_file(name, native, &exists)),
+        _ => None,
+    }
+}
+
+fn native_file(
+    name: &PackageName,
+    native: &NativeManifest,
+    exists: &impl Fn(&str) -> bool,
+) -> Result<Resolved, String> {
+    let file = native.library_for_current_target(&name.to_string())?;
+    if !exists(file) {
+        return Err(format!(
+            "{}'s native library '{}' is missing from the installed package; reinstall it",
+            name, file
+        ));
+    }
+    Ok(Resolved::Native(file.to_string()))
+}
+
+enum Resolved {
+    Module(String),
+    Native(String),
+}
+
+fn find_on_disk(name: &PackageName, dir: &Path, module: &str) -> Option<Result<Located, String>> {
     if !dir.is_dir() {
         return None;
     }
-    let entry = std::fs::read_to_string(dir.join(MANIFEST))
-        .ok()
-        .and_then(|t| manifest_entry(&t));
-    candidates(module, entry)
-        .into_iter()
-        .map(|file| dir.join(file))
-        .find(|path| path.is_file())
+    let manifest = std::fs::read_to_string(dir.join(MANIFEST)).ok();
+    let found = resolve_in_package(name, module, manifest, |file| {
+        crate::pkg::native::library_in(dir, file).is_file()
+    })?;
+    Some(found.map(|resolved| match resolved {
+        Resolved::Module(file) => Located::Disk(dir.join(file)),
+        Resolved::Native(file) => Located::Native {
+            package: name.to_string(),
+            file: Box::new(Located::Disk(crate::pkg::native::library_in(dir, &file))),
+        },
+    }))
 }
 
 /// Inside a built app, project packages are in the bundle under
 /// `neyuki_packages/` (see `neyuki build`).
-fn find_in_bundle(name: &PackageName, module: &str) -> Option<String> {
+fn find_in_bundle(name: &PackageName, module: &str) -> Option<Result<Located, String>> {
     let bundle = crate::app::installed()?;
     let base = format!("{}/{}/{}", PACKAGES_DIR, name.scope, name.name);
-    let entry = bundle
+    let manifest = bundle
         .read(&format!("{}/{}", base, MANIFEST))
         .and_then(Result::ok)
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| manifest_entry(&text));
-    candidates(module, entry).into_iter().find_map(|file| {
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    let normalized = |file: &str| {
         let path = format!("{}/{}", base, file);
         match bundle.entry(&path) {
             Some(crate::app::Entry::File { .. }) => crate::app::bundle::normalize(&path),
             _ => None,
         }
-    })
+    };
+    let found = resolve_in_package(name, module, manifest, |file| normalized(file).is_some())?;
+    Some(found.map(|resolved| match resolved {
+        Resolved::Module(file) => Located::Bundled(normalized(&file).unwrap_or_default()),
+        Resolved::Native(file) => Located::Native {
+            package: name.to_string(),
+            file: Box::new(Located::Bundled(normalized(&file).unwrap_or_default())),
+        },
+    }))
 }
 
 /// Finds the file for a package request, starting the project search at
@@ -127,7 +191,7 @@ pub fn locate(request: &PackageRequest, base_dir: Option<&Path>) -> Result<Locat
     let mut roots: Vec<PathBuf> = Vec::new();
     if request.local {
         if let Some(found) = find_in_bundle(name, &request.module) {
-            return Ok(Located::Bundled(found));
+            return found;
         }
         let starts = [
             base_dir.map(Path::to_path_buf),
@@ -149,14 +213,12 @@ pub fn locate(request: &PackageRequest, base_dir: Option<&Path>) -> Result<Locat
     for root in &roots {
         let dir = name.dir_in(root);
         if dir.is_dir() {
-            return find_on_disk(&dir, &request.module)
-                .map(Located::Disk)
-                .ok_or_else(|| {
-                    format!(
-                        "cannot find module '{}': the package has no such file",
-                        what
-                    )
-                });
+            return find_on_disk(name, &dir, &request.module).unwrap_or_else(|| {
+                Err(format!(
+                    "cannot find module '{}': the package has no such file",
+                    what
+                ))
+            });
         }
     }
 

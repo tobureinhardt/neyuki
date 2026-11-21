@@ -50,6 +50,8 @@ pub struct Report {
     pub installed: Vec<String>,
     pub unchanged: usize,
     pub removed: Vec<String>,
+    /// Installed native packages that cannot load on this machine.
+    pub warnings: Vec<String>,
 }
 
 fn marker_text(pkg: &LockedPackage) -> String {
@@ -141,6 +143,9 @@ fn apply(lock: &Lockfile, root: &Path, registry: &Registry) -> Result<Report, St
         }
         let archive = registry.download(name, &pkg.version, &pkg.checksum)?;
         place(&archive, &dir, &marker_text(pkg))?;
+        if let Some(warning) = native_warning(&dir, &pkg.name) {
+            report.warnings.push(warning);
+        }
         report
             .installed
             .push(format!("{}@{}", pkg.name, pkg.version));
@@ -159,6 +164,14 @@ fn apply(lock: &Lockfile, root: &Path, registry: &Registry) -> Result<Report, St
         }
     }
     Ok(report)
+}
+
+/// Why the native library of the package installed at `dir` will not load
+/// here (wrong ABI, no build for this target), if it has one.
+fn native_warning(dir: &Path, name: &str) -> Option<String> {
+    let text = fs::read_to_string(dir.join(MANIFEST)).ok()?;
+    let manifest = PackageManifest::parse(&text).ok()?;
+    manifest.native?.install_warning(name)
 }
 
 /// Unpacks next to `dir` first and swaps it in, so a failed download or

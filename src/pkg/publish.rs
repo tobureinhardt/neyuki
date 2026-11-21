@@ -148,7 +148,12 @@ pub fn metadata(manifest: &PackageManifest, files: &[(String, Vec<u8>)]) -> Resu
         )
     })?;
     let entry = manifest.entry.trim_start_matches("./").to_string();
-    if !files.iter().any(|(path, _)| *path == entry) {
+    if let Some(native) = &manifest.native {
+        super::native::check_publish(native, files)?;
+    }
+    // A package with native libraries may have no Neyuki code at all:
+    // requiring it then loads the library.
+    if manifest.native.is_none() && !files.iter().any(|(path, _)| *path == entry) {
         return Err(format!(
             "the entry file '{}' is not in the package; set entry in {} or add the file",
             entry, MANIFEST
@@ -192,6 +197,10 @@ pub fn metadata(manifest: &PackageManifest, files: &[(String, Vec<u8>)]) -> Resu
         "keywords": manifest.keywords,
         "dependencies": dependencies,
         "readme": readme,
+        "native": manifest.native.as_ref().map(|n| json!({
+            "abi": n.abi,
+            "targets": n.targets.keys().collect::<Vec<_>>(),
+        })),
     }))
 }
 

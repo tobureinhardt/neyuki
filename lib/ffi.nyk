@@ -24,11 +24,9 @@ function ffi.open(path: string?, signatures: {[string]: any}): any
     return table.freeze(api)
 end
 
-function ffi.loadExtension(path: string): any
-    if (type(path) != "string") then
-        error("path must be a string")
-    end
-    local libId, fnMap = __ffi_load_extension(path)
+-- Wraps a loaded extension's `name -> function index` map in callable
+-- functions. Also used by `require` for native packages.
+local function bindExtension(libId: int, fnMap: {[string]: int}): any
     local api = {}
     for name, fnId in fnMap do
         api[name] = function(...: any): any
@@ -40,6 +38,26 @@ function ffi.loadExtension(path: string): any
     end
     return table.freeze(api)
 end
+
+function ffi.loadExtension(path: string): any
+    if (type(path) != "string") then
+        error("path must be a string")
+    end
+    local libId, fnMap = __ffi_load_extension(path)
+    return bindExtension(libId, fnMap)
+end
+
+-- Internal: `require` of a native package binds its library through this.
+ffi._bindExtension = bindExtension
+
+-- The target name native packages list their libraries under
+-- (`x86_64-linux`, `aarch64-macos`, `x86_64-windows`, ...).
+function ffi.target(): string
+    return __ffi_target()
+end
+
+-- The native extension ABI version this runtime speaks.
+ffi.abiVersion = 1
 
 function ffi.alloc(size: int): int
     if (type(size) != "number") then error("size must be a number") end
