@@ -41,9 +41,7 @@ jobs:
           key: ${{ matrix.target }}
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
-      # Staged before the next build runs: both land on the same path under
-      # target/, so the default executable has to be copied out first.
-      - name: Stage the default build
+      - name: Package
         shell: bash
         run: |
           name=neyuki-${GITHUB_REF_NAME}-${{ matrix.target }}
@@ -51,25 +49,9 @@ jobs:
           cp LICENSE README.md "$name/"
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             cp target/${{ matrix.target }}/release/neyuki.exe "$name/"
-          else
-            cp target/${{ matrix.target }}/release/neyuki "$name/"
-          fi
-      # `@neyuki/gpu` stays out of `default` because it costs several MiB, so
-      # each archive carries a second executable with it compiled in rather
-      # than there being a second archive to pick between: one download, and
-      # `neyuki-gpu` for the scripts that want it. The first build has already
-      # compiled everything the two share, so this adds wgpu's tree and a link.
-      - name: Build with the gpu feature
-        run: cargo build --release --features gpu --target ${{ matrix.target }}
-      - name: Package
-        shell: bash
-        run: |
-          name=neyuki-${GITHUB_REF_NAME}-${{ matrix.target }}
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
-            cp target/${{ matrix.target }}/release/neyuki.exe "$name/neyuki-gpu.exe"
             7z a "$name.zip" "$name"
           else
-            cp target/${{ matrix.target }}/release/neyuki "$name/neyuki-gpu"
+            cp target/${{ matrix.target }}/release/neyuki "$name/"
             tar czf "$name.tar.gz" "$name"
           fi
       - uses: actions/upload-artifact@v4

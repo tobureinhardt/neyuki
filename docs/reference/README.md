@@ -37,7 +37,6 @@ Load these with `require("@neyuki/name")`.
 | [@neyuki/yaml](yaml.md) | Reading and writing YAML 1.2 configuration files and multi-document streams |
 | [@neyuki/csv](csv.md) | Reading and writing CSV, with or without a header line |
 | [@neyuki/ui](ui.md) | Windows, drawing, input events and animation |
-| [@neyuki/gpu](gpu.md) | GPU rendering on a `ui` window, behind the `gpu` cargo feature: textured, depth-tested meshes and canvases as textures |
 | [@neyuki/profile](profile.md) | Finding slow functions |
 | [@neyuki/test](test.md) | Tests with `describe`/`it`, hooks, expectations with diffs, snapshots and a summary line |
 
@@ -48,6 +47,7 @@ Some libraries live in packages rather than in the executable, so a build only c
 | Package | What it covers |
 | --- | --- |
 | [@nyk/audio](https://neyuki.cc/packages/@nyk/audio) | Playing sound files, tones and samples: volume, panning, speed, looping, fades and seeking (formerly `@neyuki/audio`) |
+| [@nyk/gpu](https://neyuki.cc/packages/@nyk/gpu) | GPU rendering on a `@nyk/ui` window through wgpu: textured, depth-tested meshes and canvases as textures (formerly `@neyuki/gpu`) |
 | [@nyk/hid](https://neyuki.cc/packages/@nyk/hid) | Keyboard and mouse automation, screen size, clipboard (formerly `@neyuki/hid`) |
 | [@nyk/html](https://neyuki.cc/packages/@nyk/html) | Parsing HTML like a browser, CSS selectors, text and rendering (formerly `@neyuki/html`) |
 | [@nyk/markdown](https://neyuki.cc/packages/@nyk/markdown) | CommonMark and GFM parsing, plain-table ASTs, frontmatter and safe HTML rendering (formerly `@neyuki/markdown`) |

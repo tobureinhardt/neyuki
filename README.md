@@ -50,8 +50,6 @@ cargo build --release
 
 The executable is `target/release/neyuki` (`neyuki.exe` on Windows); put it on your `PATH`.
 
-[@neyuki/gpu](docs/reference/gpu.md) is the one module a stock build leaves out, because `wgpu` adds several MiB to the executable. Add `--features gpu` to either command for a build that has it — `cargo install neyuki --features gpu` — or take the `neyuki-gpu` that sits beside `neyuki` in every release archive. The two are otherwise the same build, and `gpu.isAvailable()` tells a script which one it is running on.
-
 ## Use
 
 ```bash

@@ -15,7 +15,6 @@ pub mod csv;
 pub mod debug;
 pub mod ffi;
 pub mod fs;
-pub mod gpu;
 pub mod http;
 pub mod io;
 pub mod json;
@@ -59,6 +58,7 @@ pub(crate) const MOVED_LIBRARIES: &[(&str, &str)] = &[
     ("audio", "@nyk/audio"),
     ("sql", "@nyk/sql"),
     ("webview", "@nyk/webview"),
+    ("gpu", "@nyk/gpu"),
 ];
 
 /// The error for `require("@neyuki/<name>")` of a library that moved into a
@@ -81,7 +81,6 @@ pub fn register_natives(vm: &mut VM) {
         csv::NATIVES,
         ffi::NATIVES,
         fs::NATIVES,
-        gpu::NATIVES,
         clipboard::NATIVES,
         http::NATIVES,
         io::NATIVES,

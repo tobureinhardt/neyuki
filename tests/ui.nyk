@@ -183,6 +183,7 @@ expectError(ui.open, "non-negative", "open rejects negative minimum sizes", { mi
 expectError(ui.open, "transparent must be a boolean", "open checks transparent", { transparent = 1 })
 expectError(ui.open, "shadow must be a boolean", "open checks shadow", { shadow = 1 })
 expectError(ui.open, "icon must be a PNG path", "open checks the icon", { icon = 5 })
+expectError(ui.open, "neyuki pkg add @nyk/gpu", "gpu windows point to the package", { gpu = true })
 expectError(ui.open, "cannot open", "open reports a missing icon", { icon = "tests/fixtures/missing.png" })
 expectError(ui.poll, "timeout must be a number", "poll checks the timeout", "soon")
 expectError(ui.poll, "non-negative", "poll rejects negative timeouts", -1)
