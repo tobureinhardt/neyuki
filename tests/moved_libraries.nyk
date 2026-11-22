@@ -1,7 +1,7 @@
 -- Libraries that moved out of the runtime into packages: requiring the old
 -- @neyuki/ name says which package to install instead.
 
-for _, name in { "markdown", "html", "hid", "audio" } do
+for _, name in { "markdown", "html", "hid", "audio", "sql" } do
     local ok, err = pcall(require, "@neyuki/" .. name)
     assert(not ok, "@neyuki/" .. name .. " should no longer load")
     assert(string.find(err, "neyuki pkg add @nyk/" .. name, 1, true), err)

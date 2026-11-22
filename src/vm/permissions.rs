@@ -12,7 +12,7 @@ pub enum PermissionScope {
 }
 
 /// Runtime permission set enforced by host natives (`fs`, `http`, `net`,
-/// `sql`, `os`, `require`).
+/// `os`, `require`) and, through the extension API, native packages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Permissions {
     pub read: PermissionScope,

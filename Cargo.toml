@@ -54,9 +54,9 @@ tiny_http = { package = "tiny_http_dh", version = "0.12.2" }
 # responses (brotli through the pure-Rust `brotli-decompressor`).
 ureq = { version = "3", default-features = false, features = ["native-tls", "gzip", "brotli", "charset"] }
 # Not used directly: naming `flate2` with `zlib-rs` switches the deflate
-# backend that `ureq` (gzip responses) and `mysql` (compressed protocol) share
-# from `miniz_oxide` to `zlib-rs`, which decompresses noticeably faster and
-# needs no C compiler or CMake (unlike `zlib-ng`).
+# backend that `ureq` uses for gzip responses from `miniz_oxide` to
+# `zlib-rs`, which decompresses noticeably faster and needs no C compiler or
+# CMake (unlike `zlib-ng`).
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 
 # `neyuki pkg` reads the registry's JSON answers with `serde_json` (already
@@ -90,23 +90,9 @@ pkcs8 = { version = "0.10", features = ["pem", "std"] }
 base64 = "0.22"
 subtle = "2"
 
-# `@neyuki/sql` speaks to PostgreSQL and MySQL/MariaDB through these native
-# Rust drivers (no libpq or libmysqlclient), with TLS through the platform
-# `native-tls` like `ureq` above. The `mysql` defaults are dropped: their
-# `minimal` feature forces the stock C zlib onto every `flate2` user (it wins
-# over `zlib-rs`, chosen above) and `derive` is unused. `minimal-rust` leaves
-# the backend to `flate2`. `postgres-protocol` decodes the wire values that the
-# `postgres` crate leaves to companion crates (dates, uuids, arrays).
-postgres = "0.19"
-postgres-native-tls = "0.5"
-postgres-protocol = "0.6"
+# `@neyuki/net` uses `native-tls` directly for TLS sockets, the same
+# platform library as `ureq` above.
 native-tls = "0.2"
-fallible-iterator = "0.2"
-mysql = { version = "28", default-features = false, features = ["minimal-rust", "native-tls", "buffer-pool"] }
-# SQLite runs in-process, so there is no server to talk to: `rusqlite` with
-# `bundled` compiles the SQLite amalgamation into the executable (needs only
-# the C compiler listed in CONTRIBUTING.md), so no system libsqlite3 is used.
-rusqlite = { version = "0.43", features = ["bundled", "hooks"] }
 
 # `@neyuki/ui` opens windows through `winit`, blits CPU-rendered frames with
 # `softbuffer` and draws them with `tiny-skia` and `fontdue`. `image` decodes

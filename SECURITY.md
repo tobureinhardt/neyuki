@@ -48,7 +48,7 @@ Neyuki is pre-1.0 and things are still moving quickly, but the following are alw
 
 - memory unsafety (crashes, use-after-free, out-of-bounds reads/writes) in the VM, garbage collector or any native library reachable from a `.nyk` script
 - bugs in `@neyuki/crypto` that weaken hashing, password hashing, encryption, signatures or random number generation
-- bugs in `@neyuki/sql` that allow parameterized queries to be turned into SQL injection
+- bugs in `@nyk/sql` (an official package) that allow parameterized queries to be turned into SQL injection
 - bugs in `@neyuki/http` that allow request smuggling, header injection, TLS verification bypass or path traversal in the server
 - any way for a script to gain capabilities that the runtime is documented as not granting it
 

@@ -23,7 +23,6 @@ pub mod log;
 pub mod math;
 pub mod net;
 pub mod os;
-pub mod sql;
 pub mod string;
 pub mod strlib;
 pub mod table;
@@ -66,6 +65,7 @@ pub(crate) const MOVED_LIBRARIES: &[(&str, &str)] = &[
     ("html", "@nyk/html"),
     ("hid", "@nyk/hid"),
     ("audio", "@nyk/audio"),
+    ("sql", "@nyk/sql"),
 ];
 
 /// The error for `require("@neyuki/<name>")` of a library that moved into a
@@ -94,7 +94,6 @@ pub fn register_natives(vm: &mut VM) {
         io::NATIVES,
         log::NATIVES,
         net::NATIVES,
-        sql::NATIVES,
         toml::NATIVES,
         ui::NATIVES,
         webview::NATIVES,

@@ -32,7 +32,6 @@ Load these with `require("@neyuki/name")`.
 | [@neyuki/log](log.md) | Structured logging with levels, colored console output, JSON Lines and rotating file sinks |
 | [@neyuki/http](http.md) | HTTP client and server, router, middleware, static files, cookies, sessions, multipart and port forwarding |
 | [@neyuki/net](net.md) | Pipes, Unix sockets, TCP sockets, WebSocket clients and servers, UDP sockets |
-| [@neyuki/sql](sql.md) | PostgreSQL, MySQL, MariaDB and SQLite |
 | [@neyuki/crypto](crypto.md) | Hashes, passwords, encryption, signatures, secure random values |
 | [@neyuki/toml](toml.md) | Reading and writing TOML configuration files |
 | [@neyuki/yaml](yaml.md) | Reading and writing YAML 1.2 configuration files and multi-document streams |
@@ -53,3 +52,4 @@ Some libraries live in packages rather than in the executable, so a build only c
 | [@nyk/hid](https://neyuki.cc/packages/@nyk/hid) | Keyboard and mouse automation, screen size, clipboard (formerly `@neyuki/hid`) |
 | [@nyk/html](https://neyuki.cc/packages/@nyk/html) | Parsing HTML like a browser, CSS selectors, text and rendering (formerly `@neyuki/html`) |
 | [@nyk/markdown](https://neyuki.cc/packages/@nyk/markdown) | CommonMark and GFM parsing, plain-table ASTs, frontmatter and safe HTML rendering (formerly `@neyuki/markdown`) |
+| [@nyk/sql](https://neyuki.cc/packages/@nyk/sql) | PostgreSQL, MySQL, MariaDB and SQLite (formerly `@neyuki/sql`) |

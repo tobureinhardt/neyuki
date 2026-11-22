@@ -41,7 +41,7 @@ print(today.year, today.month, today.day)
 The value of an environment variable, or `nil` when it is unset.
 
 ```lua
-local db = sql.connect(os.getenv("DATABASE_URL") ?? "postgres://localhost/dev")
+local port = tonumber(os.getenv("PORT") ?? "8080")
 ```
 
 ## os.args(): {string}
