@@ -76,9 +76,10 @@ here.
 
 ## Responsible Use and Security
 
-Neyuki ships libraries that can reach the network, databases, cryptography,
-the clipboard, and keyboard and mouse input. These are legitimate tools for
-building real software, and they can also be misused. In project spaces:
+Neyuki and its official packages ship libraries that can reach the network,
+databases, cryptography, the clipboard, and keyboard and mouse input. These are
+legitimate tools for building real software, and they can also be misused. In
+project spaces:
 
 - Do not use project channels to build, share, or request malware, credential
   stealers, stalkerware, or tools whose purpose is to deceive, surveil, or

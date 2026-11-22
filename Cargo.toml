@@ -85,44 +85,17 @@ subtle = "2"
 # platform library as `ureq` above.
 native-tls = "0.2"
 
-# `@neyuki/ui` opens windows through `winit`, blits CPU-rendered frames with
-# `softbuffer` and draws them with `tiny-skia` and `fontdue`. `image` decodes
-# PNG, JPEG, WebP, GIF and BMP (animations included) through its pure-Rust
-# codecs (`png`, `zune-jpeg`, `image-webp`, `gif`); only those formats are
-# enabled. All pure Rust, so no GPU, GL or C compiler is needed. On Linux the
-# X11, Wayland and xkbcommon client libraries are loaded at runtime (dlopen)
-# rather than linked, so a build machine needs none of them and a headless
-# machine still runs everything else.
-winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
-softbuffer = "0.4"
-tiny-skia = "0.11"
-fontdue = "0.9"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
-# The now-playing session and media keys of `@neyuki/ui`: Windows'
-# SystemMediaTransportControls, MPRIS on Linux and MPNowPlayingInfoCenter on
-# macOS behind one API. Its zbus backend speaks D-Bus in pure Rust, where
-# the default one links the C libdbus.
-souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
-# `ui.openUrl` hands links to the default browser or mail client through
-# `open` (ShellExecuteW on Windows, `open` on macOS, xdg-open and friends on
-# Linux) instead of spawning shell commands by hand.
-open = "5"
-
 # (`@neyuki/toml` and `@neyuki/csv` are hand-written, like `json`.)
 # `@neyuki/yaml` parses YAML 1.2 streams with `saphyr-parser`, the pure-Rust
 # event parser from the saphyr suite, so src/vm/libs/yaml.rs constructs VM
 # tables directly with exact BigInt integers and strict alias-expansion caps.
 saphyr-parser = "0.4"
 
-# `ui.clipboard` reads and writes the system clipboard through `arboard`.
-arboard = { version = "3", default-features = false }
-
 # `os.date` formats times and reads the local time zone through the
 # operating system (the TZ variable and /etc/localtime, or the Windows API).
 jiff = "0.2"
 # `@neyuki/ffi` loads dynamic shared libraries and native Neyuki extensions.
 libloading = "0.8"
-fontdb = "0.23"
 
 # `neyuki build` sets the icon, version resource and subsystem of the Windows
 # executable it writes. `editpe` edits PE files on any host, so a Linux or
@@ -164,8 +137,7 @@ opt-level = 3
 
 # Optimized for speed and small binary size. `panic = "abort"` is intentionally
 # omitted: the parser, the VM and the REPL keep `catch_unwind` as a last-resort
-# guard against interpreter bugs, and `@neyuki/ui` catches the panic `winit`
-# raises on macOS when an event loop is built off the main thread.
+# guard against interpreter bugs.
 [profile.release]
 opt-level = 3
 lto = true

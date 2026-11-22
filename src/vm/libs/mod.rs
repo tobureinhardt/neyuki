@@ -8,7 +8,6 @@ pub mod args;
 pub mod background;
 pub mod bit;
 pub mod buffer;
-pub mod clipboard;
 pub mod coroutine;
 pub mod crypto;
 pub mod csv;
@@ -27,7 +26,6 @@ pub mod strlib;
 pub mod table;
 pub mod task;
 pub mod toml;
-pub mod ui;
 pub mod utf8;
 pub mod yaml;
 
@@ -59,6 +57,7 @@ pub(crate) const MOVED_LIBRARIES: &[(&str, &str)] = &[
     ("sql", "@nyk/sql"),
     ("webview", "@nyk/webview"),
     ("gpu", "@nyk/gpu"),
+    ("ui", "@nyk/ui"),
 ];
 
 /// The error for `require("@neyuki/<name>")` of a library that moved into a
@@ -81,13 +80,11 @@ pub fn register_natives(vm: &mut VM) {
         csv::NATIVES,
         ffi::NATIVES,
         fs::NATIVES,
-        clipboard::NATIVES,
         http::NATIVES,
         io::NATIVES,
         log::NATIVES,
         net::NATIVES,
         toml::NATIVES,
-        ui::NATIVES,
         yaml::NATIVES,
     ] {
         for def in natives {

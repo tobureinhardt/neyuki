@@ -1949,11 +1949,11 @@ mod tests {
 
     #[test]
     fn test_lsp_completion_through_require_binding() {
-        let resp = complete_at_end("local g = require(\"@neyuki/ui\")\ng.");
-        assert!(resp.contains("\"label\":\"open\""));
-        assert!(resp.contains("\"label\":\"isAvailable\""));
-        // Methods of Window belong after `w:`, not after `ui.`.
-        assert!(!resp.contains("\"label\":\"fillRect\""));
+        let resp = complete_at_end("local g = require(\"@neyuki/net\")\ng.");
+        assert!(resp.contains("\"label\":\"connect\""));
+        assert!(resp.contains("\"label\":\"udp\""));
+        // Methods of Connection belong after `c:`, not after `net.`.
+        assert!(!resp.contains("\"label\":\"readAvailable\""));
 
         let resp = complete_at_end("local m = require(\"@neyuki/math\")\nm.fl");
         assert!(resp.contains("\"label\":\"floor\""));
@@ -1961,34 +1961,27 @@ mod tests {
     }
 
     #[test]
-    fn test_lsp_completion_of_nested_namespace() {
-        let resp = complete_at_end("local ui = require(\"@neyuki/ui\")\nui.");
-        assert!(resp.contains("\"label\":\"clipboard\""));
-        let resp = complete_at_end("ui.clipboard.g");
-        assert!(resp.contains("\"label\":\"get\""));
-        assert!(!resp.contains("\"label\":\"set\""));
-    }
-
-    #[test]
     fn test_lsp_completion_importall_binds_bundled_modules() {
-        let resp = complete_at_end("--!importall\nlocal w = ui.open({})\nw:");
-        assert!(resp.contains("\"label\":\"fillRect\""));
+        let resp = complete_at_end("--!importall\nlocal c = net.connect(\"h\", 1)\nc:");
+        assert!(resp.contains("\"label\":\"write\""));
         assert!(resp.contains("\"label\":\"close\""));
-        // The type of `w` is known, so strings are not guessed.
+        // The type of `c` is known, so strings are not guessed.
         assert!(!resp.contains("\"label\":\"upper\""));
     }
 
     #[test]
     fn test_lsp_method_completion_from_known_types() {
         // The receiver is the result of a known call through a require alias.
-        let resp = complete_at_end("local g = require(\"@neyuki/ui\")\nlocal w = g.open({})\nw:cl");
-        assert!(resp.contains("\"label\":\"clear\""));
-        assert!(resp.contains("\"label\":\"close\""));
-        assert!(!resp.contains("\"label\":\"fillRect\""));
+        let resp = complete_at_end(
+            "local g = require(\"@neyuki/net\")\nlocal c = g.connect(\"h\", 1)\nc:re",
+        );
+        assert!(resp.contains("\"label\":\"read\""));
+        assert!(resp.contains("\"label\":\"readAvailable\""));
+        assert!(!resp.contains("\"label\":\"write\""));
 
         // The receiver is annotated.
-        let resp = complete_at_end("local win: Window? = nil\nwin:");
-        assert!(resp.contains("\"label\":\"fillRect\""));
+        let resp = complete_at_end("local conn: Connection? = nil\nconn:");
+        assert!(resp.contains("\"label\":\"write\""));
         assert!(!resp.contains("\"label\":\"upper\""));
 
         // A string literal, directly or through a variable: the string
@@ -2014,13 +2007,13 @@ mod tests {
         let resp = complete_at_end("local x = require(\"@neyuki/f");
         assert!(resp.contains("\"label\":\"@neyuki/fs\""));
         assert!(resp.contains("\"newText\":\"@neyuki/fs\""));
-        assert!(!resp.contains("\"label\":\"@neyuki/ui\""));
+        assert!(!resp.contains("\"label\":\"@neyuki/net\""));
 
         let resp = complete_at_end("local x = require(\"ma");
         assert!(resp.contains("\"label\":\"math\""));
 
-        let resp = complete_at_end("local w: Wi");
-        assert!(resp.contains("\"label\":\"Window\""));
+        let resp = complete_at_end("local c: Conn");
+        assert!(resp.contains("\"label\":\"Connection\""));
         assert!(!resp.contains("\"label\":\"number\""));
     }
 
@@ -2062,11 +2055,15 @@ mod tests {
 
     #[test]
     fn test_lsp_signature_help_active_parameter_with_nested_calls() {
-        let text = "local ui = require(\"@neyuki/ui\")\nlocal w = ui.open({})\nw:fillRect(1, math.max(2, 3), ";
+        let text =
+            "local log = require(\"@neyuki/log\")\nlocal l = log.new()\nl:log(1, math.max(2, 3), ";
         let resp = query_at_end(text, "textDocument/signatureHelp");
-        assert!(resp.contains(
-            "\"label\":\"fillRect(x: number, y: number, w: number, h: number, color: any, options: table?)\""
-        ));
+        assert!(
+            resp.contains(
+                "\"label\":\"log(level: string | number, message: string, fields: table?)\""
+            ),
+            "{resp}"
+        );
         assert!(resp.contains("\"activeParameter\":2"));
 
         // Commas in strings and in brackets do not count.
@@ -2104,16 +2101,19 @@ mod tests {
 
     #[test]
     fn test_lsp_hover_through_bindings() {
-        let text = "local ui = require(\"@neyuki/ui\")\nlocal w = ui.open({})\nw:clear()\nprint(\"math.floor\")\n";
+        let text = "local log = require(\"@neyuki/log\")\nlocal l = log.new()\nl:info(\"x\")\nprint(\"math.floor\")\n";
         let mut server = LspServer::new();
         open_document(&mut server, text);
 
         // A method of a known type.
         let resp = position_request(&mut server, "textDocument/hover", 2, 3);
-        assert!(resp.contains("Window:clear(color: any?): ()"));
+        assert!(
+            resp.contains("Logger:info(message: string, fields: table?): ()"),
+            "{resp}"
+        );
         // A bundled module.
         let resp = position_request(&mut server, "textDocument/hover", 1, 11);
-        assert!(resp.contains("**@neyuki/ui**"));
+        assert!(resp.contains("**@neyuki/log**"), "{resp}");
         // Inside a string the words are not names.
         let resp = position_request(&mut server, "textDocument/hover", 3, 10);
         assert!(resp.contains("\"result\":null"));
@@ -2123,26 +2123,26 @@ mod tests {
     fn test_lsp_utf16_positions_after_non_ascii_text() {
         // The crab is two UTF-16 units and four bytes, the accent one unit
         // and two bytes, so the columns differ from both counts.
-        let before_member = "local s = \"\u{e9}\u{1f980}\"; ui.";
-        let line = format!("{before_member}open({{}}) -- \u{65e5}\u{672c}");
-        let text = format!("local ui = require(\"@neyuki/ui\")\n{line}\n");
+        let before_member = "local s = \"\u{e9}\u{1f980}\"; log.";
+        let line = format!("{before_member}new({{}}) -- \u{65e5}\u{672c}");
+        let text = format!("local log = require(\"@neyuki/log\")\n{line}\n");
         let column = char_col_to_utf16_col(before_member, before_member.chars().count());
         assert_ne!(column, before_member.chars().count());
 
         let mut server = LspServer::new();
         open_document(&mut server, &text);
-        // Completion with the cursor right after `ui.`.
+        // Completion with the cursor right after `log.`.
         let resp = position_request(&mut server, "textDocument/completion", 1, column);
-        assert!(resp.contains("\"label\":\"open\""));
-        // Hover inside `open`.
-        let resp = position_request(&mut server, "textDocument/hover", 1, column + 2);
-        assert!(resp.contains("ui.open(options: table?): Window"));
+        assert!(resp.contains("\"label\":\"new\""));
+        // Hover inside `new`.
+        let resp = position_request(&mut server, "textDocument/hover", 1, column + 1);
+        assert!(resp.contains("log.new(options: table?): Logger"));
         // The hover range is in UTF-16 units as well.
         assert!(resp.contains(&format!("\"character\":{}", column)));
-        assert!(resp.contains(&format!("\"character\":{}", column + 4)));
+        assert!(resp.contains(&format!("\"character\":{}", column + 3)));
         // Signature help inside the parentheses.
-        let resp = position_request(&mut server, "textDocument/signatureHelp", 1, column + 5);
-        assert!(resp.contains("\"label\":\"open(options: table?): Window\""));
+        let resp = position_request(&mut server, "textDocument/signatureHelp", 1, column + 4);
+        assert!(resp.contains("\"label\":\"new(options: table?): Logger\""));
     }
 
     /// The value `root` holds at `path` (`read`, `keyboard.press`), nil if absent.
@@ -2466,7 +2466,7 @@ mod tests {
         write_file(&dir.join("target").join("skipped.nyk"), "return {}");
         write_file(&dir.join(".hidden").join("skipped.nyk"), "return {}");
         let resp = query_in(&dir, "local m = require(\"", "textDocument/completion");
-        for label in ["@neyuki/ui", "math", "dep", "khione", "sub/inner"] {
+        for label in ["@neyuki/log", "math", "dep", "khione", "sub/inner"] {
             assert!(
                 resp.contains(&format!("\"label\":\"{label}\"")),
                 "{label}: {resp}"
@@ -2626,14 +2626,14 @@ mod tests {
         assert!(resp.contains("\"label\":\"x\""), "{resp}");
         assert!(resp.contains("\"label\":\"y\""));
         // The elements of a list of the bundled module's type.
-        let text = "local ui = require(\"@neyuki/ui\")\nfunction frame(events: {ui.Event}, dt: number)\n    for _, e in events do\n        e.";
+        let text = "local log = require(\"@neyuki/log\")\nfunction sink(records: {log.LogRecord}, n: number)\n    for _, r in records do\n        r.";
         let resp = query_in(&dir, text, "textDocument/completion");
-        assert!(resp.contains("\"label\":\"kind\""), "{resp}");
-        assert!(resp.contains("\"label\":\"key\""));
+        assert!(resp.contains("\"label\":\"level\""), "{resp}");
+        assert!(resp.contains("\"label\":\"message\""));
         // `--!importall` makes the types available as well.
-        let text = "--!importall\nlocal e: ui.Event = nil\ne.";
+        let text = "--!importall\nlocal r: log.LogRecord = nil\nr.";
         let resp = query_in(&dir, text, "textDocument/completion");
-        assert!(resp.contains("\"label\":\"kind\""), "{resp}");
+        assert!(resp.contains("\"label\":\"level\""), "{resp}");
         cleanup(&dir);
     }
 
@@ -2700,7 +2700,7 @@ mod tests {
         write_file(&dir.join("khione.nyk"), MODULE);
         let target = modules::path_to_uri(&dir.join("khione.nyk"));
         let mut server = LspServer::new();
-        let text = "local k = require(\"khione\")\nlocal o: k.Options = nil\nk.new(o)\nlocal v = k.version\nrequire(\"@neyuki/ui\")\nrequire(\"missing\")\nlocal local_value = 1\nprint(local_value)\n";
+        let text = "local k = require(\"khione\")\nlocal o: k.Options = nil\nk.new(o)\nlocal v = k.version\nrequire(\"@neyuki/log\")\nrequire(\"missing\")\nlocal local_value = 1\nprint(local_value)\n";
         let uri = open_file(&mut server, &dir.join("main.nyk"), text);
 
         // A member: `function khione.new` is on line 6 of the module.

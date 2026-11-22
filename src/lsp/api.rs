@@ -591,8 +591,8 @@ mod tests {
     fn test_modules_namespaces_and_types() {
         let api = api();
         assert_eq!(
-            api.namespace_for_module("@neyuki/ui").as_deref(),
-            Some("ui")
+            api.namespace_for_module("@neyuki/log").as_deref(),
+            Some("log")
         );
         assert_eq!(
             api.namespace_for_module("@neyuki/math").as_deref(),
@@ -610,25 +610,32 @@ mod tests {
         assert!(standard.contains(&"math".to_string()));
         assert!(!standard.contains(&"@neyuki/fs".to_string()));
 
-        // Nested namespaces show up as members of their parent.
-        let ui = api.namespace_members("ui");
         assert!(
-            ui.iter()
-                .any(|e| e.name == "ui.clipboard" && e.kind == EntryKind::Namespace)
-        );
-        assert!(
-            api.namespace_members("ui.clipboard")
+            api.type_methods("Logger")
                 .iter()
-                .any(|e| e.name == "ui.clipboard.get")
+                .any(|e| e.name == "Logger:info")
         );
+        assert!(api.type_names().contains(&"Logger".to_string()));
+        assert_eq!(api.entry("log.new").unwrap().returns, "Logger");
+    }
 
+    #[test]
+    fn test_nested_namespaces_are_members_of_their_parent() {
+        // No reference page nests one today, so a page made up for the test.
+        let page = "# @neyuki/demo\n\nA demo.\n\n\
+            ## demo.open(): Window\n\nOpens.\n\n\
+            ## demo.clipboard.get(): string?\n\nReads.\n";
+        let api = Api::from_pages(&[("demo", page)]);
         assert!(
-            api.type_methods("Window")
+            api.namespace_members("demo")
                 .iter()
-                .any(|e| e.name == "Window:clear")
+                .any(|e| e.name == "demo.clipboard" && e.kind == EntryKind::Namespace)
         );
-        assert!(api.type_names().contains(&"Window".to_string()));
-        assert_eq!(api.entry("ui.open").unwrap().returns, "Window");
+        assert!(
+            api.namespace_members("demo.clipboard")
+                .iter()
+                .any(|e| e.name == "demo.clipboard.get")
+        );
     }
 
     #[test]

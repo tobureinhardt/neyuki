@@ -1505,7 +1505,7 @@ mod tests {
 
     #[test]
     fn test_bindings_read_parameter_and_list_annotations() {
-        let text = "local ui = require(\"@neyuki/ui\")\nfunction run(options: Opts, events: {ui.Event}, n: number?)\n    for _, e in events do\n    end\nend\n";
+        let text = "local log = require(\"@neyuki/log\")\nfunction run(options: Opts, records: {log.LogRecord}, n: number?)\n    for _, e in records do\n    end\nend\n";
         let src = crate::lsp::api::api();
         let binds = bindings_at(text, text.len(), src);
         assert_eq!(
@@ -1513,10 +1513,13 @@ mod tests {
             Some(&Binding::Type("Opts".to_string()))
         );
         assert_eq!(
-            binds.get("events"),
-            Some(&Binding::Array("ui.Event".to_string()))
+            binds.get("records"),
+            Some(&Binding::Array("log.LogRecord".to_string()))
         );
-        assert_eq!(binds.get("e"), Some(&Binding::Type("ui.Event".to_string())));
+        assert_eq!(
+            binds.get("e"),
+            Some(&Binding::Type("log.LogRecord".to_string()))
+        );
         assert_eq!(binds.get("n"), Some(&Binding::Type("number".to_string())));
         // Before the function starts its parameters are not known.
         let early = bindings_at(text, 10, src);
@@ -1530,11 +1533,14 @@ mod tests {
     #[test]
     fn test_constructor_context_finds_the_declared_type() {
         let src = crate::lsp::api::api();
-        let binds = bindings("local k = require(\"@neyuki/ui\")\n", src);
+        let binds = bindings("local k = require(\"@neyuki/log\")\n", src);
         let at = |text: &str| constructor_context(text, &binds);
         let found =
             |namespace: &str, prefix: &str| Some((namespace.to_string(), prefix.to_string()));
-        assert_eq!(at("local o: k.Event = { ki"), found("ui.Event", "ki"));
+        assert_eq!(
+            at("local o: k.LogRecord = { le"),
+            found("log.LogRecord", "le")
+        );
         assert_eq!(
             at("local o: Options = {\n    name = 1,\n    "),
             found("Options", "")

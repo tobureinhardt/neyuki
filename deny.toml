@@ -27,21 +27,13 @@ ignore = [
     # network service and point to ed25519/x25519. Remove once a fixed `rsa`
     # ships.
     { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release yet; RSA private-key ops are documented as unsuitable for network-facing use" },
-    # `ttf-parser` is unmaintained. It parses only the fonts bundled in
-    # lib/fonts or chosen by the script author, through `fontdue` and through
-    # winit's `sctk-adwaita` window decorations; neither has moved off it yet.
-    { id = "RUSTSEC-2026-0192", reason = "unmaintained, no replacement in fontdue/winit yet; parses trusted fonts only" },
-    # `derivative` is unmaintained. It comes from zbus 3, which `souvlaki` uses
-    # for the MPRIS media session on Linux, and only generates trait impls at
-    # compile time. Remove once souvlaki moves to a newer zbus.
-    { id = "RUSTSEC-2024-0388", reason = "unmaintained derive macro pulled in by souvlaki's zbus 3; compile-time only" },
     # `zbus_names`, `zvariant` and `zvariant_derive` were folded into zbus 6
-    # and are no longer released on their own. They come from zbus 3
-    # (souvlaki, MPRIS) and zbus 4 (keyring's Secret Service backend); neither
-    # crate has a release on zbus 6 yet. Remove once both move to zbus 6.
-    { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; souvlaki and keyring still depend on zbus 3/4" },
-    { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; souvlaki and keyring still depend on zbus 3/4" },
-    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6; souvlaki and keyring still depend on zbus 3/4" },
+    # and are no longer released on their own. They come from zbus 4, which
+    # keyring's Secret Service backend uses; keyring has no release on zbus 6
+    # yet. Remove once it moves.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; keyring still depends on zbus 4" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; keyring still depends on zbus 4" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6; keyring still depends on zbus 4" },
 ]
 
 [licenses]
@@ -67,7 +59,7 @@ confidence-threshold = 0.9
 
 [bans]
 # Duplicate versions (windows-sys, rand_core, digest generations, ...) come
-# from the GUI and crypto stacks moving at different speeds. Report them, but
+# from the platform and crypto stacks moving at different speeds. Report them, but
 # don't fail on them.
 multiple-versions = "warn"
 wildcards = "deny"

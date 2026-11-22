@@ -37,13 +37,13 @@ Unschedules a task and closes its coroutine, so it never runs again. A running t
 
 ## Blocking calls
 
-Inside a task, calls that would block on the outside world (`http.request` and the helpers built on it, `os.run` and reading files with `fs.read`) suspend only that task. The work runs on a background thread, the other tasks keep running, and the task resumes with the result (or the error) once the work finishes. Under `ui.run` finished work is picked up every frame, so the window stays responsive while a request is in flight.
+Inside a task, calls that would block on the outside world (`http.request` and the helpers built on it, `os.run` and reading files with `fs.read`) suspend only that task. The work runs on a background thread, the other tasks keep running, and the task resumes with the result (or the error) once the work finishes. Under `ui.run` from [`@nyk/ui`](https://neyuki.cc/packages/@nyk/ui) finished work is picked up every frame, so the window stays responsive while a request is in flight.
 
 Where a task cannot yield (the main program, a plain coroutine or a function a native called back, such as a `try` body) these calls block as before. A task cancelled while its work runs never resumes; the work itself runs to its end, so give requests a `timeout`.
 
 ## Windows in a task
 
-`ui.poll` with a timeout also suspends only the calling task, so a whole UI loop can run as a task:
+`ui.poll` from [`@nyk/ui`](https://neyuki.cc/packages/@nyk/ui) with a timeout also suspends only the calling task, so a whole UI loop can run as a task. The package parks the task through the extension SDK's task hooks, which any native package with an event loop of its own can use the same way:
 
 ```lua
 local game = task.spawn(function()

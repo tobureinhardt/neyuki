@@ -1135,7 +1135,7 @@ impl ModuleStore {
         })
     }
 
-    /// The shape of a bundled module (`ui` or `@neyuki/ui`), for its types.
+    /// The shape of a bundled module (`log` or `@neyuki/log`), for its types.
     pub fn bundled_shape(&self, module: &str) -> Option<Rc<Shape>> {
         let bare = module.strip_prefix("@neyuki/").unwrap_or(module);
         let (_, source) = crate::vm::libs::BUNDLED_LIBRARIES
@@ -1658,7 +1658,7 @@ mod tests {
         assert!(!is_plain_module_path(""));
         assert!(!is_plain_module_path("../up"));
         assert!(!is_plain_module_path("/abs"));
-        assert!(!is_plain_module_path("@neyuki/ui"));
+        assert!(!is_plain_module_path("@neyuki/log"));
         assert!(!is_plain_module_path("a\0b"));
     }
 
@@ -1718,7 +1718,7 @@ mod tests {
         }
         assert!(resolve_module_file(&main, "missing").is_none());
         assert!(resolve_module_file(&main, "../main").is_none());
-        assert!(resolve_module_file(&main, "@neyuki/ui").is_none());
+        assert!(resolve_module_file(&main, "@neyuki/log").is_none());
         cleanup(&dir);
     }
 
@@ -1848,8 +1848,8 @@ mod tests {
         assert_eq!(src.qualify_type("@m0.new", "Inner"), "@m0.Inner");
         // Standard library names still answer.
         assert_eq!(
-            src.namespace_for_module("@neyuki/ui").as_deref(),
-            Some("ui")
+            src.namespace_for_module("@neyuki/log").as_deref(),
+            Some("log")
         );
         // A missing module is no namespace.
         assert!(src.namespace_for_module("missing").is_none());
@@ -1892,9 +1892,13 @@ mod tests {
         assert_eq!(src.entry("@m0.Options.size").unwrap().returns, "number");
 
         // A bundled module's types.
-        let event = src.namespace_members("ui.Event");
-        assert!(event.iter().any(|e| e.name == "ui.Event.kind"));
-        assert!(src.type_aliases("ui").iter().any(|e| e.name == "ui.Event"));
+        let record = src.namespace_members("log.LogRecord");
+        assert!(record.iter().any(|e| e.name == "log.LogRecord.level"));
+        assert!(
+            src.type_aliases("log")
+                .iter()
+                .any(|e| e.name == "log.LogRecord")
+        );
         cleanup(&dir);
     }
 
@@ -2016,7 +2020,7 @@ mod tests {
         let src = source(&store, &documents, &main, "");
         let modules = src.modules();
         let find = |name: &str| modules.iter().find(|l| l.module.as_deref() == Some(name));
-        assert!(find("@neyuki/ui").is_some_and(|l| l.file.is_none()));
+        assert!(find("@neyuki/log").is_some_and(|l| l.file.is_none()));
         assert!(find("sibling").is_some_and(|l| l.file.is_some()));
         cleanup(&dir);
     }
