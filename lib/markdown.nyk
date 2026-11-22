@@ -1,0 +1,82 @@
+-- CommonMark + GitHub Flavored Markdown parsing and safe HTML rendering,
+-- backed by src/vm/libs/markdown.rs (on pulldown-cmark).
+
+local table = require("@neyuki/table")
+
+export type MarkdownOptions = {
+    gfm: boolean?,
+    breaks: boolean?,
+    smart: boolean?,
+    unsafeHtml: boolean?,
+    headingIds: boolean?,
+    frontmatter: boolean?,
+}
+
+export type Frontmatter = {
+    format: string,
+    raw: string,
+}
+
+local markdown = {}
+
+local function checkString(s: any, name: string)
+    if s == nil then error(name .. " must be provided") end
+    if type(s) != "string" then error(name .. " must be a string, got " .. type(s)) end
+end
+
+local function checkOptionalTable(t: any, name: string)
+    if t != nil and type(t) != "table" then
+        error(name .. " must be a table, got " .. type(t))
+    end
+end
+
+local function unpackOptions(options: MarkdownOptions?): (boolean?, boolean?, boolean?, boolean?, boolean?, boolean?)
+    checkOptionalTable(options, "options")
+    if options == nil then
+        return nil, nil, nil, nil, nil, nil
+    end
+    local keys = { "gfm", "breaks", "smart", "unsafeHtml", "headingIds", "frontmatter" }
+    for _, key in keys do
+        if options[key] != nil and type(options[key]) != "boolean" then
+            error("options." .. key .. " must be a boolean")
+        end
+    end
+    return options.gfm, options.breaks, options.smart, options.unsafeHtml, options.headingIds, options.frontmatter
+end
+
+-- Renders CommonMark / GFM `text` as HTML. Safe by default: raw HTML is
+-- escaped and unsafe link/image URL schemes (such as `javascript:` and
+-- `data:`) are stripped unless `options.unsafeHtml = true`.
+function markdown.toHtml(text: string, options: MarkdownOptions?): string
+    checkString(text, "text")
+    local gfm, breaks, smart, unsafeHtml, headingIds, frontmatter = unpackOptions(options)
+    return __markdown_to_html(text, gfm, breaks, smart, unsafeHtml, headingIds, frontmatter)
+end
+
+-- Parses CommonMark / GFM `text` into a plain-table AST document node:
+-- `{ type = "document", frontmatter?, children = { ... } }`.
+function markdown.parse(text: string, options: MarkdownOptions?): {[string]: any}
+    checkString(text, "text")
+    local gfm, breaks, smart, unsafeHtml, headingIds, frontmatter = unpackOptions(options)
+    return __markdown_parse(text, gfm, breaks, smart, unsafeHtml, headingIds, frontmatter)
+end
+
+-- Splits a leading YAML (`---`) or TOML (`+++`) frontmatter block from `text`.
+-- Returns `({ format = "yaml" | "toml", raw = "..." }, body)`, or `(nil, text)`
+-- when no frontmatter block is present.
+function markdown.frontmatter(text: string): (Frontmatter?, string)
+    checkString(text, "text")
+    return __markdown_frontmatter(text)
+end
+
+-- Extracts plain text from either a Markdown string or an AST node table
+-- returned by `markdown.parse`.
+function markdown.text(input: string | {[string]: any}): string
+    if input == nil then error("input must be provided") end
+    if type(input) != "string" and type(input) != "table" then
+        error("input must be a string or a node table, got " .. type(input))
+    end
+    return __markdown_text(input)
+end
+
+return table.freeze(markdown)

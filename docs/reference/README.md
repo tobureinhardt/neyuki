@@ -36,6 +36,7 @@ Load these with `require("@neyuki/name")`.
 | [@neyuki/toml](toml.md) | Reading and writing TOML configuration files |
 | [@neyuki/csv](csv.md) | Reading and writing CSV, with or without a header line |
 | [@neyuki/html](html.md) | Parsing HTML like a browser, CSS selectors, text and rendering |
+| [@neyuki/markdown](markdown.md) | CommonMark and GFM parsing, plain-table ASTs, frontmatter and safe HTML rendering |
 | [@neyuki/ui](ui.md) | Windows, drawing, input events and animation |
 | [@neyuki/webview](webview.md) | Web pages in a window: load a URL, HTML or app files, and exchange messages with the page |
 | [@neyuki/gpu](gpu.md) | GPU rendering on a `ui` window, behind the `gpu` cargo feature: textured, depth-tested meshes and canvases as textures |
