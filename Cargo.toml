@@ -24,11 +24,7 @@ name = "neyuki"
 path = "src/main.rs"
 
 [features]
-default = ["webview"]
-# `@neyuki/webview`: pages rendered by the system web engine through `wry`.
-# On Linux this links WebKitGTK and GTK 3 (libwebkit2gtk-4.1-dev, libgtk-3-dev);
-# build with `--no-default-features` where those are not installed.
-webview = ["dep:wry", "dep:gtk"]
+default = []
 # `@neyuki/gpu`: a GPU surface on a `ui` window through `wgpu` (Direct3D 12,
 # Vulkan, Metal). Off by default while the module is a spike: it adds a large
 # dependency tree and several MiB to the executable, and `@neyuki/ui` keeps
@@ -139,9 +135,6 @@ wgpu = { version = "30", default-features = false, features = ["std", "parking_l
 # of spinning on it.
 pollster = { version = "0.4", optional = true }
 
-# `@neyuki/webview` hosts WebView2 (Windows), WKWebView (macOS) and WebKitGTK
-# (Linux) through `wry`, inside the same `winit` event loop as `@neyuki/ui`.
-wry = { version = "0.52", optional = true }
 
 # `os.date` formats times and reads the local time zone through the
 # operating system (the TZ variable and /etc/localtime, or the Windows API).
@@ -174,17 +167,13 @@ schannel = ">=0.1.23, <0.1.28"
 # user. 0.59 is the generation that still links through import libraries,
 # for the same windows-gnu reason as `schannel` above. A built app also
 # shows an error that ends it in a message box, as it has no console.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_UI_WindowsAndMessaging"] }
 
 # Elsewhere `os.protect` keeps a random AES-256-GCM key in the OS keychain:
 # Keychain Services on macOS, the Secret Service over the pure-Rust `zbus`
 # D-Bus client on Linux and the BSDs (no libdbus needed to build or run).
 [target.'cfg(not(windows))'.dependencies]
 keyring = { version = "3.6", features = ["apple-native", "async-secret-service", "async-io", "crypto-rust"] }
-
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-# `gtk` hosts the web view on Linux, where WebKitGTK cannot live in a winit window.
-gtk = { version = "0.18", optional = true }
 
 # Debug builds still optimize dependencies: the crypto crates run 10-50x
 # slower unoptimized, enough that `hashPassword` and `pbkdf2` at their default

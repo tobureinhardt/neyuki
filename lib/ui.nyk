@@ -1203,35 +1203,13 @@ function ui.poll(timeout: number?): {Event}
     local raw = __ui_poll(timeout)
     local events = {}
     for _, event in raw do
-        if (event.kind == "webview") then
-            -- Web views register under their own ids (`@neyuki/webview`).
-            local view = windows[tostring(event.webview)]
-            if (view != nil) then
-                event.webview = view
-                events[#events + 1] = event
-            end
-        else
-            local window = windows[tostring(event.window)]
-            if (window != nil) then
-                event.window = window
-                events[#events + 1] = event
-            end
+        local window = windows[tostring(event.window)]
+        if (window != nil) then
+            event.window = window
+            events[#events + 1] = event
         end
     end
     return events
-end
-
--- Internal: lets `@neyuki/webview` have its views counted by `ui.run` and
--- their events routed through `ui.poll`. Not part of the public API.
-function ui.track(id: number, object: any): ()
-    windows[tostring(id)] = object
-    openCount += 1
-end
-
-function ui.untrack(id: number): ()
-    if (windows[tostring(id)] == nil) then return end
-    windows[tostring(id)] = nil
-    openCount -= 1
 end
 
 -- Frame pacing state shared with the tween list below: how many tweens from
@@ -1298,7 +1276,6 @@ function ui.run(handler: ({Event}, number) -> any, options: RunOptions?): ()
         if (autoClose) then
             for _, event in events do
                 if (event.kind == "close") then event.window:close() end
-                if (event.kind == "webview" and event.type == "close") then event.webview:close() end
             end
         end
         local now = os.clock()

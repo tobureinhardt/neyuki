@@ -133,11 +133,7 @@ pub trait MemberSource {
 /// Some pages head a method with the variable it is usually called on
 /// (`conn:read`) while the functions return the type (`Connection`). Method
 /// completion goes by type, so these owners are read as the type.
-const OWNER_ALIASES: &[(&str, &str)] = &[
-    ("conn", "Connection"),
-    ("ws", "WebSocket"),
-    ("view", "WebView"),
-];
+const OWNER_ALIASES: &[(&str, &str)] = &[("conn", "Connection"), ("ws", "WebSocket")];
 
 /// The object type a method heading's owner stands for.
 fn owner_type(owner: &str) -> &str {
@@ -638,13 +634,12 @@ mod tests {
 
     #[test]
     fn test_methods_headed_by_a_variable_belong_to_the_type() {
-        // net.md and webview.md write `conn:read`, `ws:send` and
-        // `view:navigate`, while the functions return the types.
+        // net.md writes `conn:read` and `ws:send`, while the functions
+        // return the types.
         let api = api();
         let has = |ty: &str, name: &str| api.type_methods(ty).iter().any(|e| e.name == name);
         assert!(has("Connection", "conn:read"));
         assert!(has("WebSocket", "ws:send"));
-        assert!(has("WebView", "view:navigate"));
         assert!(!api.type_names().contains(&"conn".to_string()));
         // The entries keep their headings.
         assert!(api.entry("conn:read").is_some());

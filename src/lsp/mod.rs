@@ -2177,9 +2177,9 @@ mod tests {
             .into_iter()
             .filter_map(|lib| lib.module)
             .collect();
-        // The bundled modules that load without a desktop session or a web
-        // engine. `ui` and `webview` need one, so what their pages
-        // document is not compared with the runtime here.
+        // The bundled modules that load without a desktop session. `ui`
+        // needs one, so what its page documents is not compared with the
+        // runtime here.
         let headless = [
             "crypto", "csv", "fs", "http", "io", "log", "net", "profile", "test", "toml", "yaml",
         ];

@@ -11,10 +11,10 @@
 //! from one instance must be. They live in thread locals, like the windows
 //! in `ui.rs`, because the whole UI runs on the event loop thread.
 //!
-//! The module is behind the `gpu` cargo feature, which is **off** by default
-//! (unlike `webview`). Without it `gpu.isAvailable()` returns `false` and
-//! every other native fails with a clear error, so a default build links no
-//! graphics driver loader at all.
+//! The module is behind the `gpu` cargo feature, which is **off** by
+//! default. Without it `gpu.isAvailable()` returns `false` and every other
+//! native fails with a clear error, so a default build links no graphics
+//! driver loader at all.
 //!
 //! wgpu's own environment variables work (`WGPU_BACKEND`, `WGPU_POWER_PREF`,
 //! the validation flags), and `NEYUKI_GPU_SOFTWARE=1` adds the one it has

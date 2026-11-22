@@ -57,7 +57,6 @@ use winit::window::{
 use crate::vm::libs::args::array as new_table;
 use crate::vm::libs::gpu;
 use crate::vm::libs::task;
-use crate::vm::libs::webview;
 use crate::vm::machine::VM;
 use crate::vm::value::{NativeDef, StrRef, Value, VmTable};
 
@@ -949,18 +948,13 @@ struct App;
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         create_pending(event_loop);
-        webview::create_pending(event_loop);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         create_pending(event_loop);
-        webview::create_pending(event_loop);
     }
 
     fn window_event(&mut self, _: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
-        if webview::window_event(window_id, &event) {
-            return;
-        }
         let Some(id) = WINDOW_IDS.with(|ids| ids.borrow().get(&window_id).copied()) else {
             return;
         };
@@ -3450,11 +3444,8 @@ const TASK_BUDGET: Duration = Duration::from_millis(4);
 /// and takes the events that arrived.
 fn pump_events(timeout: Duration) -> Result<Vec<Value>, String> {
     pump(timeout)?;
-    webview::pump_toolkit();
     drain_media_commands();
-    let mut events = EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()));
-    events.extend(webview::take_events());
-    Ok(events)
+    Ok(EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut())))
 }
 
 /// The hook the task scheduler pumps the event loop through for the tasks
