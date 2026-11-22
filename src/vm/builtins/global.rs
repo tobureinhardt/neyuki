@@ -348,7 +348,10 @@ fn load_bundled_module(vm: &mut VM, name: &str) -> Result<Option<Value>, String>
         .iter()
         .find(|(bundled, _)| bundled.strip_prefix("@neyuki/") == Some(bare))
     else {
-        return Ok(None);
+        return match crate::vm::libs::moved_library_error(name) {
+            Some(moved) => Err(moved),
+            None => Ok(None),
+        };
     };
     thread_local! {
         static BUNDLED_PROTOS: RefCell<FxHashMap<&'static str, Proto>> =

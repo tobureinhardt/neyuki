@@ -1,0 +1,15 @@
+-- Libraries that moved out of the runtime into packages: requiring the old
+-- @neyuki/ name says which package to install instead.
+
+local ok, err = pcall(require, "@neyuki/markdown")
+assert(not ok, "@neyuki/markdown should no longer load")
+assert(string.find(err, "neyuki pkg add @nyk/markdown", 1, true), err)
+assert(string.find(err, 'require("@pkg/nyk/markdown")', 1, true), err)
+
+-- A bundled library is unaffected, and an unknown @neyuki/ name still says
+-- the module cannot be found.
+assert(require("@neyuki/toml") != nil)
+local ok2, err2 = pcall(require, "@neyuki/nope")
+assert(not ok2 and not string.find(err2, "no longer bundled", 1, true), err2)
+
+print("moved libraries ok")

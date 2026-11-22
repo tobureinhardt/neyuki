@@ -6,9 +6,6 @@
 use crate::compiler::{compile_source, compile_to_proto};
 use crate::vm::libs::http::parse_multipart_bytes;
 use crate::vm::libs::json::decode_from_str;
-use crate::vm::libs::markdown::{
-    parse_from_str as parse_md_from_str, to_html_from_str as render_md_from_str,
-};
 use crate::vm::libs::yaml::decode_from_str as decode_yaml_from_str;
 use crate::vm::machine::VM;
 use crate::vm::value::Value;
@@ -223,32 +220,6 @@ AAAA
     assert!(execute_source(crypto_script).is_ok());
 }
 
-pub fn fuzz_markdown_parser_and_xss() {
-    // 1. Pathological delimiter and nesting inputs must run linearly and respect depth limits
-    let deep_quotes = "> ".repeat(300) + "deep";
-    assert!(
-        parse_md_from_str(&deep_quotes).is_err(),
-        "deeply nested blockquotes must hit depth limit"
-    );
-
-    let bracket_storm = "[".repeat(4_000) + "x" + &"]".repeat(4_000);
-    assert!(render_md_from_str(&bracket_storm).is_ok());
-
-    let star_storm = "*a ".repeat(2_000);
-    assert!(render_md_from_str(&star_storm).is_ok());
-
-    // 2. Default safe HTML must neutralize raw HTML and dangerous URL schemes
-    let xss = "<script>alert(1)</script>\n\nHi <img src=x onerror=alert(1)>\n\n[bad](javascript:alert(1))\n\n[b2](<JaVa\tScRiPt:1>)\n\n![img](data:text/html,hi)";
-    let rendered = render_md_from_str(xss).expect("safe render should succeed");
-    assert!(!rendered.contains("<script>"));
-    assert!(rendered.contains("&lt;script&gt;"));
-    assert!(!rendered.contains("<img src=x"));
-    assert!(rendered.contains("&lt;img "));
-    assert!(!rendered.contains("javascript:"));
-    assert!(!rendered.contains("ScRiPt:"));
-    assert!(!rendered.contains("data:text/html"));
-}
-
 pub fn fuzz_http_multipart_and_cookies() {
     // 1. Malformed multipart payloads must error cleanly, never panic
     let bad_cases: &[(&[u8], &str)] = &[
@@ -345,7 +316,6 @@ mod tests {
         fuzz_string_and_utf8_edge_cases();
         fuzz_number_parsing_and_radix();
         fuzz_crypto_boundaries();
-        fuzz_markdown_parser_and_xss();
         fuzz_http_multipart_and_cookies();
         fuzz_yaml_parser_and_bombs();
     }

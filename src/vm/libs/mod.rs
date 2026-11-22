@@ -22,7 +22,6 @@ pub mod http;
 pub mod io;
 pub mod json;
 pub mod log;
-pub mod markdown;
 pub mod math;
 pub mod net;
 pub mod os;
@@ -62,6 +61,23 @@ use crate::vm::machine::VM;
 pub(crate) const BUNDLED_LIBRARIES: &[(&str, &str)] =
     include!(concat!(env!("OUT_DIR"), "/bundled_libraries.rs"));
 
+/// Libraries that used to be bundled and now live in packages, as
+/// (`@neyuki/` name, package). `require` of the old name says where it went.
+pub(crate) const MOVED_LIBRARIES: &[(&str, &str)] = &[("markdown", "@nyk/markdown")];
+
+/// The error for `require("@neyuki/<name>")` of a library that moved into a
+/// package, or `None` when `name` never did.
+pub(crate) fn moved_library_error(name: &str) -> Option<String> {
+    let bare = name.strip_prefix("@neyuki/")?;
+    let (_, package) = MOVED_LIBRARIES.iter().find(|(old, _)| *old == bare)?;
+    let path = package.trim_start_matches('@');
+    Some(format!(
+        "@neyuki/{} is no longer bundled; it is the {} package now: \
+         run 'neyuki pkg add {}' and require(\"@pkg/{}\")",
+        bare, package, package, path
+    ))
+}
+
 /// Registers the natives the bundled `lib/*.nyk` modules are built on.
 pub fn register_natives(vm: &mut VM) {
     for natives in [
@@ -76,7 +92,6 @@ pub fn register_natives(vm: &mut VM) {
         http::NATIVES,
         io::NATIVES,
         log::NATIVES,
-        markdown::NATIVES,
         net::NATIVES,
         sql::NATIVES,
         toml::NATIVES,

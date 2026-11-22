@@ -141,10 +141,6 @@ open = "5"
 # than a DOM crate, whose CSS selector dependencies are unmaintained.
 # (`@neyuki/toml` and `@neyuki/csv` are hand-written, like `json`.)
 html5ever = "0.29"
-# `@neyuki/markdown` parses CommonMark and GitHub Flavored Markdown with
-# `pulldown-cmark` (pure Rust, MIT, linear-time). Only the HTML escape helper
-# is enabled; the CLI `getopts` binary feature is dropped.
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 # `@neyuki/yaml` parses YAML 1.2 streams with `saphyr-parser`, the pure-Rust
 # event parser from the saphyr suite, so src/vm/libs/yaml.rs constructs VM
 # tables directly with exact BigInt integers and strict alias-expansion caps.

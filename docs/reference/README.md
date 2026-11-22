@@ -38,7 +38,6 @@ Load these with `require("@neyuki/name")`.
 | [@neyuki/yaml](yaml.md) | Reading and writing YAML 1.2 configuration files and multi-document streams |
 | [@neyuki/csv](csv.md) | Reading and writing CSV, with or without a header line |
 | [@neyuki/html](html.md) | Parsing HTML like a browser, CSS selectors, text and rendering |
-| [@neyuki/markdown](markdown.md) | CommonMark and GFM parsing, plain-table ASTs, frontmatter and safe HTML rendering |
 | [@neyuki/ui](ui.md) | Windows, drawing, input events and animation |
 | [@neyuki/webview](webview.md) | Web pages in a window: load a URL, HTML or app files, and exchange messages with the page |
 | [@neyuki/gpu](gpu.md) | GPU rendering on a `ui` window, behind the `gpu` cargo feature: textured, depth-tested meshes and canvases as textures |
@@ -46,3 +45,11 @@ Load these with `require("@neyuki/name")`.
 | [@neyuki/hid](hid.md) | Keyboard and mouse automation, screen size, clipboard |
 | [@neyuki/profile](profile.md) | Finding slow functions |
 | [@neyuki/test](test.md) | Tests with `describe`/`it`, hooks, expectations with diffs, snapshots and a summary line |
+
+## Official packages
+
+Some libraries live in packages rather than in the executable, so a build only carries what a project uses. Install one with `neyuki pkg add @nyk/name` and load it with `require("@pkg/nyk/name")`. Each package's page on the registry is its reference.
+
+| Package | What it covers |
+| --- | --- |
+| [@nyk/markdown](https://neyuki.cc/packages/@nyk/markdown) | CommonMark and GFM parsing, plain-table ASTs, frontmatter and safe HTML rendering (formerly `@neyuki/markdown`) |
