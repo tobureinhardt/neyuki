@@ -4,6 +4,7 @@
 // tonumber, crypto and the sandbox.
 
 use crate::compiler::{compile_source, compile_to_proto};
+use crate::vm::libs::http::parse_multipart_bytes;
 use crate::vm::libs::json::decode_from_str;
 use crate::vm::libs::markdown::{
     parse_from_str as parse_md_from_str, to_html_from_str as render_md_from_str,
@@ -247,6 +248,46 @@ pub fn fuzz_markdown_parser_and_xss() {
     assert!(!rendered.contains("data:text/html"));
 }
 
+pub fn fuzz_http_multipart_and_cookies() {
+    // 1. Malformed multipart payloads must error cleanly, never panic
+    let bad_cases: &[(&[u8], &str)] = &[
+        (b"", "multipart/form-data; boundary=abc"),
+        (b"--abc\r\n", "text/plain"),
+        (b"--abc\r\n", "multipart/form-data"),
+        (b"--abc\r\n", "multipart/form-data; boundary="),
+        (
+            b"--abc\r\nContent-Disposition: form-data\r\n\r\nval\r\n--abc--",
+            "multipart/form-data; boundary=abc",
+        ),
+        (
+            b"--abc\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\nunterminated",
+            "multipart/form-data; boundary=abc",
+        ),
+        (
+            b"--abc\r\nBadHeaderNoColon\r\n\r\nval\r\n--abc--",
+            "multipart/form-data; boundary=abc",
+        ),
+    ];
+    for (body, ct) in bad_cases {
+        assert!(
+            parse_multipart_bytes(body, ct).is_err(),
+            "malformed multipart ({}) must be rejected",
+            ct
+        );
+    }
+
+    // 2. Cookie & redirect CRLF injection guards through @neyuki/http
+    let cookie_script = r#"
+        local http = require("@neyuki/http")
+        assert(pcall(http.formatCookie, "bad;name", "v") == false)
+        assert(pcall(http.formatCookie, "ok", "bad;val") == false)
+        assert(pcall(http.formatCookie, "ok", "v", { path = "/\r\nX-Injected: 1" }) == false)
+        assert(pcall(http.redirect, "/ok\r\nSet-Cookie: evil=1") == false)
+        assert(http.unsignCookie("tampered.sig", "secret") == nil)
+    "#;
+    assert!(execute_source(cookie_script).is_ok());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +299,6 @@ mod tests {
         fuzz_number_parsing_and_radix();
         fuzz_crypto_boundaries();
         fuzz_markdown_parser_and_xss();
+        fuzz_http_multipart_and_cookies();
     }
 }

@@ -1,0 +1,412 @@
+-- End-to-end tests for @neyuki/http router, middleware, path params, wildcards,
+-- static files, cookies, signed sessions and lossless binary multipart uploads.
+
+local buffer = require("@neyuki/buffer")
+local fs = require("@neyuki/fs")
+local http = require("@neyuki/http")
+local json = require("@neyuki/json")
+local math = require("@neyuki/math")
+local os = require("@neyuki/os")
+local string = require("@neyuki/string")
+
+-- Lockstep client/server exchange: runs the client call in a spawned task
+-- (so it yields on background I/O) while the main chunk accepts and dispatches
+-- through `app:handle(req)`.
+local function exchange(server: any, app: any, clientFn: () -> any): any
+    local st = { done = false, result = nil }
+    task.spawn(function()
+        st.result = clientFn()
+        st.done = true
+    end)
+    local req = server:accept(5)
+    assert(req != nil, "server did not accept client request")
+    app:handle(req)
+    local waited = 0
+    while not st.done and waited < 5 do
+        waited += task.wait(0.002)
+    end
+    assert(st.done, "client task did not finish")
+    return st.result
+end
+
+local function makeTempDir(tag: string): string
+    local base = os.getenv("TMPDIR") ?? os.getenv("TEMP") ?? "/tmp"
+    local dir = fs.join(base, "neyuki_http_" .. tag .. "_" .. tostring(math.random(1, 1000000000)))
+    fs.mkdir(dir, true)
+    return dir
+end
+
+-- 1. Cookies & signing
+do
+    local parsed = http.parseCookies('a=1; b="hello=world"; c=3')
+    assert(parsed.a == "1")
+    assert(parsed.b == "hello=world")
+    assert(parsed.c == "3")
+
+    local formatted = http.formatCookie("sid", "abc123", {
+        path = "/",
+        maxAge = 3600,
+        expires = 0,
+        httpOnly = true,
+        secure = true,
+        sameSite = "lax",
+        partitioned = true,
+    })
+    assert(
+        formatted == "sid=abc123; Max-Age=3600; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/; SameSite=Lax; Secure; HttpOnly; Partitioned",
+        "unexpected cookie format: " .. formatted
+    )
+
+    local signed = http.signCookie("user.42", "super-secret")
+    assert(http.unsignCookie(signed, "super-secret") == "user.42")
+    assert(http.unsignCookie(signed, "wrong-secret") == nil)
+    assert(http.unsignCookie(signed .. "x", "super-secret") == nil)
+
+    assert(not try(http.formatCookie, "bad name", "1"))
+    assert(not try(http.formatCookie, "ok", "a;b"))
+    assert(not try(http.formatCookie, "ok", "1", { path = "/\r\nEvil: 1" }))
+    assert(not try(http.redirect, "/ok\r\nSet-Cookie: a=1"))
+end
+
+-- 2. Standalone lossless binary multipart parsing
+do
+    local rawPng = buffer.fromhex("89504e470d0a1a0a00fffe7f")
+    local head1 = "--bnd\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\nfirst\r\n"
+    local head2 = "--bnd\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\nsecond\r\n"
+    local head3 = "--bnd\r\nContent-Disposition: form-data; name=\"img\"; filename=\"dot.png\"\r\nContent-Type: image/png\r\n\r\n"
+    local tail = "\r\n--bnd--\r\n"
+
+    local payload = buffer.create(#head1 + #head2 + #head3 + buffer.len(rawPng) + #tail)
+    local off = 0
+    for _, chunk in { head1, head2, head3 } do
+        buffer.writestring(payload, off, chunk)
+        off += #chunk
+    end
+    buffer.copy(payload, off, rawPng, 0, buffer.len(rawPng))
+    off += buffer.len(rawPng)
+    buffer.writestring(payload, off, tail)
+
+    local form = http.parseMultipart(payload, "multipart/form-data; boundary=bnd")
+    assert(#form.fields.tag == 2 and form.fields.tag[1] == "first" and form.fields.tag[2] == "second")
+    assert(form.files.img.filename == "dot.png")
+    assert(form.files.img.contentType == "image/png")
+    assert(form.files.img.size == buffer.len(rawPng))
+    assert(buffer.tohex(form.files.img.data) == buffer.tohex(rawPng))
+    assert(#form.parts == 3)
+
+    assert(not try(http.parseMultipart, payload, "multipart/form-data; boundary=bnd", { maxFileSize = 4 }))
+    assert(not try(http.parseMultipart, payload, "multipart/form-data; boundary=bnd", { maxParts = 2 }))
+end
+
+-- 3. Router: static > :param > *wildcard, backtracking, HEAD, 405, mount, middleware, onError, notFound
+do
+    local app = http.router()
+    local trace = {}
+
+    app:use(function(req, next)
+        trace[#trace + 1] = "before:" .. req.pathname
+        local res = next()
+        res.headers["x-traced"] = "yes"
+        trace[#trace + 1] = "after:" .. tostring(res.status)
+        return res
+    end)
+
+    app:get("/users/me", function()
+        return http.json({ who = "self" })
+    end)
+    app:get("/users/:id", function(req)
+        return http.json({ id = req.params.id, q = req.query.q })
+    end)
+    app:get("/files/*filepath", function(req)
+        return http.json({ filepath = req.params.filepath })
+    end)
+    app:get("/a/b/c", function() return "static-abc" end)
+    app:get("/a/:x/d", function(req) return "param-" .. req.params.x end)
+
+    local api = http.router()
+    api:use(function(req, next)
+        req.locals.scope = "v1"
+        local res = next()
+        res.headers["x-api"] = "v1"
+        return res
+    end)
+    api:get("/ping", function(req)
+        return http.json({ ok = true, scope = req.locals.scope })
+    end)
+    app:mount("/api/v1", api)
+
+    app:get("/boom", function() error("kaboom") end)
+    app:onError(function(err, req)
+        return http.json({ error = tostring(err), path = req.pathname }, 500)
+    end)
+    app:notFound(function(req)
+        return http.json({ missing = req.pathname }, 404)
+    end)
+
+    local server = http.listen({ host = "127.0.0.1", port = 0 })
+    local url = server.url
+
+    local r1 = exchange(server, app, function() return http.get(url .. "/users/me") end)
+    assert(r1.status == 200 and r1:header("x-traced") == "yes")
+    assert(json.decode(r1.body).who == "self")
+
+    local r2 = exchange(server, app, function() return http.get(url .. "/users/c++%20dev?q=hello+world") end)
+    local d2 = json.decode(r2.body)
+    assert(r2.status == 200 and d2.id == "c++ dev" and d2.q == "hello world")
+
+    local r3 = exchange(server, app, function() return http.get(url .. "/files/docs/v1/readme.md") end)
+    assert(json.decode(r3.body).filepath == "docs/v1/readme.md")
+
+    local r4 = exchange(server, app, function() return http.get(url .. "/a/b/d") end)
+    assert(r4.body == "param-b")
+
+    local r5 = exchange(server, app, function() return http.head(url .. "/users/me") end)
+    assert(r5.status == 200 and r5.body == "")
+
+    local r6 = exchange(server, app, function() return http.post(url .. "/users/me", "") end)
+    assert(r6.status == 405)
+    assert(string.find(r6:header("allow") ?? "", "GET", 1, true) != nil)
+    assert(string.find(r6:header("allow") ?? "", "HEAD", 1, true) != nil)
+
+    local r7 = exchange(server, app, function() return http.get(url .. "/api/v1/ping") end)
+    assert(r7.status == 200 and r7:header("x-api") == "v1")
+    local d7 = json.decode(r7.body)
+    assert(d7.ok == true and d7.scope == "v1")
+    assert(r1:header("x-api") == nil)
+
+    local r8 = exchange(server, app, function() return http.get(url .. "/boom") end)
+    assert(r8.status == 500 and string.find(json.decode(r8.body).error, "kaboom", 1, true) != nil)
+
+    local r9 = exchange(server, app, function() return http.get(url .. "/nope") end)
+    assert(r9.status == 404 and json.decode(r9.body).missing == "/nope")
+
+    server:close()
+    assert(trace[1] == "before:/users/me" and trace[2] == "after:200")
+end
+
+-- 4. Multi Set-Cookie & Signed Sessions (create, persist, tamper reject, regenerate, destroy)
+do
+    local app = http.router()
+    app:use(http.sessions({
+        name = "sid",
+        secret = "test-session-secret",
+        maxAge = 3600,
+    }))
+
+    app:get("/anon", function(req)
+        return http.json({ user = req.session.user })
+    end)
+
+    app:post("/login", function(req)
+        req.session.user = "ada"
+        req.session.visits = 1
+        req:setCookie("theme", "dark", { path = "/" })
+        return http.json({ ok = true })
+    end)
+
+    app:get("/me", function(req)
+        if req.session.user == nil then
+            return http.json({ authed = false }, 401)
+        end
+        req.session.visits += 1
+        return http.json({ user = req.session.user, visits = req.session.visits, sid = req.sessionId })
+    end)
+
+    app:post("/rotate", function(req)
+        local oldId = req.sessionId
+        local newId = req:regenerateSession()
+        return http.json({ oldId = oldId, newId = newId, user = req.session.user })
+    end)
+
+    app:post("/logout", function(req)
+        req:destroySession()
+        return http.json({ loggedOut = true })
+    end)
+
+    app:post("/direct-respond", function(req)
+        req.session.user = "grace"
+        req.session.visits = 1
+        req:setCookie("mode", "fast", { path = "/" })
+        req:respond(http.json({ direct = true }))
+    end)
+
+    local function extractCookie(setCookies: {string}, name: string): string?
+        for _, line in setCookies do
+            if string.startswith(line, name .. "=") then
+                local semi = string.find(line, ";", 1, true)
+                if semi != nil then return string.sub(line, 1, semi - 1) end
+                return line
+            end
+        end
+        return nil
+    end
+
+    local server = http.listen({ host = "127.0.0.1", port = 0 })
+    local url = server.url
+
+    local anon = exchange(server, app, function() return http.get(url .. "/anon") end)
+    assert(#anon:headerValues("set-cookie") == 0, "anonymous request must not set session cookie")
+
+    local login = exchange(server, app, function() return http.post(url .. "/login", "") end)
+    local setCookies = login:headerValues("set-cookie")
+    assert(#setCookies == 2, "expected 2 separate Set-Cookie headers")
+    local sidPair = extractCookie(setCookies, "sid")
+    local themePair = extractCookie(setCookies, "theme")
+    assert(sidPair != nil and themePair == "theme=dark")
+
+    local me = exchange(server, app, function()
+        return http.get(url .. "/me", { headers = { cookie = sidPair } })
+    end)
+    assert(me.status == 200)
+    local meData = json.decode(me.body)
+    assert(meData.user == "ada" and meData.visits == 2)
+
+    local bad = exchange(server, app, function()
+        return http.get(url .. "/me", { headers = { cookie = sidPair .. "tampered" } })
+    end)
+    assert(bad.status == 401)
+
+    local rot = exchange(server, app, function()
+        return http.post(url .. "/rotate", "", { headers = { cookie = sidPair } })
+    end)
+    local rotData = json.decode(rot.body)
+    assert(rotData.newId != rotData.oldId and rotData.user == "ada")
+    local newSidPair = extractCookie(rot:headerValues("set-cookie"), "sid")
+    assert(newSidPair != nil and newSidPair != sidPair)
+
+    local oldRejected = exchange(server, app, function()
+        return http.get(url .. "/me", { headers = { cookie = sidPair } })
+    end)
+    assert(oldRejected.status == 401)
+
+    local out = exchange(server, app, function()
+        return http.post(url .. "/logout", "", { headers = { cookie = newSidPair } })
+    end)
+    assert(out.status == 200)
+    local clearLine = out:headerValues("set-cookie")[1] ?? ""
+    assert(string.find(clearLine, "Max-Age=0", 1, true) != nil)
+
+    local afterOut = exchange(server, app, function()
+        return http.get(url .. "/me", { headers = { cookie = newSidPair } })
+    end)
+    assert(afterOut.status == 401)
+
+    local direct = exchange(server, app, function()
+        return http.post(url .. "/direct-respond", "")
+    end)
+    assert(direct.status == 200)
+    local directCookies = direct:headerValues("set-cookie")
+    assert(#directCookies == 2, "direct req:respond must flush pending cookies and session cookie")
+    local directSid = extractCookie(directCookies, "sid")
+    local directMode = extractCookie(directCookies, "mode")
+    assert(directSid != nil and directMode == "mode=fast")
+
+    local directMe = exchange(server, app, function()
+        return http.get(url .. "/me", { headers = { cookie = directSid } })
+    end)
+    assert(directMe.status == 200 and json.decode(directMe.body).user == "grace")
+
+    server:close()
+end
+
+-- 5. Static files (index, ETag 304, HEAD, traversal/dotfile 403) + live binary multipart upload
+do
+    local dir = makeTempDir("static")
+    local pub = fs.join(dir, "public")
+    fs.mkdir(pub, true)
+    fs.mkdir(fs.join(pub, "admin"), true)
+    fs.write(fs.join(pub, "index.html"), "<h1>Home</h1>")
+    fs.write(fs.join(pub, "admin", "secret.html"), "TOP-SECRET")
+    fs.write(fs.join(pub, "100%.txt"), "percent")
+    fs.write(fs.join(pub, ".env"), "SECRET=nope")
+    fs.write(fs.join(dir, "outside.txt"), "do-not-read")
+
+    local pngHex = "89504e470d0a1a0a000102fffe7f"
+    local app = http.router()
+    app:use("/assets/admin", function(req, next)
+        if req:header("x-admin") != "1" then
+            return { status = 403, body = "Admin Forbidden" }
+        end
+        return next()
+    end)
+    app:use("/assets", http.static(pub, { maxAge = 120 }))
+    app:post("/upload-bin", function(req)
+        local form = req:multipart()
+        return http.json({
+            title = form.fields.title,
+            filename = form.files.file.filename,
+            hex = buffer.tohex(form.files.file.data),
+            size = form.files.file.size,
+        })
+    end)
+    app:get("/fallback", function() return "route-ok" end)
+
+    local server = http.listen({ host = "127.0.0.1", port = 0 })
+    local url = server.url
+
+    local idx = exchange(server, app, function() return http.get(url .. "/assets/") end)
+    assert(idx.status == 200 and idx.body == "<h1>Home</h1>")
+    assert(string.startswith(idx:header("content-type") ?? "", "text/html"))
+    assert(idx:header("cache-control") == "public, max-age=120")
+    assert(idx:header("x-content-type-options") == "nosniff")
+    local etag = idx:header("etag")
+    assert(etag != nil)
+
+    local cached = exchange(server, app, function()
+        return http.get(url .. "/assets/", { headers = { ["if-none-match"] = etag } })
+    end)
+    assert(cached.status == 304 and cached.body == "")
+
+    local head = exchange(server, app, function() return http.head(url .. "/assets/index.html") end)
+    assert(head.status == 200 and head.body == "" and head:header("content-length") == tostring(#"<h1>Home</h1>"))
+
+    local dot = exchange(server, app, function() return http.get(url .. "/assets/.env") end)
+    assert(dot.status == 403)
+    local trav = exchange(server, app, function() return http.get(url .. "/assets/%2e%2e/outside.txt") end)
+    assert(trav.status == 403)
+
+    -- Percent-encoded `/assets/%61dmin/secret.html` must still run the `/assets/admin` auth middleware.
+    local encDeny = exchange(server, app, function() return http.get(url .. "/assets/%61dmin/secret.html") end)
+    assert(encDeny.status == 403 and encDeny.body == "Admin Forbidden")
+    local encAllow = exchange(server, app, function()
+        return http.get(url .. "/assets/%61dmin/secret.html", { headers = { ["x-admin"] = "1" } })
+    end)
+    assert(encAllow.status == 200 and encAllow.body == "TOP-SECRET")
+    assert(buffer.tostring(encAllow:bytes()) == "TOP-SECRET")
+
+    -- Double encoding must not bypass the auth middleware either: the path is
+    -- decoded exactly once, so `%2561dmin` is the literal segment `%61dmin`.
+    local dblEnc = exchange(server, app, function() return http.get(url .. "/assets/%2561dmin/secret.html") end)
+    assert(dblEnc.status != 200 and dblEnc.body != "TOP-SECRET", "double-encoded path bypassed auth")
+
+    -- A literal `%` in a file name is served (decoded once, not twice).
+    local pct = exchange(server, app, function() return http.get(url .. "/assets/100%25.txt") end)
+    assert(pct.status == 200 and pct.body == "percent")
+
+    local fb = exchange(server, app, function() return http.get(url .. "/fallback") end)
+    assert(fb.status == 200 and fb.body == "route-ok")
+
+    local rawBin = buffer.fromhex(pngHex)
+    local p1 = "--up99\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nlogo\r\n"
+    local p2 = "--up99\r\nContent-Disposition: form-data; name=\"file\"; filename=\"logo.png\"\r\nContent-Type: image/png\r\n\r\n"
+    local p3 = "\r\n--up99--\r\n"
+    local bodyBuf = buffer.create(#p1 + #p2 + buffer.len(rawBin) + #p3)
+    buffer.writestring(bodyBuf, 0, p1)
+    buffer.writestring(bodyBuf, #p1, p2)
+    buffer.copy(bodyBuf, #p1 + #p2, rawBin, 0, buffer.len(rawBin))
+    buffer.writestring(bodyBuf, #p1 + #p2 + buffer.len(rawBin), p3)
+
+    local up = exchange(server, app, function()
+        return http.post(url .. "/upload-bin", bodyBuf, {
+            headers = { ["content-type"] = "multipart/form-data; boundary=up99" },
+        })
+    end)
+    assert(up.status == 200)
+    local parsed = json.decode(up.body)
+    assert(parsed.title == "logo" and parsed.filename == "logo.png" and parsed.hex == pngHex and parsed.size == buffer.len(rawBin))
+
+    server:close()
+    fs.remove(dir, true)
+end
+
+print("[pass] http router, middleware, cookies, sessions, static and multipart")

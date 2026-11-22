@@ -1,8 +1,17 @@
 local table = require("@neyuki/table")
 local string = require("@neyuki/string")
+local buffer = require("@neyuki/buffer")
 local io = require("@neyuki/io")
+local crypto = require("@neyuki/crypto")
+local json = require("@neyuki/json")
+local os = require("@neyuki/os")
 
 local http = {}
+
+-- Private sentinel tagging a static-file reply returned by `http.static` so
+-- `request:respond` streams it through `__http_respond_file` without exposing
+-- an internal hook to callers.
+local FILE_REPLY = {}
 
 function checkString(s: string, name: string)
     if (s == nil) then error(name .. " must be provided") end
@@ -11,6 +20,12 @@ end
 
 function checkOptionalString(s: string?, name: string)
     if (s != nil) then checkString(s, name) end
+end
+
+local function checkOptionalBody(b: any, name: string)
+    if (b != nil and type(b) != "string" and type(b) != "buffer") then
+        error(name .. " must be a string or a buffer")
+    end
 end
 
 function checkOptionalNumber(n: number?, name: string)
@@ -25,14 +40,28 @@ function checkOptionalTable(t: {any}?, name: string)
     if (t != nil and type(t) != "table") then error(name .. " must be a table") end
 end
 
--- Every header name and value must be a string or a number; names are sent
--- as given, so callers can pick their own casing.
-function checkHeaders(headers: {[string]: string}?, name: string)
+-- Every header name must be a string and each value a string, a number, or a
+-- non-empty array of strings/numbers (for repeated headers like Set-Cookie).
+function checkHeaders(headers: {[string]: any}?, name: string)
     checkOptionalTable(headers, name)
     if (headers == nil) then return end
     for key, value in headers do
         if (type(key) != "string") then error(name .. " must be keyed by header names") end
-        if (type(value) != "string" and type(value) != "number") then
+        if (type(value) == "table") then
+            local count = 0
+            for k, item in value do
+                if (type(k) != "number" or k != int(k) or k < 1) then
+                    error("header `" .. key .. "` must be a string, a number or a non-empty array of strings")
+                end
+                if (type(item) != "string" and type(item) != "number") then
+                    error("header `" .. key .. "` must be a string, a number or a non-empty array of strings")
+                end
+                count += 1
+            end
+            if (count == 0) then
+                error("header `" .. key .. "` must be a string, a number or a non-empty array of strings")
+            end
+        elseif (type(value) != "string" and type(value) != "number") then
             error("header `" .. key .. "` must be a string or a number")
         end
     end
@@ -56,6 +85,24 @@ function makeResponse(raw: {[string]: any}): Response
         return findHeader(raw.headers, name)
     end
 
+    function response.headerValues(self: Response, name: string): {string}
+        checkString(name, "name")
+        local values = raw.headerValues[string.lower(name)]
+        if (values == nil) then return {} end
+        local copy = {}
+        for i = 1, #values do
+            copy[i] = values[i]
+        end
+        return copy
+    end
+
+    function response.bytes(self: Response): any
+        if (raw.bytes == nil) then
+            raw.bytes = buffer.fromstring(raw.body)
+        end
+        return raw.bytes
+    end
+
     return table.freeze(response)
 end
 
@@ -75,7 +122,7 @@ function http.request(url: string, options: RequestOptions?): Response
     options = options ?? {}
     checkOptionalString(options.method, "method")
     checkHeaders(options.headers, "headers")
-    checkOptionalString(options.body, "body")
+    checkOptionalBody(options.body, "body")
     checkOptionalNumber(options.timeout, "timeout")
     checkOptionalBoolean(options.follow, "follow")
     checkOptionalNumber(options.maxBody, "maxBody")
@@ -119,18 +166,18 @@ function http.delete(url: string, options: RequestOptions?): Response
     return http.request(url, withMethod(options, "DELETE"))
 end
 
-function http.post(url: string, body: string?, options: RequestOptions?): Response
-    checkOptionalString(body, "body")
+function http.post(url: string, body: any?, options: RequestOptions?): Response
+    checkOptionalBody(body, "body")
     return http.request(url, withMethod(options, "POST", body))
 end
 
-function http.put(url: string, body: string?, options: RequestOptions?): Response
-    checkOptionalString(body, "body")
+function http.put(url: string, body: any?, options: RequestOptions?): Response
+    checkOptionalBody(body, "body")
     return http.request(url, withMethod(options, "PUT", body))
 end
 
-function http.patch(url: string, body: string?, options: RequestOptions?): Response
-    checkOptionalString(body, "body")
+function http.patch(url: string, body: any?, options: RequestOptions?): Response
+    checkOptionalBody(body, "body")
     return http.request(url, withMethod(options, "PATCH", body))
 end
 
@@ -190,17 +237,20 @@ end
 --   nil       204 with an empty body
 --   a string  200 with that body as text/plain
 --   a table   { status?, headers?, body? }
-function normalizeReply(reply: any): (number, {[string]: string}, string)
+function normalizeReply(reply: any): (number, {[string]: any}, any)
     if (reply == nil) then return 204, {}, "" end
     if (type(reply) == "string") then
         return 200, { ["content-type"] = "text/plain; charset=utf-8" }, reply
     end
+    if (type(reply) == "buffer") then
+        return 200, { ["content-type"] = "application/octet-stream" }, reply
+    end
     if (type(reply) != "table") then
-        error("a response must be nil, a string or a table, got " .. type(reply))
+        error("a response must be nil, a string, a buffer or a table, got " .. type(reply))
     end
     checkOptionalNumber(reply.status, "status")
     checkHeaders(reply.headers, "headers")
-    checkOptionalString(reply.body, "body")
+    checkOptionalBody(reply.body, "body")
     return reply.status ?? 200, reply.headers ?? {}, reply.body ?? ""
 end
 
@@ -256,9 +306,31 @@ function makeRequest(raw: {[string]: any}): Request
     -- Sends the reply (see `normalizeReply`). Each request is answered once.
     function request.respond(self: Request, reply: any): ()
         if (answered) then error("request was already answered") end
+        if (type(reply) == "table" and reply[FILE_REPLY] != nil) then
+            local fileInfo = reply[FILE_REPLY]
+            local status, headers, _ = normalizeReply(reply)
+            answered = true
+            __http_respond_file(raw.id, status, headers, fileInfo.path, fileInfo.bundled, fileInfo.headOnly)
+            return
+        end
         local status, headers, body = normalizeReply(reply)
         answered = true
         __http_respond(raw.id, status, headers, body)
+    end
+
+    -- Parses a `multipart/form-data` request body directly from the raw bytes
+    -- captured on accept, keeping binary uploaded files lossless in Buffers.
+    function request.multipart(self: Request, options: {[string]: any}?): {[string]: any}
+        if (answered) then error("request was already answered") end
+        local ct = findHeader(raw.headers, "content-type")
+        if (ct == nil) then error("request is missing a Content-Type header") end
+        checkOptionalTable(options, "options")
+        local opts = options ?? {}
+        checkOptionalNumber(opts.maxParts, "maxParts")
+        checkOptionalNumber(opts.maxFieldSize, "maxFieldSize")
+        checkOptionalNumber(opts.maxFileSize, "maxFileSize")
+        checkOptionalNumber(opts.maxHeaderBytes, "maxHeaderBytes")
+        return __http_parse_multipart(raw.id, ct, opts.maxParts, opts.maxFieldSize, opts.maxFileSize, opts.maxHeaderBytes)
     end
 
     function request.answered(self: Request): boolean
@@ -379,22 +451,1192 @@ function http.forward(options: ServerOptions | number | nil, target: ForwardTarg
     return table.freeze(forward)
 end
 
--- Runs `handler(request)` for every incoming request, forever. A handler's
--- return value is sent with `request:respond` unless the handler already
--- answered; an error inside the handler is reported on stderr and answered
--- with a 500 so the server keeps going.
-function http.serve(options: ServerOptions | number | nil, handler: (Request) -> any): ()
-    if (type(handler) != "function") then error("handler must be a function") end
+-- ---------------------------------------------------------------------------
+-- Response helpers, cookies, multipart, static files, sessions and router
+-- ---------------------------------------------------------------------------
+
+local function hasCrlfOrNul(s: string): boolean
+    for i = 1, #s do
+        local b = string.byte(s, i)
+        if (b == 13 or b == 10 or b == 0) then return true end
+    end
+    return false
+end
+
+local function isValidCookieName(name: string): boolean
+    if (#name == 0) then return false end
+    for i = 1, #name do
+        local b = string.byte(name, i)
+        if (b <= 32 or b >= 127) then return false end
+        -- Reject RFC 6265 / RFC 9110 separator characters.
+        if (b == 40 or b == 41 or b == 60 or b == 62 or b == 64 or b == 44
+            or b == 59 or b == 58 or b == 92 or b == 34 or b == 47
+            or b == 91 or b == 93 or b == 63 or b == 61 or b == 123 or b == 125) then
+            return false
+        end
+    end
+    return true
+end
+
+local function isValidCookieValue(value: string): boolean
+    for i = 1, #value do
+        local b = string.byte(value, i)
+        if (b <= 32 or b >= 127 or b == 34 or b == 44 or b == 59 or b == 92) then
+            return false
+        end
+    end
+    return true
+end
+
+local function cloneHeaders(headers: {[string]: any}?): {[string]: any}
+    local copy = {}
+    if (headers != nil) then
+        for k, v in headers do
+            if (type(v) == "table") then
+                local arr = {}
+                for i = 1, #v do arr[i] = v[i] end
+                copy[k] = arr
+            else
+                copy[k] = v
+            end
+        end
+    end
+    return copy
+end
+
+local function setDefaultHeader(headers: {[string]: any}, lowerName: string, value: string)
+    for k, _ in headers do
+        if (string.lower(k) == lowerName) then return end
+    end
+    headers[lowerName] = value
+end
+
+local function appendHeaderValue(headers: {[string]: any}, lowerName: string, value: string)
+    local existingKey = nil
+    for k, _ in headers do
+        if (string.lower(k) == lowerName) then
+            existingKey = k
+            break
+        end
+    end
+    if (existingKey == nil) then
+        headers[lowerName] = value
+        return
+    end
+    local current = headers[existingKey]
+    if (type(current) == "table") then
+        current[#current + 1] = value
+    else
+        headers[existingKey] = { current, value }
+    end
+end
+
+-- Builds a JSON reply table `{ status, headers, body }`.
+function http.json(value: any, status: number?, headers: {[string]: any}?): {[string]: any}
+    checkOptionalNumber(status, "status")
+    checkHeaders(headers, "headers")
+    local h = cloneHeaders(headers)
+    setDefaultHeader(h, "content-type", "application/json; charset=utf-8")
+    return {
+        status = status ?? 200,
+        headers = h,
+        body = json.encode(value),
+    }
+end
+
+-- Builds an HTML reply table `{ status, headers, body }`.
+function http.html(body: string, status: number?, headers: {[string]: any}?): {[string]: any}
+    checkString(body, "body")
+    checkOptionalNumber(status, "status")
+    checkHeaders(headers, "headers")
+    local h = cloneHeaders(headers)
+    setDefaultHeader(h, "content-type", "text/html; charset=utf-8")
+    return {
+        status = status ?? 200,
+        headers = h,
+        body = body,
+    }
+end
+
+-- Builds a redirect reply (default 302 Found), rejecting CRLF header injection.
+function http.redirect(location: string, status: number?): {[string]: any}
+    checkString(location, "location")
+    if (hasCrlfOrNul(location)) then error("redirect location must not contain CR, LF or NUL") end
+    checkOptionalNumber(status, "status")
+    return {
+        status = status ?? 302,
+        headers = { location = location },
+        body = "",
+    }
+end
+
+-- Parses an HTTP `Cookie` request header into a `{ name = value }` table.
+function http.parseCookies(header: string): {[string]: string}
+    checkString(header, "header")
+    local cookies = {}
+    if (#header == 0) then return cookies end
+    for part in string.gmatch(header, "[^;]+") do
+        local eq = string.find(part, "=", 1, true)
+        if (eq != nil) then
+            local k = string.trim(string.sub(part, 1, eq - 1))
+            local v = string.trim(string.sub(part, eq + 1))
+            if (#k > 0) then
+                if (#v >= 2 and string.sub(v, 1, 1) == '"' and string.sub(v, #v, #v) == '"') then
+                    v = string.sub(v, 2, #v - 1)
+                end
+                if (cookies[k] == nil) then
+                    cookies[k] = v
+                end
+            end
+        end
+    end
+    return cookies
+end
+
+-- Formats a `Set-Cookie` header value with strict RFC 6265 validation.
+function http.formatCookie(name: string, value: string, options: {[string]: any}?): string
+    checkString(name, "name")
+    checkString(value, "value")
+    checkOptionalTable(options, "options")
+    if (not isValidCookieName(name)) then error("invalid cookie name `" .. name .. "`") end
+    if (not isValidCookieValue(value)) then error("invalid cookie value for `" .. name .. "`") end
+
+    local parts = { name .. "=" .. value }
+    local opts = options ?? {}
+
+    if (opts.maxAge != nil) then
+        if (type(opts.maxAge) != "number" or opts.maxAge != int(opts.maxAge)) then
+            error("cookie maxAge must be an integer")
+        end
+        parts[#parts + 1] = "Max-Age=" .. tostring(opts.maxAge)
+    end
+    if (opts.expires != nil) then
+        if (type(opts.expires) == "number") then
+            parts[#parts + 1] = "Expires=" .. __http_date(int(opts.expires))
+        elseif (type(opts.expires) == "string") then
+            if (hasCrlfOrNul(opts.expires) or string.find(opts.expires, ";", 1, true) != nil) then
+                error("invalid cookie expires value")
+            end
+            parts[#parts + 1] = "Expires=" .. opts.expires
+        else
+            error("cookie expires must be a Unix timestamp or an HTTP date string")
+        end
+    end
+    if (opts.domain != nil) then
+        checkString(opts.domain, "domain")
+        if (hasCrlfOrNul(opts.domain) or string.find(opts.domain, ";", 1, true) != nil) then
+            error("invalid cookie domain")
+        end
+        parts[#parts + 1] = "Domain=" .. opts.domain
+    end
+    if (opts.path != nil) then
+        checkString(opts.path, "path")
+        if (hasCrlfOrNul(opts.path) or string.find(opts.path, ";", 1, true) != nil) then
+            error("invalid cookie path")
+        end
+        parts[#parts + 1] = "Path=" .. opts.path
+    end
+    checkOptionalBoolean(opts.secure, "secure")
+    checkOptionalBoolean(opts.httpOnly, "httpOnly")
+    checkOptionalBoolean(opts.partitioned, "partitioned")
+    if (opts.sameSite != nil) then
+        checkString(opts.sameSite, "sameSite")
+        local ss = string.lower(opts.sameSite)
+        if (ss == "strict") then
+            parts[#parts + 1] = "SameSite=Strict"
+        elseif (ss == "lax") then
+            parts[#parts + 1] = "SameSite=Lax"
+        elseif (ss == "none") then
+            parts[#parts + 1] = "SameSite=None"
+        else
+            error("cookie sameSite must be Strict, Lax or None")
+        end
+    end
+    if (opts.secure == true) then parts[#parts + 1] = "Secure" end
+    if (opts.httpOnly == true) then parts[#parts + 1] = "HttpOnly" end
+    if (opts.partitioned == true) then parts[#parts + 1] = "Partitioned" end
+
+    return table.concat(parts, "; ")
+end
+
+-- Signs a cookie value with HMAC-SHA256 (base64url) as `<value>.<signature>`.
+function http.signCookie(value: string, secret: string): string
+    checkString(value, "value")
+    checkString(secret, "secret")
+    if (#secret == 0) then error("secret must not be empty") end
+    local mac = crypto.hmac(value, secret, "sha256", "base64url")
+    return value .. "." .. mac
+end
+
+-- Verifies a cookie produced by `http.signCookie` in constant time and returns
+-- the original value, or nil if tampered.
+function http.unsignCookie(signed: string, secret: string): string?
+    checkString(signed, "signed")
+    checkString(secret, "secret")
+    if (#secret == 0) then error("secret must not be empty") end
+    local dot = nil
+    local pos = 1
+    while true do
+        local found = string.find(signed, ".", pos, true)
+        if (found == nil) then break end
+        dot = found
+        pos = found + 1
+    end
+    if (dot == nil or dot <= 1) then return nil end
+    local value = string.sub(signed, 1, dot - 1)
+    local given = string.sub(signed, dot + 1)
+    local expected = crypto.hmac(value, secret, "sha256", "base64url")
+    if (crypto.equals(given, expected)) then
+        return value
+    end
+    return nil
+end
+
+-- Parses an RFC 7578 `multipart/form-data` payload from a string or binary
+-- Buffer. Uploaded files stay lossless in Buffers under `files` and `parts`.
+function http.parseMultipart(body: any, contentType: string, options: {[string]: any}?): {[string]: any}
+    if (body == nil) then error("body must be provided") end
+    if (type(body) != "string" and type(body) != "buffer") then
+        error("body must be a string or a buffer")
+    end
+    checkString(contentType, "contentType")
+    checkOptionalTable(options, "options")
+    local opts = options ?? {}
+    checkOptionalNumber(opts.maxParts, "maxParts")
+    checkOptionalNumber(opts.maxFieldSize, "maxFieldSize")
+    checkOptionalNumber(opts.maxFileSize, "maxFileSize")
+    checkOptionalNumber(opts.maxHeaderBytes, "maxHeaderBytes")
+    return __http_parse_multipart(body, contentType, opts.maxParts, opts.maxFieldSize, opts.maxFileSize, opts.maxHeaderBytes)
+end
+
+local function normalizeWeakTag(tag: string): string
+    local trimmed = string.trim(tag)
+    if (string.startswith(trimmed, "W/")) then
+        return string.sub(trimmed, 3)
+    end
+    return trimmed
+end
+
+local function etagMatches(ifNoneMatch: string?, etag: string): boolean
+    if (ifNoneMatch == nil or #ifNoneMatch == 0) then return false end
+    if (string.trim(ifNoneMatch) == "*") then return true end
+    local target = normalizeWeakTag(etag)
+    for item in string.gmatch(ifNoneMatch, "[^,]+") do
+        if (normalizeWeakTag(item) == target) then return true end
+    end
+    return false
+end
+
+-- Returns a static-file middleware serving files safely inside `root`.
+-- Prevents path traversal, dotfile leakage and symlink escapes, streams disk
+-- files without buffering in VM memory, and supports ETag / If-None-Match 304.
+function http.static(root: string, options: {[string]: any}?): any
+    checkString(root, "root")
+    if (#root == 0) then error("root must not be empty") end
+    checkOptionalTable(options, "options")
+    local opts = options ?? {}
+
+    local indexFile: string? = "index.html"
+    if (opts.index == false) then
+        indexFile = nil
+    elseif (opts.index != nil) then
+        checkString(opts.index, "index")
+        indexFile = opts.index
+    end
+
+    local dotfiles = opts.dotfiles ?? "deny"
+    checkString(dotfiles, "dotfiles")
+    if (dotfiles != "deny" and dotfiles != "ignore" and dotfiles != "allow") then
+        error("dotfiles must be \"deny\", \"ignore\" or \"allow\"")
+    end
+
+    local maxAge = opts.maxAge ?? 0
+    checkOptionalNumber(maxAge, "maxAge")
+    if (maxAge < 0) then error("maxAge must be non-negative") end
+
+    checkOptionalBoolean(opts.etag, "etag")
+    local useEtag = true
+    if (opts.etag != nil) then useEtag = opts.etag end
+
+    checkOptionalBoolean(opts.fallthrough, "fallthrough")
+    local fallthrough = true
+    if (opts.fallthrough != nil) then fallthrough = opts.fallthrough end
+
+    return function(req: any, nextFn: () -> any): any
+        if (req.method != "GET" and req.method != "HEAD") then
+            if (fallthrough) then return nextFn() end
+            return {
+                status = 405,
+                headers = { allow = "GET, HEAD" },
+                body = "Method Not Allowed",
+            }
+        end
+        -- `req.pathname` was decoded exactly once by the router; tell the
+        -- native not to decode it again (double decoding would bypass
+        -- prefix middleware via `%2561dmin`).
+        local resolved = __http_resolve_static(root, req.pathname, indexFile, dotfiles, true)
+        if (resolved == nil) then
+            if (fallthrough) then return nextFn() end
+            return { status = 404, body = "Not Found" }
+        end
+        if (resolved.status == "forbidden") then
+            return { status = 403, body = "Forbidden" }
+        end
+
+        local headers = {
+            ["content-type"] = resolved.contentType,
+            ["x-content-type-options"] = "nosniff",
+        }
+        if (maxAge > 0) then
+            headers["cache-control"] = "public, max-age=" .. tostring(int(maxAge))
+        end
+        if (useEtag) then
+            headers["etag"] = resolved.etag
+            if (etagMatches(req:header("if-none-match"), resolved.etag)) then
+                return {
+                    status = 304,
+                    headers = headers,
+                    body = "",
+                }
+            end
+        end
+
+        return {
+            [FILE_REPLY] = {
+                path = resolved.path,
+                bundled = resolved.bundled,
+                headOnly = req.method == "HEAD",
+            },
+            status = 200,
+            headers = headers,
+            body = "",
+        }
+    end
+end
+
+local function deepCopyData(value: any): any
+    if (type(value) != "table") then return value end
+    local copy = {}
+    for k, v in value do
+        copy[k] = deepCopyData(v)
+    end
+    return copy
+end
+
+local function makeMemorySessionStore(maxEntries: number): {[string]: any}
+    local entries = {}
+    local order = {}
+    local count = 0
+
+    local function removeFromOrder(targetId: string)
+        for i = 1, #order do
+            if (order[i] == targetId) then
+                table.remove(order, i)
+                return
+            end
+        end
+    end
+
+    local function sweep(now: number)
+        local kept = {}
+        for _, id in order do
+            local entry = entries[id]
+            if (entry != nil) then
+                if (entry.expiresAt <= now) then
+                    entries[id] = nil
+                    count -= 1
+                else
+                    kept[#kept + 1] = id
+                end
+            end
+        end
+        order = kept
+    end
+
+    return {
+        get = function(id: string): any
+            local entry = entries[id]
+            if (entry == nil) then return nil end
+            if (entry.expiresAt <= os.clock()) then
+                entries[id] = nil
+                count -= 1
+                removeFromOrder(id)
+                return nil
+            end
+            return deepCopyData(entry.data)
+        end,
+        set = function(id: string, data: {[string]: any}, ttl: number)
+            local now = os.clock()
+            local existing = entries[id]
+            if (existing == nil) then
+                if (count >= maxEntries or #order >= maxEntries) then
+                    sweep(now)
+                end
+                while (count >= maxEntries and #order > 0) do
+                    local oldest = table.remove(order, 1)
+                    if (oldest != nil and entries[oldest] != nil) then
+                        entries[oldest] = nil
+                        count -= 1
+                    end
+                end
+                order[#order + 1] = id
+                count += 1
+            end
+            entries[id] = {
+                data = deepCopyData(data),
+                expiresAt = now + ttl,
+            }
+        end,
+        delete = function(id: string)
+            if (entries[id] != nil) then
+                entries[id] = nil
+                count -= 1
+                removeFromOrder(id)
+            end
+        end,
+    }
+end
+
+-- Returns a session middleware attaching `req.session`, `req.sessionId`,
+-- `req:regenerateSession()` and `req:destroySession()`. Uses CSPRNG 32-byte
+-- IDs, optional HMAC-SHA256 signed cookies and a TTL-bounded store.
+function http.sessions(options: {[string]: any}?): any
+    checkOptionalTable(options, "options")
+    local opts = options ?? {}
+    local cookieName = opts.name ?? "neyuki.sid"
+    checkString(cookieName, "name")
+    if (not isValidCookieName(cookieName)) then error("invalid session cookie name") end
+
+    local secret: string? = opts.secret
+    checkOptionalString(secret, "secret")
+    if (secret != nil and #secret == 0) then error("session secret must not be empty") end
+
+    local maxAge = opts.maxAge ?? 86400
+    checkOptionalNumber(maxAge, "maxAge")
+    if (maxAge <= 0) then error("session maxAge must be positive") end
+
+    local maxEntries = opts.maxEntries ?? 10000
+    checkOptionalNumber(maxEntries, "maxEntries")
+    if (maxEntries < 1) then error("session maxEntries must be at least 1") end
+
+    checkOptionalBoolean(opts.rolling, "rolling")
+    local rolling = opts.rolling == true
+
+    checkOptionalTable(opts.cookie, "cookie")
+    local cookieOpts = {
+        path = "/",
+        httpOnly = true,
+        sameSite = "Lax",
+        maxAge = int(maxAge),
+    }
+    if (opts.cookie != nil) then
+        for k, v in opts.cookie do
+            cookieOpts[k] = v
+        end
+    end
+
+    local clearOpts = {
+        path = cookieOpts.path,
+        domain = cookieOpts.domain,
+        httpOnly = cookieOpts.httpOnly,
+        secure = cookieOpts.secure,
+        sameSite = cookieOpts.sameSite,
+        partitioned = cookieOpts.partitioned,
+    }
+
+    local store = opts.store
+    if (store != nil) then
+        if (type(store) != "table" or type(store.get) != "function" or type(store.set) != "function" or type(store.delete) != "function") then
+            error("session store must provide get, set and delete functions")
+        end
+    else
+        store = makeMemorySessionStore(int(maxEntries))
+    end
+
+    local function encodeId(id: string): string
+        if (secret != nil) then return http.signCookie(id, secret) end
+        return id
+    end
+
+    local function decodeId(raw: string?): string?
+        if (raw == nil or #raw == 0) then return nil end
+        if (secret != nil) then return http.unsignCookie(raw, secret) end
+        return raw
+    end
+
+    return function(req: any, nextFn: () -> any): any
+        local sid = decodeId(req.cookies[cookieName])
+        local loaded = nil
+        if (sid != nil) then
+            loaded = store.get(sid)
+            if (loaded == nil) then sid = nil end
+        end
+
+        local hadSession = sid != nil
+        local sessionData = {}
+        if (loaded != nil) then sessionData = loaded end
+        local beforeSnap = json.encode(sessionData)
+        local destroyed = false
+        local regenerated = false
+        local flushed = false
+
+        req.session = sessionData
+        req.sessionId = sid
+
+        function req.regenerateSession(self: any): string
+            if (sid != nil) then store.delete(sid) end
+            sid = crypto.randomBytes(32, "base64url")
+            self.sessionId = sid
+            destroyed = false
+            regenerated = true
+            return sid
+        end
+
+        function req.destroySession(self: any): ()
+            if (sid != nil) then store.delete(sid) end
+            sid = nil
+            self.sessionId = nil
+            for k, _ in self.session do
+                self.session[k] = nil
+            end
+            destroyed = true
+            regenerated = false
+        end
+
+        local function commitSession()
+            if (flushed) then return end
+            flushed = true
+            if (destroyed) then
+                if (hadSession or regenerated) then
+                    req:clearCookie(cookieName, clearOpts)
+                end
+                return
+            end
+
+            local afterSnap = json.encode(req.session)
+            local changed = (afterSnap != beforeSnap) or regenerated
+            if (changed) then
+                if (sid == nil) then
+                    sid = crypto.randomBytes(32, "base64url")
+                    req.sessionId = sid
+                end
+                store.set(sid, req.session, maxAge)
+                req:setCookie(cookieName, encodeId(sid), cookieOpts)
+            elseif (hadSession and rolling and sid != nil) then
+                store.set(sid, req.session, maxAge)
+                req:setCookie(cookieName, encodeId(sid), cookieOpts)
+            end
+        end
+
+        if (type(req._onBeforeRespond) == "function") then
+            req._onBeforeRespond(commitSession)
+        end
+
+        local res = nextFn()
+        commitSession()
+        return res
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Router & middleware pipeline
+-- ---------------------------------------------------------------------------
+
+local ROUTER_TAG = {}
+
+local function normalizePrefix(prefix: string): string
+    checkString(prefix, "prefix")
+    if (#prefix == 0 or prefix == "/") then return "/" end
+    if (string.sub(prefix, 1, 1) != "/") then
+        error("route prefix must start with `/`")
+    end
+    while (#prefix > 1 and string.sub(prefix, #prefix, #prefix) == "/") do
+        prefix = string.sub(prefix, 1, #prefix - 1)
+    end
+    return prefix
+end
+
+local function stripPrefix(pathname: string, prefix: string): string?
+    if (prefix == "/") then return pathname end
+    if (pathname == prefix) then return "/" end
+    local plen = #prefix
+    if (#pathname > plen and string.sub(pathname, 1, plen) == prefix and string.sub(pathname, plen + 1, plen + 1) == "/") then
+        return string.sub(pathname, plen + 1)
+    end
+    return nil
+end
+
+local function normalizePathname(rawPathname: string): (boolean, string)
+    if (#rawPathname == 0) then return true, "/" end
+    local hasTrailingSlash = #rawPathname > 1 and string.sub(rawPathname, #rawPathname, #rawPathname) == "/"
+    local decodedSegs = {}
+    local start = 1
+    if (string.sub(rawPathname, 1, 1) == "/") then start = 2 end
+    local len = #rawPathname
+    while (start <= len) do
+        local slash = string.find(rawPathname, "/", start, true)
+        local rawSeg = nil
+        if (slash == nil) then
+            rawSeg = string.sub(rawPathname, start, len)
+            start = len + 1
+        else
+            rawSeg = string.sub(rawPathname, start, slash - 1)
+            start = slash + 1
+        end
+        if (#rawSeg > 0 and rawSeg != ".") then
+            local okDec, dec = try(__http_path_decode, rawSeg)
+            if (not okDec) then return false, "" end
+            if (dec != ".") then
+                decodedSegs[#decodedSegs + 1] = dec
+            end
+        end
+    end
+    if (#decodedSegs == 0) then return true, "/" end
+    local norm = "/" .. table.concat(decodedSegs, "/")
+    if (hasTrailingSlash) then norm = norm .. "/" end
+    return true, norm
+end
+
+local function splitSegments(path: string, strictSlash: boolean): {string}
+    if (not strictSlash and #path > 1 and string.sub(path, #path, #path) == "/") then
+        path = string.sub(path, 1, #path - 1)
+    end
+    local segs = {}
+    if (path == "/" or path == "") then return segs end
+    local start = 1
+    if (string.sub(path, 1, 1) == "/") then start = 2 end
+    local len = #path
+    while (start <= len) do
+        local slash = string.find(path, "/", start, true)
+        if (slash == nil) then
+            segs[#segs + 1] = string.sub(path, start, len)
+            break
+        else
+            segs[#segs + 1] = string.sub(path, start, slash - 1)
+            start = slash + 1
+            if (strictSlash and start == len + 1) then
+                segs[#segs + 1] = ""
+            end
+        end
+    end
+    return segs
+end
+
+local function makeTrieNode(): {[string]: any}
+    return {
+        statics = {},
+        param = nil,
+        wild = nil,
+        methods = {},
+    }
+end
+
+local function parsePattern(pattern: string, strictSlash: boolean): {any}
+    checkString(pattern, "pattern")
+    if (string.sub(pattern, 1, 1) != "/") then
+        error("route pattern must start with `/`")
+    end
+    local rawSegs = splitSegments(pattern, strictSlash)
+    local parsed = {}
+    local seenParams = {}
+    for i = 1, #rawSegs do
+        local seg = rawSegs[i]
+        local first = string.sub(seg, 1, 1)
+        if (first == ":") then
+            local pname = string.sub(seg, 2)
+            if (#pname == 0) then error("empty parameter name in route `" .. pattern .. "`") end
+            if (seenParams[pname]) then error("duplicate parameter `:" .. pname .. "` in route `" .. pattern .. "`") end
+            seenParams[pname] = true
+            parsed[i] = { kind = "param", name = pname }
+        elseif (first == "*") then
+            if (i != #rawSegs) then
+                error("wildcard segment must be last in route `" .. pattern .. "`")
+            end
+            local wname = string.sub(seg, 2)
+            if (#wname == 0) then wname = "*" end
+            if (seenParams[wname]) then error("duplicate parameter `*" .. wname .. "` in route `" .. pattern .. "`") end
+            seenParams[wname] = true
+            parsed[i] = { kind = "wild", name = wname }
+        else
+            parsed[i] = { kind = "static", text = seg }
+        end
+    end
+    return parsed
+end
+
+local function normalizeReplyTable(reply: any): {[string]: any}
+    if (type(reply) == "table" and reply[FILE_REPLY] != nil) then
+        local status, headers, _ = normalizeReply(reply)
+        return {
+            [FILE_REPLY] = reply[FILE_REPLY],
+            status = status,
+            headers = cloneHeaders(headers),
+            body = "",
+        }
+    end
+    local status, headers, body = normalizeReply(reply)
+    return {
+        status = status,
+        headers = cloneHeaders(headers),
+        body = body,
+    }
+end
+
+-- Creates an HTTP router with path parameters (`:id`), wildcards (`*path`),
+-- composable middleware (`use`), sub-router mounting (`mount`), automatic HEAD
+-- and 405 Method Not Allowed handling, cookies and multipart helpers.
+function http.router(options: {[string]: any}?): {[string]: any}
+    checkOptionalTable(options, "options")
+    local opts = options ?? {}
+    checkOptionalBoolean(opts.strictSlash, "strictSlash")
+    local strictSlash = opts.strictSlash == true
+
+    local rootNode = makeTrieNode()
+    local middlewares = {}
+    local customNotFound = nil
+    local customOnError = nil
+
+    local router = {}
+
+    local function insertRoute(method: string, pattern: string, handlers: {any})
+        checkString(method, "method")
+        if (#handlers == 0) then error("at least one route handler must be provided") end
+        for i = 1, #handlers do
+            if (type(handlers[i]) != "function") then
+                error("route handler must be a function")
+            end
+        end
+        local upper = string.upper(method)
+        local parsed = parsePattern(pattern, strictSlash)
+        local node = rootNode
+        for _, seg in parsed do
+            if (seg.kind == "static") then
+                local nextNode = node.statics[seg.text]
+                if (nextNode == nil) then
+                    nextNode = makeTrieNode()
+                    node.statics[seg.text] = nextNode
+                end
+                node = nextNode
+            elseif (seg.kind == "param") then
+                if (node.param == nil) then
+                    node.param = { name = seg.name, node = makeTrieNode() }
+                end
+                node = node.param.node
+            else
+                if (node.wild == nil) then
+                    node.wild = { name = seg.name, node = makeTrieNode() }
+                end
+                node = node.wild.node
+            end
+        end
+        node.methods[upper] = {
+            handlers = handlers,
+            paramNames = parsed,
+        }
+    end
+
+    local function matchNode(node: any, segs: {string}, idx: number, captured: {string}): (any, {string}?)
+        if (idx > #segs) then
+            if (next(node.methods) != nil) then
+                return node, captured
+            end
+            if (node.wild != nil and next(node.wild.node.methods) != nil) then
+                local c = {}
+                for i = 1, #captured do c[i] = captured[i] end
+                c[#c + 1] = ""
+                return node.wild.node, c
+            end
+            return nil, nil
+        end
+
+        local seg = segs[idx]
+        -- 1. Static segment match (highest priority)
+        local staticChild = node.statics[seg]
+        if (staticChild != nil) then
+            local found, caps = matchNode(staticChild, segs, idx + 1, captured)
+            if (found != nil) then return found, caps end
+        end
+
+        -- 2. Parameter segment match (`:param`)
+        if (node.param != nil) then
+            local c = {}
+            for i = 1, #captured do c[i] = captured[i] end
+            c[#c + 1] = seg
+            local found, caps = matchNode(node.param.node, segs, idx + 1, c)
+            if (found != nil) then return found, caps end
+        end
+
+        -- 3. Wildcard segment match (`*rest`)
+        if (node.wild != nil and next(node.wild.node.methods) != nil) then
+            local decodedParts = {}
+            for i = idx, #segs do
+                decodedParts[#decodedParts + 1] = segs[i]
+            end
+            local c = {}
+            for i = 1, #captured do c[i] = captured[i] end
+            c[#c + 1] = table.concat(decodedParts, "/")
+            return node.wild.node, c
+        end
+
+        return nil, nil
+    end
+
+    local function collectAllowedMethods(methodsMap: {[string]: any}): string
+        local list = {}
+        local hasGet = false
+        local hasHead = false
+        for m, _ in methodsMap do
+            if (m != "*") then
+                list[#list + 1] = m
+                if (m == "GET") then hasGet = true end
+                if (m == "HEAD") then hasHead = true end
+            end
+        end
+        if (hasGet and not hasHead) then
+            list[#list + 1] = "HEAD"
+        end
+        table.sort(list, function(a: string, b: string): boolean return a <= b end)
+        return table.concat(list, ", ")
+    end
+
+    local function buildParams(parsed: {any}, captured: {string}): {[string]: string}
+        local params = {}
+        local ci = 1
+        for _, seg in parsed do
+            if (seg.kind == "param" or seg.kind == "wild") then
+                params[seg.name] = captured[ci] ?? ""
+                ci += 1
+            end
+        end
+        return params
+    end
+
+    -- Dispatches `ctx` through this router's middlewares and routes. When
+    -- mounted as a sub-router, `fallbackNext` lets unmatched paths fall through.
+    local function dispatch(ctx: any, fallbackNext: (() -> any)?): any
+        local function runRoute(): any
+            local segs = splitSegments(ctx.pathname, strictSlash)
+            local okDecode, matchedNode, captured = try(matchNode, rootNode, segs, 1, {})
+            if (not okDecode) then
+                return { status = 400, body = "Bad Request" }
+            end
+            if (matchedNode != nil) then
+                local entry = matchedNode.methods[ctx.method]
+                if (entry == nil and ctx.method == "HEAD") then
+                    entry = matchedNode.methods["GET"]
+                end
+                if (entry == nil) then
+                    entry = matchedNode.methods["*"]
+                end
+                if (entry != nil) then
+                    local savedParams = ctx.params
+                    ctx.params = buildParams(entry.paramNames, captured ?? {})
+                    local handlers = entry.handlers
+                    local function runHandler(hIdx: number): any
+                        local fn = handlers[hIdx]
+                        if (hIdx == #handlers) then
+                            return normalizeReplyTable(fn(ctx))
+                        end
+                        local nextCalled = false
+                        local res = fn(ctx, function()
+                            if (nextCalled) then error("next() called multiple times") end
+                            nextCalled = true
+                            return runHandler(hIdx + 1)
+                        end)
+                        return normalizeReplyTable(res)
+                    end
+                    local okRun, result = try(runHandler, 1)
+                    ctx.params = savedParams
+                    if (not okRun) then error(result) end
+                    return result
+                end
+                -- Path matched but method did not -> 405 Method Not Allowed.
+                return {
+                    status = 405,
+                    headers = { allow = collectAllowedMethods(matchedNode.methods) },
+                    body = "Method Not Allowed",
+                }
+            end
+            if (customNotFound != nil) then
+                return normalizeReplyTable(customNotFound(ctx))
+            end
+            if (fallbackNext != nil) then
+                return fallbackNext()
+            end
+            return { status = 404, body = "Not Found" }
+        end
+
+        local function runMiddleware(idx: number): any
+            if (idx > #middlewares) then
+                return runRoute()
+            end
+            local entry = middlewares[idx]
+            local subPath = stripPrefix(ctx.pathname, entry.prefix)
+            if (subPath == nil) then
+                return runMiddleware(idx + 1)
+            end
+
+            local savedPath = ctx.pathname
+            ctx.pathname = subPath
+            local nextCalled = false
+            local okMw, result = try(entry.fn, ctx, function()
+                if (nextCalled) then error("next() called multiple times") end
+                nextCalled = true
+                ctx.pathname = savedPath
+                return runMiddleware(idx + 1)
+            end)
+            ctx.pathname = savedPath
+            if (not okMw) then error(result) end
+            return normalizeReplyTable(result)
+        end
+
+        return runMiddleware(1)
+    end
+
+    function router.route(self: any, method: string, pattern: string, ...: any): any
+        local handlers = { ... }
+        insertRoute(method, pattern, handlers)
+        return self
+    end
+
+    function router.get(self: any, pattern: string, ...: any): any
+        insertRoute("GET", pattern, { ... })
+        return self
+    end
+
+    function router.post(self: any, pattern: string, ...: any): any
+        insertRoute("POST", pattern, { ... })
+        return self
+    end
+
+    function router.put(self: any, pattern: string, ...: any): any
+        insertRoute("PUT", pattern, { ... })
+        return self
+    end
+
+    function router.patch(self: any, pattern: string, ...: any): any
+        insertRoute("PATCH", pattern, { ... })
+        return self
+    end
+
+    function router.delete(self: any, pattern: string, ...: any): any
+        insertRoute("DELETE", pattern, { ... })
+        return self
+    end
+
+    function router.head(self: any, pattern: string, ...: any): any
+        insertRoute("HEAD", pattern, { ... })
+        return self
+    end
+
+    function router.options(self: any, pattern: string, ...: any): any
+        insertRoute("OPTIONS", pattern, { ... })
+        return self
+    end
+
+    function router.all(self: any, pattern: string, ...: any): any
+        insertRoute("*", pattern, { ... })
+        return self
+    end
+
+    function router.use(self: any, prefixOrFn: any, maybeFn: any?): any
+        if (type(prefixOrFn) == "function") then
+            middlewares[#middlewares + 1] = { prefix = "/", fn = prefixOrFn }
+            return self
+        end
+        if (type(prefixOrFn) == "string" and type(maybeFn) == "function") then
+            middlewares[#middlewares + 1] = { prefix = normalizePrefix(prefixOrFn), fn = maybeFn }
+            return self
+        end
+        error("use expects (middleware) or (prefix, middleware)")
+    end
+
+    function router.mount(self: any, prefix: string, subRouter: any): any
+        local norm = normalizePrefix(prefix)
+        if (type(subRouter) != "table" or subRouter[ROUTER_TAG] == nil) then
+            error("mount expects a router created by http.router()")
+        end
+        local subDispatch = subRouter[ROUTER_TAG]
+        middlewares[#middlewares + 1] = {
+            prefix = norm,
+            fn = function(ctx: any, nextFn: () -> any): any
+                return subDispatch(ctx, nextFn)
+            end,
+        }
+        return self
+    end
+
+    function router.notFound(self: any, handler: any): any
+        if (type(handler) != "function") then error("notFound handler must be a function") end
+        customNotFound = handler
+        return self
+    end
+
+    function router.onError(self: any, handler: any): any
+        if (type(handler) != "function") then error("onError handler must be a function") end
+        customOnError = handler
+        return self
+    end
+
+    function router.handle(self: any, request: Request): ()
+        if (type(request) != "table" or type(request.respond) != "function") then
+            error("handle expects a Request from server:accept()")
+        end
+        local rawPathname, queryParams = request:query()
+        local okPath, pathname = normalizePathname(rawPathname)
+        if (not okPath) then
+            request:respond({ status = 400, body = "Bad Request" })
+            return
+        end
+        local cookieHeader = request:header("cookie")
+        local parsedCookies = {}
+        if (cookieHeader != nil) then parsedCookies = http.parseCookies(cookieHeader) end
+        local pendingCookies = {}
+        local beforeRespond = {}
+
+        local function sendFinalReply(rawReply: any, failed: boolean?)
+            if (request:answered()) then return end
+            -- A failed request (500 / onError) does not persist session changes.
+            if (not failed) then
+                for i = 1, #beforeRespond do
+                    beforeRespond[i]()
+                end
+            end
+            local finalReply = normalizeReplyTable(rawReply)
+            for _, cookieLine in pendingCookies do
+                appendHeaderValue(finalReply.headers, "set-cookie", cookieLine)
+            end
+            if (request.method == "HEAD" and finalReply[FILE_REPLY] == nil) then
+                local bodyLen = 0
+                if (type(finalReply.body) == "string") then
+                    bodyLen = #finalReply.body
+                elseif (type(finalReply.body) == "buffer") then
+                    bodyLen = buffer.len(finalReply.body)
+                end
+                setDefaultHeader(finalReply.headers, "content-length", tostring(bodyLen))
+                finalReply.body = ""
+            end
+            request:respond(finalReply)
+        end
+
+        local ctx = {
+            method = request.method,
+            path = request.path,
+            pathname = pathname,
+            query = queryParams,
+            headers = request.headers,
+            body = request.body,
+            remote = request.remote,
+            params = {},
+            cookies = parsedCookies,
+            locals = {},
+            session = nil,
+            sessionId = nil,
+            _onBeforeRespond = function(cb: () -> ())
+                beforeRespond[#beforeRespond + 1] = cb
+            end,
+        }
+
+        function ctx.header(_self: any, name: string): string?
+            return request:header(name)
+        end
+
+        function ctx.multipart(_self: any, mpOpts: {[string]: any}?): {[string]: any}
+            return request:multipart(mpOpts)
+        end
+
+        function ctx.json(_self: any): any
+            return json.decode(request.body)
+        end
+
+        function ctx.form(_self: any): {[string]: string}
+            local _, formParams = http.parseQuery("?" .. request.body)
+            return formParams
+        end
+
+        function ctx.setCookie(_self: any, name: string, value: string, cookieOpts: {[string]: any}?): ()
+            pendingCookies[#pendingCookies + 1] = http.formatCookie(name, value, cookieOpts)
+        end
+
+        function ctx.clearCookie(_self: any, name: string, cookieOpts: {[string]: any}?): ()
+            local clear = {}
+            if (cookieOpts != nil) then
+                checkOptionalTable(cookieOpts, "options")
+                for k, v in cookieOpts do clear[k] = v end
+            end
+            clear.maxAge = 0
+            clear.expires = 0
+            if (clear.path == nil) then clear.path = "/" end
+            pendingCookies[#pendingCookies + 1] = http.formatCookie(name, "", clear)
+        end
+
+        function ctx.forward(_self: any, target: ForwardTarget, fOpts: ForwardOptions?): ()
+            request:forward(target, fOpts)
+        end
+
+        function ctx.respond(_self: any, reply: any): ()
+            sendFinalReply(reply)
+        end
+
+        function ctx.answered(_self: any): boolean
+            return request:answered()
+        end
+
+        local ok, reply = try(dispatch, ctx, nil)
+        if (request:answered()) then return end
+
+        if (not ok) then
+            if (customOnError != nil) then
+                local okErr, errReply = try(customOnError, reply, ctx)
+                if (request:answered()) then return end
+                if (okErr) then
+                    reply = normalizeReplyTable(errReply)
+                else
+                    io.stderr:write("http: onError failed for ", request.method, " ", request.path, ": ", tostring(errReply), "\n")
+                    reply = { status = 500, headers = {}, body = "Internal Server Error" }
+                end
+            else
+                io.stderr:write("http: handler failed for ", request.method, " ", request.path, ": ", tostring(reply), "\n")
+                reply = { status = 500, headers = {}, body = "Internal Server Error" }
+            end
+        end
+
+        sendFinalReply(reply, not ok)
+    end
+
+    function router.serve(self: any, serveOptions: ServerOptions | number | nil): ()
+        http.serve(serveOptions, function(request: Request)
+            self:handle(request)
+        end)
+    end
+
+    router[ROUTER_TAG] = dispatch
+    return table.freeze(router)
+end
+
+-- Runs `handler(request)` (or a `Router` created by `http.router()`) for every
+-- incoming request, forever. A handler's return value is sent with
+-- `request:respond` unless the handler already answered; an error inside the
+-- handler is reported on stderr and answered with a 500 so the server keeps going.
+function http.serve(options: ServerOptions | number | nil, handler: any): ()
+    local isRouter = type(handler) == "table" and handler[ROUTER_TAG] != nil
+    if (type(handler) != "function" and not isRouter) then
+        error("handler must be a function or a router")
+    end
     local server = http.listen(options)
     while (true) do
         local request = server:accept()
-        local ok, reply = try(handler, request)
-        if (ok) then
-            if (not request:answered()) then request:respond(reply) end
+        if (isRouter) then
+            handler:handle(request)
         else
-            io.stderr:write("http: handler failed for ", request.method, " ", request.path, ": ", tostring(reply), "\n")
-            if (not request:answered()) then
-                request:respond({ status = 500, body = "Internal Server Error" })
+            local ok, reply = try(handler, request)
+            if (ok) then
+                if (not request:answered()) then request:respond(reply) end
+            else
+                io.stderr:write("http: handler failed for ", request.method, " ", request.path, ": ", tostring(reply), "\n")
+                if (not request:answered()) then
+                    request:respond({ status = 500, body = "Internal Server Error" })
+                end
             end
         end
     end

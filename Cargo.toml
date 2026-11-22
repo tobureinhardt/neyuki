@@ -60,6 +60,9 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 # in the tree through other crates); package archives are plain ustar +
 # gzip, written and read by src/pkg/tarball.rs on top of `flate2`.
 serde_json = "1"
+# `@neyuki/http` uses `memchr::memmem` (already in the dependency tree) for
+# single-pass SIMD boundary searches when parsing `multipart/form-data` bodies.
+memchr = "2"
 
 # `@neyuki/crypto` is built on the RustCrypto / dalek crates, which cover
 # every algorithm it exposes (including RSA key generation, bcrypt and

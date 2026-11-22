@@ -19,16 +19,22 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use ureq::ResponseExt;
 
+use crate::app::Entry;
+use crate::vm::buffer::VmBuffer;
 use crate::vm::machine::VM;
 use crate::vm::value::{NativeDef, StrRef, Value, VmTable};
 
@@ -84,6 +90,26 @@ pub(crate) const NATIVES: &[NativeDef] = &[
     NativeDef {
         name: "__http_url_decode",
         func: builtin_url_decode,
+    },
+    NativeDef {
+        name: "__http_path_decode",
+        func: builtin_path_decode,
+    },
+    NativeDef {
+        name: "__http_date",
+        func: builtin_date,
+    },
+    NativeDef {
+        name: "__http_respond_file",
+        func: builtin_respond_file,
+    },
+    NativeDef {
+        name: "__http_resolve_static",
+        func: builtin_resolve_static,
+    },
+    NativeDef {
+        name: "__http_parse_multipart",
+        func: builtin_parse_multipart,
     },
 ];
 
@@ -189,8 +215,68 @@ fn bool_arg(args: &[Value], index: usize, name: &str, default: bool) -> Result<b
     }
 }
 
+/// Validates an RFC 9110 header field name token and rejects CRLF/NUL.
+fn validate_header_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || !name.bytes().all(|b| {
+            matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+            )
+        })
+    {
+        return Err(format!("invalid header name `{}`", name));
+    }
+    Ok(())
+}
+
+/// Rejects CR, LF and NUL bytes in header values to prevent HTTP response
+/// splitting and header injection.
+fn validate_header_value(name: &str, value: &str) -> Result<(), String> {
+    if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        return Err(format!(
+            "header `{}` value must not contain CR, LF or NUL bytes",
+            name
+        ));
+    }
+    Ok(())
+}
+
+fn scalar_header_value(key: &str, value: &Value) -> Result<String, String> {
+    let text = match value {
+        Value::String(text) => text.to_string(),
+        Value::Int(_) | Value::BigInt(_) | Value::Float(_) => value.to_string(),
+        other => {
+            return Err(format!(
+                "header `{}` must be a string or a number, got {}",
+                key,
+                other.type_name()
+            ));
+        }
+    };
+    validate_header_value(key, &text)?;
+    Ok(text)
+}
+
 /// Reads a `{ name = value }` table of headers; nil is an empty set. Values
-/// may be strings or numbers.
+/// may be strings, numbers, or (for repeated headers such as `Set-Cookie`) a
+/// non-empty array of strings or numbers.
 fn headers_arg(args: &[Value], index: usize, name: &str) -> Result<Vec<(String, String)>, String> {
     let table = match args.get(index) {
         None | Some(Value::Nil) => return Ok(Vec::new()),
@@ -204,27 +290,65 @@ fn headers_arg(args: &[Value], index: usize, name: &str) -> Result<Vec<(String, 
         }
     };
     let table = table.borrow();
-    let mut headers: Vec<(String, String)> = table
-        .fields
-        .iter()
-        .map(|(key, value)| {
-            let value = match value {
-                Value::String(text) => text.to_string(),
-                Value::Int(_) | Value::BigInt(_) | Value::Float(_) => value.to_string(),
-                other => {
+    let mut pairs: Vec<(&StrRef, &Value)> = table.fields.iter().collect();
+    // Deterministic key order makes requests and responses reproducible.
+    pairs.sort_by_key(|(a, _)| *a);
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for (key, value) in pairs {
+        validate_header_name(key)?;
+        match value {
+            Value::Table(list) => {
+                let list = list.borrow();
+                if list.array.is_empty() || !list.fields.is_empty() || list.general.is_some() {
                     return Err(format!(
-                        "header `{}` must be a string or a number, got {}",
-                        key,
-                        other.type_name()
+                        "header `{}` must be a string, a number or a non-empty array of strings",
+                        key
                     ));
                 }
-            };
-            Ok((key.to_string(), value))
-        })
-        .collect::<Result<_, _>>()?;
-    // Deterministic order makes requests reproducible regardless of hashing.
-    headers.sort();
+                for item in &list.array {
+                    headers.push((key.to_string(), scalar_header_value(key, item)?));
+                }
+            }
+            other => {
+                headers.push((key.to_string(), scalar_header_value(key, other)?));
+            }
+        }
+    }
     Ok(headers)
+}
+
+/// Builds a `{ name = { value1, value2, ... } }` table preserving every header
+/// occurrence verbatim (needed for multiple `Set-Cookie` headers).
+fn multi_headers_table<'a>(headers: impl Iterator<Item = (&'a str, &'a [u8])>) -> Value {
+    let mut grouped: HashMap<String, Vec<Value>> = HashMap::new();
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        let text = String::from_utf8_lossy(value).into_owned();
+        grouped.entry(lower).or_default().push(Value::string(text));
+    }
+    let mut table = VmTable::with_capacity(0, grouped.len());
+    for (name, values) in grouped {
+        let mut arr = VmTable::with_capacity(values.len(), 0);
+        arr.array = values;
+        arr.frozen = true;
+        table
+            .fields
+            .insert(StrRef::from(name), Value::Table(Rc::new(RefCell::new(arr))));
+    }
+    Value::Table(Rc::new(RefCell::new(table)))
+}
+
+fn optional_body_arg(args: &[Value], index: usize, name: &str) -> Result<Option<Vec<u8>>, String> {
+    match args.get(index) {
+        None | Some(Value::Nil) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_bytes().to_vec())),
+        Some(Value::Buffer(buf)) => Ok(Some(buf.borrow().data.clone())),
+        Some(other) => Err(format!(
+            "{} must be a string or a buffer, got {}",
+            name,
+            other.type_name()
+        )),
+    }
 }
 
 /// Builds a `{ name = value }` table with lower-cased names. Repeated headers
@@ -311,7 +435,7 @@ struct RequestSpec {
     method: String,
     url: String,
     headers: Vec<(String, String)>,
-    body: Option<String>,
+    body: Option<Vec<u8>>,
     timeout: Option<Duration>,
     follow: bool,
     max_body: u64,
@@ -350,7 +474,7 @@ fn perform_request(spec: RequestSpec) -> Result<RawResponse, String> {
         builder = builder.header(name.as_str(), value.as_str());
     }
     let request = builder
-        .body(body.map(String::into_bytes).unwrap_or_default())
+        .body(body.unwrap_or_default())
         .map_err(|err| format!("cannot build request for `{}`: {}", url, err))?;
     let configured = agent()
         .configure_request(request)
@@ -414,7 +538,7 @@ fn builtin_request(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         method: string_arg(args, 0, "method")?.to_ascii_uppercase(),
         url: string_arg(args, 1, "url")?,
         headers: headers_arg(args, 2, "headers")?,
-        body: optional_string_arg(args, 3, "body")?,
+        body: optional_body_arg(args, 3, "body")?,
         timeout: timeout_arg(args, 4, "timeout")?,
         follow: bool_arg(args, 5, "follow", true)?,
         max_body: max_body_arg(args, 6)?,
@@ -431,20 +555,39 @@ fn finish_request(_vm: &mut VM, raw: RawResponse) -> Result<Vec<Value>, String> 
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_slice())),
     );
-    let body = match raw.body {
-        ResponseBody::Complete(bytes) => ("body", Value::string(bytes_to_string(bytes))),
+    let header_values = multi_headers_table(
+        raw.headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_slice())),
+    );
+    let mut fields = vec![
+        ("status", integer(u64::from(raw.status))),
+        ("headers", headers),
+        ("headerValues", header_values),
+        ("url", Value::string(raw.url)),
+    ];
+    match raw.body {
+        ResponseBody::Complete(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => {
+                fields.push(("body", Value::string(text)));
+            }
+            Err(err) => {
+                let raw_bytes = err.into_bytes();
+                let lossy = String::from_utf8_lossy(&raw_bytes).into_owned();
+                fields.push(("body", Value::string(lossy)));
+                fields.push((
+                    "bytes",
+                    Value::Buffer(Rc::new(RefCell::new(VmBuffer::from_bytes(raw_bytes)))),
+                ));
+            }
+        },
         ResponseBody::Stream(reader) => {
             let id = next_id();
             STREAMS.with(|streams| streams.borrow_mut().insert(id, Some(*reader)));
-            ("stream", integer(id))
+            fields.push(("stream", integer(id)));
         }
-    };
-    Ok(vec![record(vec![
-        ("status", integer(u64::from(raw.status))),
-        ("headers", headers),
-        body,
-        ("url", Value::string(raw.url)),
-    ])])
+    }
+    Ok(vec![record(fields)])
 }
 
 /// `__http_read(stream, size?)` reads the next chunk of a streamed response
@@ -706,7 +849,8 @@ fn park_request(request: tiny_http::Request, bytes: Vec<u8>) -> Value {
 }
 
 /// `__http_respond(request, status, headers?, body?)` answers a request that
-/// `__http_accept` returned. Each request can be answered once.
+/// `__http_accept` returned. Each request can be answered once. `body` may be
+/// nil, a string or a binary buffer.
 fn builtin_respond(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let id = integer_arg(args, 0, "request")?;
     let status = integer_arg(args, 1, "status")?;
@@ -714,14 +858,14 @@ fn builtin_respond(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         return Err(format!("invalid status code {}", status));
     }
     let headers = headers_arg(args, 2, "headers")?;
-    let body = optional_string_arg(args, 3, "body")?.unwrap_or_default();
+    let body = optional_body_arg(args, 3, "body")?.unwrap_or_default();
 
     let (request, _) = PENDING
         .with(|pending| pending.borrow_mut().remove(&id))
         .ok_or_else(|| "request was already answered".to_string())?;
 
-    let mut response = tiny_http::Response::from_string(body)
-        .with_status_code(tiny_http::StatusCode(status as u16));
+    let mut response =
+        tiny_http::Response::from_data(body).with_status_code(tiny_http::StatusCode(status as u16));
     for (name, value) in headers {
         let header = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes())
             .map_err(|_| format!("invalid header `{}: {}`", name, value))?;
@@ -1111,6 +1255,748 @@ fn builtin_url_decode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
     Ok(vec![Value::string(bytes_to_string(decoded))])
 }
 
+/// Decodes RFC 3986 percent-escapes in URL paths without turning `+` into a
+/// space, and rejects encoded NUL bytes.
+fn percent_decode_path(text: &str) -> Result<String, String> {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let code = bytes
+                .get(index + 1..index + 3)
+                .and_then(|pair| std::str::from_utf8(pair).ok())
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(|| format!("invalid percent-escape at byte {}", index + 1))?;
+            if code == 0 {
+                return Err("path must not contain NUL bytes".to_string());
+            }
+            decoded.push(code);
+            index += 3;
+        } else {
+            if bytes[index] == 0 {
+                return Err("path must not contain NUL bytes".to_string());
+            }
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    Ok(bytes_to_string(decoded))
+}
+
+/// `__http_path_decode(s)`: RFC 3986 path segment decoder (keeps `+` literal).
+fn builtin_path_decode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+    let text = string_arg(args, 0, "s")?;
+    Ok(vec![Value::string(percent_decode_path(&text)?)])
+}
+
+/// Formats a Unix timestamp (seconds) as an IMF-fixdate HTTP date in GMT
+/// (e.g. `Wed, 21 Oct 2026 07:28:00 GMT`) for `Set-Cookie` `Expires`.
+fn format_http_date(seconds: i64) -> Result<String, String> {
+    let ts = Timestamp::from_second(seconds)
+        .map_err(|_| format!("timestamp {} is out of range", seconds))?;
+    let dt = TimeZone::UTC.to_datetime(ts);
+    let wday = match dt.weekday() {
+        jiff::civil::Weekday::Monday => "Mon",
+        jiff::civil::Weekday::Tuesday => "Tue",
+        jiff::civil::Weekday::Wednesday => "Wed",
+        jiff::civil::Weekday::Thursday => "Thu",
+        jiff::civil::Weekday::Friday => "Fri",
+        jiff::civil::Weekday::Saturday => "Sat",
+        jiff::civil::Weekday::Sunday => "Sun",
+    };
+    let month = match dt.month() {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "Jan",
+    };
+    Ok(format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        wday,
+        dt.day(),
+        month,
+        dt.year(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
+    ))
+}
+
+/// `__http_date(seconds)`: formats a Unix epoch timestamp as an HTTP GMT date.
+fn builtin_date(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+    let seconds = crate::vm::libs::args::int_arg(args, 0, "seconds")?;
+    Ok(vec![Value::string(format_http_date(seconds)?)])
+}
+
+/// Maps a file extension to a standard MIME `Content-Type` header value.
+fn mime_for_path(path: &Path) -> &'static str {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return "application/octet-stream";
+    };
+    match ext.to_ascii_lowercase().as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" | "cjs" => "text/javascript; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "txt" | "log" => "text/plain; charset=utf-8",
+        "md" | "markdown" => "text/markdown; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        "yaml" | "yml" => "application/yaml; charset=utf-8",
+        "toml" => "application/toml; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        "bmp" => "image/bmp",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "wasm" => "application/wasm",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
+    }
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn forbidden_static() -> Value {
+    record(vec![("status", Value::str("forbidden"))])
+}
+
+/// `__http_resolve_static(root, reqPath, indexFile?, dotfiles?, alreadyDecoded?)`: resolves a
+/// URL path safely inside `root`, preventing path traversal (`..`, `%2e%2e`,
+/// backslashes, NUL bytes) and symlink escapes via `fs::canonicalize`.
+fn builtin_resolve_static(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+    let root = string_arg(args, 0, "root")?;
+    if root.is_empty() || root.contains('\0') {
+        return Err("root must be a non-empty valid directory path".to_string());
+    }
+    let req_path = string_arg(args, 1, "reqPath")?;
+    let index_file = optional_string_arg(args, 2, "index")?;
+    let dotfiles = optional_string_arg(args, 3, "dotfiles")?.unwrap_or_else(|| "deny".to_string());
+    if !matches!(dotfiles.as_str(), "deny" | "ignore" | "allow") {
+        return Err(format!(
+            "invalid dotfiles policy `{}` (expected deny, ignore or allow)",
+            dotfiles
+        ));
+    }
+    if let Some(ref idx) = index_file
+        && !idx.is_empty()
+        && (idx.contains('/')
+            || idx.contains('\\')
+            || idx.contains('\0')
+            || idx == "."
+            || idx == "..")
+    {
+        return Err("index must be a plain filename".to_string());
+    }
+
+    let decoded = if bool_arg(args, 4, "alreadyDecoded", false)? {
+        // The router already decoded the path exactly once; decoding again
+        // would let `%2561dmin` slip past prefix middleware as `admin`.
+        if req_path.contains('\0') {
+            return Ok(vec![forbidden_static()]);
+        }
+        req_path.clone()
+    } else {
+        match percent_decode_path(&req_path) {
+            Ok(p) => p,
+            Err(_) => return Ok(vec![forbidden_static()]),
+        }
+    };
+    if decoded.contains('\\') {
+        return Ok(vec![forbidden_static()]);
+    }
+
+    let mut segments: Vec<&str> = Vec::new();
+    for seg in decoded.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            return Ok(vec![forbidden_static()]);
+        }
+        if seg.starts_with('.') {
+            match dotfiles.as_str() {
+                "deny" => return Ok(vec![forbidden_static()]),
+                "ignore" => return Ok(vec![Value::Nil]),
+                _ => {}
+            }
+        }
+        segments.push(seg);
+    }
+
+    // Check bundled assets first (apps built with `neyuki build`).
+    let root_trimmed = root.trim_end_matches(['/', '\\']);
+    let mut bundled_key = if root_trimmed.is_empty() || root_trimmed == "." {
+        segments.join("/")
+    } else if segments.is_empty() {
+        root_trimmed.to_string()
+    } else {
+        format!("{}/{}", root_trimmed, segments.join("/"))
+    };
+    if matches!(crate::app::entry(&bundled_key), Some(Entry::Dir)) {
+        if let Some(ref idx) = index_file
+            && !idx.is_empty()
+        {
+            if bundled_key.is_empty() {
+                bundled_key = idx.clone();
+            } else {
+                bundled_key.push('/');
+                bundled_key.push_str(idx);
+            }
+        } else {
+            return Ok(vec![Value::Nil]);
+        }
+    }
+    if matches!(crate::app::entry(&bundled_key), Some(Entry::File { .. }))
+        && let Some(Ok(bytes)) = crate::app::read(&bundled_key)
+    {
+        let size = bytes.len() as u64;
+        let etag = format!("W/\"{:x}-{:x}\"", size, fnv1a_64(&bytes));
+        let mime = mime_for_path(Path::new(&bundled_key));
+        return Ok(vec![record(vec![
+            ("status", Value::str("ok")),
+            ("bundled", Value::Bool(true)),
+            ("path", Value::string(bundled_key)),
+            ("size", integer(size)),
+            ("etag", Value::string(etag)),
+            ("contentType", Value::str(mime)),
+        ])]);
+    }
+
+    vm.permissions.check_read(&root)?;
+    let Ok(canon_root) = fs::canonicalize(&root) else {
+        return Ok(vec![Value::Nil]);
+    };
+    if !canon_root.is_dir() {
+        return Ok(vec![Value::Nil]);
+    }
+
+    let mut candidate = canon_root.clone();
+    for seg in &segments {
+        candidate.push(seg);
+    }
+    if candidate.is_dir() {
+        if let Some(ref idx) = index_file
+            && !idx.is_empty()
+        {
+            candidate.push(idx);
+        } else {
+            return Ok(vec![Value::Nil]);
+        }
+    }
+    if !candidate.exists() {
+        return Ok(vec![Value::Nil]);
+    }
+    let Ok(canon_target) = fs::canonicalize(&candidate) else {
+        return Ok(vec![Value::Nil]);
+    };
+    // Prevent symlink escapes outside the static root directory.
+    if !canon_target.starts_with(&canon_root) {
+        return Ok(vec![forbidden_static()]);
+    }
+    let Ok(meta) = fs::metadata(&canon_target) else {
+        return Ok(vec![Value::Nil]);
+    };
+    if !meta.is_file() {
+        return Ok(vec![Value::Nil]);
+    }
+    let target_str = canon_target
+        .to_str()
+        .ok_or_else(|| "static file path is not valid UTF-8".to_string())?
+        .to_string();
+    vm.permissions.check_read(&target_str)?;
+
+    let size = meta.len();
+    let (mtime_secs, mtime_nanos) = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or((0, 0), |d| (d.as_secs(), d.subsec_nanos()));
+    let etag = format!("W/\"{:x}-{:x}-{:x}\"", size, mtime_secs, mtime_nanos);
+    let mime = mime_for_path(&canon_target);
+
+    Ok(vec![record(vec![
+        ("status", Value::str("ok")),
+        ("bundled", Value::Bool(false)),
+        ("path", Value::string(target_str)),
+        ("size", integer(size)),
+        ("etag", Value::string(etag)),
+        ("contentType", Value::str(mime)),
+    ])])
+}
+
+/// `__http_respond_file(request, status, headers?, path, isBundled, headOnly)`:
+/// streams a resolved file (or bundled asset) to a parked request without
+/// UTF-8 conversion or buffering large disk files in VM memory.
+fn builtin_respond_file(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+    let id = integer_arg(args, 0, "request")?;
+    let status = integer_arg(args, 1, "status")?;
+    if !(100..=999).contains(&status) {
+        return Err(format!("invalid status code {}", status));
+    }
+    let headers = headers_arg(args, 2, "headers")?;
+    let path = string_arg(args, 3, "path")?;
+    let is_bundled = bool_arg(args, 4, "isBundled", false)?;
+    let head_only = bool_arg(args, 5, "headOnly", false)?;
+
+    let has_content_length = headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+
+    let mut prepared_headers: Vec<tiny_http::Header> = Vec::with_capacity(headers.len() + 1);
+    for (name, value) in headers {
+        let header = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes())
+            .map_err(|_| format!("invalid header `{}: {}`", name, value))?;
+        prepared_headers.push(header);
+    }
+
+    if is_bundled {
+        let bytes = crate::app::read(&path)
+            .ok_or_else(|| format!("bundled asset `{}` not found", path))?
+            .map_err(|err| format!("cannot read bundled asset `{}`: {}", path, err))?;
+        let len = bytes.len();
+        let (request, _) = PENDING
+            .with(|pending| pending.borrow_mut().remove(&id))
+            .ok_or_else(|| "request was already answered".to_string())?;
+        let mut response =
+            tiny_http::Response::from_data(if head_only { Vec::new() } else { bytes })
+                .with_status_code(tiny_http::StatusCode(status as u16));
+        for header in prepared_headers {
+            response.add_header(header);
+        }
+        if head_only
+            && !has_content_length
+            && let Ok(cl) =
+                tiny_http::Header::from_bytes("Content-Length", len.to_string().as_bytes())
+        {
+            response.add_header(cl);
+        }
+        request
+            .respond(response)
+            .map_err(|err| format!("cannot send file response: {}", err))?;
+        return Ok(vec![Value::Nil]);
+    }
+
+    vm.permissions.check_read(&path)?;
+    let file = fs::File::open(&path).map_err(|err| format!("cannot open `{}`: {}", path, err))?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let (request, _) = PENDING
+        .with(|pending| pending.borrow_mut().remove(&id))
+        .ok_or_else(|| "request was already answered".to_string())?;
+
+    if head_only {
+        drop(file);
+        let mut response = tiny_http::Response::from_data(Vec::new())
+            .with_status_code(tiny_http::StatusCode(status as u16));
+        for header in prepared_headers {
+            response.add_header(header);
+        }
+        if !has_content_length
+            && let Ok(cl) =
+                tiny_http::Header::from_bytes("Content-Length", len.to_string().as_bytes())
+        {
+            response.add_header(cl);
+        }
+        request
+            .respond(response)
+            .map_err(|err| format!("cannot send file response: {}", err))?;
+    } else {
+        let mut response = tiny_http::Response::from_file(file)
+            .with_status_code(tiny_http::StatusCode(status as u16));
+        for header in prepared_headers {
+            response.add_header(header);
+        }
+        request
+            .respond(response)
+            .map_err(|err| format!("cannot send file response: {}", err))?;
+    }
+    Ok(vec![Value::Nil])
+}
+
+// ---------------------------------------------------------------------------
+// multipart/form-data parser (RFC 7578)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct MultipartLimits {
+    max_parts: usize,
+    max_field_size: usize,
+    max_file_size: usize,
+    max_header_bytes: usize,
+}
+
+impl Default for MultipartLimits {
+    fn default() -> Self {
+        Self {
+            max_parts: 256,
+            max_field_size: 1024 * 1024,
+            max_file_size: 16 * 1024 * 1024,
+            max_header_bytes: 16 * 1024,
+        }
+    }
+}
+
+fn extract_boundary(content_type: &str) -> Result<Vec<u8>, String> {
+    let mut parts = content_type.split(';');
+    let media = parts.next().unwrap_or("").trim();
+    if !media.eq_ignore_ascii_case("multipart/form-data") {
+        return Err(format!(
+            "expected multipart/form-data Content-Type, got `{}`",
+            media
+        ));
+    }
+    for param in parts {
+        let param = param.trim();
+        let Some((key, val)) = param.split_once('=') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("boundary") {
+            continue;
+        }
+        let raw = val.trim();
+        let unquoted = if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+            &raw[1..raw.len() - 1]
+        } else {
+            raw
+        };
+        if unquoted.is_empty() || unquoted.len() > 70 {
+            return Err("multipart boundary must be between 1 and 70 bytes".to_string());
+        }
+        if unquoted
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7f || b == b'\r' || b == b'\n')
+        {
+            return Err("multipart boundary contains invalid control bytes".to_string());
+        }
+        return Ok(unquoted.as_bytes().to_vec());
+    }
+    Err("missing boundary parameter in multipart/form-data Content-Type".to_string())
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    memchr::memmem::find(haystack, needle)
+}
+
+fn parse_disposition(header: &str) -> Result<(String, Option<String>), String> {
+    let mut segments = header.split(';');
+    let disp_type = segments.next().unwrap_or("").trim();
+    if !disp_type.eq_ignore_ascii_case("form-data") {
+        return Err(format!(
+            "unsupported Content-Disposition `{}` (expected form-data)",
+            disp_type
+        ));
+    }
+    let mut name: Option<String> = None;
+    let mut filename: Option<String> = None;
+    let mut filename_star: Option<String> = None;
+
+    for param in segments {
+        let param = param.trim();
+        let Some((raw_k, raw_v)) = param.split_once('=') else {
+            continue;
+        };
+        let key = raw_k.trim().to_ascii_lowercase();
+        let val = raw_v.trim();
+        let decoded_val = if val.len() >= 2 && val.starts_with('"') && val.ends_with('"') {
+            let inner = &val[1..val.len() - 1];
+            let mut out = String::with_capacity(inner.len());
+            let mut chars = inner.chars();
+            while let Some(ch) = chars.next() {
+                if ch == '\\'
+                    && let Some(escaped) = chars.next()
+                {
+                    out.push(escaped);
+                } else {
+                    out.push(ch);
+                }
+            }
+            out
+        } else {
+            val.to_string()
+        };
+        match key.as_str() {
+            "name" => name = Some(decoded_val),
+            "filename" => filename = Some(decoded_val),
+            "filename*" => {
+                // RFC 5987: charset'lang'percent-encoded
+                if let Some((_, rest)) = decoded_val.split_once("''")
+                    && let Ok(decoded) = percent_decode_path(rest)
+                {
+                    filename_star = Some(decoded);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let field_name =
+        name.ok_or_else(|| "multipart part is missing Content-Disposition name".to_string())?;
+    Ok((field_name, filename_star.or(filename)))
+}
+
+fn insert_multi_field(table: &mut VmTable, key: &str, value: Value) {
+    let existing = table.get_str(key);
+    match existing {
+        Value::Nil => table.set_str(key, value),
+        Value::Table(ref arr)
+            if arr.borrow().fields.is_empty() && !arr.borrow().array.is_empty() =>
+        {
+            // Check whether existing is already a promoted list (not a FilePart record).
+            arr.borrow_mut().array.push(value);
+        }
+        prev => {
+            let mut list = VmTable::with_capacity(2, 0);
+            list.array.push(prev);
+            list.array.push(value);
+            table.set_str(key, Value::Table(Rc::new(RefCell::new(list))));
+        }
+    }
+}
+
+/// Parses an RFC 7578 `multipart/form-data` payload from raw bytes with
+/// default DoS limits (also used by fuzz tests).
+pub fn parse_multipart_bytes(body: &[u8], content_type: &str) -> Result<Value, String> {
+    parse_multipart_bytes_with_limits(body, content_type, MultipartLimits::default())
+}
+
+fn parse_multipart_bytes_with_limits(
+    body: &[u8],
+    content_type: &str,
+    limits: MultipartLimits,
+) -> Result<Value, String> {
+    let boundary = extract_boundary(content_type)?;
+    let mut dash_boundary = Vec::with_capacity(boundary.len() + 2);
+    dash_boundary.extend_from_slice(b"--");
+    dash_boundary.extend_from_slice(&boundary);
+
+    let first = find_bytes(body, &dash_boundary)
+        .ok_or_else(|| "multipart body does not contain opening boundary".to_string())?;
+    let mut pos = first + dash_boundary.len();
+
+    let mut fields = VmTable::new();
+    let mut files = VmTable::new();
+    let mut parts_list: Vec<Value> = Vec::new();
+    let mut part_count = 0usize;
+
+    loop {
+        if body.get(pos..pos + 2) == Some(b"--") {
+            break;
+        }
+        if body.get(pos..pos + 2) == Some(b"\r\n") {
+            pos += 2;
+        } else if body.get(pos) == Some(&b'\n') {
+            pos += 1;
+        } else {
+            return Err("malformed multipart boundary delimiter".to_string());
+        }
+
+        part_count += 1;
+        if part_count > limits.max_parts {
+            return Err(format!(
+                "multipart body exceeds maxParts limit ({})",
+                limits.max_parts
+            ));
+        }
+
+        let remaining = &body[pos..];
+        let header_search_len = remaining.len().min(limits.max_header_bytes + 4);
+        let header_slice = &remaining[..header_search_len];
+        let (header_end, sep_len) = match (
+            find_bytes(header_slice, b"\r\n\r\n"),
+            find_bytes(header_slice, b"\n\n"),
+        ) {
+            (Some(a), Some(b)) if a <= b => (a, 4),
+            (Some(_), Some(b)) => (b, 2),
+            (Some(a), None) => (a, 4),
+            (None, Some(b)) => (b, 2),
+            (None, None) => {
+                return Err(format!(
+                    "multipart part headers are unterminated or exceed {} bytes",
+                    limits.max_header_bytes
+                ));
+            }
+        };
+        if header_end > limits.max_header_bytes {
+            return Err(format!(
+                "multipart part headers exceed {} bytes",
+                limits.max_header_bytes
+            ));
+        }
+
+        let headers_text = std::str::from_utf8(&remaining[..header_end])
+            .map_err(|_| "multipart part headers are not valid UTF-8".to_string())?;
+        let mut disposition: Option<String> = None;
+        let mut part_ct: Option<String> = None;
+        for line in headers_text.lines() {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
+            let Some((hname, hval)) = line.split_once(':') else {
+                return Err("malformed multipart part header".to_string());
+            };
+            if hname.trim().eq_ignore_ascii_case("content-disposition") {
+                disposition = Some(hval.trim().to_string());
+            } else if hname.trim().eq_ignore_ascii_case("content-type") {
+                part_ct = Some(hval.trim().to_string());
+            }
+        }
+        let disp_header = disposition
+            .ok_or_else(|| "multipart part is missing Content-Disposition".to_string())?;
+        let (field_name, filename) = parse_disposition(&disp_header)?;
+
+        let data_start = pos + header_end + sep_len;
+        let rest = &body[data_start..];
+        // Both `\r\n--boundary` and `\n--boundary` end with `\n--boundary`,
+        // so one `memmem::find` locates the next boundary in a single pass.
+        let mut lf_delim = Vec::with_capacity(dash_boundary.len() + 1);
+        lf_delim.push(b'\n');
+        lf_delim.extend_from_slice(&dash_boundary);
+
+        let Some(lf_pos) = find_bytes(rest, &lf_delim) else {
+            return Err("unterminated multipart body (missing closing boundary)".to_string());
+        };
+        let data_end = if lf_pos > 0 && rest[lf_pos - 1] == b'\r' {
+            lf_pos - 1
+        } else {
+            lf_pos
+        };
+        let next_pos = data_start + lf_pos + lf_delim.len();
+        let payload = &rest[..data_end];
+        pos = next_pos;
+
+        if let Some(filename) = filename {
+            if payload.len() > limits.max_file_size {
+                return Err(format!(
+                    "uploaded file `{}` exceeds maxFileSize ({} bytes)",
+                    field_name, limits.max_file_size
+                ));
+            }
+            let ct = part_ct.unwrap_or_else(|| "application/octet-stream".to_string());
+            let file_record = record(vec![
+                ("name", Value::string(field_name.clone())),
+                ("filename", Value::string(filename)),
+                ("contentType", Value::string(ct)),
+                ("size", integer(payload.len() as u64)),
+                (
+                    "data",
+                    Value::Buffer(Rc::new(RefCell::new(VmBuffer::from_bytes(
+                        payload.to_vec(),
+                    )))),
+                ),
+            ]);
+            insert_multi_field(&mut files, &field_name, file_record.clone());
+            parts_list.push(file_record);
+        } else {
+            if payload.len() > limits.max_field_size {
+                return Err(format!(
+                    "multipart field `{}` exceeds maxFieldSize ({} bytes)",
+                    field_name, limits.max_field_size
+                ));
+            }
+            let text = bytes_to_string(payload.to_vec());
+            let ct = part_ct.unwrap_or_else(|| "text/plain".to_string());
+            insert_multi_field(&mut fields, &field_name, Value::string(text.clone()));
+            parts_list.push(record(vec![
+                ("name", Value::string(field_name)),
+                ("value", Value::string(text)),
+                ("contentType", Value::string(ct)),
+                ("size", integer(payload.len() as u64)),
+            ]));
+        }
+    }
+
+    Ok(record(vec![
+        ("fields", Value::Table(Rc::new(RefCell::new(fields)))),
+        ("files", Value::Table(Rc::new(RefCell::new(files)))),
+        ("parts", crate::vm::libs::args::array(parts_list)),
+    ]))
+}
+
+/// `__http_parse_multipart(source, contentType, maxParts?, maxFieldSize?,
+/// maxFileSize?, maxHeaderBytes?)`: parses a `multipart/form-data` payload
+/// from a parked request id (using lossless raw bytes), a `Buffer`, or a string.
+fn builtin_parse_multipart(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+    let content_type = string_arg(args, 1, "contentType")?;
+    let mut limits = MultipartLimits::default();
+    if !matches!(args.get(2), None | Some(Value::Nil)) {
+        limits.max_parts = integer_arg(args, 2, "maxParts")? as usize;
+    }
+    if !matches!(args.get(3), None | Some(Value::Nil)) {
+        limits.max_field_size = integer_arg(args, 3, "maxFieldSize")? as usize;
+    }
+    if !matches!(args.get(4), None | Some(Value::Nil)) {
+        limits.max_file_size = integer_arg(args, 4, "maxFileSize")? as usize;
+    }
+    if !matches!(args.get(5), None | Some(Value::Nil)) {
+        limits.max_header_bytes = integer_arg(args, 5, "maxHeaderBytes")? as usize;
+    }
+
+    let result = match args.first() {
+        Some(Value::Int(id)) if *id > 0 => {
+            let req_id = *id as u64;
+            PENDING.with(|pending| {
+                let map = pending.borrow();
+                let (_, raw_bytes) = map
+                    .get(&req_id)
+                    .ok_or_else(|| "request was already answered".to_string())?;
+                parse_multipart_bytes_with_limits(raw_bytes, &content_type, limits)
+            })?
+        }
+        Some(Value::Buffer(buf)) => {
+            let borrowed = buf.borrow();
+            parse_multipart_bytes_with_limits(&borrowed.data, &content_type, limits)?
+        }
+        Some(Value::String(s)) => {
+            parse_multipart_bytes_with_limits(s.as_bytes(), &content_type, limits)?
+        }
+        None | Some(Value::Nil) => return Err("source must be provided".to_string()),
+        Some(other) => {
+            return Err(format!(
+                "source must be a request, buffer or string, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    Ok(vec![result])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1476,5 +2362,198 @@ mod tests {
             panic!("a body of exactly maxBody should be accepted: {}", err);
         }
         server.join().unwrap();
+    }
+
+    #[test]
+    fn test_headers_arg_supports_multi_value_and_blocks_crlf() {
+        let mut h = VmTable::new();
+        let mut cookies = VmTable::new();
+        cookies.array.push(Value::str("a=1; HttpOnly"));
+        cookies.array.push(Value::str("b=2; Path=/"));
+        h.set_str("set-cookie", Value::Table(Rc::new(RefCell::new(cookies))));
+        let parsed = headers_arg(&[Value::Table(Rc::new(RefCell::new(h)))], 0, "headers").unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("set-cookie".to_string(), "a=1; HttpOnly".to_string()),
+                ("set-cookie".to_string(), "b=2; Path=/".to_string()),
+            ]
+        );
+
+        let mut bad = VmTable::new();
+        bad.set_str("x-test", Value::str("ok\r\nSet-Cookie: evil=1"));
+        assert!(
+            headers_arg(&[Value::Table(Rc::new(RefCell::new(bad)))], 0, "headers").is_err(),
+            "CRLF header injection must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_path_decode_preserves_plus_and_blocks_nul() {
+        assert_eq!(percent_decode_path("c++%20guide").unwrap(), "c++ guide");
+        assert!(percent_decode_path("foo%00bar").is_err());
+        assert!(percent_decode_path("50%").is_err());
+    }
+
+    #[test]
+    fn test_resolve_static_blocks_traversal_dotfiles_and_symlink_escape() {
+        use std::sync::atomic::AtomicU64;
+        static CNT: AtomicU64 = AtomicU64::new(0);
+        let n = CNT.fetch_add(1, Ordering::Relaxed);
+        let base =
+            std::env::temp_dir().join(format!("neyuki_http_static_{}_{}", std::process::id(), n));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("public");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("hello.txt"), "hello").unwrap();
+        fs::write(root.join(".env"), "SECRET=1").unwrap();
+        let outside = base.join("secret.txt");
+        fs::write(&outside, "top-secret").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("escape.txt")).unwrap();
+
+        let mut vm = VM::new();
+        let root_str = root.to_string_lossy().into_owned();
+
+        let ok = builtin_resolve_static(
+            &mut vm,
+            &[
+                Value::string(root_str.clone()),
+                Value::str("/hello.txt"),
+                Value::str("index.html"),
+                Value::str("deny"),
+            ],
+        )
+        .unwrap();
+        let Value::Table(rec) = &ok[0] else {
+            panic!("expected resolved record");
+        };
+        assert_eq!(rec.borrow().get_str("status"), Value::str("ok"));
+
+        for bad_path in [
+            "/../secret.txt",
+            "/%2e%2e/secret.txt",
+            "/..\\secret.txt",
+            "/.env",
+            "/hello.txt%00.png",
+        ] {
+            let res = builtin_resolve_static(
+                &mut vm,
+                &[
+                    Value::string(root_str.clone()),
+                    Value::str(bad_path),
+                    Value::str("index.html"),
+                    Value::str("deny"),
+                ],
+            )
+            .unwrap();
+            let Value::Table(rec) = &res[0] else {
+                panic!("expected forbidden record for {}", bad_path);
+            };
+            assert_eq!(
+                rec.borrow().get_str("status"),
+                Value::str("forbidden"),
+                "path `{}` must be forbidden",
+                bad_path
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let res = builtin_resolve_static(
+                &mut vm,
+                &[
+                    Value::string(root_str.clone()),
+                    Value::str("/escape.txt"),
+                    Value::str("index.html"),
+                    Value::str("deny"),
+                ],
+            )
+            .unwrap();
+            let Value::Table(rec) = &res[0] else {
+                panic!("expected forbidden record for symlink escape");
+            };
+            assert_eq!(rec.borrow().get_str("status"), Value::str("forbidden"));
+        }
+
+        // An already-decoded path is not decoded a second time: a literal `%`
+        // in a file name resolves, and `%61` stays literal instead of `a`.
+        fs::write(root.join("100%.txt"), "percent").unwrap();
+        let pre = |path: &str, vm: &mut VM| {
+            builtin_resolve_static(
+                vm,
+                &[
+                    Value::string(root_str.clone()),
+                    Value::str(path),
+                    Value::str("index.html"),
+                    Value::str("deny"),
+                    Value::Bool(true),
+                ],
+            )
+            .unwrap()
+        };
+        let Value::Table(rec) = &pre("/100%.txt", &mut vm)[0] else {
+            panic!("expected resolved record for literal percent file");
+        };
+        assert_eq!(rec.borrow().get_str("status"), Value::str("ok"));
+        assert!(matches!(pre("/%68ello.txt", &mut vm)[0], Value::Nil));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_multipart_preserves_binary_bytes_and_enforces_limits() {
+        let png_bytes: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff];
+        let mut body = Vec::new();
+        body.extend_from_slice(b"--bound123\r\n");
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"title\"\r\n\r\n");
+        body.extend_from_slice(b"avatar\r\n");
+        body.extend_from_slice(b"--bound123\r\n");
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"pic.png\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: image/png\r\n\r\n");
+        body.extend_from_slice(png_bytes);
+        body.extend_from_slice(b"\r\n--bound123--\r\n");
+
+        let parsed =
+            parse_multipart_bytes(&body, "multipart/form-data; boundary=bound123").unwrap();
+        let Value::Table(tbl) = parsed else {
+            panic!("expected table");
+        };
+        let Value::Table(fields) = tbl.borrow().get_str("fields") else {
+            panic!("expected fields table");
+        };
+        assert_eq!(fields.borrow().get_str("title"), Value::str("avatar"));
+
+        let Value::Table(files) = tbl.borrow().get_str("files") else {
+            panic!("expected files table");
+        };
+        let Value::Table(file) = files.borrow().get_str("file") else {
+            panic!("expected file record");
+        };
+        assert_eq!(file.borrow().get_str("filename"), Value::str("pic.png"));
+        assert_eq!(
+            file.borrow().get_str("contentType"),
+            Value::str("image/png")
+        );
+        let Value::Buffer(buf) = file.borrow().get_str("data") else {
+            panic!("expected binary Buffer");
+        };
+        assert_eq!(buf.borrow().data.as_slice(), png_bytes);
+
+        // Exceeding maxFileSize must return an error.
+        let small = MultipartLimits {
+            max_file_size: 4,
+            ..MultipartLimits::default()
+        };
+        let err = parse_multipart_bytes_with_limits(
+            &body,
+            "multipart/form-data; boundary=bound123",
+            small,
+        )
+        .unwrap_err();
+        assert!(err.contains("maxFileSize"), "{}", err);
     }
 }

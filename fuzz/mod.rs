@@ -46,6 +46,7 @@ pub fn run_all_fuzz_tests() {
     libs::lib_fuzz::fuzz_number_parsing_and_radix();
     libs::lib_fuzz::fuzz_crypto_boundaries();
     libs::lib_fuzz::fuzz_markdown_parser_and_xss();
+    libs::lib_fuzz::fuzz_http_multipart_and_cookies();
 
     println!("=== All Fuzz Tests Passed Cleanly ===");
 }
