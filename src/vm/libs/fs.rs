@@ -27,6 +27,10 @@ pub(crate) const NATIVES: &[NativeDef] = &[
         func: builtin_read,
     },
     NativeDef {
+        name: "__fs_read_buffer",
+        func: builtin_read_buffer,
+    },
+    NativeDef {
         name: "__fs_write",
         func: builtin_write,
     },
@@ -139,6 +143,44 @@ fn builtin_read(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         move || fs::read_to_string(&path).map_err(|err| io_error("read", &path, err)),
         |_vm, text| Ok(vec![Value::string(text)]),
     )
+}
+
+/// The largest file `readBuffer` reads, the size limit of a buffer.
+const MAX_BUFFER: u64 = crate::vm::libs::buffer::MAX_SIZE as u64;
+
+fn too_large(path: &str) -> String {
+    format!(
+        "cannot read `{}`: larger than the {} GiB buffer limit",
+        path,
+        MAX_BUFFER / (1024 * 1024 * 1024)
+    )
+}
+
+/// `__fs_read_buffer(path)`: the bytes of a file, from the app bundle or
+/// the disk, as a buffer. Like `read`, but for any bytes, not just UTF-8.
+fn builtin_read_buffer(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+    let path = str_arg(args, 0, "path")?.to_string();
+    if let Some(bytes) = read_bundled(&path) {
+        return crate::vm::libs::buffer::new_buffer(vm, bytes?);
+    }
+    vm.permissions.check_read(&path)?;
+    let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    if size > MAX_BUFFER {
+        return Err(too_large(&path));
+    }
+    let read = move || {
+        let bytes = fs::read(&path).map_err(|err| io_error("read", &path, err))?;
+        if bytes.len() as u64 > MAX_BUFFER {
+            return Err(too_large(&path));
+        }
+        Ok(bytes)
+    };
+    if size < BACKGROUND_READ {
+        let bytes = read()?;
+        return crate::vm::libs::buffer::new_buffer(vm, bytes);
+    }
+    // Inside a task only that task waits; see `background::run`.
+    crate::vm::libs::background::run(vm, read, crate::vm::libs::buffer::new_buffer)
 }
 
 fn builtin_write(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {

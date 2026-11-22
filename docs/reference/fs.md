@@ -18,6 +18,15 @@ end
 
 The contents of a text file.
 
+## fs.readBuffer(path: string): buffer
+
+The contents of any file as a [buffer](buffer.md), for binary formats such as images and sounds. Like `fs.read`, it reads a built app's own files and checks the sandbox; files of 1 MiB or more are read without blocking other tasks. Raises an error for a file over the 1 GiB buffer limit.
+
+```lua
+local png = fs.readBuffer("logo.png")
+print(buffer.readstring(png, 1, 3)) --> PNG
+```
+
 ## fs.write(path: string, text: string): ()
 
 Replaces the contents of a file, creating it if needed.

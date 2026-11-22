@@ -115,4 +115,19 @@ assert(fs.dirname("docs/guide.md") == "docs" and fs.dirname("guide.md") == ".", 
 assert(fs.extension("a.tar.gz") == ".gz" and fs.extension(".gitignore") == "", "extension")
 assert(fs.absolute("x") == fs.join(fs.cwd(), "x") or #fs.absolute("x") > 1, "absolute")
 
+-- readBuffer: any bytes, not just UTF-8
+local png = fs.readBuffer("tests/fixtures/dot.png")
+assert(type(png) == "buffer" and buffer.readstring(png, 1, 3) == "PNG", "readBuffer reads binary files")
+assert(buffer.readu8(png, 0) == 0x89, "readBuffer keeps bytes that are not UTF-8")
+local okMissing, missingErr = try(fs.readBuffer, "tests/fixtures/missing.bin")
+assert(not okMissing and string.find(missingErr, "cannot read", 1, true) != nil, "readBuffer reports a missing file")
+assert(not try(fs.readBuffer, nil), "readBuffer needs a path")
+local big = dir .. "-big.bin"
+fs.write(big, string.rep("x", 1024 * 1024 + 3))
+local size = nil
+task.spawn(function() size = buffer.len(fs.readBuffer(big)) end)
+while size == nil do task.wait(0.01) end
+assert(size == 1024 * 1024 + 3, "readBuffer reads large files inside a task")
+fs.remove(big)
+
 print("[pass] fs operations")

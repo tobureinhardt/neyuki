@@ -128,6 +128,12 @@ function fs.read(path: string): string
     return __fs_read(path)
 end
 
+-- The contents of any file, text or not, as a buffer.
+function fs.readBuffer(path: string): buffer
+    checkString(path, "path")
+    return __fs_read_buffer(path)
+end
+
 -- Replaces the contents of a file, creating it if needed.
 function fs.write(path: string, text: string): ()
     checkString(path, "path")

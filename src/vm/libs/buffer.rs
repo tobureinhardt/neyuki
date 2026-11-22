@@ -16,7 +16,7 @@ use crate::vm::libs::args::{bool_arg, str_arg};
 use crate::vm::machine::VM;
 use crate::vm::value::{Value, VmTable};
 
-const MAX_SIZE: usize = 1024 * 1024 * 1024;
+pub(crate) const MAX_SIZE: usize = 1024 * 1024 * 1024;
 
 fn buffer_arg<'a>(
     args: &'a [Value],
