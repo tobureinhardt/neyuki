@@ -1484,6 +1484,60 @@ return path .. \" \" .. params.name .. \" \" .. http.encode(\"a b\")";
         assert_eq!(run_code(code).to_string(), "true");
     }
 
+    #[test]
+    fn test_licm_does_not_hoist_reads_of_captured_locals() {
+        // Without guarding captured uses in LICM, reading `done` in the loop
+        // header is hoisted into a preheader Move copy and the loop ignores
+        // updates written via SETUPVAL inside `setDone`, a metamethod, or a task.
+        let code = r#"
+        local function loopHeaderCapture()
+            local done = false
+            local function setDone()
+                done = true
+            end
+            local iters = 0
+            while not done and iters < 10 do
+                iters += 1
+                if iters == 2 then setDone() end
+            end
+            return iters == 2 and done == true
+        end
+
+        local function loopBodyCapture()
+            local val = 1
+            local function bump()
+                val += 10
+            end
+            local sum = 0
+            for i = 1, 3 do
+                local snapshot = val
+                sum += snapshot
+                bump()
+            end
+            return sum == (1 + 11 + 21)
+        end
+
+        local function metamethodCapture()
+            local flag = false
+            local obj = setmetatable({}, {
+                __index = function()
+                    flag = true
+                    return 1
+                end
+            })
+            local steps = 0
+            while not flag and steps < 5 do
+                local _ = obj.x
+                steps += 1
+            end
+            return steps == 1 and flag == true
+        end
+
+        return loopHeaderCapture() and loopBodyCapture() and metamethodCapture()
+        "#;
+        assert_eq!(run_code(code).to_string(), "true");
+    }
+
     fn compile_src(src: &str) -> Proto {
         let mut parser = Parser::new(src);
         let (stmts, _pool) = parser.parse_program().expect("parse failed");
@@ -1943,5 +1997,35 @@ return path .. \" \" .. params.name .. \" \" .. http.encode(\"a b\")";
         );
         let mut vm = VM::new();
         assert_eq!(vm.execute(proto).expect("exec").to_string(), "2584");
+    }
+
+    #[test]
+    fn test_captured_local_mutated_by_metamethod_and_loop() {
+        let code = r#"
+            local x = 1
+            local t = setmetatable({}, {
+                __add = function(_, _)
+                    x = 10
+                    return 0
+                end,
+            })
+            local side = t + 1
+            local after_add = x + 1 + side
+
+            local done = false
+            local flips = 0
+            local step = function()
+                flips = flips + 1
+                if flips >= 3 then
+                    done = true
+                end
+            end
+            while not done do
+                step()
+            end
+
+            return tostring(after_add) .. ":" .. tostring(flips)
+        "#;
+        assert_eq!(run_code(code).to_string(), "11:3");
     }
 }

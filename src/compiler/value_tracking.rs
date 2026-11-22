@@ -394,6 +394,7 @@ impl ValueTracker {
 
     /// Runs fixed-point dataflow analysis over the ControlFlowGraph.
     pub fn analyze(&mut self, cfg: &ControlFlowGraph) {
+        let captured = crate::compiler::ir::opt::captured_vars(cfg);
         let mut worklist = VecDeque::new();
         let mut in_worklist = new_set();
 
@@ -438,18 +439,43 @@ impl ValueTracker {
                         state.insert(*dst, TrackedValue::Const(IrConstant::Nil));
                     }
                     IrInst::Move { dst, src } => {
-                        let val = state.get(src).cloned().unwrap_or(TrackedValue::Bottom);
+                        let val = if captured.contains(src) {
+                            TrackedValue::Bottom
+                        } else {
+                            state.get(src).cloned().unwrap_or(TrackedValue::Bottom)
+                        };
                         state.insert(*dst, val);
                     }
                     IrInst::BinOp { dst, op, lhs, rhs } => {
-                        let l_val = state.get(lhs).cloned().unwrap_or(TrackedValue::Bottom);
-                        let r_val = state.get(rhs).cloned().unwrap_or(TrackedValue::Bottom);
+                        let l_val = if captured.contains(lhs) {
+                            TrackedValue::Bottom
+                        } else {
+                            state.get(lhs).cloned().unwrap_or(TrackedValue::Bottom)
+                        };
+                        let r_val = if captured.contains(rhs) {
+                            TrackedValue::Bottom
+                        } else {
+                            state.get(rhs).cloned().unwrap_or(TrackedValue::Bottom)
+                        };
                         let res = eval_binop(*op, &l_val, &r_val);
+                        if !matches!(res, TrackedValue::Const(_)) && !captured.is_empty() {
+                            state.retain(|var, _| !captured.contains(var));
+                        }
                         state.insert(*dst, res);
                     }
                     IrInst::UnOp { dst, op, src } => {
-                        let s_val = state.get(src).cloned().unwrap_or(TrackedValue::Bottom);
+                        let s_val = if captured.contains(src) {
+                            TrackedValue::Bottom
+                        } else {
+                            state.get(src).cloned().unwrap_or(TrackedValue::Bottom)
+                        };
                         let res = eval_unop(*op, &s_val);
+                        if !matches!(res, TrackedValue::Const(_))
+                            && *op != IrUnaryOp::Not
+                            && !captured.is_empty()
+                        {
+                            state.retain(|var, _| !captured.contains(var));
+                        }
                         state.insert(*dst, res);
                     }
                     IrInst::NewTable { dst, .. } => {
@@ -467,9 +493,24 @@ impl ValueTracker {
                         state.insert(*dst, phi_val);
                     }
                     IrInst::Call { dsts, .. } => {
+                        if !captured.is_empty() {
+                            state.retain(|var, _| !captured.contains(var));
+                        }
                         for dst in dsts {
                             state.insert(*dst, TrackedValue::Bottom);
                         }
+                    }
+                    IrInst::Spread { .. }
+                    | IrInst::TForCall { .. }
+                    | IrInst::GetTable { .. }
+                    | IrInst::SetTable { .. }
+                    | IrInst::AppendArray { .. } => {
+                        if !captured.is_empty() {
+                            state.retain(|var, _| !captured.contains(var));
+                        }
+                        inst.for_each_def(|dst| {
+                            state.insert(dst, TrackedValue::Bottom);
+                        });
                     }
                     other => {
                         if let Some(dst) = other.def_var() {
@@ -517,7 +558,9 @@ pub fn value_tracking_cfg(cfg: &mut ControlFlowGraph) -> bool {
                     optimized_instructions.push(inst);
                 }
                 IrInst::Move { dst, src } => {
-                    let const_opt = if let Some(TrackedValue::Const(c)) = state.get(&src) {
+                    let const_opt = if !captured.contains(&src)
+                        && let Some(TrackedValue::Const(c)) = state.get(&src)
+                    {
                         Some(c.clone())
                     } else {
                         None
@@ -530,52 +573,85 @@ pub fn value_tracking_cfg(cfg: &mut ControlFlowGraph) -> bool {
                         state.insert(dst, TrackedValue::Const(c.clone()));
                         optimized_instructions.push(IrInst::LoadConst { dst, val: c });
                     } else {
-                        let val = state.get(&src).cloned().unwrap_or(TrackedValue::Bottom);
+                        let val = if captured.contains(&src) {
+                            TrackedValue::Bottom
+                        } else {
+                            state.get(&src).cloned().unwrap_or(TrackedValue::Bottom)
+                        };
                         state.insert(dst, val);
                         optimized_instructions.push(inst);
                     }
                 }
                 IrInst::BinOp { dst, op, lhs, rhs } => {
-                    let l_val = state.get(&lhs).cloned().unwrap_or(TrackedValue::Bottom);
-                    let r_val = state.get(&rhs).cloned().unwrap_or(TrackedValue::Bottom);
+                    let l_val = if captured.contains(&lhs) {
+                        TrackedValue::Bottom
+                    } else {
+                        state.get(&lhs).cloned().unwrap_or(TrackedValue::Bottom)
+                    };
+                    let r_val = if captured.contains(&rhs) {
+                        TrackedValue::Bottom
+                    } else {
+                        state.get(&rhs).cloned().unwrap_or(TrackedValue::Bottom)
+                    };
                     let res = eval_binop(op, &l_val, &r_val);
                     let const_opt = if let TrackedValue::Const(ref c) = res {
                         Some(c.clone())
                     } else {
                         None
                     };
-                    state.insert(dst, res);
 
                     if !captured.contains(&dst)
+                        && !captured.contains(&lhs)
+                        && !captured.contains(&rhs)
                         && let Some(c) = const_opt
                     {
                         changed = true;
+                        state.insert(dst, res);
                         optimized_instructions.push(IrInst::LoadConst { dst, val: c });
                     } else {
+                        if !captured.is_empty() {
+                            state.retain(|var, _| !captured.contains(var));
+                        }
+                        state.insert(dst, res);
                         optimized_instructions.push(IrInst::BinOp { dst, op, lhs, rhs });
                     }
                 }
                 IrInst::UnOp { dst, op, src } => {
-                    let s_val = state.get(&src).cloned().unwrap_or(TrackedValue::Bottom);
+                    let s_val = if captured.contains(&src) {
+                        TrackedValue::Bottom
+                    } else {
+                        state.get(&src).cloned().unwrap_or(TrackedValue::Bottom)
+                    };
                     let res = eval_unop(op, &s_val);
                     let const_opt = if let TrackedValue::Const(ref c) = res {
                         Some(c.clone())
                     } else {
                         None
                     };
-                    state.insert(dst, res);
 
                     if !captured.contains(&dst)
+                        && !captured.contains(&src)
                         && let Some(c) = const_opt
                     {
                         changed = true;
+                        state.insert(dst, res);
                         optimized_instructions.push(IrInst::LoadConst { dst, val: c });
                     } else {
+                        if op != IrUnaryOp::Not && !captured.is_empty() {
+                            state.retain(|var, _| !captured.contains(var));
+                        }
+                        state.insert(dst, res);
                         optimized_instructions.push(IrInst::UnOp { dst, op, src });
                     }
                 }
-                IrInst::Call { .. } | IrInst::Spread { .. } => {
-                    // Function calls may execute closures and mutate captured variables.
+                IrInst::Call { .. }
+                | IrInst::Spread { .. }
+                | IrInst::TForCall { .. }
+                | IrInst::GetTable { .. }
+                | IrInst::SetTable { .. }
+                | IrInst::AppendArray { .. } => {
+                    // Calls, iterators and table operations (via metamethods) may
+                    // execute closures and mutate captured variables.
                     if !captured.is_empty() {
                         state.retain(|var, _| !captured.contains(var));
                     }

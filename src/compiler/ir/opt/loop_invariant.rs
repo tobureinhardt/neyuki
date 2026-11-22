@@ -248,7 +248,11 @@ pub fn loop_invariant_code_motion(cfg: &mut ControlFlowGraph, dom: &ImmediateDom
                 if !past_branch && is_hoistable_header(&inst) && defs_hoistable(&inst) {
                     let mut is_invariant = true;
                     inst.for_each_use(|u| {
-                        if loop_defs.contains(&u) && !invariant_defs.contains(&u) {
+                        // A variable captured by a closure may be mutated via
+                        // `SETUPVAL` on any call, yield or metamethod inside the loop.
+                        if captured.contains(&u)
+                            || (loop_defs.contains(&u) && !invariant_defs.contains(&u))
+                        {
                             is_invariant = false;
                         }
                     });
@@ -282,7 +286,9 @@ pub fn loop_invariant_code_motion(cfg: &mut ControlFlowGraph, dom: &ImmediateDom
                 if is_hoistable_body(&inst) && defs_hoistable(&inst) {
                     let mut is_invariant = true;
                     inst.for_each_use(|u| {
-                        if loop_defs.contains(&u) && !invariant_defs.contains(&u) {
+                        if captured.contains(&u)
+                            || (loop_defs.contains(&u) && !invariant_defs.contains(&u))
+                        {
                             is_invariant = false;
                         }
                     });

@@ -285,8 +285,16 @@ pub fn strength_reduction_cfg(cfg: &mut ControlFlowGraph) -> bool {
                     out.push(inst);
                 }
                 IrInst::BinOp { dst, op, lhs, rhs } => {
-                    let l_val = state.get(&lhs).cloned().unwrap_or(TrackedValue::Bottom);
-                    let r_val = state.get(&rhs).cloned().unwrap_or(TrackedValue::Bottom);
+                    let l_val = if captured.contains(&lhs) {
+                        TrackedValue::Bottom
+                    } else {
+                        state.get(&lhs).cloned().unwrap_or(TrackedValue::Bottom)
+                    };
+                    let r_val = if captured.contains(&rhs) {
+                        TrackedValue::Bottom
+                    } else {
+                        state.get(&rhs).cloned().unwrap_or(TrackedValue::Bottom)
+                    };
                     let res_val = eval_binop(op, &l_val, &r_val);
 
                     if !captured.contains(&dst)
@@ -310,13 +318,21 @@ pub fn strength_reduction_cfg(cfg: &mut ControlFlowGraph) -> bool {
                         origins.remove(&dst);
                         out.push(rewritten);
                     } else {
+                        if !captured.is_empty() {
+                            state.retain(|var, _| !captured.contains(var));
+                            origins.retain(|var, _| !captured.contains(var));
+                        }
                         state.insert(dst, res_val);
                         origins.remove(&dst);
                         out.push(IrInst::BinOp { dst, op, lhs, rhs });
                     }
                 }
                 IrInst::UnOp { dst, op, src } => {
-                    let s_val = state.get(&src).cloned().unwrap_or(TrackedValue::Bottom);
+                    let s_val = if captured.contains(&src) {
+                        TrackedValue::Bottom
+                    } else {
+                        state.get(&src).cloned().unwrap_or(TrackedValue::Bottom)
+                    };
                     let res_val = eval_unop(op, &s_val);
                     let double_cancel = if !captured.contains(&dst) && !captured.contains(&src) {
                         match origins.get(&src) {
@@ -360,12 +376,21 @@ pub fn strength_reduction_cfg(cfg: &mut ControlFlowGraph) -> bool {
                         origins.remove(&dst);
                         out.push(IrInst::Move { dst, src: inner });
                     } else {
+                        if op != IrUnaryOp::Not && !captured.is_empty() {
+                            state.retain(|var, _| !captured.contains(var));
+                            origins.retain(|var, _| !captured.contains(var));
+                        }
                         state.insert(dst, res_val);
                         origins.insert(dst, UnOpOrigin::Unary(op, src));
                         out.push(IrInst::UnOp { dst, op, src });
                     }
                 }
-                IrInst::Call { .. } | IrInst::Spread { .. } => {
+                IrInst::Call { .. }
+                | IrInst::Spread { .. }
+                | IrInst::TForCall { .. }
+                | IrInst::GetTable { .. }
+                | IrInst::SetTable { .. }
+                | IrInst::AppendArray { .. } => {
                     state.retain(|var, _| !captured.contains(var));
                     origins.retain(|var, _| !captured.contains(var));
                     for d in inst.def_vars() {
