@@ -57,7 +57,7 @@ function ffi.target(): string
 end
 
 -- The native extension ABI version this runtime speaks.
-ffi.abiVersion = 1
+ffi.abiVersion = 2
 
 function ffi.alloc(size: int): int
     if (type(size) != "number") then error("size must be a number") end

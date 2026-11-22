@@ -1,5 +1,5 @@
 /*
- * neyuki_ext.h: the Neyuki native extension ABI, version 1.
+ * neyuki_ext.h: the Neyuki native extension ABI, version 2.
  *
  * An extension is a shared library (.so / .dylib / .dll) that exports
  *
@@ -31,9 +31,19 @@
  *   your functions (or neyuki_extension_init) is running. Outside of that
  *   the api returns ERROR / false / 0.
  *
+ * Services and tasks (ABI 2)
+ *   An extension can publish a vtable under a name at init
+ *   (`provide_service`) for other extensions to find (`lookup_service`),
+ *   and can drive its own event loop inside the task scheduler: park the
+ *   running task on its pump (`task_park`, then return NEYUKI_YIELD),
+ *   install a waker for background work, ask when the next task is due
+ *   and run the due tasks.
+ *
  * Compatibility
  *   NeyukiExtApi is append-only: newer runtimes add fields at the end and
- *   raise `struct_size`. Check `abi_version` in neyuki_extension_init.
+ *   raise `struct_size`. Check `abi_version` (and `struct_size` before
+ *   using fields of a newer ABI) in neyuki_extension_init. Runtimes load
+ *   every ABI from 1 up to their own.
  */
 
 #ifndef NEYUKI_EXT_H
@@ -47,7 +57,7 @@
 extern "C" {
 #endif
 
-#define NEYUKI_EXT_ABI_VERSION 1
+#define NEYUKI_EXT_ABI_VERSION 2
 
 enum {
     NEYUKI_NIL = 0,
@@ -57,7 +67,8 @@ enum {
     NEYUKI_STRING = 4, /* ptr, len: UTF-8 (invalid bytes become U+FFFD) */
     NEYUKI_ERROR = 5,  /* ptr, len: message; returning it raises an error */
     NEYUKI_HANDLE = 6, /* i: handle id */
-    NEYUKI_MULTI = 7   /* ptr: NeyukiExtValue[len]; return value / call result only */
+    NEYUKI_MULTI = 7,  /* ptr: NeyukiExtValue[len]; return value / call result only */
+    NEYUKI_YIELD = 8   /* return value only, right after task_park parked the task */
 };
 
 /* api->handle_kind */
@@ -88,6 +99,13 @@ typedef struct NeyukiExtValue {
 } NeyukiExtValue;
 
 typedef NeyukiExtValue (*NeyukiExtFn)(size_t argc, const NeyukiExtValue *argv, void *user_data);
+
+/* An event pump for task_park: wait up to `timeout_secs`, return the events
+ * as an array table (or ERROR). The api is usable inside it. */
+typedef NeyukiExtValue (*NeyukiExtPumpFn)(double timeout_secs, void *user_data);
+/* Wakes a blocked event loop. Called from worker threads: be thread-safe and
+ * do not use the api. */
+typedef void (*NeyukiExtWakeFn)(void *user_data);
 
 typedef struct NeyukiExtApi {
     uint32_t abi_version;
@@ -134,6 +152,26 @@ typedef struct NeyukiExtApi {
      * Native code is not sandboxed by itself: call this before doing I/O
      * on a script's behalf. */
     NeyukiExtValue (*check_permission)(uint32_t kind, const uint8_t *target, size_t target_len);
+
+    /* ---- ABI 2 ---- */
+    /* Init only: publishes `service` (memory the extension owns) as `name`.
+     * Forgotten when the library is closed. */
+    bool (*provide_service)(void *ctx, const uint8_t *name, size_t name_len, const void *service);
+    /* The service published as `name`, or NULL. */
+    const void *(*lookup_service)(const uint8_t *name, size_t name_len);
+    /* Parks the running task on `pump` for up to `timeout_secs` and returns
+     * NEYUKI_YIELD, which you must return at once; the task resumes with the
+     * pump's events (or an empty table after the timeout) as your result.
+     * Returns NIL when it cannot park (not in a task, zero timeout): pump in
+     * place instead. */
+    NeyukiExtValue (*task_park)(double timeout_secs, NeyukiExtPumpFn pump, void *user_data);
+    /* Installs the waker background work calls on completion. */
+    bool (*set_waker)(NeyukiExtWakeFn wake, void *user_data);
+    bool (*has_waker)(void);
+    /* Seconds until the next task is due in *out_secs; false when none waits. */
+    bool (*next_due)(double *out_secs);
+    /* Resumes due tasks for about `budget_secs`. */
+    void (*run_tasks)(double budget_secs);
 } NeyukiExtApi;
 
 typedef int32_t (*NeyukiExtInitFn)(const NeyukiExtApi *api, void *ctx);

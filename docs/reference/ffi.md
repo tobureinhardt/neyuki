@@ -39,7 +39,7 @@ The target this runtime runs on, as native packages name it: `x86_64-linux`, `aa
 
 ## ffi.abiVersion: int
 
-The native extension ABI version this runtime speaks (`1`).
+The native extension ABI version this runtime speaks (`2`). It also loads extensions and [native packages](../runtime.md#native-packages) built for ABI `1`.
 
 ## Native extensions
 
@@ -65,7 +65,7 @@ static NeyukiExtValue sum(size_t argc, const NeyukiExtValue *argv, void *ud) {
 }
 
 NEYUKI_EXPORT int32_t neyuki_extension_init(const NeyukiExtApi *host, void *ctx) {
-    if (host->abi_version != NEYUKI_EXT_ABI_VERSION) return 1;
+    if (host->abi_version < NEYUKI_EXT_ABI_VERSION) return 1; /* runtime too old */
     api = host;
     return api->register_fn(ctx, (const uint8_t *)"sum", 3, sum, NULL) ? 0 : 2;
 }
@@ -90,12 +90,13 @@ local total, count = ext.sum({ 1, 2, 3 }) --> 6, 3
 | `NEYUKI_HANDLE` | table, function, buffer or big integer | `i` is the handle |
 | `NEYUKI_ERROR` | raises an error | `ptr`, `len` hold the message |
 | `NEYUKI_MULTI` | several return values | `ptr` points at `len` values |
+| `NEYUKI_YIELD` | suspends the running task | only right after `task_park` (ABI 2) |
 
 Returning `NEYUKI_MULTI` gives the script several values; returning `NEYUKI_ERROR` raises an error it can catch with `pcall`.
 
 ### Host API
 
-`NeyukiExtApi` gives extensions access to script values. Its layout is append-only: later versions add fields at the end and raise `struct_size`.
+`NeyukiExtApi` gives extensions access to script values. Its layout is append-only: later versions add fields at the end and raise `struct_size`, so an extension built for an older ABI keeps loading.
 
 - `handle_kind(v)`: `NEYUKI_KIND_TABLE`, `_FUNCTION`, `_BUFFER`, `_BIGINT`, or `_INVALID` for a value that is not a live handle.
 - `new_table(array_hint, field_hint)`, `table_get(t, key)`, `table_set(t, key, value)` (returns `NIL`, or an `ERROR` for a frozen table or a nil key), `table_len(t)` (`#t`), and `table_next(t, key, &out_key, &out_value)` (start with `NIL`; returns false at the end). These are raw accesses that skip metamethods.
@@ -104,6 +105,20 @@ Returning `NEYUKI_MULTI` gives the script several values; returning `NEYUKI_ERRO
 - `to_string(v)` is `tostring(v)`.
 - `retain(handle)` returns a persistent handle and `release(handle)` drops it (see below).
 - `check_permission(kind, target, len)` asks the sandbox about `NEYUKI_PERM_READ`, `_WRITE`, `_NET`, `_RUN`, `_ENV` or `_FFI`. It returns `NIL` when the access is allowed, or an `ERROR` to return. Native code is not sandboxed by itself, so an extension that does I/O on a script's behalf should check first.
+
+### Services (ABI 2)
+
+One extension can hand others a table of C functions, as `@nyk/ui` does for the packages that draw into its windows. In `neyuki_extension_init`, `provide_service(ctx, name, len, ptr)` publishes `ptr` (memory the extension owns, usually a `static` struct of function pointers) under `name`; any extension then finds it with `lookup_service(name, len)`, which returns `NULL` when nothing provides it. Put a version in the name (`"nyk.ui/1"`) and change it when the struct changes. A service is forgotten when the library that provides it is closed, so look it up when you need it rather than once at load. Require the providing package first: a service exists only once its library has loaded.
+
+### Tasks and event loops (ABI 2)
+
+An extension that runs its own event loop (windows, audio devices) can let the [task scheduler](task.md) keep running while it waits:
+
+- `task_park(timeout_secs, pump, user_data)` parks the running task and returns `NEYUKI_YIELD`, which your function must return at once. While other tasks run, the scheduler calls `pump(wait_secs, user_data)`, which waits up to `wait_secs` and returns the events that happened as an array table (the API is usable inside it). The task resumes with that table as the result of your function, or with an empty table once `timeout_secs` passes. `task_park` returns `NIL` instead when it cannot park: outside a task, under a native that called back into Neyuki, or for a zero timeout. Then call your pump yourself and return what it returns.
+- `set_waker(wake, user_data)` installs the function background work (`fs`, `http`, `net`, `os.spawn` callbacks) calls when it completes, so a loop blocked in the OS returns and lets the scheduler run. It is called from worker threads: it must be thread-safe and must not use the API. `has_waker()` says whether one is installed.
+- `next_due(&secs)` stores the seconds until the next task is due (`0` when one is ready) and returns false when no task is waiting; cap your wait with it. `run_tasks(budget_secs)` resumes the due tasks for about that long.
+
+Check `api->abi_version >= 2` (or `struct_size`) before using these fields.
 
 ### Handles and ownership
 

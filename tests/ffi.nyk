@@ -56,6 +56,6 @@ end
 
 -- Native package targets look like x86_64-linux / aarch64-macos.
 assert(string.find(ffi.target(), "-") != nil)
-assert(ffi.abiVersion == 1)
+assert(ffi.abiVersion == 2)
 
 print("[pass] ffi")

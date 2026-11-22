@@ -4,7 +4,7 @@
 //!
 //! ```toml
 //! [native]
-//! abi = 1
+//! abi = 2
 //! x86_64-linux   = "native/x86_64-linux/libzlib.so"
 //! aarch64-macos  = "native/aarch64-macos/libzlib.dylib"
 //! x86_64-windows = "native/x86_64-windows/zlib.dll"
@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::vm::libs::ffi::ext::NEYUKI_EXT_ABI_VERSION;
+use crate::vm::libs::ffi::ext::{NEYUKI_EXT_ABI_MIN, NEYUKI_EXT_ABI_VERSION};
 
 /// The module name under a package that loads its native library.
 pub const NATIVE_MODULE: &str = "native";
@@ -100,7 +100,7 @@ impl NativeManifest {
     /// The library path for the running target, or an error that names the
     /// targets the package does ship.
     pub fn library_for_current_target(&self, package: &str) -> Result<&str, String> {
-        if self.abi != NEYUKI_EXT_ABI_VERSION {
+        if !(NEYUKI_EXT_ABI_MIN..=NEYUKI_EXT_ABI_VERSION).contains(&self.abi) {
             return Err(format!(
                 "{} was built for native extension ABI {}, but this Neyuki speaks ABI {}; \
                  install a version of the package built for it",
@@ -217,6 +217,20 @@ mod tests {
             m.library_for_current_target("@a/b").unwrap(),
             "native/lib.so"
         );
+    }
+
+    #[test]
+    fn older_abis_still_load() {
+        let mut m = manifest(&[(&current_target(), "native/lib.so")]);
+        for abi in NEYUKI_EXT_ABI_MIN..=NEYUKI_EXT_ABI_VERSION {
+            m.abi = abi;
+            assert_eq!(
+                m.library_for_current_target("@a/b").unwrap(),
+                "native/lib.so"
+            );
+        }
+        m.abi = 0;
+        assert!(m.library_for_current_target("@a/b").is_err());
     }
 
     #[test]

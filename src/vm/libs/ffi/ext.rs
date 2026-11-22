@@ -18,6 +18,12 @@
 //!   between calls. It keeps the value alive (the cycle collector spares
 //!   values held from outside the VM).
 //!
+//! ABI 2 appends services (one extension handing others a vtable, as
+//! `@nyk/ui` does for `@nyk/gpu` and `@nyk/webview`) and the task
+//! scheduler (parking a task on the extension's own event pump, a waker,
+//! the next due time and running due tasks). `NeyukiExtApi` is append-only,
+//! so ABI 1 extensions keep loading.
+//!
 //! Host API functions may only be called on the thread running the script,
 //! while an extension function (or `neyuki_extension_init`) is running.
 //! Outside that they return an `ERROR` value (or false / 0).
@@ -33,15 +39,19 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use libloading::Library;
 
 use super::{LIBRARIES, LoadedLibrary, next_lib_id};
 use crate::vm::buffer::VmBuffer;
+use crate::vm::libs::task;
 use crate::vm::machine::VM;
 use crate::vm::value::{Value, VmTable};
 
-pub const NEYUKI_EXT_ABI_VERSION: u32 = 1;
+pub const NEYUKI_EXT_ABI_VERSION: u32 = 2;
+/// The oldest ABI this runtime still loads (`NeyukiExtApi` is append-only).
+pub const NEYUKI_EXT_ABI_MIN: u32 = 1;
 
 pub const EXT_TAG_NIL: u8 = 0;
 pub const EXT_TAG_BOOL: u8 = 1;
@@ -54,6 +64,9 @@ pub const EXT_TAG_HANDLE: u8 = 6;
 /// Several values: `ptr` points at `len` `NeyukiExtValue`s. Only valid as a
 /// function's return value (multiple returns) and as `api->call`'s result.
 pub const EXT_TAG_MULTI: u8 = 7;
+/// Returned by an extension function right after `api->task_park` parked
+/// the running task: the host yields it. Valid only as that return value.
+pub const EXT_TAG_YIELD: u8 = 8;
 
 /// What a handle refers to (`api->handle_kind`). 0 means not a live handle.
 pub const EXT_KIND_INVALID: u32 = 0;
@@ -140,6 +153,16 @@ pub type NeyukiExtRegisterFn = unsafe extern "C" fn(
     user_data: *mut c_void,
 ) -> bool;
 
+/// An extension's event pump (`api->task_park`): waits up to `timeout_secs`
+/// for events and returns them as an array table handle (or `ERROR`). The
+/// host runs it inside a frame of its own, so the api can be used.
+pub type NeyukiExtPumpFn =
+    unsafe extern "C" fn(timeout_secs: f64, user_data: *mut c_void) -> NeyukiExtValue;
+
+/// Wakes an extension's blocked event loop (`api->set_waker`). Called from
+/// worker threads, so it must be thread-safe and must not use the api.
+pub type NeyukiExtWakeFn = unsafe extern "C" fn(user_data: *mut c_void);
+
 /// The host API handed to `neyuki_extension_init`.
 ///
 /// The layout is append-only: later ABI revisions add fields at the end and
@@ -182,6 +205,23 @@ pub struct NeyukiExtApi {
     pub release: unsafe extern "C" fn(handle: NeyukiExtValue),
     pub check_permission:
         unsafe extern "C" fn(kind: u32, target: *const u8, target_len: usize) -> NeyukiExtValue,
+    // ---- ABI 2 ----
+    pub provide_service: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        name_ptr: *const u8,
+        name_len: usize,
+        service: *const c_void,
+    ) -> bool,
+    pub lookup_service: unsafe extern "C" fn(name_ptr: *const u8, name_len: usize) -> *const c_void,
+    pub task_park: unsafe extern "C" fn(
+        timeout_secs: f64,
+        pump: NeyukiExtPumpFn,
+        user_data: *mut c_void,
+    ) -> NeyukiExtValue,
+    pub set_waker: unsafe extern "C" fn(wake: NeyukiExtWakeFn, user_data: *mut c_void) -> bool,
+    pub has_waker: unsafe extern "C" fn() -> bool,
+    pub next_due: unsafe extern "C" fn(out_secs: *mut f64) -> bool,
+    pub run_tasks: unsafe extern "C" fn(budget_secs: f64),
 }
 
 pub type NeyukiExtInitFn = unsafe extern "C" fn(api: *const NeyukiExtApi, ctx: *mut c_void) -> i32;
@@ -203,6 +243,13 @@ static API: NeyukiExtApi = NeyukiExtApi {
     retain: api_retain,
     release: api_release,
     check_permission: api_check_permission,
+    provide_service: api_provide_service,
+    lookup_service: api_lookup_service,
+    task_park: api_task_park,
+    set_waker: api_set_waker,
+    has_waker: api_has_waker,
+    next_due: api_next_due,
+    run_tasks: api_run_tasks,
 };
 
 // ---------------------------------------------------------------------------
@@ -231,6 +278,16 @@ struct ExtState {
     closed_while_running: Vec<LoadedLibrary>,
     next_persistent: i64,
     next_serial: u32,
+    /// Set by `api->task_park` for the frame with this serial; taken by
+    /// `call_ext` when the function returns `YIELD`.
+    parked: Option<(u32, Duration, NeyukiExtPumpFn, *mut c_void)>,
+}
+
+/// A service vtable an extension provided, and the library that owns it.
+#[derive(Clone, Copy)]
+struct Service {
+    lib_id: u64,
+    ptr: *const c_void,
 }
 
 #[allow(dead_code)] // the boxes are only held to keep their memory alive
@@ -241,6 +298,13 @@ enum Scratch {
 
 thread_local! {
     static STATE: RefCell<ExtState> = RefCell::new(ExtState::default());
+    static SERVICES: RefCell<HashMap<String, Service>> = RefCell::new(HashMap::new());
+}
+
+/// Forgets the services of a library that is being closed, so lookups
+/// fail instead of handing out pointers into unloaded code.
+pub(super) fn forget_services(lib_id: u64) {
+    SERVICES.with(|s| s.borrow_mut().retain(|_, svc| svc.lib_id != lib_id));
 }
 
 /// Pops its frame (and everything the frame handed out) when dropped, so an
@@ -390,6 +454,9 @@ impl ExtState {
             EXT_TAG_HANDLE => self.lookup(ext.i),
             EXT_TAG_ERROR => Err(error_message(ext)),
             EXT_TAG_MULTI => Err("a MULTI value is only allowed as a return value".to_string()),
+            EXT_TAG_YIELD => {
+                Err("YIELD is only allowed as the return value after task_park".to_string())
+            }
             other => Err(format!("invalid extension value tag {}", other)),
         }
     }
@@ -452,6 +519,7 @@ fn api_value(f: impl FnOnce(&mut ExtState) -> Result<NeyukiExtValue, String>) ->
 
 struct RegisterContext {
     exports: Vec<(String, NeyukiExtFn, *mut c_void)>,
+    services: Vec<(String, *const c_void)>,
 }
 
 unsafe extern "C" fn api_register(
@@ -725,6 +793,151 @@ unsafe extern "C" fn api_check_permission(
 // Loading and calling extensions
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ABI 2: services and the task scheduler
+// ---------------------------------------------------------------------------
+
+unsafe fn name_arg<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    std::str::from_utf8(unsafe { std::slice::from_raw_parts(ptr, len) })
+        .ok()
+        .filter(|n| !n.is_empty())
+}
+
+/// Init only: makes `service` (a vtable the extension owns) findable by
+/// `name` through `lookup_service`. A later provider of the same name
+/// replaces it. It is forgotten when the library is closed.
+unsafe extern "C" fn api_provide_service(
+    ctx: *mut c_void,
+    name_ptr: *const u8,
+    name_len: usize,
+    service: *const c_void,
+) -> bool {
+    let Some(name) = (unsafe { name_arg(name_ptr, name_len) }) else {
+        return false;
+    };
+    if ctx.is_null() || service.is_null() {
+        return false;
+    }
+    let ctx = unsafe { &mut *(ctx as *mut RegisterContext) };
+    ctx.services.retain(|(n, _)| n != name);
+    ctx.services.push((name.to_string(), service));
+    true
+}
+
+unsafe extern "C" fn api_lookup_service(name_ptr: *const u8, name_len: usize) -> *const c_void {
+    let Some(name) = (unsafe { name_arg(name_ptr, name_len) }) else {
+        return std::ptr::null();
+    };
+    SERVICES.with(|s| s.borrow().get(name).map_or(std::ptr::null(), |svc| svc.ptr))
+}
+
+/// The VM of the innermost extension call, with STATE released: the
+/// scheduler calls below run script code, which may call extensions again.
+fn frame_vm() -> Option<NonNull<VM>> {
+    in_frame(|s| s.vm()).ok()
+}
+
+/// Parks the running task on `pump` for up to `timeout_secs` and returns
+/// `YIELD`, which the calling function must return at once. Returns `NIL`
+/// (nothing parked) outside a task, under a native that called back into
+/// Neyuki, or for a zero timeout: the caller then pumps in place. The task
+/// resumes with the events table `pump` returns, or an empty table once
+/// the timeout passes, as the result of the function that parked.
+unsafe extern "C" fn api_task_park(
+    timeout_secs: f64,
+    pump: NeyukiExtPumpFn,
+    user_data: *mut c_void,
+) -> NeyukiExtValue {
+    api_value(|s| {
+        if timeout_secs.is_nan() || timeout_secs < 0.0 {
+            return Err("task_park: the timeout must be a non-negative number".to_string());
+        }
+        let wait = Duration::try_from_secs_f64(timeout_secs).unwrap_or(Duration::MAX);
+        let vm = s.vm()?;
+        if wait.is_zero() || task::current_task(unsafe { vm.as_ref() }).is_none() {
+            return Ok(NeyukiExtValue::nil());
+        }
+        s.parked = Some((s.serial(), wait, pump, user_data));
+        Ok(NeyukiExtValue::with(
+            EXT_TAG_YIELD,
+            0,
+            0.0,
+            std::ptr::null(),
+            0,
+        ))
+    })
+}
+
+/// A wake callback and its data, handed to worker threads.
+struct ExtWaker(NeyukiExtWakeFn, *mut c_void);
+// SAFETY: `NeyukiExtWakeFn` is documented as callable from any thread.
+unsafe impl Send for ExtWaker {}
+
+/// Installs `wake` as the scheduler's waker: background work that
+/// completes calls it so a blocked event loop returns and lets the
+/// scheduler run. Replaces any waker installed before.
+unsafe extern "C" fn api_set_waker(wake: NeyukiExtWakeFn, user_data: *mut c_void) -> bool {
+    let Some(vm) = frame_vm() else { return false };
+    let waker = ExtWaker(wake, user_data);
+    // SAFETY: see `frame_vm`; the caller is blocked in the extension.
+    task::set_waker(
+        unsafe { &mut *vm.as_ptr() },
+        Box::new(move || {
+            let ExtWaker(wake, data) = &waker;
+            unsafe { wake(*data) }
+        }),
+    );
+    true
+}
+
+unsafe extern "C" fn api_has_waker() -> bool {
+    frame_vm().is_some_and(|vm| task::has_waker(unsafe { vm.as_ref() }))
+}
+
+/// Seconds until the next task is due (0 when one is ready) in
+/// `*out_secs`; false when no task is waiting.
+unsafe extern "C" fn api_next_due(out_secs: *mut f64) -> bool {
+    let Some(vm) = frame_vm() else { return false };
+    let Some(due) = task::next_due(unsafe { &mut *vm.as_ptr() }) else {
+        return false;
+    };
+    if !out_secs.is_null() {
+        let secs = due.saturating_duration_since(Instant::now()).as_secs_f64();
+        unsafe { out_secs.write(secs) };
+    }
+    true
+}
+
+/// Resumes the tasks that are due, for about `budget_secs`.
+unsafe extern "C" fn api_run_tasks(budget_secs: f64) {
+    let Some(vm) = frame_vm() else { return };
+    let budget = Duration::try_from_secs_f64(budget_secs.max(0.0)).unwrap_or(Duration::ZERO);
+    task::run_for(unsafe { &mut *vm.as_ptr() }, budget);
+}
+
+/// The scheduler side of a parked extension pump: calls it inside a frame
+/// and checks that it handed back an events table.
+fn ext_pump(
+    pump: NeyukiExtPumpFn,
+    user_data: *mut c_void,
+) -> impl Fn(&mut VM, Duration) -> Result<Value, String> + 'static {
+    move |vm, wait| {
+        let _frame = FrameGuard::push(vm);
+        let ret = unsafe { pump(wait.as_secs_f64(), user_data) };
+        let value = STATE.with(|s| s.borrow().import(&ret))?;
+        match value {
+            Value::Table(_) => Ok(value),
+            other => Err(format!(
+                "native event pump returned {} instead of an events table",
+                other.type_name()
+            )),
+        }
+    }
+}
+
 pub(super) struct BoundExtFn {
     func: NeyukiExtFn,
     user_data: *mut c_void,
@@ -739,6 +952,7 @@ pub fn init_extension_with_fn(
 ) -> Result<(u64, VmTable), String> {
     let mut ctx = RegisterContext {
         exports: Vec::new(),
+        services: Vec::new(),
     };
     let status = {
         let _frame = FrameGuard::push(vm);
@@ -759,6 +973,12 @@ pub fn init_extension_with_fn(
     }
 
     let id = next_lib_id();
+    SERVICES.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        for (name, ptr) in ctx.services {
+            registry.insert(name, Service { lib_id: id, ptr });
+        }
+    });
     LIBRARIES.with(|libs| {
         libs.borrow_mut().insert(
             id,
@@ -815,6 +1035,19 @@ pub(super) fn call_ext(
     // loaded while `lib_id` is in LIBRARIES; `ext_args` and everything it
     // points to live until `_frame` drops.
     let ret = unsafe { func(ext_args.len(), ext_args.as_ptr(), user_data) };
+    let serial = STATE.with(|s| s.borrow().serial());
+    let parked = STATE.with(|s| s.borrow_mut().parked.take());
+    if ret.tag == EXT_TAG_YIELD {
+        let Some((_, wait, pump, data)) = parked.filter(|p| p.0 == serial) else {
+            return Err("extension returned YIELD without parking the task".to_string());
+        };
+        // The frame goes first: the task is suspended past this return.
+        drop(_frame);
+        let thread =
+            task::current_task(vm).ok_or_else(|| "extension parked outside a task".to_string())?;
+        let deadline = task::deadline_after(Instant::now(), wait);
+        return task::park_poller(vm, thread, deadline, ext_pump(pump, data));
+    }
     STATE.with(|s| {
         let s = s.borrow();
         if ret.tag == EXT_TAG_MULTI {
@@ -839,6 +1072,7 @@ pub(super) fn call_ext(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::vm::value::StrRef;
 
     fn args<'a>(argc: usize, argv: *const NeyukiExtValue) -> &'a [NeyukiExtValue] {
         if argc == 0 {
@@ -994,6 +1228,105 @@ pub(super) mod tests {
         }
     }
 
+    static SERVICE: u64 = 0x5e7c;
+
+    /// The test pump: one `"tick"` event, as an event loop would report.
+    unsafe extern "C" fn tick_pump(_timeout: f64, ud: *mut c_void) -> NeyukiExtValue {
+        let api = unsafe { api(ud) };
+        let t = unsafe { (api.new_table)(1, 0) };
+        unsafe {
+            (api.table_set)(
+                t,
+                NeyukiExtValue::from_int(1),
+                NeyukiExtValue::from_bytes(b"tick"),
+            )
+        };
+        t
+    }
+
+    /// `park(seconds)`: parks on `tick_pump`, or pumps in place when it
+    /// cannot.
+    unsafe extern "C" fn ext_park(
+        argc: usize,
+        argv: *const NeyukiExtValue,
+        ud: *mut c_void,
+    ) -> NeyukiExtValue {
+        let api = unsafe { api(ud) };
+        let secs = args(argc, argv).first().map_or(0.0, |a| a.f);
+        let r = unsafe { (api.task_park)(secs, tick_pump, ud) };
+        if r.tag != EXT_TAG_NIL {
+            return r;
+        }
+        unsafe { tick_pump(secs, ud) }
+    }
+
+    /// `yield_unparked()`: returns YIELD without parking, which must fail.
+    unsafe extern "C" fn ext_yield_unparked(
+        _argc: usize,
+        _argv: *const NeyukiExtValue,
+        _ud: *mut c_void,
+    ) -> NeyukiExtValue {
+        NeyukiExtValue::with(EXT_TAG_YIELD, 0, 0.0, std::ptr::null(), 0)
+    }
+
+    /// `service()`: whether `lookup_service` finds the one init provided.
+    unsafe extern "C" fn ext_service(
+        _argc: usize,
+        _argv: *const NeyukiExtValue,
+        ud: *mut c_void,
+    ) -> NeyukiExtValue {
+        let api = unsafe { api(ud) };
+        let found = unsafe { (api.lookup_service)(b"test.service".as_ptr(), 12) };
+        let missing = unsafe { (api.lookup_service)(b"test.none".as_ptr(), 9) };
+        NeyukiExtValue::from_bool(
+            std::ptr::eq(found, (&raw const SERVICE).cast()) && missing.is_null(),
+        )
+    }
+
+    /// `due()`: seconds until the next task is due, or nil.
+    unsafe extern "C" fn ext_due(
+        _argc: usize,
+        _argv: *const NeyukiExtValue,
+        ud: *mut c_void,
+    ) -> NeyukiExtValue {
+        let api = unsafe { api(ud) };
+        let mut secs = -1.0;
+        if unsafe { (api.next_due)(&mut secs) } {
+            NeyukiExtValue::from_float(secs)
+        } else {
+            NeyukiExtValue::nil()
+        }
+    }
+
+    /// `run()`: runs the due tasks.
+    unsafe extern "C" fn ext_run(
+        _argc: usize,
+        _argv: *const NeyukiExtValue,
+        ud: *mut c_void,
+    ) -> NeyukiExtValue {
+        unsafe { (api(ud).run_tasks)(0.05) };
+        NeyukiExtValue::nil()
+    }
+
+    static WAKES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn count_wake(_ud: *mut c_void) {
+        WAKES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `waker()`: installs `count_wake`; returns has_waker before and after.
+    unsafe extern "C" fn ext_waker(
+        _argc: usize,
+        _argv: *const NeyukiExtValue,
+        ud: *mut c_void,
+    ) -> NeyukiExtValue {
+        let api = unsafe { api(ud) };
+        let before = unsafe { (api.has_waker)() };
+        let set = unsafe { (api.set_waker)(count_wake, std::ptr::null_mut()) };
+        let after = unsafe { (api.has_waker)() };
+        NeyukiExtValue::from_bool(!before && set && after)
+    }
+
     pub(in crate::vm::libs::ffi) unsafe extern "C" fn test_ext_init(
         api: *const NeyukiExtApi,
         ctx: *mut c_void,
@@ -1002,7 +1335,18 @@ pub(super) mod tests {
         if api_ref.abi_version != NEYUKI_EXT_ABI_VERSION {
             return -1;
         }
-        let fns: [(&[u8], NeyukiExtFn); 8] = [
+        let provided = unsafe {
+            (api_ref.provide_service)(
+                ctx,
+                b"test.service".as_ptr(),
+                12,
+                (&raw const SERVICE).cast(),
+            )
+        };
+        if !provided {
+            return -3;
+        }
+        let fns: [(&[u8], NeyukiExtFn); 14] = [
             (b"add_ints", ext_add),
             (b"inspect", ext_inspect),
             (b"range", ext_range),
@@ -1011,6 +1355,12 @@ pub(super) mod tests {
             (b"kept", ext_kept),
             (b"release", ext_release),
             (b"can_read", ext_can_read),
+            (b"park", ext_park),
+            (b"yield_unparked", ext_yield_unparked),
+            (b"service", ext_service),
+            (b"due", ext_due),
+            (b"run", ext_run),
+            (b"waker", ext_waker),
         ];
         for (name, f) in fns {
             let ok = unsafe {
@@ -1131,10 +1481,127 @@ pub(super) mod tests {
         assert!(err.contains("permission denied"), "{err}");
     }
 
+    /// A VM with the test extension loaded as the globals `EXT` (its id)
+    /// and `F` (name -> function index), for scripts that call it through
+    /// `__ffi_ext_call` the way `lib/ffi.nyk` does.
+    fn script_vm() -> (VM, u64, VmTable) {
+        let mut vm = VM::new();
+        let (id, map) = load(&mut vm);
+        vm.globals
+            .insert(StrRef::from("EXT"), Value::from_usize(id as usize));
+        vm.globals.insert(
+            StrRef::from("F"),
+            Value::Table(Rc::new(RefCell::new(map.clone()))),
+        );
+        (vm, id, map)
+    }
+
+    fn run(vm: &mut VM, src: &str) -> Result<Value, String> {
+        let proto =
+            crate::compiler::compile_program(src, "test", crate::compiler::Options::UNCHECKED)?;
+        vm.execute_program(proto)
+    }
+
+    fn global(vm: &VM, name: &str) -> Value {
+        vm.globals
+            .get(&StrRef::from(name))
+            .cloned()
+            .unwrap_or(Value::Nil)
+    }
+
+    #[test]
+    fn services_are_found_until_the_library_closes() {
+        let mut vm = VM::new();
+        let (id, map) = load(&mut vm);
+        let f = idx(&map, "service");
+        assert_eq!(
+            call_ext(&mut vm, id, f, &[]).unwrap(),
+            vec![Value::Bool(true)]
+        );
+        forget_services(id);
+        let none = unsafe { (API.lookup_service)(b"test.service".as_ptr(), 12) };
+        assert!(none.is_null());
+    }
+
+    #[test]
+    fn a_task_parks_on_the_extension_pump() {
+        let (mut vm, _, _) = script_vm();
+        run(
+            &mut vm,
+            "task.spawn(function()\n\
+             \u{20} local events = __ffi_ext_call(EXT, F.park, 5.0)\n\
+             \u{20} _G.count = #events\n\
+             \u{20} _G.first = events[1]\n\
+             end)\n\
+             _G.before = _G.count",
+        )
+        .expect("program runs");
+        assert!(matches!(global(&vm, "before"), Value::Nil));
+        assert_eq!(global(&vm, "count").to_string(), "1");
+        assert_eq!(global(&vm, "first").to_string(), "tick");
+    }
+
+    #[test]
+    fn outside_a_task_the_extension_pumps_in_place() {
+        let (mut vm, id, map) = script_vm();
+        let res = call_ext(&mut vm, id, idx(&map, "park"), &[Value::Float(5.0)]).unwrap();
+        let Value::Table(t) = &res[0] else {
+            panic!("expected the events table")
+        };
+        assert_eq!(t.borrow().array, vec![Value::str("tick")]);
+        let err = call_ext(&mut vm, id, idx(&map, "park"), &[Value::Float(-1.0)]).unwrap_err();
+        assert!(err.contains("non-negative"), "{err}");
+    }
+
+    #[test]
+    fn yield_without_parking_is_an_error() {
+        let (mut vm, id, map) = script_vm();
+        let err = call_ext(&mut vm, id, idx(&map, "yield_unparked"), &[]).unwrap_err();
+        assert!(err.contains("without parking"), "{err}");
+    }
+
+    #[test]
+    fn extensions_see_and_run_due_tasks() {
+        let (mut vm, _, _) = script_vm();
+        run(
+            &mut vm,
+            "_G.idle = __ffi_ext_call(EXT, F.due)\n\
+             task.delay(30, function() end)\n\
+             _G.later = __ffi_ext_call(EXT, F.due)\n\
+             task.defer(function() _G.ran = true end)\n\
+             _G.now = __ffi_ext_call(EXT, F.due)\n\
+             __ffi_ext_call(EXT, F.run)\n\
+             _G.ran_inside = _G.ran\n\
+             error(\"stop before the delay\")",
+        )
+        .expect_err("the script stops itself");
+        assert!(matches!(global(&vm, "idle"), Value::Nil));
+        let later = global(&vm, "later").to_string().parse::<f64>().unwrap();
+        assert!(later > 25.0 && later <= 30.0, "{later}");
+        let now = global(&vm, "now").to_string().parse::<f64>().unwrap();
+        assert!(now < 0.01, "{now}");
+        assert_eq!(global(&vm, "ran_inside").to_string(), "true");
+    }
+
+    #[test]
+    fn the_extension_waker_is_installed() {
+        let (mut vm, id, map) = script_vm();
+        let res = call_ext(&mut vm, id, idx(&map, "waker"), &[]).unwrap();
+        assert_eq!(res, vec![Value::Bool(true)]);
+        let before = WAKES.load(std::sync::atomic::Ordering::SeqCst);
+        let waker = task::take_waker(&mut vm).expect("a waker");
+        waker();
+        assert_eq!(WAKES.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+    }
+
     #[test]
     fn host_api_outside_a_call_is_an_error() {
         let r = unsafe { (API.new_table)(0, 0) };
         assert_eq!(r.tag, EXT_TAG_ERROR);
         assert_eq!(unsafe { (API.table_len)(r) }, 0);
+        let r = unsafe { (API.task_park)(1.0, tick_pump, std::ptr::null_mut()) };
+        assert_eq!(r.tag, EXT_TAG_ERROR);
+        assert!(!unsafe { (API.has_waker)() });
+        assert!(!unsafe { (API.next_due)(std::ptr::null_mut()) });
     }
 }

@@ -449,6 +449,7 @@ fn builtin_close(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let removed = LIBRARIES.with(|libs| libs.borrow_mut().remove(&lib_id));
     let closed = removed.is_some();
     if let Some(lib) = removed {
+        ext::forget_services(lib_id);
         ext::unload_when_idle(lib);
     }
     Ok(vec![Value::Bool(closed)])
@@ -1275,6 +1276,11 @@ mod tests {
         assert_eq!(offset_of!(ext::NeyukiExtValue, i), 8);
         assert_eq!(offset_of!(ext::NeyukiExtValue, ptr), 24);
         assert_eq!(offset_of!(ext::NeyukiExtApi, register_fn), 8);
-        assert_eq!(size_of::<ext::NeyukiExtApi>(), 8 + 14 * size_of::<usize>());
+        // ABI 1 ends after 14 pointers; ABI 2 appends 7 more.
+        assert_eq!(
+            offset_of!(ext::NeyukiExtApi, provide_service),
+            8 + 14 * size_of::<usize>()
+        );
+        assert_eq!(size_of::<ext::NeyukiExtApi>(), 8 + 21 * size_of::<usize>());
     }
 }

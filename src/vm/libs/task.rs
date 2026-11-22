@@ -49,8 +49,10 @@ enum Wake {
 
 /// Pumps the OS event loop for up to the given time (it may return sooner,
 /// when something happens or background work wakes it) and returns the
-/// events as an array table. Installed by the UI library.
-pub(crate) type Pump = fn(&mut VM, Duration) -> Result<Value, String>;
+/// events as an array table. Installed by the UI library, or by a native
+/// extension through the extension API (`ffi::ext`), whose pump carries
+/// its own state.
+pub(crate) type PumpHook = Rc<dyn Fn(&mut VM, Duration) -> Result<Value, String>>;
 
 /// Called from a worker thread after it queued a completion, to wake an
 /// interpreter that is blocked somewhere other than the completion queue
@@ -92,7 +94,7 @@ pub struct Scheduler {
     /// the time their poll ends.
     pollers: VecDeque<(Value, Instant)>,
     /// How the pollers' events are pumped; set when one parks.
-    pump: Option<Pump>,
+    pump: Option<PumpHook>,
     /// Tasks waiting for background work, by job id.
     waiting: HashMap<u64, Value>,
     next_job: u64,
@@ -362,6 +364,16 @@ pub(crate) fn set_waker(vm: &mut VM, waker: Waker) {
     *vm.tasks.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
 }
 
+/// Takes the installed waker out, for tests that call it by hand.
+#[cfg(test)]
+pub(crate) fn take_waker(vm: &mut VM) -> Option<Waker> {
+    vm.tasks
+        .waker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
 /// Whether a waker is installed.
 pub(crate) fn has_waker(vm: &VM) -> bool {
     vm.tasks
@@ -390,9 +402,9 @@ pub(crate) fn park_poller(
     vm: &mut VM,
     thread: Value,
     deadline: Instant,
-    pump: Pump,
+    pump: impl Fn(&mut VM, Duration) -> Result<Value, String> + 'static,
 ) -> Result<Vec<Value>, String> {
-    vm.tasks.pump = Some(pump);
+    vm.tasks.pump = Some(Rc::new(pump));
     vm.tasks.pollers.push_back((thread, deadline));
     coroutine::coroutine_yield(vm, &[])
 }
@@ -445,7 +457,7 @@ fn service_pollers(vm: &mut VM, wait: Duration) {
     if vm.tasks.pollers.is_empty() {
         return;
     }
-    let pumped = match vm.tasks.pump {
+    let pumped = match vm.tasks.pump.clone() {
         Some(pump) => pump(vm, wait),
         None => {
             std::thread::sleep(wait);
@@ -817,11 +829,12 @@ mod tests {
     /// task with a timeout parks, anything else pumps in place.
     fn fake_poll(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         let seconds = crate::vm::libs::args::number_arg(args, 0, "seconds")?;
-        let pump: super::Pump = if matches!(args.get(1), Some(Value::Bool(true))) {
-            failing_pump
-        } else {
-            fake_pump
-        };
+        let pump: fn(&mut VM, Duration) -> Result<Value, String> =
+            if matches!(args.get(1), Some(Value::Bool(true))) {
+                failing_pump
+            } else {
+                fake_pump
+            };
         let wait = Duration::from_secs_f64(seconds);
         if !wait.is_zero()
             && let Some(thread) = super::current_task(vm)

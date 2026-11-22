@@ -133,13 +133,13 @@ A package can ship prebuilt [native extensions](reference/ffi.md#native-extensio
 
 ```toml
 [native]
-abi = 1                                         # extension ABI the libraries speak
+abi = 2                                         # extension ABI the libraries speak
 x86_64-linux   = "native/x86_64-linux/libzlib.so"
 aarch64-macos  = "native/aarch64-macos/libzlib.dylib"
 x86_64-windows = "native/x86_64-windows/zlib.dll"
 ```
 
-Targets are `<arch>-<os>` as [`ffi.target()`](reference/ffi.md#ffitarget-string) reports them (`x86_64-linux`, `aarch64-linux`, `x86_64-macos`, `aarch64-macos`, `x86_64-windows`, …), with `-musl` for musl Linux; `<arch>-linux-gnu` also matches glibc Linux. `require("@pkg/user/package/native")` loads the library for the running target and returns its functions, as `ffi.loadExtension` does; `require("@pkg/user/package")` does the same when the package has no Neyuki entry file, so a package can be native only or wrap its library in Neyuki code. Loading fails with a clear message when the package was built for another `abi` or has no library for the target, and `neyuki pkg install` warns about both. `publish` refuses a `[native]` section whose libraries are missing from the package.
+Targets are `<arch>-<os>` as [`ffi.target()`](reference/ffi.md#ffitarget-string) reports them (`x86_64-linux`, `aarch64-linux`, `x86_64-macos`, `aarch64-macos`, `x86_64-windows`, …), with `-musl` for musl Linux; `<arch>-linux-gnu` also matches glibc Linux. `require("@pkg/user/package/native")` loads the library for the running target and returns its functions, as `ffi.loadExtension` does; `require("@pkg/user/package")` does the same when the package has no Neyuki entry file, so a package can be native only or wrap its library in Neyuki code. Loading fails with a clear message when the package was built for an `abi` this runtime does not speak (it loads every ABI from 1 up to [`ffi.abiVersion`](reference/ffi.md#ffiabiversion-int)) or has no library for the target, and `neyuki pkg install` warns about both. `publish` refuses a `[native]` section whose libraries are missing from the package.
 
 All targets travel in one archive, so the lockfile checksum covers every library. `neyuki build` bundles them all (the runtime it builds on may be for another platform); a built app writes its target's library to `~/.neyuki/native-cache/<hash>/` the first time it loads it, because the OS cannot load a library from inside the executable.
 
