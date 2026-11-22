@@ -76,6 +76,21 @@ local ext = ffi.loadExtension("./libsum.so")
 local total, count = ext.sum({ 1, 2, 3 }) --> 6, 3
 ```
 
+### Writing extensions in Rust
+
+The [`neyuki-ext`](../../crates/neyuki-ext/README.md) crate wraps this ABI in safe Rust: build a `cdylib`, register functions that take `&[Value]` and return `Result<_, String>`, and `neyuki_ext::export!` writes `neyuki_extension_init`. Its `args` helpers raise the same errors as the standard libraries (`width must be a number, got string`), panics are raised as script errors, and it covers services and the task scheduler below.
+
+```rust
+use neyuki_ext::{Module, Value, args};
+
+fn init(m: &mut Module) -> Result<(), String> {
+    m.function("hello", |a: &[Value]| Ok(format!("hello, {}", args::str_arg(a, 0, "name")?)))?;
+    Ok(())
+}
+
+neyuki_ext::export!(init);
+```
+
 ### Values
 
 `NeyukiExtValue` is `{ uint8_t tag; int64_t i; double f; const uint8_t *ptr; size_t len; }`.

@@ -3393,6 +3393,7 @@ dependencies = [
  "mimalloc",
  "mysql",
  "native-tls",
+ "neyuki-ext",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -3429,6 +3430,10 @@ dependencies = [
  "wry",
  "x25519-dalek",
 ]
+
+[[package]]
+name = "neyuki-ext"
+version = "0.1.0"
 
 [[package]]
 name = "nix"

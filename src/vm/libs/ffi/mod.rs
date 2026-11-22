@@ -12,6 +12,8 @@
 
 mod call;
 pub mod ext;
+#[cfg(test)]
+mod sdk_tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};

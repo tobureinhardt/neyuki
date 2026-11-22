@@ -85,6 +85,8 @@ src/
 ├── repl.rs, dap.rs    REPL and debug adapter
 └── diagnostics/
 lib/                   bundled @neyuki/* modules written in Neyuki
+include/neyuki_ext.h   the C ABI for native extensions
+crates/neyuki-ext/     the Rust SDK for native extensions and packages
 tests/                 .nyk test scripts (`neyuki test`)
 bench/, fuzz/          `neyuki bench` and `neyuki fuzz`
 docs/

@@ -1,0 +1,15 @@
+[package]
+name = "neyuki-ext"
+version = "0.1.0"
+edition = "2024"
+description = "Write Neyuki native extensions and native packages in safe Rust"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/neyuki-lang/neyuki"
+homepage = "https://neyuki.cc/"
+keywords = ["neyuki", "extension", "ffi", "scripting"]
+categories = ["api-bindings", "development-tools::ffi"]
+
+# No dependencies: an extension links only this crate and what it needs
+# itself, and the C ABI in `sys` is all it shares with the runtime.
+[dependencies]

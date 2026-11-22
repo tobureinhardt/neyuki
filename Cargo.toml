@@ -8,6 +8,13 @@ license = "MIT"
 repository = "https://github.com/neyuki-lang/neyuki"
 homepage = "https://neyuki.cc/"
 
+# The SDK for native extensions lives beside the runtime so the two change
+# together; both are default members, so plain `cargo test` / `clippy` (and
+# CI) cover it.
+[workspace]
+members = ["crates/neyuki-ext"]
+default-members = [".", "crates/neyuki-ext"]
+
 [lib]
 name = "neyuki"
 path = "src/lib.rs"
@@ -190,6 +197,11 @@ editpe = { version = "0.2", default-features = false, features = ["std"] }
 # workload mimalloc is built for; it needs a C compiler. Off by default until
 # `neyuki bench` numbers on each release platform justify turning it on.
 mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[dev-dependencies]
+# The extension SDK, loaded in-process by src/vm/libs/ffi/sdk_tests.rs to
+# check it against the host side of the ABI.
+neyuki-ext = { version = "0.1", path = "crates/neyuki-ext" }
 
 [target.'cfg(windows)'.dependencies]
 schannel = ">=0.1.23, <0.1.28"
