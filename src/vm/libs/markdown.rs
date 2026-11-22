@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use pulldown_cmark::{
-    Alignment, BlockQuoteKind, CodeBlockKind, CowStr, Event, HeadingLevel, MetadataBlockKind,
-    Options, Parser, Tag, TagEnd, html as cmark_html,
+    Alignment, BlockQuoteKind, CodeBlockKind, CowStr, Event, HeadingLevel, Options, Parser, Tag,
+    TagEnd, html as cmark_html,
 };
 
 use crate::vm::libs::args::{array, bool_arg, str_arg};
@@ -110,10 +110,6 @@ impl MdOptions {
         if self.heading_ids {
             opts |= Options::ENABLE_HEADING_ATTRIBUTES;
         }
-        if self.frontmatter {
-            opts |= Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
-                | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
-        }
         opts
     }
 }
@@ -183,14 +179,20 @@ fn slugify(text: &str, seen: &mut HashMap<String, usize>) -> String {
     if base.is_empty() {
         base.push_str("section");
     }
-    let count = seen.entry(base.clone()).or_insert(0);
-    let slug = if *count == 0 {
-        base
-    } else {
-        format!("{}-{}", base, *count)
-    };
-    *count += 1;
-    slug
+    let mut idx = *seen.get(&base).unwrap_or(&0);
+    loop {
+        let candidate = if idx == 0 {
+            base.clone()
+        } else {
+            format!("{}-{}", base, idx)
+        };
+        idx += 1;
+        if !seen.contains_key(&candidate) {
+            seen.insert(base, idx);
+            seen.entry(candidate.clone()).or_insert(1);
+            return candidate;
+        }
+    }
 }
 
 fn escape_html_text(out: &mut String, text: &str) {
@@ -320,7 +322,6 @@ fn render_html(text: &str, opts: MdOptions) -> Result<String, String> {
     let mut filtered: Vec<Event<'_>> = Vec::with_capacity(raw_events.len());
     let mut depth = 0usize;
     let mut event_count = 0usize;
-    let mut in_metadata = false;
     let mut slugs: HashMap<String, usize> = HashMap::new();
 
     let mut idx = 0usize;
@@ -334,18 +335,8 @@ fn render_html(text: &str, opts: MdOptions) -> Result<String, String> {
         }
 
         let ev = raw_events[idx].clone();
-        if in_metadata {
-            if matches!(ev, Event::End(TagEnd::MetadataBlock(_))) {
-                in_metadata = false;
-            }
-            idx += 1;
-            continue;
-        }
 
         match ev {
-            Event::Start(Tag::MetadataBlock(_)) => {
-                in_metadata = true;
-            }
             Event::Start(Tag::Heading {
                 level,
                 id,
@@ -358,7 +349,10 @@ fn render_html(text: &str, opts: MdOptions) -> Result<String, String> {
                 }
                 if opts.heading_ids {
                     let final_id = match id {
-                        Some(explicit) if !explicit.is_empty() => explicit,
+                        Some(explicit) if !explicit.is_empty() => {
+                            *slugs.entry(explicit.to_string()).or_insert(0) += 1;
+                            explicit
+                        }
                         _ => {
                             let mut title = String::new();
                             let mut j = idx + 1;
@@ -606,10 +600,6 @@ enum OpenFrame {
         label: String,
         children: Vec<AstNode>,
     },
-    MetadataBlock {
-        format: &'static str,
-        raw: String,
-    },
 }
 
 fn push_child(frame: &mut OpenFrame, child: AstNode) {
@@ -700,7 +690,10 @@ fn ast_node_to_value(
             children,
         } => {
             let resolved_id = match id {
-                Some(explicit) if !explicit.is_empty() => Some(explicit),
+                Some(explicit) if !explicit.is_empty() => {
+                    *slugs.entry(explicit.clone()).or_insert(0) += 1;
+                    Some(explicit)
+                }
                 _ if heading_ids => {
                     let mut plain = String::new();
                     collect_inline_text(&children, &mut plain);
@@ -845,7 +838,7 @@ fn nodes_to_array(
 }
 
 fn parse_ast(text: &str, opts: MdOptions) -> Result<Value, String> {
-    let (mut frontmatter, body) = if opts.frontmatter {
+    let (frontmatter, body) = if opts.frontmatter {
         match extract_frontmatter(text) {
             Some((fmt, raw, rest)) => (Some((fmt, raw.replace("\r\n", "\n"))), rest),
             None => (None, text),
@@ -950,13 +943,6 @@ fn parse_ast(text: &str, opts: MdOptions) -> Result<Value, String> {
                         label: label.into_string(),
                         children: Vec::new(),
                     },
-                    Tag::MetadataBlock(kind) => OpenFrame::MetadataBlock {
-                        format: match kind {
-                            MetadataBlockKind::YamlStyle => "yaml",
-                            MetadataBlockKind::PlusesStyle => "toml",
-                        },
-                        raw: String::new(),
-                    },
                     _ => OpenFrame::Paragraph(Vec::new()),
                 };
                 stack.push(frame);
@@ -969,11 +955,6 @@ fn parse_ast(text: &str, opts: MdOptions) -> Result<Value, String> {
                     continue;
                 };
                 match finished {
-                    OpenFrame::MetadataBlock { format, raw } => {
-                        if frontmatter.is_none() {
-                            frontmatter = Some((format, raw));
-                        }
-                    }
                     OpenFrame::TableCell(children) => match stack.last_mut() {
                         Some(OpenFrame::TableHead(cells)) | Some(OpenFrame::TableRow(cells)) => {
                             cells.push(children);
@@ -1049,7 +1030,6 @@ fn parse_ast(text: &str, opts: MdOptions) -> Result<Value, String> {
                                 AstNode::FootnoteDef { label, children }
                             }
                             OpenFrame::Document(_)
-                            | OpenFrame::MetadataBlock { .. }
                             | OpenFrame::TableHead(_)
                             | OpenFrame::TableRow(_)
                             | OpenFrame::TableCell(_) => continue,
@@ -1063,7 +1043,6 @@ fn parse_ast(text: &str, opts: MdOptions) -> Result<Value, String> {
             Event::Text(s) => match stack.last_mut() {
                 Some(OpenFrame::CodeBlock { text, .. }) => text.push_str(&s),
                 Some(OpenFrame::HtmlBlock(text)) => text.push_str(&s),
-                Some(OpenFrame::MetadataBlock { raw, .. }) => raw.push_str(&s),
                 Some(parent) => {
                     bump_nodes()?;
                     push_child(parent, AstNode::Text(s.into_string()));
@@ -1347,7 +1326,7 @@ mod tests {
 
     #[test]
     fn test_heading_ids_and_deduplication() {
-        let md = "# Hello World\n\n## Hello World\n";
+        let md = "# Hello World\n\n## Hello World\n\n# Intro {#setup}\n\n# Setup\n";
         let html = render_html(
             md,
             MdOptions {
@@ -1358,6 +1337,8 @@ mod tests {
         .unwrap();
         assert!(html.contains("<h1 id=\"hello-world\">Hello World</h1>"));
         assert!(html.contains("<h2 id=\"hello-world-1\">Hello World</h2>"));
+        assert!(html.contains("<h1 id=\"setup\">Intro</h1>"));
+        assert!(html.contains("<h1 id=\"setup-1\">Setup</h1>"));
     }
 
     #[test]
@@ -1373,5 +1354,12 @@ mod tests {
         assert_eq!(fmt, "toml");
         assert_eq!(raw, "title = \"Demo\"\n");
         assert_eq!(body, "Body");
+
+        // A thematic break immediately after frontmatter is kept as body content,
+        // not stripped a second time.
+        let double_dash = "---\ntitle: Post\n---\n---\nParagraph\n---\n";
+        let html = render_html(double_dash, MdOptions::default()).unwrap();
+        assert!(html.contains("Paragraph"));
+        assert!(html.contains("<hr />"));
     }
 }

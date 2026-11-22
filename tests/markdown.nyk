@@ -52,12 +52,17 @@ print("hi")
     end)
 
     it("supports headingIds, breaks and smart punctuation options", function()
-        local h = markdown.toHtml("# Hello World\n\n## Hello World\n\n# Custom {#my-id}\n", {
+        local h = markdown.toHtml("# Hello World\n\n## Hello World\n\n# Custom {#my-id}\n\n# My ID\n", {
             headingIds = true,
         })
         expect(string.find(h, '<h1 id="hello-world">Hello World</h1>', 1, true) != nil):toBe(true)
         expect(string.find(h, '<h2 id="hello-world-1">Hello World</h2>', 1, true) != nil):toBe(true)
         expect(string.find(h, '<h1 id="my-id">Custom</h1>', 1, true) != nil):toBe(true)
+        expect(string.find(h, '<h1 id="my-id-1">My ID</h1>', 1, true) != nil):toBe(true)
+
+        local ast = markdown.parse("# Intro {#setup}\n\n# Setup\n", { headingIds = true })
+        expect(ast.children[1].id):toBe("setup")
+        expect(ast.children[2].id):toBe("setup-1")
 
         local br = markdown.toHtml("line 1\nline 2", { breaks = true })
         expect(string.find(br, "<br />", 1, true) != nil):toBe(true)
@@ -140,10 +145,12 @@ fn main() {}
         expect(fm3):toBeNil()
         expect(body3):toBe("# No frontmatter")
 
-        -- Frontmatter is excluded from toHtml by default
-        local rendered = markdown.toHtml("---\ntitle: Hidden\n---\nVisible")
+        -- Frontmatter is excluded from toHtml by default, and a leading ---
+        -- in the remaining body is preserved rather than stripped twice.
+        local rendered = markdown.toHtml("---\ntitle: Hidden\n---\n---\nVisible\n---\n")
         expect(string.find(rendered, "Hidden", 1, true)):toBeNil()
-        expect(string.find(rendered, "<p>Visible</p>", 1, true) != nil):toBe(true)
+        expect(string.find(rendered, "Visible", 1, true) != nil):toBe(true)
+        expect(string.find(rendered, "<hr />", 1, true) != nil):toBe(true)
     end)
 
     it("extracts plain text from both Markdown strings and AST nodes", function()
