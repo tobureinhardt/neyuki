@@ -12,7 +12,7 @@ If you are planning a larger change, please bring it up there or in an issue fir
 
 Besides a recent stable Rust toolchain you need:
 
-- **Linux:** a C compiler (`gcc` or `clang`), `pkg-config` and the OpenSSL development headers (`build-essential pkg-config libssl-dev` on Debian/Ubuntu, `gcc pkgconf-pkg-config openssl-devel` on Fedora), plus the ALSA headers for `@neyuki/audio` (`libasound2-dev` / `alsa-lib-devel`; or build with `--no-default-features`). The X11, Wayland and xkbcommon libraries are loaded at runtime and are not needed to build.
+- **Linux:** a C compiler (`gcc` or `clang`), `pkg-config` and the OpenSSL development headers (`build-essential pkg-config libssl-dev` on Debian/Ubuntu, `gcc pkgconf-pkg-config openssl-devel` on Fedora). The X11, Wayland and xkbcommon libraries are loaded at runtime and are not needed to build.
 - **macOS:** the Xcode Command Line Tools (`xcode-select --install`).
 - **Windows (msvc):** the Visual Studio Build Tools with the "Desktop development with C++" workload.
 - **Windows (gnu):** a MinGW-w64 GCC on `PATH` (for example MSYS2's `mingw-w64-x86_64-gcc`), which also provides `dlltool`.

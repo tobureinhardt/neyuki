@@ -24,7 +24,7 @@ name = "neyuki"
 path = "src/main.rs"
 
 [features]
-default = ["webview", "audio"]
+default = ["webview"]
 # `@neyuki/webview`: pages rendered by the system web engine through `wry`.
 # On Linux this links WebKitGTK and GTK 3 (libwebkit2gtk-4.1-dev, libgtk-3-dev);
 # build with `--no-default-features` where those are not installed.
@@ -34,10 +34,6 @@ webview = ["dep:wry", "dep:gtk"]
 # dependency tree and several MiB to the executable, and `@neyuki/ui` keeps
 # rendering on the CPU either way.
 gpu = ["dep:wgpu", "dep:pollster"]
-# `@neyuki/audio`: sound playback through `rodio` and `cpal` (WASAPI, Core
-# Audio, ALSA). On Linux this links ALSA (libasound2-dev); build with
-# `--no-default-features` where it is not installed.
-audio = ["dep:rodio"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
@@ -156,15 +152,6 @@ wgpu = { version = "30", default-features = false, features = ["std", "parking_l
 # `pollster` (no dependencies of its own) parks the thread properly instead
 # of spinning on it.
 pollster = { version = "0.4", optional = true }
-
-# `@neyuki/audio` plays through `rodio`'s device sink and mixer (`cpal`
-# underneath: WASAPI on Windows, Core Audio on macOS, ALSA on Linux) and
-# decodes with Symphonia (pure Rust, MPL-2.0): WAV, FLAC, Ogg Vorbis, MP3 and
-# AAC in MP4/M4A. Symphonia seeks, which the alternative decoders rodio offers
-# do not, and the only MP3 one of those (`minimp3`) pulls in a crate with an
-# unfixed double-free advisory. `recording` and `dither` are left out. Voices
-# are mixed, resampled and panned by `src/vm/libs/audio.rs` itself.
-rodio = { version = "0.23", default-features = false, features = ["playback", "wav", "flac", "vorbis", "mp3", "mp4"], optional = true }
 
 # `@neyuki/webview` hosts WebView2 (Windows), WKWebView (macOS) and WebKitGTK
 # (Linux) through `wry`, inside the same `winit` event loop as `@neyuki/ui`.

@@ -67,7 +67,8 @@ allow = [
     "Unicode-3.0",
     # webpki-root-certs: the Mozilla root store data.
     "CDLA-Permissive-2.0",
-    # Symphonia, the decoders behind `@neyuki/audio`. MPL-2.0 is file-level
+    # cssparser and selectors, through `wry`'s HTML handling (kuchikiki) for
+    # `@neyuki/webview`. MPL-2.0 is file-level
     # copyleft: changes to its own files would have to be shared, but it
     # places no terms on the rest of an executable that links it.
     "MPL-2.0",

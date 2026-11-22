@@ -29,7 +29,7 @@ print(`total: {total}`)
 - **Optional types, checked before running.** `local n: number = "x"` is reported with its line before anything executes, and `neyuki lint` shows the same diagnostics in your editor.
 - **Tests built in.** `@neyuki/test` gives `describe`/`it`, hooks, expectations that show a diff, snapshots and a summary line; `neyuki test` runs them.
 - **Batteries for daily work.** Files and paths, JSON, TOML, YAML and CSV, dates, running programs, structured logging, HTTP client and server, PostgreSQL, MySQL and SQLite, hashing and encryption, and windows with 2D drawing and animation.
-- **Official packages for the rest.** Libraries a project may not need install on demand: `neyuki pkg add @nyk/html` for HTML, `@nyk/markdown` for Markdown and `@nyk/hid` for keyboard and mouse automation. See [the library reference](docs/reference/README.md#official-packages).
+- **Official packages for the rest.** Libraries a project may not need install on demand, such as `neyuki pkg add @nyk/html` for HTML. `@nyk/markdown`, `@nyk/hid` (keyboard and mouse automation) and `@nyk/audio` (sound) work the same way. See [the library reference](docs/reference/README.md#official-packages).
 - **One executable.** No runtime to install; on Linux, TLS uses the system's OpenSSL. Scripts can also be compiled to verified bytecode.
 
 ## Install

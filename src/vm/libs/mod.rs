@@ -5,7 +5,6 @@
 //! and built on the `__`-prefixed natives registered here.
 
 pub mod args;
-pub mod audio;
 pub mod background;
 pub mod bit;
 pub mod buffer;
@@ -66,6 +65,7 @@ pub(crate) const MOVED_LIBRARIES: &[(&str, &str)] = &[
     ("markdown", "@nyk/markdown"),
     ("html", "@nyk/html"),
     ("hid", "@nyk/hid"),
+    ("audio", "@nyk/audio"),
 ];
 
 /// The error for `require("@neyuki/<name>")` of a library that moved into a
@@ -88,7 +88,6 @@ pub fn register_natives(vm: &mut VM) {
         csv::NATIVES,
         ffi::NATIVES,
         fs::NATIVES,
-        audio::NATIVES,
         gpu::NATIVES,
         clipboard::NATIVES,
         http::NATIVES,
