@@ -1,0 +1,84 @@
+-- YAML 1.2 reading and writing, backed by src/vm/libs/yaml.rs.
+
+local table = require("@neyuki/table")
+
+export type DecodeOptions = {
+    keepNull: boolean?,
+}
+
+export type EncodeOptions = {
+    indent: number?,
+    sortKeys: boolean?,
+}
+
+local yaml = {}
+
+local function checkString(s: any, name: string)
+    if s == nil then error(name .. " must be provided") end
+    if type(s) != "string" then error(name .. " must be a string, got " .. type(s)) end
+end
+
+local function checkOptionalTable(t: any, name: string)
+    if t != nil and type(t) != "table" then
+        error(name .. " must be a table, got " .. type(t))
+    end
+end
+
+-- Shared null sentinel (the same value as `json.null`), preserved in decoded
+-- tables when `keepNull = true` and emitted back as `null`.
+yaml.null = __yaml_null()
+
+-- Parses a single YAML 1.2 document according to the Core Schema. Integers stay
+-- exact (promoting to arbitrary precision when needed), `.inf` and `.nan` become
+-- floats, and `null` / `~` become nil (or `yaml.null` with `keepNull = true`).
+-- Raises an error for malformed input, duplicate mapping keys, multi-document
+-- streams (use `yaml.decodeAll`), or documents exceeding nesting/node limits.
+function yaml.decode(text: string, options: DecodeOptions?): any
+    checkString(text, "text")
+    checkOptionalTable(options, "options")
+    local keepNull = false
+    if options != nil then
+        if options.keepNull != nil and type(options.keepNull) != "boolean" then
+            error("options.keepNull must be a boolean")
+        end
+        keepNull = options.keepNull == true
+    end
+    return __yaml_decode(text, keepNull)
+end
+
+-- Parses a YAML 1.2 stream containing zero, one or more documents separated by
+-- `---` / `...` and returns them as an array table.
+function yaml.decodeAll(text: string, options: DecodeOptions?): {any}
+    checkString(text, "text")
+    checkOptionalTable(options, "options")
+    local keepNull = false
+    if options != nil then
+        if options.keepNull != nil and type(options.keepNull) != "boolean" then
+            error("options.keepNull must be a boolean")
+        end
+        keepNull = options.keepNull == true
+    end
+    return __yaml_decode_all(text, keepNull)
+end
+
+-- Writes a value as YAML 1.2 text. `options` accepts `indent` (1..8 spaces,
+-- default 2) and `sortKeys` (default true). Raises an error for functions,
+-- cycles, nesting deeper than 128 levels, and output over 64 MiB.
+function yaml.encode(value: any, options: EncodeOptions?): string
+    checkOptionalTable(options, "options")
+    local indent: number? = nil
+    local sortKeys: boolean? = nil
+    if options != nil then
+        if options.indent != nil and type(options.indent) != "number" then
+            error("options.indent must be a number")
+        end
+        if options.sortKeys != nil and type(options.sortKeys) != "boolean" then
+            error("options.sortKeys must be a boolean")
+        end
+        indent = options.indent
+        sortKeys = options.sortKeys
+    end
+    return __yaml_encode(value, indent, sortKeys)
+end
+
+return table.freeze(yaml)

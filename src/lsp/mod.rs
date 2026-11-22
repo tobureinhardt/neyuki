@@ -2182,7 +2182,7 @@ mod tests {
         // document is not compared with the runtime here.
         let headless = [
             "crypto", "csv", "fs", "html", "http", "io", "log", "markdown", "net", "profile",
-            "sql", "test", "toml",
+            "sql", "test", "toml", "yaml",
         ];
         let modules: HashMap<&str, Value> = headless
             .iter()

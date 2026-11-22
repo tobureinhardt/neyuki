@@ -46,7 +46,7 @@ thread_local! {
 
 /// `json.null`: a value that encodes as `null`, and what `decode` produces
 /// for `null` with `keepNull`, so the key stays present.
-fn null_sentinel() -> Value {
+pub(crate) fn null_sentinel() -> Value {
     NULL.with(|n| Value::Table(n.clone()))
 }
 

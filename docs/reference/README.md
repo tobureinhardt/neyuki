@@ -35,6 +35,7 @@ Load these with `require("@neyuki/name")`.
 | [@neyuki/sql](sql.md) | PostgreSQL, MySQL, MariaDB and SQLite |
 | [@neyuki/crypto](crypto.md) | Hashes, passwords, encryption, signatures, secure random values |
 | [@neyuki/toml](toml.md) | Reading and writing TOML configuration files |
+| [@neyuki/yaml](yaml.md) | Reading and writing YAML 1.2 configuration files and multi-document streams |
 | [@neyuki/csv](csv.md) | Reading and writing CSV, with or without a header line |
 | [@neyuki/html](html.md) | Parsing HTML like a browser, CSS selectors, text and rendering |
 | [@neyuki/markdown](markdown.md) | CommonMark and GFM parsing, plain-table ASTs, frontmatter and safe HTML rendering |

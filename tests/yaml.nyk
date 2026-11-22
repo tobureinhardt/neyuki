@@ -1,0 +1,191 @@
+-- Tests for @neyuki/yaml: YAML 1.2 Core Schema, block scalars, flow syntax,
+-- anchors/aliases, merge keys, multi-document streams, encoding roundtrips
+-- and hostile input caps.
+
+local json = require("@neyuki/json")
+local math = require("@neyuki/math")
+local string = require("@neyuki/string")
+local test = require("@neyuki/test")
+local yaml = require("@neyuki/yaml")
+
+local describe, it, expect = test.describe, test.it, test.expect
+
+describe("@neyuki/yaml", function()
+    it("decodes YAML 1.2 Core Schema scalars and exact integers", function()
+        local doc = yaml.decode([[
+str: hello world
+quoted: "true"
+norway: NO
+yes_word: yes
+on_word: on
+bool_t: true
+bool_f: FALSE
+dec: -42
+hex: 0x1a
+oct: 0o755
+bad_hex: 0x-1A
+bad_oct: 0o+7
+big: 36893488147419103232
+flt: 3.14159
+sci: 1.5e3
+pinf: .inf
+ninf: -.inf
+nanv: .nan
+nil_val: ~
+explicit_str: !!str 12345
+]], { keepNull = true })
+
+        expect(doc.str):toBe("hello world")
+        expect(doc.quoted):toBe("true")
+        expect(doc.norway):toBe("NO")
+        expect(doc.yes_word):toBe("yes")
+        expect(doc.on_word):toBe("on")
+        expect(doc.bool_t):toBe(true)
+        expect(doc.bool_f):toBe(false)
+        expect(doc.dec):toBe(-42)
+        expect(doc.hex):toBe(26)
+        expect(doc.oct):toBe(493)
+        expect(doc.bad_hex):toBe("0x-1A")
+        expect(doc.bad_oct):toBe("0o+7")
+        expect(doc.big):toBe(2 ^ 65)
+        expect(doc.flt):toBe(3.14159)
+        expect(doc.sci):toBe(1500.0)
+        expect(math.isinf(doc.pinf) and doc.pinf > 0):toBe(true)
+        expect(math.isinf(doc.ninf) and doc.ninf < 0):toBe(true)
+        expect(math.isnan(doc.nanv)):toBe(true)
+        expect(doc.nil_val):toBe(yaml.null)
+        expect(yaml.null):toBe(json.null)
+        expect(doc.explicit_str):toBe("12345")
+    end)
+
+    it("decodes block scalars with literal, folded and chomping indicators", function()
+        local doc = yaml.decode([[
+clip: |
+  line 1
+  line 2
+strip: |-
+  line 1
+  line 2
+keep: |+
+  line 1
+
+folded: >
+  hello
+  world
+]])
+        expect(doc.clip):toBe("line 1\nline 2\n")
+        expect(doc.strip):toBe("line 1\nline 2")
+        expect(doc.keep):toBe("line 1\n\n")
+        expect(doc.folded):toBe("hello world\n")
+    end)
+
+    it("supports anchors, aliases and merge keys", function()
+        local doc = yaml.decode([[
+base: &base
+  host: 127.0.0.1
+  port: 8080
+extra: &extra
+  port: 9090
+  tls: true
+service:
+  <<: [*base, *extra]
+  name: api
+copy: *base
+]])
+        expect(doc.service):toEqual({
+            host = "127.0.0.1",
+            port = 8080,
+            tls = true,
+            name = "api",
+        })
+        expect(doc.copy):toEqual({ host = "127.0.0.1", port = 8080 })
+    end)
+
+    it("handles empty documents and multi-document streams", function()
+        expect(yaml.decode("")):toBeNil()
+        expect(yaml.decode("# just a comment\n")):toBeNil()
+        expect(yaml.decode("", { keepNull = true })):toBe(yaml.null)
+
+        local multi = "---\nkind: Config\nval: 1\n---\nkind: Service\nval: 2\n...\n"
+        expect(function() yaml.decode(multi) end):toThrow("decodeAll")
+
+        local docs = yaml.decodeAll(multi)
+        expect(#docs):toBe(2)
+        expect(docs[1]):toEqual({ kind = "Config", val = 1 })
+        expect(docs[2]):toEqual({ kind = "Service", val = 2 })
+        expect(yaml.decodeAll("# empty\n")):toEqual({})
+    end)
+
+    it("encodes values cleanly and roundtrips tricky strings and structures", function()
+        local original = {
+            name = "neyuki",
+            flag = true,
+            empty_str = "",
+            looks_bool = "true",
+            looks_yes = "yes",
+            looks_num = "0123",
+            has_colon = "a: b",
+            has_hash = "x # not a comment",
+            leading_dash = "- item",
+            multiline = "first line\nsecond line",
+            multiline_nl = "  indented\nsecond\n",
+            exact_big = 2 ^ 100,
+            empty_map = {},
+            empty_arr = json.array(),
+            null_field = yaml.null,
+            nested = {
+                { id = 1, tags = { "alpha", "beta" } },
+                { id = 2, tags = { "gamma" } },
+            },
+        }
+        local text = yaml.encode(original)
+        local decoded = yaml.decode(text, { keepNull = true })
+
+        expect(decoded.name):toBe(original.name)
+        expect(decoded.flag):toBe(true)
+        expect(decoded.empty_str):toBe("")
+        expect(decoded.looks_bool):toBe("true")
+        expect(decoded.looks_yes):toBe("yes")
+        expect(decoded.looks_num):toBe("0123")
+        expect(decoded.has_colon):toBe("a: b")
+        expect(decoded.has_hash):toBe("x # not a comment")
+        expect(decoded.leading_dash):toBe("- item")
+        expect(decoded.multiline):toBe("first line\nsecond line")
+        expect(decoded.multiline_nl):toBe("  indented\nsecond\n")
+        expect(decoded.exact_big):toBe(2 ^ 100)
+        expect(decoded.empty_map):toEqual({})
+        expect(decoded.empty_arr):toEqual({})
+        expect(decoded.null_field):toBe(yaml.null)
+        expect(decoded.nested):toEqual(original.nested)
+
+        -- Custom indent option and quoting of "<<", "...", "---"
+        local indented = yaml.encode({ a = { b = 1 } }, { indent = 4 })
+        expect(string.find(indented, "    b: 1", 1, true) != nil):toBe(true)
+        expect(yaml.decode(yaml.encode({ ["<<"] = "literal-merge-key" }))["<<"]):toBe("literal-merge-key")
+        expect(yaml.decode(yaml.encode("..."))):toBe("...")
+        expect(yaml.decode(yaml.encode("---"))):toBe("---")
+    end)
+
+    it("rejects duplicate keys, cycles, bombs and invalid options", function()
+        expect(function() yaml.decode("a: 1\na: 2\n") end):toThrow("duplicate")
+        expect(function() yaml.decode("a: *missing") end):toThrow("anchor")
+        expect(function() yaml.decode("a: &a [*a]") end):toThrow("cyclic")
+        expect(function() yaml.decode("[1, 2]: value") end):toThrow("scalar")
+
+        local bomb = [[
+a: &a [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]
+c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]
+d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c, *c]
+e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d, *d]
+f: &f [*e, *e, *e, *e, *e, *e, *e, *e, *e, *e]
+]]
+        expect(function() yaml.decode(bomb) end):toThrow("limit")
+
+        local cyclic = {}
+        cyclic.self = cyclic
+        expect(function() yaml.encode(cyclic) end):toThrow("contains itself")
+        expect(function() yaml.encode(function() end) end):toThrow("cannot encode")
+        expect(function() yaml.encode({}, { indent = 0 }) end):toThrow("indent")
+    end)
+end)

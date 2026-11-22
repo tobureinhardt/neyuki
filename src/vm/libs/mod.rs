@@ -42,6 +42,7 @@ pub mod webview;
     target_arch = "x86_64"
 ))]
 pub mod webview2_loader;
+pub mod yaml;
 
 pub use bit::create_bit_lib;
 pub use buffer::create_buffer_lib;
@@ -81,6 +82,7 @@ pub fn register_natives(vm: &mut VM) {
         toml::NATIVES,
         ui::NATIVES,
         webview::NATIVES,
+        yaml::NATIVES,
     ] {
         for def in natives {
             vm.register_native(def);

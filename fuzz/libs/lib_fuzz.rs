@@ -9,6 +9,7 @@ use crate::vm::libs::json::decode_from_str;
 use crate::vm::libs::markdown::{
     parse_from_str as parse_md_from_str, to_html_from_str as render_md_from_str,
 };
+use crate::vm::libs::yaml::decode_from_str as decode_yaml_from_str;
 use crate::vm::machine::VM;
 use crate::vm::value::Value;
 
@@ -288,6 +289,52 @@ pub fn fuzz_http_multipart_and_cookies() {
     assert!(execute_source(cookie_script).is_ok());
 }
 
+pub fn fuzz_yaml_parser_and_bombs() {
+    // 1. Deeply nested YAML sequences beyond depth limit (128)
+    let mut deep = "1".to_string();
+    for _ in 0..150 {
+        deep = format!("[{}]", deep);
+    }
+    assert!(
+        decode_yaml_from_str(&deep).is_err(),
+        "deeply nested YAML must be rejected"
+    );
+
+    // 2. Billion Laughs alias expansion bomb
+    let bomb = "\
+a: &a [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]\n\
+b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\n\
+c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\n\
+d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c, *c]\n\
+e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d, *d]\n\
+f: &f [*e, *e, *e, *e, *e, *e, *e, *e, *e, *e]\n";
+    assert!(
+        decode_yaml_from_str(bomb).is_err(),
+        "YAML alias expansion bomb must be rejected"
+    );
+
+    // 3. Malformed YAML inputs must return clean errors, never panic
+    let malformed = [
+        "a: [1, 2",
+        "a: {b: 1",
+        "a: *missing",
+        "a: 1\na: 2\n",
+        "---\na: 1\n---\nb: 2\n",
+        "key:\n\t- tab_indent",
+        "\"unterminated",
+        "!!int not_an_int",
+        "!!bool maybe",
+        "[1, 2]: value",
+    ];
+    for input in malformed {
+        assert!(
+            decode_yaml_from_str(input).is_err(),
+            "malformed YAML {:?} must be rejected",
+            input
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +347,6 @@ mod tests {
         fuzz_crypto_boundaries();
         fuzz_markdown_parser_and_xss();
         fuzz_http_multipart_and_cookies();
+        fuzz_yaml_parser_and_bombs();
     }
 }
