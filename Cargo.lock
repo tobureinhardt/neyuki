@@ -3390,6 +3390,7 @@ dependencies = [
  "keyring",
  "libloading",
  "md-5 0.10.6",
+ "memchr",
  "mimalloc",
  "mysql",
  "native-tls",
