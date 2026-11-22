@@ -465,11 +465,8 @@ fn publish_package(dry_run: bool) -> Result<(), String> {
     let files = publish::collect(&root)?;
     let metadata = publish::metadata(&manifest, &files)?;
     let archive = tarball::pack(&files)?;
-    if archive.len() > publish::MAX_ARCHIVE {
-        return Err(format!(
-            "the package is {:.1} MB compressed; the limit is 10 MB. List what to leave out in .neyukiignore",
-            archive.len() as f64 / 1024.0 / 1024.0
-        ));
+    if let Some(note) = publish::check_size(archive.len())? {
+        eprintln!("note: {}", note);
     }
     let name: PackageName = manifest.name.parse()?;
     let registry = registry();

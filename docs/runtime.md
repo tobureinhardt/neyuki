@@ -121,7 +121,7 @@ keywords = ["http", "router"]
 
 Every package installs once, flat, into `neyuki_packages/<user>/<package>/`, so all requirements on a package must agree on one version. `neyuki.lock` records the exact version and SHA-256 checksum of each one. Installs keep the locked versions while they still fit the manifest, download only what changed, refuse an archive whose checksum differs from the lockfile, and remove packages that are no longer needed. `--frozen` fails instead of changing the lockfile, for CI.
 
-To publish, create an account at neyuki.cc, confirm your email, create an API token on the account page and run `neyuki pkg login`. `publish` uploads every file in the project except hidden files, `neyuki_packages/`, `target/`, `node_modules/`, `neyuki.lock` and what `.neyukiignore` lists (one glob per line), up to 10 MB compressed; a `README.md` becomes the package page.
+To publish, create an account at neyuki.cc, confirm your email, create an API token on the account page and run `neyuki pkg login`. `publish` uploads every file in the project except hidden files, `neyuki_packages/`, `target/`, `node_modules/`, `neyuki.lock` and what `.neyukiignore` lists (one glob per line), up to 10 MB compressed (40 MB for the publishers of the official native packages, which ship one library per target); a `README.md` becomes the package page.
 
 `NEYUKI_REGISTRY` points `neyuki pkg` at another registry, `NEYUKI_TOKEN` supplies a token (for CI), `NEYUKI_PATH` moves the global packages (default `~/.neyuki/packages`) and `NEYUKI_HOME` moves `~/.neyuki`, where `neyuki pkg login` keeps its token.
 

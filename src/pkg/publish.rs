@@ -16,8 +16,36 @@ use serde_json::{Map, Value as Json, json};
 use super::manifest::PackageManifest;
 use super::paths::{LOCKFILE, MANIFEST, PACKAGES_DIR};
 
-/// The registry refuses larger archives.
-pub const MAX_ARCHIVE: usize = 10 * 1024 * 1024;
+/// The largest archive the registry takes from anyone: trusted publishers
+/// (the official native packages, one library per target) may upload this
+/// much, everyone else `STANDARD_ARCHIVE`. The registry enforces which
+/// applies; the CLI only refuses what no account could publish.
+pub const MAX_ARCHIVE: usize = 40 * 1024 * 1024;
+/// The archive limit for most publishers.
+pub const STANDARD_ARCHIVE: usize = 10 * 1024 * 1024;
+
+fn megabytes(bytes: usize) -> f64 {
+    bytes as f64 / 1024.0 / 1024.0
+}
+
+/// Checks a packed archive's size: an error past `MAX_ARCHIVE`, and a note
+/// past `STANDARD_ARCHIVE`, which only trusted publishers may upload.
+pub fn check_size(len: usize) -> Result<Option<String>, String> {
+    if len > MAX_ARCHIVE {
+        return Err(format!(
+            "the package is {:.1} MB compressed; the registry takes at most {} MB. List what to leave out in .neyukiignore",
+            megabytes(len),
+            MAX_ARCHIVE / (1024 * 1024)
+        ));
+    }
+    Ok((len > STANDARD_ARCHIVE).then(|| {
+        format!(
+            "the package is {:.1} MB compressed: over {} MB, the registry only takes it from trusted publishers",
+            megabytes(len),
+            STANDARD_ARCHIVE / (1024 * 1024)
+        )
+    }))
+}
 const MAX_README: usize = 200_000;
 const ALWAYS_SKIPPED: &[&str] = &[PACKAGES_DIR, "target", "node_modules"];
 
@@ -207,6 +235,19 @@ pub fn metadata(manifest: &PackageManifest, files: &[(String, Vec<u8>)]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_size_limits() {
+        assert_eq!(check_size(STANDARD_ARCHIVE).unwrap(), None);
+        let note = check_size(STANDARD_ARCHIVE + 1).unwrap().unwrap();
+        assert!(note.contains("trusted publishers"), "{note}");
+        assert!(check_size(MAX_ARCHIVE).is_ok());
+        let err = check_size(MAX_ARCHIVE + 1).unwrap_err();
+        assert!(
+            err.contains("at most 40 MB") && err.contains(".neyukiignore"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn ignore_globs() {

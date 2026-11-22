@@ -9,8 +9,9 @@ use serde_json::{Value as Json, json};
 use super::paths::{PackageName, registry_url};
 use super::version::Version;
 
-/// The most a package download may be; the registry caps uploads at 10 MB.
-const MAX_DOWNLOAD: u64 = 16 * 1024 * 1024;
+/// The most a package download may be: the registry caps uploads at 40 MB
+/// (`publish::MAX_ARCHIVE`), with room to spare.
+const MAX_DOWNLOAD: u64 = 48 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct VersionMeta {
