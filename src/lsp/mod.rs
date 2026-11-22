@@ -1962,11 +1962,11 @@ mod tests {
 
     #[test]
     fn test_lsp_completion_of_nested_namespace() {
-        let resp = complete_at_end("local hid = require(\"@neyuki/hid\")\nhid.");
-        assert!(resp.contains("\"label\":\"keyboard\""));
-        let resp = complete_at_end("hid.keyboard.pr");
-        assert!(resp.contains("\"label\":\"press\""));
-        assert!(!resp.contains("\"label\":\"tap\""));
+        let resp = complete_at_end("local ui = require(\"@neyuki/ui\")\nui.");
+        assert!(resp.contains("\"label\":\"clipboard\""));
+        let resp = complete_at_end("ui.clipboard.g");
+        assert!(resp.contains("\"label\":\"get\""));
+        assert!(!resp.contains("\"label\":\"set\""));
     }
 
     #[test]
@@ -2178,7 +2178,7 @@ mod tests {
             .filter_map(|lib| lib.module)
             .collect();
         // The bundled modules that load without a desktop session or a web
-        // engine. `ui`, `hid` and `webview` need one, so what their pages
+        // engine. `ui` and `webview` need one, so what their pages
         // document is not compared with the runtime here.
         let headless = [
             "crypto", "csv", "fs", "http", "io", "log", "net", "profile", "sql", "test", "toml",

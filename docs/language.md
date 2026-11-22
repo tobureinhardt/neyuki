@@ -262,7 +262,7 @@ local geometry = require("geometry")
 print(geometry.area(2, 3))
 ```
 
-The standard libraries (`math`, `string`, `table`, `bit`, `buffer`, `coroutine`, `task`, `utf8`, `debug`, `json`, `os`) are always available as globals. The bundled modules are loaded with `require("@neyuki/name")`: `fs`, `io`, `http`, `net`, `sql`, `crypto`, `toml`, `csv`, `ui`, `hid`, `profile`, `test` and `webview`.
+The standard libraries (`math`, `string`, `table`, `bit`, `buffer`, `coroutine`, `task`, `utf8`, `debug`, `json`, `os`) are always available as globals. The bundled modules are loaded with `require("@neyuki/name")`: `fs`, `io`, `http`, `net`, `sql`, `crypto`, `toml`, `csv`, `ui`, `profile`, `test` and `webview`.
 
 A `--!importall` line before the first line of code makes every bundled module available under its own name, without a `require` for each:
 

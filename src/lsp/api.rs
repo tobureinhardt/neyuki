@@ -31,7 +31,7 @@ pub enum EntryKind {
     /// A function of an object type, written `Type:method`.
     Method,
     Value,
-    /// A name that only has members, such as `hid.keyboard`.
+    /// A name that only has members, such as `ui.clipboard`.
     Namespace,
 }
 
@@ -616,10 +616,10 @@ mod tests {
         assert!(!standard.contains(&"@neyuki/fs".to_string()));
 
         // Nested namespaces show up as members of their parent.
-        let hid = api.namespace_members("hid");
+        let ui = api.namespace_members("ui");
         assert!(
-            hid.iter()
-                .any(|e| e.name == "hid.keyboard" && e.kind == EntryKind::Namespace)
+            ui.iter()
+                .any(|e| e.name == "ui.clipboard" && e.kind == EntryKind::Namespace)
         );
         assert!(
             api.namespace_members("ui.clipboard")

@@ -65,7 +65,7 @@ When `require(path)` is invoked, the runtime resolves the target in the followin
    If the canonical name has already been resolved and executed, the cached exported value is returned immediately without re-executing the module code.
 
 2. **Standard and Bundled Libraries (`@neyuki/`)**:
-   Paths matching `@neyuki/<name>` or `<name>` (where `<name>` is one of the built-in libraries: `bit`, `bit32`, `buffer`, `coroutine`, `crypto`, `csv`, `debug`, `fs`, `hid`, `http`, `io`, `json`, `log`, `math`, `net`, `os`, `sql`, `string`, `table`, `task`, `toml`, `ui`, `utf8`, `yaml`) are served directly from the embedded standard library distribution.
+   Paths matching `@neyuki/<name>` or `<name>` (where `<name>` is one of the built-in libraries: `bit`, `bit32`, `buffer`, `coroutine`, `crypto`, `csv`, `debug`, `fs`, `http`, `io`, `json`, `log`, `math`, `net`, `os`, `sql`, `string`, `table`, `task`, `toml`, `ui`, `utf8`, `yaml`) are served directly from the embedded standard library distribution.
 
 3. **Registry Packages (`@pkg/` and `@<user>/`)**:
    `@pkg/<user>/<package>[/<module>]` resolves against the project's `neyuki_packages/<user>/<package>/` (the project is the nearest directory above the entry script with a `neyuki.toml` or `neyuki_packages`; inside a built app, the bundle). Outside a project it falls back to the global packages, so a library that requires its dependencies this way works installed either way. `@<user>/<package>[/<module>]` resolves only against the global packages (`$NEYUKI_PATH`, else `~/.neyuki/packages`). Without a module, the `entry` named in the package's `neyuki.toml` loads, else `init.nyk`, else `main.nyk`; with one, `<module>.nyk`, `<module>.nykb` or `<module>/init.nyk`.

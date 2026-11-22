@@ -112,7 +112,7 @@ end
 ```
 ## ui.clipboard.get(): string?
 
-The clipboard's text, or nil when it holds something else or nothing. The same clipboard as `@neyuki/hid`.
+The clipboard's text, or nil when it holds something else or nothing. The same clipboard as `@nyk/hid`.
 
 ## ui.clipboard.set(text: string): ()
 

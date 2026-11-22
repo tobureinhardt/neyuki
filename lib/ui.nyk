@@ -1143,17 +1143,17 @@ end
 
 -- CLIPBOARD AND LINKS ------------------------------------------------------
 
--- The system clipboard, shared with `@neyuki/hid` (same natives).
+-- The system clipboard (src/vm/libs/clipboard.rs).
 local clipboard = {}
 
 -- The clipboard's text, or nil when it holds something else or nothing.
 function clipboard.get(): string?
-    return __hid_clipboard_get()
+    return __ui_clipboard_get()
 end
 
 function clipboard.set(text: string): ()
     checkString(text, "text")
-    __hid_clipboard_set(text)
+    __ui_clipboard_set(text)
 end
 
 ui.clipboard = table.freeze(clipboard)

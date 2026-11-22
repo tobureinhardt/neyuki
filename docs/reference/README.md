@@ -41,7 +41,6 @@ Load these with `require("@neyuki/name")`.
 | [@neyuki/webview](webview.md) | Web pages in a window: load a URL, HTML or app files, and exchange messages with the page |
 | [@neyuki/gpu](gpu.md) | GPU rendering on a `ui` window, behind the `gpu` cargo feature: textured, depth-tested meshes and canvases as textures |
 | [@neyuki/audio](audio.md) | Playing sound files, tones and samples: volume, panning, speed, looping, fades and seeking |
-| [@neyuki/hid](hid.md) | Keyboard and mouse automation, screen size, clipboard |
 | [@neyuki/profile](profile.md) | Finding slow functions |
 | [@neyuki/test](test.md) | Tests with `describe`/`it`, hooks, expectations with diffs, snapshots and a summary line |
 
@@ -51,5 +50,6 @@ Some libraries live in packages rather than in the executable, so a build only c
 
 | Package | What it covers |
 | --- | --- |
+| [@nyk/hid](https://neyuki.cc/packages/@nyk/hid) | Keyboard and mouse automation, screen size, clipboard (formerly `@neyuki/hid`) |
 | [@nyk/html](https://neyuki.cc/packages/@nyk/html) | Parsing HTML like a browser, CSS selectors, text and rendering (formerly `@neyuki/html`) |
 | [@nyk/markdown](https://neyuki.cc/packages/@nyk/markdown) | CommonMark and GFM parsing, plain-table ASTs, frontmatter and safe HTML rendering (formerly `@neyuki/markdown`) |

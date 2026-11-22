@@ -141,10 +141,7 @@ open = "5"
 # tables directly with exact BigInt integers and strict alias-expansion caps.
 saphyr-parser = "0.4"
 
-# `@neyuki/hid` drives the keyboard and mouse through `enigo` (SendInput on
-# Windows, CoreGraphics on macOS, XTest over the pure-Rust `x11rb` on X11)
-# and the clipboard through `arboard`.
-enigo = "0.6"
+# `ui.clipboard` reads and writes the system clipboard through `arboard`.
 arboard = { version = "3", default-features = false }
 
 # `@neyuki/gpu` talks to the platform graphics API through `wgpu`: Direct3D 12
@@ -212,17 +209,9 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 [target.'cfg(not(windows))'.dependencies]
 keyring = { version = "3.6", features = ["apple-native", "async-secret-service", "async-io", "crypto-rust"] }
 
-# On Wayland, XTest only reaches XWayland windows, so `@neyuki/hid` drives the
-# compositor's virtual keyboard and pointer itself. enigo's own Wayland
-# backend would link libxkbcommon; these are protocol bindings only, and
-# `tempfile` holds the keymap the virtual keyboard is given.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 # `gtk` hosts the web view on Linux, where WebKitGTK cannot live in a winit window.
 gtk = { version = "0.18", optional = true }
-wayland-client = "0.31"
-wayland-protocols-misc = { version = "0.3", features = ["client"] }
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-tempfile = "3"
 
 # Debug builds still optimize dependencies: the crypto crates run 10-50x
 # slower unoptimized, enough that `hashPassword` and `pbkdf2` at their default
