@@ -59,32 +59,41 @@ This document outlines the architectural milestones and engineering trajectory f
 
 ---
 
+## Milestone: Official native packages
+- [x] Native extension ABI 2: services one extension publishes for others (`provide_service`/`lookup_service`) and task scheduler hooks, so an extension's event loop parks only the calling task.
+- [x] `neyuki-ext`, the Rust SDK for native extensions, on crates.io.
+- [x] `[native]` packages: one prebuilt library per target in the package, loaded by `require("@pkg/user/package/native")`, bundled by `neyuki build`; the registry gives the official publishers 40 MB.
+- [x] `fs.readBuffer`, so packages read files the way the runtime does (from a built app's bundle, under the sandbox).
+- [x] The libraries a project may not need moved out of the runtime into `@nyk` packages, one repository each (`neyuki-lang/pkg-<name>`): `@nyk/markdown`, `@nyk/html`, `@nyk/hid`, `@nyk/audio`, `@nyk/sql`, `@nyk/ui`, `@nyk/gpu` and `@nyk/webview`. `require("@neyuki/<name>")` of a moved library says which package to add. `@nyk/gpu` and `@nyk/webview` reach `@nyk/ui`'s windows through its `nyk.ui/1` service.
+
+---
+
 ## Milestone: Desktop app platform
 - [x] `neyuki build`: package an entry script and an asset folder into a standalone executable with an embedded read-only file system.
 - [x] `[app]` manifest section: name, identifier, icon, publisher, copyright; no console window by default on Windows.
 - [x] `os.app()`: read the app's name, version and identifier at runtime.
 - [x] Per-user storage in `@neyuki/os`: `dataDir`, `configDir` and `cacheDir` following each platform's conventions, and `protect`/`unprotect` for secrets (DPAPI on Windows, an OS keychain key elsewhere).
-- [x] `@neyuki/ui` window chrome and input: frameless windows with app-drawn title bars (`startDrag`, `startResize`, minimize/maximize/restore, fullscreen, minimum size, icon, drop shadow), pointer cursors, IME text input (`textinput` and `ime` events), click counts for double-click, window state, file drop and DPI change events, `ui.clipboard` and `ui.openUrl`.
-- [x] `@neyuki/ui` text: font fallback chains for apps that ship their own CJK fonts (`ui.setFallbackFonts`, per-call `fallback`, `ui.loadFont` from a buffer, `ui.systemFont`), plus ellipsis, clip and wrap overflow, alignment, line height and letter spacing.
-- [x] OS media integration for `@neyuki/ui`: now-playing metadata in the system media controls (`ui.mediaSession`) and global media keys as `mediakey` events.
-- [x] `@neyuki/ui` image decoding: PNG, JPEG, WebP, GIF and BMP detected by magic bytes, from files (`ui.loadImage`) or memory (`ui.decodeImage`).
+- [x] `@nyk/ui` window chrome and input: frameless windows with app-drawn title bars (`startDrag`, `startResize`, minimize/maximize/restore, fullscreen, minimum size, icon, drop shadow), pointer cursors, IME text input (`textinput` and `ime` events), click counts for double-click, window state, file drop and DPI change events, `ui.clipboard` and `ui.openUrl`.
+- [x] `@nyk/ui` text: font fallback chains for apps that ship their own CJK fonts (`ui.setFallbackFonts`, per-call `fallback`, `ui.loadFont` from a buffer, `ui.systemFont`), plus ellipsis, clip and wrap overflow, alignment, line height and letter spacing.
+- [x] OS media integration for `@nyk/ui`: now-playing metadata in the system media controls (`ui.mediaSession`) and global media keys as `mediakey` events.
+- [x] `@nyk/ui` image decoding: PNG, JPEG, WebP, GIF and BMP detected by magic bytes, from files (`ui.loadImage`) or memory (`ui.decodeImage`).
   - [x] Animated GIF/WebP/PNG frames with browser-style delay clamping, `ui.animation` playback helper and `image:resized`.
   - [x] `drawImage` options `frame`, `opacity`, `radius` and `fit` (`fill`, `contain`, `cover`) with cached smooth resampling.
   - [x] Pixel-count and decoded-memory limits.
-- [x] `@neyuki/ui` canvas and effects, CPU only:
+- [x] `@nyk/ui` canvas and effects, CPU only:
   - [x] `ui.canvas` off-screen surfaces with the full drawing API, drawable like an image, and `ui.path` with `fillPath`, `strokePath` and `getPixel`.
   - [x] Rectangle and path clipping (`pushClip`, `pushClipPath`), group opacity (`pushOpacity`), linear/radial gradients and box shadows on fills.
   - [x] Gaussian blur: `blurRegion` backdrop blur with rounded masks and `Image:blur`.
-  - [x] CPU render performance: `present({ dirty })` partial present, `ui.run({ fps = "auto" })` idle throttling, `ui.stats()` frame timing and an opaque glyph fast path. A GPU backend *behind* these drawing calls is still left out: `@neyuki/gpu` sits beside them as its own module, so `ui` keeps rendering on the CPU with no driver.
+  - [x] CPU render performance: `present({ dirty })` partial present, `ui.run({ fps = "auto" })` idle throttling, `ui.stats()` frame timing and an opaque glyph fast path. A GPU backend *behind* these drawing calls is still left out: `@nyk/gpu` sits beside them as its own module, so `ui` keeps rendering on the CPU with no driver.
 - [x] Async I/O: `http.request`, `os.run` and `fs.read` suspend only the calling task and run on background threads; `ui.run` pumps the completions every frame so windows stay responsive.
 - [x] `@neyuki/net`: named pipes, Unix sockets, TCP sockets and a WebSocket client with reader threads and buffered reads that suspend only the calling task, plus `os.spawn` for child processes with streamed stdin, stdout and stderr.
   - [x] WebSocket servers (`net.listenWebSocket`) whose handshakes run natively, and UDP sockets (`net.udp`) with `sendTo`, connected `send`, timed `receive` and multicast groups.
-- [x] `@neyuki/webview`: web pages through the system web engine (WebView2, WKWebView, WebKitGTK) in the `ui` event loop, with a custom asset protocol and page/script messaging. Embedded web content is one route to GPU-accelerated drawing; `@neyuki/gpu` is the other.
-- [x] `@neyuki/gpu`: GPU rendering on a `ui` window through `wgpu` (Direct3D 12, Metal, Vulkan), behind the `gpu` cargo feature, which is off in stock builds because it adds several MiB to the executable.
+- [x] `@nyk/webview`: web pages through the system web engine (WebView2, WKWebView, WebKitGTK) in the `ui` event loop, with a custom asset protocol and page/script messaging. Embedded web content is one route to GPU-accelerated drawing; `@nyk/gpu` is the other.
+- [x] `@nyk/gpu`: GPU rendering on a `ui` window through `wgpu` (Direct3D 12, Metal, Vulkan), as a package so the runtime carries none of it.
   - [x] WGSL shaders with errors that carry a line and a column, pipelines, and vertex, index and uniform data straight from `buffer` values.
-  - [x] Textures from `@neyuki/ui` images and canvases, with `texture:update` for a canvas that is redrawn: 2D drawing and text over 3D without leaving `ui`.
+  - [x] Textures from `@nyk/ui` images and canvases, with `texture:update` for a canvas that is redrawn: 2D drawing and text over 3D without leaving `ui`.
   - [x] A depth buffer on every frame, back-face culling, premultiplied blending, and `frame:read()` so a frame can be checked with no display and no GPU.
-- [x] `@neyuki/audio`: WAV, FLAC, Ogg Vorbis, MP3 and AAC playback, tones and raw samples through `rodio`/`cpal`, with per-voice volume, pan, speed, looping, fades, pausing and seeking, loaded or streamed, and output device selection.
+- [x] `@nyk/audio`: WAV, FLAC, Ogg Vorbis, MP3 and AAC playback, tones and raw samples through `rodio`/`cpal`, with per-voice volume, pan, speed, looping, fades, pausing and seeking, loaded or streamed, and output device selection.
 - [ ] Tray icon with a menu whose items arrive as events.
 - [ ] Single-instance apps: a second launch signals and focuses the first.
 - [ ] Auto-update support.
