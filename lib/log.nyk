@@ -1,0 +1,564 @@
+-- Structured logging with levels, colored console output, JSON Lines and
+-- rotating file sinks.
+
+local string = require("@neyuki/string")
+local table = require("@neyuki/table")
+
+export type SinkOptions = {
+    type: string?,
+    level: (string | number)?,
+    format: string?,
+    stream: string?,
+    color: (boolean | string)?,
+    path: string?,
+    maxSize: number?,
+    rotation: string?,
+    maxFiles: number?,
+    compress: boolean?,
+    utc: boolean?,
+    write: ((record: LogRecord) -> ())?,
+}
+
+export type LoggerOptions = {
+    name: string?,
+    level: (string | number)?,
+    fields: {[string]: any}?,
+    sinks: {SinkOptions}?,
+    utc: boolean?,
+    format: string?,
+    color: (boolean | string)?,
+    stream: string?,
+}
+
+export type LogRecord = {
+    time: string,
+    level: string,
+    levelValue: number,
+    logger: string?,
+    message: string,
+    fields: {[string]: any},
+    line: string,
+}
+
+export type Logger = {
+    setLevel: (self: Logger, level: string | number) -> (),
+    getLevel: (self: Logger) -> string,
+    child: (self: Logger, fields: {[string]: any}?, options: { name: string?, level: (string | number)? }?) -> Logger,
+    log: (self: Logger, level: string | number, message: string, fields: {[string]: any}?) -> (),
+    trace: (self: Logger, message: string, fields: {[string]: any}?) -> (),
+    debug: (self: Logger, message: string, fields: {[string]: any}?) -> (),
+    info: (self: Logger, message: string, fields: {[string]: any}?) -> (),
+    warn: (self: Logger, message: string, fields: {[string]: any}?) -> (),
+    error: (self: Logger, message: string, fields: {[string]: any}?) -> (),
+    fatal: (self: Logger, message: string, fields: {[string]: any}?) -> (),
+    flush: (self: Logger) -> (),
+    rotate: (self: Logger) -> (),
+    close: (self: Logger) -> (),
+}
+
+local log = {}
+
+local LEVEL_VALUES = {
+    trace = 10,
+    debug = 20,
+    info = 30,
+    warn = 40,
+    error = 50,
+    fatal = 60,
+    off = 100,
+}
+
+local VALUE_TO_LEVEL = {
+    [10] = "trace",
+    [20] = "debug",
+    [30] = "info",
+    [40] = "warn",
+    [50] = "error",
+    [60] = "fatal",
+    [100] = "off",
+}
+
+log.LEVEL = table.freeze({
+    trace = 10,
+    debug = 20,
+    info = 30,
+    warn = 40,
+    error = 50,
+    fatal = 60,
+    off = 100,
+})
+
+local function parseLevel(level: any, allowOff: boolean): (number, string)
+    if type(level) == "string" then
+        local lower = string.lower(level)
+        if lower == "warning" then lower = "warn" end
+        local val = LEVEL_VALUES[lower]
+        if val == nil or (not allowOff and lower == "off") then
+            error("invalid log level `" .. level .. "`")
+        end
+        return val, lower
+    end
+    if type(level) == "number" then
+        local name = VALUE_TO_LEVEL[level]
+        if name == nil or (not allowOff and name == "off") then
+            error("invalid log level " .. tostring(level))
+        end
+        return level, name
+    end
+    error("level must be a string or a log.LEVEL number, got " .. type(level))
+end
+
+local function checkOptionalTable(t: any, name: string)
+    if t != nil and type(t) != "table" then
+        error(name .. " must be a table, got " .. type(t))
+    end
+end
+
+local function checkOptionalString(s: any, name: string)
+    if s != nil and type(s) != "string" then
+        error(name .. " must be a string, got " .. type(s))
+    end
+end
+
+local function checkOptionalBoolean(b: any, name: string)
+    if b != nil and type(b) != "boolean" then
+        error(name .. " must be a boolean, got " .. type(b))
+    end
+end
+
+local function checkFormat(fmt: any, defaultFmt: string): string
+    if fmt == nil then return defaultFmt end
+    if type(fmt) != "string" then error("format must be a string, got " .. type(fmt)) end
+    local lower = string.lower(fmt)
+    if lower == "text" then lower = "pretty" end
+    if lower == "jsonl" then lower = "json" end
+    if lower != "pretty" and lower != "json" then
+        error("invalid format `" .. fmt .. "` (expected pretty or json)")
+    end
+    return lower
+end
+
+local function checkColor(color: any, defaultColor: any): any
+    if color == nil then return defaultColor end
+    if type(color) == "boolean" then return color end
+    if type(color) == "string" and string.lower(color) == "auto" then return "auto" end
+    error("color must be a boolean or \"auto\"")
+end
+
+local function mergeFields(base: {[string]: any}?, extra: {[string]: any}?): {[string]: any}?
+    if base == nil and extra == nil then return nil end
+    local merged = {}
+    local anyField = false
+    if base != nil then
+        for k, v in base do
+            merged[k] = v
+            anyField = true
+        end
+    end
+    if extra != nil then
+        for k, v in extra do
+            merged[k] = v
+            anyField = true
+        end
+    end
+    if not anyField then return nil end
+    return merged
+end
+
+local function copyFields(fields: {[string]: any}?): {[string]: any}?
+    if fields == nil then return nil end
+    local copy = {}
+    local anyField = false
+    for k, v in fields do
+        copy[k] = v
+        anyField = true
+    end
+    if not anyField then return nil end
+    return copy
+end
+
+local function closeSinks(sinks: {any})
+    for _, sink in sinks do
+        if sink.kind == "file" and sink.handle != nil then
+            __log_file_close(sink.handle)
+            sink.handle = nil
+        end
+    end
+end
+
+local function buildSink(spec: any, defaultUtc: boolean): any
+    if type(spec) == "function" then
+        return {
+            kind = "fn",
+            write = spec,
+            minLevel = nil,
+            format = "pretty",
+            color = false,
+            utc = defaultUtc,
+        }
+    end
+    if type(spec) != "table" then
+        error("each sink must be a table or a function, got " .. type(spec))
+    end
+    local kind = spec.type
+    if kind == nil then
+        if spec.write != nil then
+            kind = "fn"
+        elseif spec.path != nil then
+            kind = "file"
+        else
+            kind = "console"
+        end
+    end
+    if type(kind) != "string" then
+        error("sink.type must be a string, got " .. type(kind))
+    end
+    kind = string.lower(kind)
+
+    local minLevel = nil
+    if spec.level != nil then
+        local lv, _ = parseLevel(spec.level, true)
+        minLevel = lv
+    end
+    checkOptionalBoolean(spec.utc, "sink.utc")
+    local utc = defaultUtc
+    if spec.utc != nil then utc = spec.utc end
+
+    if kind == "console" then
+        local stream = spec.stream ?? "stderr"
+        if stream != "stderr" and stream != "stdout" then
+            error("sink.stream must be \"stderr\" or \"stdout\"")
+        end
+        local format = checkFormat(spec.format, "pretty")
+        local color = checkColor(spec.color, "auto")
+        return {
+            kind = "console",
+            stream = stream,
+            format = format,
+            color = color,
+            minLevel = minLevel,
+            utc = utc,
+        }
+    elseif kind == "file" then
+        if spec.path == nil or type(spec.path) != "string" then
+            error("file sink requires a string `path`")
+        end
+        local format = checkFormat(spec.format, "json")
+        local color = checkColor(spec.color, false)
+        if spec.maxSize != nil and type(spec.maxSize) != "number" then
+            error("sink.maxSize must be a number")
+        end
+        checkOptionalString(spec.rotation, "sink.rotation")
+        if spec.maxFiles != nil and type(spec.maxFiles) != "number" then
+            error("sink.maxFiles must be a number")
+        end
+        checkOptionalBoolean(spec.compress, "sink.compress")
+        local handle = __log_file_open(
+            spec.path,
+            spec.maxSize,
+            spec.rotation,
+            spec.maxFiles,
+            utc,
+            spec.compress ?? false
+        )
+        return {
+            kind = "file",
+            path = spec.path,
+            handle = handle,
+            format = format,
+            color = color,
+            minLevel = minLevel,
+            utc = utc,
+        }
+    elseif kind == "fn" then
+        if type(spec.write) != "function" then
+            error("fn sink requires a `write` function")
+        end
+        local format = checkFormat(spec.format, "pretty")
+        local color = checkColor(spec.color, false)
+        return {
+            kind = "fn",
+            write = spec.write,
+            format = format,
+            color = color,
+            minLevel = minLevel,
+            utc = utc,
+        }
+    else
+        error("unknown sink type `" .. kind .. "` (expected console, file or fn)")
+    end
+end
+
+local function makeLogger(
+    name: string?,
+    levelVal: number,
+    levelName: string,
+    boundFields: {[string]: any}?,
+    sinks: {any},
+    ownsSinks: boolean
+): Logger
+    local currentLevel = levelVal
+    local currentLevelName = levelName
+    local closed = false
+
+    local logger = {}
+
+    local function emit(levelArg: any, message: any, fields: any)
+        if closed then error("logger is closed") end
+        local val, lname = parseLevel(levelArg, false)
+        if val < currentLevel then return end
+        if message == nil then error("message must be provided") end
+        local msgText = tostring(message)
+        if type(message) == "string" then msgText = message end
+        checkOptionalTable(fields, "fields")
+
+        local merged = mergeFields(boundFields, fields)
+        local timeUtc = nil
+        local timeLocal = nil
+        local jsonUtc = nil
+        local jsonLocal = nil
+
+        for _, sink in sinks do
+            if sink.minLevel == nil or val >= sink.minLevel then
+                local ts
+                if sink.utc then
+                    if timeUtc == nil then timeUtc = __log_now(true) end
+                    ts = timeUtc
+                else
+                    if timeLocal == nil then timeLocal = __log_now(false) end
+                    ts = timeLocal
+                end
+
+                local line
+                if sink.format == "json" then
+                    if sink.utc then
+                        if jsonUtc == nil then
+                            jsonUtc = __log_json_line(ts, lname, msgText, name, merged)
+                        end
+                        line = jsonUtc
+                    else
+                        if jsonLocal == nil then
+                            jsonLocal = __log_json_line(ts, lname, msgText, name, merged)
+                        end
+                        line = jsonLocal
+                    end
+                else
+                    local useColor = false
+                    if sink.color == true then
+                        useColor = true
+                    elseif sink.color == "auto" and sink.kind == "console" then
+                        useColor = __log_color_auto(sink.stream)
+                    end
+                    line = __log_format_pretty(ts, lname, msgText, name, merged, useColor)
+                end
+
+                if sink.kind == "console" then
+                    __log_write_console(sink.stream, line)
+                elseif sink.kind == "file" then
+                    if sink.handle == nil then error("log file sink is closed") end
+                    __log_file_write(sink.handle, line)
+                elseif sink.kind == "fn" then
+                    sink.write({
+                        time = ts,
+                        level = lname,
+                        levelValue = val,
+                        logger = name,
+                        message = msgText,
+                        fields = copyFields(merged) ?? {},
+                        line = line,
+                    })
+                end
+            end
+        end
+    end
+
+    function logger.setLevel(self: Logger, level: string | number)
+        local val, lname = parseLevel(level, true)
+        currentLevel = val
+        currentLevelName = lname
+    end
+
+    function logger.getLevel(self: Logger): string
+        return currentLevelName
+    end
+
+    function logger.child(self: Logger, fields: {[string]: any}?, options: { name: string?, level: (string | number)? }?): Logger
+        checkOptionalTable(fields, "fields")
+        checkOptionalTable(options, "options")
+        local childName = name
+        local childVal = currentLevel
+        local childLevelName = currentLevelName
+        if options != nil then
+            checkOptionalString(options.name, "options.name")
+            if options.name != nil then
+                if name != nil and name != "" then
+                    childName = name .. "." .. options.name
+                else
+                    childName = options.name
+                end
+            end
+            if options.level != nil then
+                childVal, childLevelName = parseLevel(options.level, true)
+            end
+        end
+        local combined = mergeFields(boundFields, fields)
+        return makeLogger(childName, childVal, childLevelName, combined, sinks, false)
+    end
+
+    function logger.log(self: Logger, level: string | number, message: string, fields: {[string]: any}?)
+        emit(level, message, fields)
+    end
+
+    function logger.trace(self: Logger, message: string, fields: {[string]: any}?)
+        emit("trace", message, fields)
+    end
+
+    function logger.debug(self: Logger, message: string, fields: {[string]: any}?)
+        emit("debug", message, fields)
+    end
+
+    function logger.info(self: Logger, message: string, fields: {[string]: any}?)
+        emit("info", message, fields)
+    end
+
+    function logger.warn(self: Logger, message: string, fields: {[string]: any}?)
+        emit("warn", message, fields)
+    end
+
+    function logger.error(self: Logger, message: string, fields: {[string]: any}?)
+        emit("error", message, fields)
+    end
+
+    function logger.fatal(self: Logger, message: string, fields: {[string]: any}?)
+        emit("fatal", message, fields)
+    end
+
+    function logger.flush(self: Logger)
+        for _, sink in sinks do
+            if sink.kind == "file" and sink.handle != nil then
+                __log_file_flush(sink.handle)
+            end
+        end
+    end
+
+    function logger.rotate(self: Logger)
+        for _, sink in sinks do
+            if sink.kind == "file" and sink.handle != nil then
+                __log_file_rotate(sink.handle)
+            end
+        end
+    end
+
+    function logger.close(self: Logger)
+        if closed then return end
+        closed = true
+        if ownsSinks then
+            closeSinks(sinks)
+        end
+    end
+
+    return table.freeze(logger)
+end
+
+-- Creates an independent logger with its own level, bound fields and sinks.
+function log.new(options: LoggerOptions?): Logger
+    checkOptionalTable(options, "options")
+    local opts = options ?? {}
+    checkOptionalString(opts.name, "options.name")
+    checkOptionalTable(opts.fields, "options.fields")
+    checkOptionalBoolean(opts.utc, "options.utc")
+    local utc = true
+    if opts.utc != nil then utc = opts.utc end
+
+    local levelVal, levelName = parseLevel(opts.level ?? "info", true)
+    local built = {}
+
+    if opts.sinks != nil then
+        if type(opts.sinks) != "table" then
+            error("options.sinks must be an array of sink definitions")
+        end
+        for _, spec in opts.sinks do
+            local ok, res = pcall(buildSink, spec, utc)
+            if not ok then
+                closeSinks(built)
+                error(res)
+            end
+            built[#built + 1] = res
+        end
+    else
+        local colorOpt: any = "auto"
+        if opts.color != nil then colorOpt = opts.color end
+        built[1] = buildSink({
+            type = "console",
+            stream = opts.stream ?? "stderr",
+            format = opts.format ?? "pretty",
+            color = colorOpt,
+            utc = utc,
+        }, utc)
+    end
+
+    return makeLogger(opts.name, levelVal, levelName, copyFields(opts.fields), built, true)
+end
+
+-- Module-level default logger, mirroring `@neyuki/test`.
+local defaultLogger = log.new()
+
+function log.configure(options: LoggerOptions?): ()
+    local replacement = log.new(options)
+    defaultLogger:close()
+    defaultLogger = replacement
+end
+
+function log.setLevel(level: string | number): ()
+    defaultLogger:setLevel(level)
+end
+
+function log.getLevel(): string
+    return defaultLogger:getLevel()
+end
+
+function log.child(fields: {[string]: any}?, options: { name: string?, level: (string | number)? }?): Logger
+    return defaultLogger:child(fields, options)
+end
+
+function log.log(level: string | number, message: string, fields: {[string]: any}?): ()
+    defaultLogger:log(level, message, fields)
+end
+
+function log.trace(message: string, fields: {[string]: any}?): ()
+    defaultLogger:trace(message, fields)
+end
+
+function log.debug(message: string, fields: {[string]: any}?): ()
+    defaultLogger:debug(message, fields)
+end
+
+function log.info(message: string, fields: {[string]: any}?): ()
+    defaultLogger:info(message, fields)
+end
+
+function log.warn(message: string, fields: {[string]: any}?): ()
+    defaultLogger:warn(message, fields)
+end
+
+function log.error(message: string, fields: {[string]: any}?): ()
+    defaultLogger:error(message, fields)
+end
+
+function log.fatal(message: string, fields: {[string]: any}?): ()
+    defaultLogger:fatal(message, fields)
+end
+
+function log.flush(): ()
+    defaultLogger:flush()
+end
+
+function log.rotate(): ()
+    defaultLogger:rotate()
+end
+
+function log.close(): ()
+    defaultLogger:close()
+end
+
+return table.freeze(log)

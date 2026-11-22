@@ -22,7 +22,7 @@ const MAX_DEPTH: usize = 256;
 const MAX_OUTPUT: usize = 64 * 1024 * 1024;
 
 /// Marks a table in its metatable as one `encode` writes as an array.
-const ARRAY_MARK: &str = "__jsonarray";
+pub(crate) const ARRAY_MARK: &str = "__jsonarray";
 
 pub fn create_json_lib() -> Value {
     let mut table = VmTable::new();
@@ -123,7 +123,7 @@ fn json_encode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![Value::string(encoder.out)])
 }
 
-fn format_float(f: f64) -> Option<String> {
+pub(crate) fn format_float(f: f64) -> Option<String> {
     if !f.is_finite() {
         return None;
     }
@@ -261,7 +261,7 @@ impl Encoder<'_> {
     }
 }
 
-fn write_string(out: &mut String, s: &str) {
+pub(crate) fn write_string(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {

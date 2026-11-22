@@ -21,6 +21,7 @@ pub mod html;
 pub mod http;
 pub mod io;
 pub mod json;
+pub mod log;
 pub mod markdown;
 pub mod math;
 pub mod net;
@@ -73,6 +74,7 @@ pub fn register_natives(vm: &mut VM) {
         html::NATIVES,
         http::NATIVES,
         io::NATIVES,
+        log::NATIVES,
         markdown::NATIVES,
         net::NATIVES,
         sql::NATIVES,

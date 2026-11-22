@@ -28,7 +28,7 @@ print(`total: {total}`)
 - **Exact integers.** Integers never overflow or lose precision; `2 ^ 100` is exact.
 - **Optional types, checked before running.** `local n: number = "x"` is reported with its line before anything executes, and `neyuki lint` shows the same diagnostics in your editor.
 - **Tests built in.** `@neyuki/test` gives `describe`/`it`, hooks, expectations that show a diff, snapshots and a summary line; `neyuki test` runs them.
-- **Batteries for daily work.** Files and paths, JSON, TOML, CSV, HTML and Markdown, dates, running programs, HTTP client and server, PostgreSQL, MySQL and SQLite, hashing and encryption, windows with 2D drawing and animation, and keyboard and mouse automation.
+- **Batteries for daily work.** Files and paths, JSON, TOML, CSV, HTML and Markdown, dates, running programs, structured logging, HTTP client and server, PostgreSQL, MySQL and SQLite, hashing and encryption, windows with 2D drawing and animation, and keyboard and mouse automation.
 - **One executable.** No runtime to install; on Linux, TLS uses the system's OpenSSL. Scripts can also be compiled to verified bytecode.
 
 ## Install

@@ -29,6 +29,7 @@ Load these with `require("@neyuki/name")`.
 | --- | --- |
 | [@neyuki/fs](fs.md) | Files, directories and paths |
 | [@neyuki/io](io.md) | Reading from and writing to the terminal |
+| [@neyuki/log](log.md) | Structured logging with levels, colored console output, JSON Lines and rotating file sinks |
 | [@neyuki/http](http.md) | HTTP client and server, port forwarding |
 | [@neyuki/net](net.md) | Pipes, Unix sockets, TCP sockets, WebSocket clients and servers, UDP sockets |
 | [@neyuki/sql](sql.md) | PostgreSQL, MySQL, MariaDB and SQLite |

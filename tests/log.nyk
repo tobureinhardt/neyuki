@@ -1,0 +1,291 @@
+-- Tests for @neyuki/log: levels, structured JSON Lines, colored console
+-- formatting, child loggers, custom sinks and rotating file sinks.
+
+local fs = require("@neyuki/fs")
+local json = require("@neyuki/json")
+local log = require("@neyuki/log")
+local math = require("@neyuki/math")
+local os = require("@neyuki/os")
+local string = require("@neyuki/string")
+local test = require("@neyuki/test")
+
+local describe, it, expect = test.describe, test.it, test.expect
+
+local function makeTempDir(tag: string): string
+    local base = os.getenv("TMPDIR") ?? os.getenv("TEMP") ?? "/tmp"
+    local dir = fs.join(base, "neyuki_log_" .. tag .. "_" .. tostring(math.random(1, 1000000000)))
+    fs.mkdir(dir, true)
+    return dir
+end
+
+describe("@neyuki/log", function()
+    it("filters records by logger level and sink level", function()
+        local allRecords = {}
+        local errorRecords = {}
+
+        local logger = log.new({
+            name = "svc",
+            level = "debug",
+            sinks = {
+                {
+                    type = "fn",
+                    format = "pretty",
+                    write = function(rec) allRecords[#allRecords + 1] = rec end,
+                },
+                {
+                    type = "fn",
+                    level = "error",
+                    format = "json",
+                    write = function(rec) errorRecords[#errorRecords + 1] = rec end,
+                },
+            },
+        })
+
+        expect(logger:getLevel()):toBe("debug")
+        logger:trace("dropped trace")
+        logger:debug("kept debug", { step = 1 })
+        logger:info("kept info")
+        logger:warn("kept warn")
+        logger:error("kept error", { code = 500 })
+        logger:fatal("kept fatal")
+
+        expect(#allRecords):toBe(5)
+        expect(allRecords[1].level):toBe("debug")
+        expect(allRecords[1].logger):toBe("svc")
+        expect(allRecords[1].fields.step):toBe(1)
+        expect(#errorRecords):toBe(2)
+        expect(errorRecords[1].level):toBe("error")
+        expect(errorRecords[2].level):toBe("fatal")
+
+        logger:setLevel("off")
+        expect(logger:getLevel()):toBe("off")
+        logger:fatal("muted")
+        expect(#allRecords):toBe(5)
+
+        logger:setLevel(log.LEVEL.warn)
+        expect(logger:getLevel()):toBe("warn")
+        logger:info("still dropped")
+        logger:warn("warning passes")
+        expect(#allRecords):toBe(6)
+        logger:close()
+    end)
+
+    it("formats valid structured JSON Lines with sorted keys and safety guards", function()
+        local lines = {}
+        local logger = log.new({
+            name = "api",
+            level = "trace",
+            fields = { service = "billing", env = "prod" },
+            sinks = {
+                {
+                    type = "fn",
+                    format = "json",
+                    write = function(rec) lines[#lines + 1] = rec.line end,
+                },
+            },
+        })
+
+        local cyclic = { a = 1 }
+        cyclic.self = cyclic
+
+        logger:info("request done", {
+            env = "staging",
+            status = 200,
+            big = 2 ^ 80,
+            msg = "user-msg",
+            empty = json.null,
+            cyclic = cyclic,
+            tags = { "a", "b" },
+        })
+
+        expect(#lines):toBe(1)
+        expect(string.find(lines[1], "\n", 1, true)):toBeNil()
+        local decoded = json.decode(lines[1], { keepNull = true })
+        expect(decoded.level):toBe("info")
+        expect(decoded.logger):toBe("api")
+        expect(decoded.msg):toBe("request done")
+        expect(decoded.field_msg):toBe("user-msg")
+        expect(decoded.service):toBe("billing")
+        expect(decoded.env):toBe("staging")
+        expect(decoded.status):toBe(200)
+        expect(decoded.big):toBe(2 ^ 80)
+        expect(decoded.empty):toBe(json.null)
+        expect(decoded.cyclic.self):toBe("<cycle>")
+        expect(decoded.tags):toEqual({ "a", "b" })
+        expect(string.endswith(decoded.time, "Z")):toBe(true)
+        logger:close()
+    end)
+
+    it("supports colored pretty formatting and escapes terminal control sequences", function()
+        local plain = {}
+        local colored = {}
+
+        local logger = log.new({
+            name = "cli",
+            level = "trace",
+            sinks = {
+                {
+                    type = "fn",
+                    format = "pretty",
+                    color = false,
+                    write = function(rec) plain[#plain + 1] = rec.line end,
+                },
+                {
+                    type = "fn",
+                    format = "pretty",
+                    color = true,
+                    write = function(rec) colored[#colored + 1] = rec.line end,
+                },
+            },
+        })
+
+        logger:warn("hello \x1b[31mred\r\nline", { user = "alice smith", count = 3 })
+
+        expect(#plain):toBe(1)
+        expect(string.find(plain[1], "\x1b", 1, true)):toBeNil()
+        expect(string.find(plain[1], "WARN ", 1, true) != nil):toBe(true)
+        expect(string.find(plain[1], "[cli]", 1, true) != nil):toBe(true)
+        expect(string.find(plain[1], "count=3", 1, true) != nil):toBe(true)
+        expect(string.find(plain[1], 'user="alice smith"', 1, true) != nil):toBe(true)
+
+        expect(#colored):toBe(1)
+        expect(string.find(colored[1], "\x1b[33mWARN \x1b[0m", 1, true) != nil):toBe(true)
+        logger:close()
+    end)
+
+    it("supports child loggers with inherited fields and non-owning close", function()
+        local records = {}
+        local root = log.new({
+            name = "app",
+            fields = { version = 1 },
+            sinks = {
+                function(rec) records[#records + 1] = rec end,
+            },
+        })
+
+        local child = root:child({ reqId = "abc" }, { name = "http", level = "debug" })
+        child:debug("handling", { method = "GET" })
+        child:close()
+
+        -- Closing child must not close root or its sinks.
+        root:info("still alive")
+        expect(#records):toBe(2)
+        expect(records[1].logger):toBe("app.http")
+        expect(records[1].fields):toEqual({ version = 1, reqId = "abc", method = "GET" })
+        expect(records[2].logger):toBe("app")
+        expect(records[2].fields):toEqual({ version = 1 })
+
+        -- Writing through a closed child raises an error.
+        expect(function() child:info("after close") end):toThrow("closed")
+        root:close()
+    end)
+
+    it("rotates file sinks by size and enforces maxFiles retention", function()
+        local dir = makeTempDir("size")
+        local logPath = fs.join(dir, "app.jsonl")
+        local ok, err = try(function()
+            local logger = log.new({
+                level = "info",
+                sinks = {
+                    {
+                        type = "file",
+                        path = logPath,
+                        format = "json",
+                        maxSize = 110,
+                        maxFiles = 2,
+                    },
+                },
+            })
+
+            for i = 1, 6 do
+                logger:info("event number " .. tostring(i), { seq = i, payload = "0123456789abcdef" })
+            end
+            logger:flush()
+            logger:close()
+
+            expect(fs.exists(logPath)):toBe(true)
+            expect(fs.exists(logPath .. ".1")):toBe(true)
+            expect(fs.exists(logPath .. ".2")):toBe(true)
+            expect(fs.exists(logPath .. ".3")):toBe(false)
+
+            local current = json.decode(string.trim(fs.read(logPath)))
+            local prev1 = json.decode(string.trim(fs.read(logPath .. ".1")))
+            local prev2 = json.decode(string.trim(fs.read(logPath .. ".2")))
+            expect(current.seq):toBe(6)
+            expect(prev1.seq):toBe(5)
+            expect(prev2.seq):toBe(4)
+        end)
+        fs.remove(dir, true)
+        if not ok then error(err) end
+    end)
+
+    it("supports manual rotation and daily dated archive naming", function()
+        local dir = makeTempDir("daily")
+        local logPath = fs.join(dir, "service.log")
+        local ok, err = try(function()
+            local logger = log.new({
+                sinks = {
+                    {
+                        type = "file",
+                        path = logPath,
+                        format = "pretty",
+                        rotation = "daily",
+                        maxFiles = 2,
+                    },
+                },
+            })
+
+            logger:info("first batch")
+            logger:rotate()
+            logger:info("second batch")
+            logger:rotate()
+            logger:info("third batch")
+            logger:rotate()
+            logger:info("active batch")
+            logger:close()
+
+            local files = fs.list(dir)
+            -- Active file + at most 2 retained dated archives = 3 files.
+            expect(#files):toBe(3)
+            expect(string.find(fs.read(logPath), "active batch", 1, true) != nil):toBe(true)
+        end)
+        fs.remove(dir, true)
+        if not ok then error(err) end
+    end)
+
+    it("supports module-level configure and default helpers", function()
+        local captured = {}
+        log.configure({
+            level = "warn",
+            sinks = {
+                {
+                    type = "fn",
+                    format = "json",
+                    write = function(rec) captured[#captured + 1] = rec end,
+                },
+            },
+        })
+        expect(log.getLevel()):toBe("warn")
+        log.info("ignored")
+        log.warn("captured")
+        local sub = log.child({ scope = "default" })
+        sub:error("from child")
+        log.flush()
+
+        expect(#captured):toBe(2)
+        expect(captured[1].message):toBe("captured")
+        expect(captured[2].fields.scope):toBe("default")
+
+        -- Reset default logger to clean defaults.
+        log.configure({})
+        expect(log.getLevel()):toBe("info")
+    end)
+
+    it("validates arguments and rejects invalid options", function()
+        expect(function() log.new({ level = "verbose" }) end):toThrow("invalid log level")
+        expect(function() log.new({ sinks = { { type = "kafka" } } }) end):toThrow("unknown sink type")
+        expect(function() log.new({ sinks = { { type = "file" } } }) end):toThrow("path")
+        expect(function() log.new({ sinks = { { type = "file", path = "x.log", rotation = "weekly" } } }) end):toThrow("invalid rotation")
+        expect(function() log.new({ sinks = { { type = "console", stream = "stdin" } } }) end):toThrow("stderr")
+    end)
+end)
