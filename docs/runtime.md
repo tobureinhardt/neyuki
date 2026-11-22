@@ -149,7 +149,7 @@ Native code runs with the process's full rights. Under `--sandbox`, loading a na
 
 Memory is managed by reference counting with a cycle collector, so most values are freed the moment they become unreachable and cycles are reclaimed in the background. `collectgarbage` controls it, `__gc` runs finalizers and `__mode` makes tables weak.
 
-A few limits keep one script from exhausting the machine: integers are capped at 2^20 bits, `string.rep` at 100 MiB, `json.encode`, `toml.encode`, `csv.encode` and `html.render` at 64 MiB of output, nesting at 120 levels, and a table passed to a native library function at a million values.
+A few limits keep one script from exhausting the machine: integers are capped at 2^20 bits, `string.rep` at 100 MiB, `json.encode`, `toml.encode` and `csv.encode` at 64 MiB of output, nesting at 120 levels, and a table passed to a native library function at a million values.
 
 ### Sandbox permissions and limits
 

@@ -135,12 +135,7 @@ souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] 
 # Linux) instead of spawning shell commands by hand.
 open = "5"
 
-# `@neyuki/html` parses with `html5ever`, Servo's implementation of the WHATWG
-# parsing algorithm, so broken markup is repaired the way a browser repairs it.
-# It is pure Rust; src/vm/libs/html.rs gives it a small tree of its own rather
-# than a DOM crate, whose CSS selector dependencies are unmaintained.
 # (`@neyuki/toml` and `@neyuki/csv` are hand-written, like `json`.)
-html5ever = "0.29"
 # `@neyuki/yaml` parses YAML 1.2 streams with `saphyr-parser`, the pure-Rust
 # event parser from the saphyr suite, so src/vm/libs/yaml.rs constructs VM
 # tables directly with exact BigInt integers and strict alias-expansion caps.

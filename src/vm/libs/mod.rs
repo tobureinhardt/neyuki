@@ -17,7 +17,6 @@ pub mod ffi;
 pub mod fs;
 pub mod gpu;
 pub mod hid;
-pub mod html;
 pub mod http;
 pub mod io;
 pub mod json;
@@ -63,7 +62,8 @@ pub(crate) const BUNDLED_LIBRARIES: &[(&str, &str)] =
 
 /// Libraries that used to be bundled and now live in packages, as
 /// (`@neyuki/` name, package). `require` of the old name says where it went.
-pub(crate) const MOVED_LIBRARIES: &[(&str, &str)] = &[("markdown", "@nyk/markdown")];
+pub(crate) const MOVED_LIBRARIES: &[(&str, &str)] =
+    &[("markdown", "@nyk/markdown"), ("html", "@nyk/html")];
 
 /// The error for `require("@neyuki/<name>")` of a library that moved into a
 /// package, or `None` when `name` never did.
@@ -88,7 +88,6 @@ pub fn register_natives(vm: &mut VM) {
         audio::NATIVES,
         gpu::NATIVES,
         hid::NATIVES,
-        html::NATIVES,
         http::NATIVES,
         io::NATIVES,
         log::NATIVES,

@@ -1,10 +1,12 @@
 -- Libraries that moved out of the runtime into packages: requiring the old
 -- @neyuki/ name says which package to install instead.
 
-local ok, err = pcall(require, "@neyuki/markdown")
-assert(not ok, "@neyuki/markdown should no longer load")
-assert(string.find(err, "neyuki pkg add @nyk/markdown", 1, true), err)
-assert(string.find(err, 'require("@pkg/nyk/markdown")', 1, true), err)
+for _, name in { "markdown", "html" } do
+    local ok, err = pcall(require, "@neyuki/" .. name)
+    assert(not ok, "@neyuki/" .. name .. " should no longer load")
+    assert(string.find(err, "neyuki pkg add @nyk/" .. name, 1, true), err)
+    assert(string.find(err, 'require("@pkg/nyk/' .. name .. '")', 1, true), err)
+end
 
 -- A bundled library is unaffected, and an unknown @neyuki/ name still says
 -- the module cannot be found.
