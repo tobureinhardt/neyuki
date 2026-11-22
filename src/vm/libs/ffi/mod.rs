@@ -1200,6 +1200,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An extension's code has to outlive the thread that loaded it: its
+    /// thread-exit destructors (every Rust thread-local has one) run after
+    /// the runtime's own, which drop the loaded libraries.
+    #[cfg(unix)]
+    #[test]
+    fn extensions_stay_loaded_for_their_thread_exit_destructors() {
+        let dir = scratch("thread_local_ext");
+        let Some(lib) = build_fixture("thread_local_ext", &dir) else {
+            return;
+        };
+        let src = format!(
+            "local ffi = require(\"@neyuki/ffi\")\nlocal ext = ffi.loadExtension({:?})\nreturn ext.touch()",
+            lib.display().to_string()
+        );
+        let finished = std::thread::spawn(move || {
+            let mut vm = VM::new();
+            run_script(&mut vm, &src).map(|value| value.to_string())
+        })
+        .join()
+        .expect("the script thread exits cleanly");
+        assert_eq!(finished.unwrap(), "true");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn native_package_loads_through_require_and_respects_the_sandbox() {

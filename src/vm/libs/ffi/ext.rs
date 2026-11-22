@@ -972,6 +972,12 @@ pub fn init_extension_with_fn(
         ext_fns.push(BoundExtFn { func, user_data });
     }
 
+    // The code stays mapped until the process exits, even after `close`:
+    // the extension may have left thread-exit destructors (any Rust
+    // thread-local, tokio's for one) that run after the runtime drops its
+    // libraries, and calling into an unloaded library crashes the process.
+    std::mem::forget(lib);
+
     let id = next_lib_id();
     SERVICES.with(|registry| {
         let mut registry = registry.borrow_mut();
@@ -983,7 +989,7 @@ pub fn init_extension_with_fn(
         libs.borrow_mut().insert(
             id,
             LoadedLibrary {
-                _lib: lib,
+                _lib: None,
                 symbols: Vec::new(),
                 ext_fns,
             },

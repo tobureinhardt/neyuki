@@ -31,7 +31,7 @@ Types: `void` (returns only), `bool`, `i8`, `u8`, `i16`, `u16`, `i32`/`int`, `u3
 
 ## ffi.loadExtension(path: string): table
 
-Loads a Neyuki native extension (a shared library exporting `neyuki_extension_init`) and returns a frozen table of the functions it registered plus `:close()`. Path rules under an allow-list are the same as for `ffi.open`. Packages can ship extensions for every platform and load them with `require`; see [native packages](../runtime.md#native-packages).
+Loads a Neyuki native extension (a shared library exporting `neyuki_extension_init`) and returns a frozen table of the functions it registered plus `:close()`. `close` makes the functions raise an error and forgets the extension's services, but the library stays loaded until the process exits: Rust thread-locals and similar thread-exit destructors in it may still have to run, and an unloaded library cannot run them. Path rules under an allow-list are the same as for `ffi.open`. Packages can ship extensions for every platform and load them with `require`; see [native packages](../runtime.md#native-packages).
 
 ## ffi.target(): string
 
