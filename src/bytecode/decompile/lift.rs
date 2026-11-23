@@ -153,8 +153,8 @@ fn bin_op(inst: &Instruction) -> Option<BinOp> {
         I::Sub { .. } | I::SubK { .. } | I::SubI { .. } => BinOp::Sub,
         I::Mul { .. } | I::MulK { .. } | I::MulI { .. } => BinOp::Mul,
         I::Div { .. } => BinOp::Div,
-        I::IDiv { .. } => BinOp::IDiv,
-        I::Mod { .. } => BinOp::Mod,
+        I::IDiv { .. } | I::IDivK { .. } => BinOp::IDiv,
+        I::Mod { .. } | I::ModK { .. } => BinOp::Mod,
         I::Pow { .. } => BinOp::Pow,
         I::BitAnd { .. } => BinOp::BitAnd,
         I::BitOr { .. } => BinOp::BitOr,
@@ -813,7 +813,11 @@ impl Lifter<'_> {
                 let (x, _) = got.remove(0);
                 self.define(pc, dst, Expr::bin(op, x, y), true)
             }
-            I::AddK { dst, a, k } | I::SubK { dst, a, k } | I::MulK { dst, a, k } => {
+            I::AddK { dst, a, k }
+            | I::SubK { dst, a, k }
+            | I::MulK { dst, a, k }
+            | I::IDivK { dst, a, k }
+            | I::ModK { dst, a, k } => {
                 let op = bin_op(inst).ok_or("unknown operator")?;
                 let y = self.constant(k)?;
                 let (x, _) = self.take(pc, &[Src::Reg(a)], none)?.remove(0);

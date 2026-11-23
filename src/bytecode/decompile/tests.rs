@@ -4,7 +4,7 @@ use std::rc::Rc;
 use super::decompile;
 use crate::bytecode::instruction::Instruction;
 use crate::bytecode::proto::Proto;
-use crate::compiler::{Options, compile_program};
+use crate::compiler::{OptLevel, Options, compile_program};
 use crate::vm::VM;
 
 const LOST: &str = "could not be recovered";
@@ -13,8 +13,11 @@ const LOST: &str = "could not be recovered";
 /// compiles again and returns what the original returns. Returns the
 /// decompiled source.
 fn roundtrip(source: &str) -> String {
-    let proto =
-        compile_program(source, "original.nyk", Options::RUN).expect("the original compiles");
+    roundtrip_with(source, Options::RUN)
+}
+
+fn roundtrip_with(source: &str, options: Options) -> String {
+    let proto = compile_program(source, "original.nyk", options).expect("the original compiles");
     let expected = VM::new()
         .execute_program(proto.clone())
         .expect("the original runs");
@@ -39,17 +42,33 @@ fn roundtrip(source: &str) -> String {
 
 #[test]
 fn test_straight_line_code_and_names() {
-    let text = roundtrip(
-        r##"
+    let src = r##"
 local width = 3
 local height = width * 2 + 1
 local label = "area: " .. width * height
 local parts = { width, height, name = "box", [10] = true }
 return label .. " " .. #parts .. " " .. parts.name .. " " .. tostring(parts[10])
+"##;
+    let text = roundtrip(src);
+    assert!(text.contains("local label = "), "{}", text);
+    assert!(text.contains("local parts = "), "{}", text);
+    assert!(text.contains("name = \"box\""), "{}", text);
+    let text_o0 = roundtrip_with(src, Options::RUN.with_opt_level(OptLevel::O0));
+    assert!(text_o0.contains("local width = 3"), "{}", text_o0);
+    assert!(text_o0.contains("name = \"box\""), "{}", text_o0);
+}
+
+#[test]
+fn test_idiv_and_mod_constant_ops() {
+    roundtrip(
+        r##"
+local function calc(n)
+    return n // 3, n % 5
+end
+local a, b = calc(17)
+return a * 10 + b
 "##,
     );
-    assert!(text.contains("local width = 3"), "{}", text);
-    assert!(text.contains("name = \"box\""), "{}", text);
 }
 
 #[test]
