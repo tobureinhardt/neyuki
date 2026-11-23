@@ -2,6 +2,11 @@
 
 use std::fmt;
 
+use crate::diagnostics::diagnostic::Diagnostic;
+use crate::diagnostics::error_code::ErrorCode as DiagErrorCode;
+use crate::diagnostics::span::Span;
+use crate::lexer::Token;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCode {
     UnexpectedToken = 1001,
@@ -23,6 +28,14 @@ impl ErrorCode {
             Self::ExpectedIdentifier => "E1005",
             Self::UnmatchedDelimiter => "E1006",
             Self::GeneralSyntaxError => "E1099",
+        }
+    }
+
+    pub fn to_diag_code(self) -> DiagErrorCode {
+        match self {
+            Self::UnfinishedConstruct | Self::UnmatchedDelimiter => DiagErrorCode::E0050,
+            Self::UnexpectedToken => DiagErrorCode::E0051,
+            _ => DiagErrorCode::E0050,
         }
     }
 }
@@ -127,6 +140,88 @@ impl ParseError {
             out.push_str(&format!("\nHint: {}", hint));
         }
         out
+    }
+
+    /// Builds a structured `ParseError` from a parser message like
+    /// `"[line 4] expected symbol \")\""` and the current lookahead token.
+    pub fn from_parser_message(raw: &str, tok: &Token) -> Self {
+        let (line, message) = raw
+            .strip_prefix("[line ")
+            .and_then(|rest| rest.split_once("] "))
+            .and_then(|(l, m)| Some((l.parse::<usize>().ok()?, m.to_string())))
+            .unwrap_or_else(|| (tok.line.max(1), raw.to_string()));
+
+        let col = if line == tok.line && tok.col > 0 {
+            tok.col
+        } else {
+            1
+        };
+        let len = if line == tok.line {
+            tok.value.chars().count().max(1)
+        } else {
+            1
+        };
+
+        let code = if message.contains("expected name") || message.contains("expected identifier") {
+            ErrorCode::ExpectedIdentifier
+        } else if message.contains("unfinished")
+            || message.contains("expected keyword \"end\"")
+            || message.contains("expected symbol \")\"")
+            || message.contains("expected symbol \"}\"")
+            || message.contains("expected symbol \"]\"")
+        {
+            ErrorCode::UnfinishedConstruct
+        } else if message.contains("unmatched") || message.contains("at top level") {
+            ErrorCode::UnmatchedDelimiter
+        } else if message.contains("assignment") || message.contains("assign target") {
+            ErrorCode::InvalidAssignment
+        } else if message.contains("type") && !message.contains("type alias") {
+            ErrorCode::TypeSyntaxError
+        } else if message.contains("unexpected token") {
+            ErrorCode::UnexpectedToken
+        } else {
+            ErrorCode::GeneralSyntaxError
+        };
+
+        let hint = if message.contains("expected keyword \"end\"") {
+            Some("add a matching 'end' to close this block".to_string())
+        } else if message.contains("expected symbol \")\"") {
+            Some("close the parenthesized expression or argument list with ')'".to_string())
+        } else if message.contains("expected symbol \"}\"") {
+            Some("close the table literal with '}'".to_string())
+        } else if message.contains("expected symbol \"]\"") {
+            Some("close the bracketed index or attribute with ']'".to_string())
+        } else if message.contains("expected keyword \"then\"") {
+            Some("add 'then' after the condition".to_string())
+        } else if message.contains("expected keyword \"do\"") {
+            Some("add 'do' before the loop body".to_string())
+        } else {
+            None
+        };
+
+        let mut err = Self::with_code(line, col, code, message);
+        err.hint = hint;
+        err.add_label(line, col, len, "syntax error", true);
+        err
+    }
+
+    /// Converts this `ParseError` into a compiler/LSP `Diagnostic`.
+    pub fn to_diagnostic(&self) -> Diagnostic {
+        let line = self.line.max(1) as u32;
+        let col = self.col.max(1) as u32;
+        let len = self
+            .labels
+            .first()
+            .map(|l| l.len.max(1) as u32)
+            .unwrap_or(1);
+        let span = Span::single_line(line, col, col.saturating_add(len));
+        let mut diag = Diagnostic::error(self.message.clone())
+            .with_code(self.code.to_diag_code())
+            .with_label(span, "syntax error");
+        if let Some(hint) = &self.hint {
+            diag = diag.with_help(hint.clone());
+        }
+        diag
     }
 }
 

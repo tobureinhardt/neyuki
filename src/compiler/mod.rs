@@ -27,6 +27,42 @@ pub struct Parsed {
     pub stmts: Vec<Stmt>,
     pub lines: Rc<HashMap<NodeId, u32>>,
     pub spans: crate::ast::span::SpanPool,
+    pub attributes: crate::ast::attr::AttributePool,
+}
+
+/// Result of parsing with error recovery: keeps partial valid AST statements,
+/// spans, attributes, and every syntax error found across the source.
+pub struct ParsedRecovery {
+    pub stmts: Vec<Stmt>,
+    pub lines: Rc<HashMap<NodeId, u32>>,
+    pub spans: crate::ast::span::SpanPool,
+    pub attributes: crate::ast::attr::AttributePool,
+    pub errors: Vec<crate::parser::ParseError>,
+}
+
+fn finalize_parsed_stmts(
+    stmts: &mut Vec<Stmt>,
+    source: &str,
+    spans: &crate::ast::span::SpanPool,
+    run_import_all: bool,
+) -> Result<(), String> {
+    crate::ast::visitor::check_ast_sanity(stmts)?;
+    crate::ast::visitor_mut::normalize_ast(stmts);
+    if run_import_all && has_import_all(source) {
+        let undeclared = crate::sema::undeclared_names(stmts, source, spans);
+        stmts.splice(0..0, bundled_imports(&undeclared)?);
+    }
+    Ok(())
+}
+
+fn map_panic_payload(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "syntax error".to_string()
+    }
 }
 
 /// Compiler optimization level.
@@ -87,31 +123,58 @@ impl Options {
 pub fn parse(source: &str) -> Result<Parsed, String> {
     // The parser reports bad input as `Err`; the guard only keeps a parser
     // bug from taking the host down with it.
-    let (mut stmts, pool) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut parser = Parser::new(source);
-        parser.parse_program()
-    }))
-    .map_err(|payload| {
-        if let Some(s) = payload.downcast_ref::<&str>() {
-            s.to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "syntax error".to_string()
-        }
-    })??;
+    let (mut stmts, pool, attributes) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut parser = Parser::new(source);
+            let (stmts, spans) = parser.parse_program()?;
+            let attributes = parser.take_attribute_pool();
+            Ok::<_, String>((stmts, spans, attributes))
+        }))
+        .map_err(map_panic_payload)??;
 
-    crate::ast::visitor::check_ast_sanity(&stmts)?;
-    crate::ast::visitor_mut::normalize_ast(&mut stmts);
-    if has_import_all(source) {
-        let undeclared = crate::sema::undeclared_names(&stmts, source, &pool);
-        stmts.splice(0..0, bundled_imports(&undeclared)?);
-    }
+    finalize_parsed_stmts(&mut stmts, source, &pool, true)?;
     Ok(Parsed {
         stmts,
         lines: Rc::new(pool.start_lines()),
         spans: pool,
+        attributes,
     })
+}
+
+/// Parses source with statement- and block-level error recovery so callers such
+/// as `neyuki lint` and `neyuki lsp` can report multiple syntax errors and
+/// still inspect valid AST declarations.
+pub fn parse_with_recovery(source: &str) -> ParsedRecovery {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut parser = Parser::new(source);
+        parser.parse_program_with_recovery()
+    }));
+
+    let (mut stmts, pool, attributes, mut errors) = match outcome {
+        Ok(res) => res,
+        Err(payload) => {
+            let msg = map_panic_payload(payload);
+            return ParsedRecovery {
+                stmts: Vec::new(),
+                lines: Rc::new(HashMap::new()),
+                spans: crate::ast::span::SpanPool::new(),
+                attributes: crate::ast::attr::AttributePool::new(),
+                errors: vec![crate::parser::ParseError::new(1, 1, msg)],
+            };
+        }
+    };
+
+    if let Err(err) = finalize_parsed_stmts(&mut stmts, source, &pool, errors.is_empty()) {
+        errors.push(crate::parser::ParseError::new(1, 1, err));
+    }
+
+    ParsedRecovery {
+        stmts,
+        lines: Rc::new(pool.start_lines()),
+        spans: pool,
+        attributes,
+        errors,
+    }
 }
 
 /// Whether a `--!importall` line comes before the first line of code.
@@ -145,19 +208,37 @@ pub fn compile_source(source: &str) -> Result<Vec<Stmt>, String> {
 /// Parses, checks and compiles a whole program with line information.
 /// `chunk` names it in error messages and tracebacks, usually a file path.
 pub fn compile_program(source: &str, chunk: &str, options: Options) -> Result<Proto, String> {
-    let parsed = match parse(source) {
-        Ok(p) => p,
-        Err(err) => {
-            let diag = crate::lint::syntax_error(&err);
-            return Err(crate::diagnostics::render_report(chunk, source, &[diag]));
-        }
-    };
+    let parsed = parse_or_render_syntax_errors(source, chunk)?;
     if options.check {
-        check(&parsed.stmts, source, chunk, Some(&parsed.spans))?;
+        check(
+            &parsed.stmts,
+            source,
+            chunk,
+            Some(&parsed.spans),
+            Some(&parsed.attributes),
+        )?;
     }
     let mut proto = lower(&parsed.stmts, Some(parsed.lines), options)?;
     proto.set_source(Rc::from(chunk));
     Ok(proto)
+}
+
+fn parse_or_render_syntax_errors(source: &str, chunk: &str) -> Result<Parsed, String> {
+    let recovered = parse_with_recovery(source);
+    if recovered.errors.is_empty() {
+        return Ok(Parsed {
+            stmts: recovered.stmts,
+            lines: recovered.lines,
+            spans: recovered.spans,
+            attributes: recovered.attributes,
+        });
+    }
+    let diags: Vec<_> = recovered
+        .errors
+        .iter()
+        .map(crate::parser::ParseError::to_diagnostic)
+        .collect();
+    Err(crate::diagnostics::render_report(chunk, source, &diags))
 }
 
 /// Reads and parses a source file.
@@ -174,10 +255,14 @@ fn check(
     source: &str,
     chunk: &str,
     spans: Option<&crate::ast::span::SpanPool>,
+    attributes: Option<&crate::ast::attr::AttributePool>,
 ) -> Result<(), String> {
-    let diags = match spans {
-        Some(spans) => crate::sema::analyze_with_spans(statements, source, spans),
-        None => crate::sema::analyze(statements, source),
+    let diags = match (spans, attributes) {
+        (Some(spans), Some(attrs)) => {
+            crate::sema::analyze_with_spans_and_attrs(statements, source, spans, attrs)
+        }
+        (Some(spans), None) => crate::sema::analyze_with_spans(statements, source, spans),
+        _ => crate::sema::analyze(statements, source),
     };
     let errors: Vec<_> = diags
         .into_iter()
@@ -195,7 +280,7 @@ fn check(
 
 /// Checks and compiles statements (without line information).
 pub fn try_compile_to_proto(statements: &[Stmt]) -> Result<Proto, String> {
-    check(statements, "", "<anon>", None)?;
+    check(statements, "", "<anon>", None, None)?;
     lower(statements, None, Options::RUN)
 }
 
@@ -286,15 +371,15 @@ pub fn compile_source_to_llvm_ir(
     chunk: &str,
     options: Options,
 ) -> Result<String, String> {
-    let parsed = match parse(source) {
-        Ok(p) => p,
-        Err(err) => {
-            let diag = crate::lint::syntax_error(&err);
-            return Err(crate::diagnostics::render_report(chunk, source, &[diag]));
-        }
-    };
+    let parsed = parse_or_render_syntax_errors(source, chunk)?;
     if options.check {
-        check(&parsed.stmts, source, chunk, Some(&parsed.spans))?;
+        check(
+            &parsed.stmts,
+            source,
+            chunk,
+            Some(&parsed.spans),
+            Some(&parsed.attributes),
+        )?;
     }
     let stmts = if options.opt_level == OptLevel::O1 {
         fold_program(parsed.stmts)

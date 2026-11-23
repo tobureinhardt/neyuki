@@ -36,11 +36,11 @@ fn push_tables(
                     if upval.is_open() {
                         continue;
                     }
-                    match &*upval.closed.borrow() {
+                    upval.with_closed(|val| match val {
                         Value::Closure(inner) => pending.push(Rc::clone(inner)),
                         Value::Table(t) => out.push(Rc::clone(t)),
                         _ => {}
-                    }
+                    });
                 }
             }
         }
@@ -357,7 +357,7 @@ impl GcTracker {
                 if upval.is_open() {
                     continue;
                 }
-                let value = upval.closed.borrow().clone();
+                let value = upval.get_closed();
                 match value {
                     Value::Closure(inner) => pending.push(inner),
                     other => self.mark_value(&other),

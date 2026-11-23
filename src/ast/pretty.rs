@@ -1,7 +1,32 @@
 //! Prints a syntax tree as source or as S-expressions.
 
+use crate::ast::attr::{Attribute, AttributePool};
 use crate::ast::expr::{Expr, InterpPart};
 use crate::ast::stmt::Stmt;
+
+pub fn pretty_print_attribute(attr: &Attribute) -> String {
+    attr.to_string()
+}
+
+pub fn pretty_print_stmt_with_attributes(
+    stmt: &Stmt,
+    attrs: &AttributePool,
+    indent: usize,
+) -> String {
+    let pad = "  ".repeat(indent);
+    let attached = attrs.get(stmt.node_id());
+    if attached.is_empty() {
+        return pretty_print_stmt(stmt, indent);
+    }
+    let mut out = String::new();
+    for attr in attached {
+        out.push_str(&pad);
+        out.push_str(&pretty_print_attribute(attr));
+        out.push('\n');
+    }
+    out.push_str(&pretty_print_stmt(stmt, indent));
+    out
+}
 
 pub fn pretty_print_stmt(stmt: &Stmt, indent: usize) -> String {
     let pad = "  ".repeat(indent);

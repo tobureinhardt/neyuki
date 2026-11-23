@@ -1577,7 +1577,8 @@ fn collect_symbols_from_expr(
 
 fn extract_document_symbols(content: &str) -> Vec<FoundSymbol> {
     let mut symbols = Vec::new();
-    if let Ok(parsed) = crate::compiler::parse(content) {
+    let parsed = crate::compiler::parse_with_recovery(content);
+    if !parsed.stmts.is_empty() {
         collect_symbols_from_stmts(&parsed.stmts, &parsed.spans, &mut symbols);
     }
     symbols
@@ -1902,6 +1903,41 @@ mod tests {
         let resp = server.handle_message(sym_req.as_bytes()).unwrap();
         let resp_str = String::from_utf8(resp).unwrap();
         assert!(resp_str.contains("\"name\":\"solve\""));
+    }
+
+    #[test]
+    fn test_lsp_publishes_multiple_syntax_diagnostics_and_recovers_symbols() {
+        let mut server = LspServer::new();
+        let broken_text = "\
+local = 1
+function healthy_one(a)
+    return a + 1
+end
+local broken =
+function healthy_two(b)
+    return b * 2
+end
+";
+        let open_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///broken.nyk","text":{}}}}}}}"#,
+            dap_json::render_json(&Json::Str(broken_text.to_string()))
+        );
+        let pub_resp = server.handle_message(open_req.as_bytes()).unwrap();
+        let pub_str = String::from_utf8(pub_resp).unwrap();
+        assert!(pub_str.contains("textDocument/publishDiagnostics"));
+        let err_count = pub_str.matches("\"code\":\"E005").count();
+        assert!(
+            err_count >= 2,
+            "expected >= 2 syntax diagnostics in LSP output, got {}: {}",
+            err_count,
+            pub_str
+        );
+
+        let sym_req = r#"{"jsonrpc":"2.0","id":55,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///broken.nyk"}}}"#;
+        let sym_resp = server.handle_message(sym_req.as_bytes()).unwrap();
+        let sym_str = String::from_utf8(sym_resp).unwrap();
+        assert!(sym_str.contains("\"name\":\"healthy_one\""), "{}", sym_str);
+        assert!(sym_str.contains("\"name\":\"healthy_two\""), "{}", sym_str);
     }
 
     /// Opens `text` as `file:///test.nyk`.

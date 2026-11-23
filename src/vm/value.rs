@@ -2,7 +2,7 @@
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -153,12 +153,12 @@ pub enum Value {
     Nil,
     Bool(bool),
     Int(i64),
-    BigInt(Rc<BigInt>),
     Float(f64),
+    Native(&'static NativeDef),
+    BigInt(Rc<BigInt>),
     String(StrRef),
     Table(Rc<RefCell<VmTable>>),
     Closure(Rc<VmClosure>),
-    Native(&'static NativeDef),
     Buffer(Rc<RefCell<VmBuffer>>),
 }
 
@@ -360,21 +360,21 @@ impl VmTable {
 pub struct Upvalue {
     /// The stack index while open, `None` once closed.
     pub location: Cell<Option<usize>>,
-    pub closed: RefCell<Value>,
+    closed: UnsafeCell<Value>,
 }
 
 impl Upvalue {
     pub fn open(index: usize) -> Rc<Upvalue> {
         Rc::new(Upvalue {
             location: Cell::new(Some(index)),
-            closed: RefCell::new(Value::Nil),
+            closed: UnsafeCell::new(Value::Nil),
         })
     }
 
     pub fn closed(value: Value) -> Rc<Upvalue> {
         Rc::new(Upvalue {
             location: Cell::new(None),
-            closed: RefCell::new(value),
+            closed: UnsafeCell::new(value),
         })
     }
 
@@ -383,8 +383,68 @@ impl Upvalue {
         self.location.get().is_some()
     }
 
+    /// Reads the closed value without re-entering user code.
+    #[inline(always)]
+    pub fn get_closed(&self) -> Value {
+        // SAFETY: VM execution is single-threaded (`!Sync`) and cloning a
+        // `Value` never mutates or re-borrows `self.closed`.
+        unsafe { &*self.closed.get() }.clone()
+    }
+
+    /// Borrows the closed value briefly for non-reentrant inspection.
+    #[inline(always)]
+    pub fn with_closed<R>(&self, f: impl FnOnce(&Value) -> R) -> R {
+        // SAFETY: `f` must not mutate this `Upvalue`; callers only inspect GC edges.
+        f(unsafe { &*self.closed.get() })
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    pub(crate) fn closed_ptr(&self) -> *mut Value {
+        self.closed.get()
+    }
+
+    /// Overwrites the closed value, updating primitives in place to skip drops.
+    #[inline(always)]
+    pub fn set_closed(&self, value: Value) {
+        // SAFETY: VM execution is single-threaded and old value drop happens
+        // only after `&mut` is released via `mem::replace`.
+        let slot = unsafe { &mut *self.closed.get() };
+        match (value, &mut *slot) {
+            (Value::Int(new), Value::Int(old)) => *old = new,
+            (Value::Float(new), Value::Float(old)) => *old = new,
+            (Value::Bool(new), Value::Bool(old)) => *old = new,
+            (v, s) => {
+                let _old = std::mem::replace(s, v);
+            }
+        }
+    }
+
+    /// Overwrites the closed value from a reference, skipping `Value::clone` on primitives.
+    #[inline(always)]
+    pub fn set_closed_ref(&self, value: &Value) {
+        // SAFETY: VM execution is single-threaded and old value drop happens
+        // only after `&mut` is released via `mem::replace`.
+        let slot = unsafe { &mut *self.closed.get() };
+        match (value, &mut *slot) {
+            (Value::Int(new), Value::Int(old)) => *old = *new,
+            (Value::Float(new), Value::Float(old)) => *old = *new,
+            (Value::Bool(new), Value::Bool(old)) => *old = *new,
+            (v, s) => {
+                let _old = std::mem::replace(s, v.clone());
+            }
+        }
+    }
+
+    /// Moves the closed value out, leaving `Value::Nil` behind.
+    #[inline]
+    pub fn take_closed(&self) -> Value {
+        // SAFETY: VM execution is single-threaded and `mem::replace` does not alias.
+        std::mem::replace(unsafe { &mut *self.closed.get() }, Value::Nil)
+    }
+
     pub fn close(&self, value: Value) {
-        *self.closed.borrow_mut() = value;
+        self.set_closed(value);
         self.location.set(None);
     }
 }

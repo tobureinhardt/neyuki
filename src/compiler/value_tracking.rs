@@ -541,107 +541,118 @@ impl ValueTracker {
 /// Propagates constants, performs range-based comparison folding, and optimizes expressions.
 pub fn value_tracking_cfg(cfg: &mut ControlFlowGraph) -> bool {
     let captured = crate::compiler::ir::opt::captured_vars(cfg);
+    value_tracking_cfg_with(cfg, &captured)
+}
+
+pub fn value_tracking_cfg_with(
+    cfg: &mut ControlFlowGraph,
+    captured: &crate::vm::hash::FxHashSet<IrVar>,
+) -> bool {
     let mut changed = false;
+    let mut state: FxHashMap<IrVar, TrackedValue> = new_map();
 
     for block in &mut cfg.blocks {
-        let mut state: FxHashMap<IrVar, TrackedValue> = new_map();
-        let mut optimized_instructions = Vec::with_capacity(block.instructions.len());
+        state.clear();
 
-        for inst in block.instructions.drain(..) {
+        for inst in &mut block.instructions {
             match inst {
-                IrInst::LoadConst { dst, ref val } => {
-                    state.insert(dst, TrackedValue::Const(val.clone()));
-                    optimized_instructions.push(inst);
+                IrInst::LoadConst { dst, val } => {
+                    state.insert(*dst, TrackedValue::Const(val.clone()));
                 }
                 IrInst::LoadNil { dst } => {
-                    state.insert(dst, TrackedValue::Const(IrConstant::Nil));
-                    optimized_instructions.push(inst);
+                    state.insert(*dst, TrackedValue::Const(IrConstant::Nil));
                 }
                 IrInst::Move { dst, src } => {
-                    let const_opt = if !captured.contains(&src)
-                        && let Some(TrackedValue::Const(c)) = state.get(&src)
+                    let dst_v = *dst;
+                    let src_v = *src;
+                    let const_opt = if !captured.contains(&src_v)
+                        && let Some(TrackedValue::Const(c)) = state.get(&src_v)
                     {
                         Some(c.clone())
                     } else {
                         None
                     };
-                    if !captured.contains(&dst)
-                        && !captured.contains(&src)
+                    if !captured.contains(&dst_v)
+                        && !captured.contains(&src_v)
                         && let Some(c) = const_opt
                     {
                         changed = true;
-                        state.insert(dst, TrackedValue::Const(c.clone()));
-                        optimized_instructions.push(IrInst::LoadConst { dst, val: c });
+                        state.insert(dst_v, TrackedValue::Const(c.clone()));
+                        *inst = IrInst::LoadConst { dst: dst_v, val: c };
                     } else {
-                        let val = if captured.contains(&src) {
+                        let val = if captured.contains(&src_v) {
                             TrackedValue::Bottom
                         } else {
-                            state.get(&src).cloned().unwrap_or(TrackedValue::Bottom)
+                            state.get(&src_v).cloned().unwrap_or(TrackedValue::Bottom)
                         };
-                        state.insert(dst, val);
-                        optimized_instructions.push(inst);
+                        state.insert(dst_v, val);
                     }
                 }
                 IrInst::BinOp { dst, op, lhs, rhs } => {
-                    let l_val = if captured.contains(&lhs) {
-                        TrackedValue::Bottom
+                    let dst_v = *dst;
+                    let op_v = *op;
+                    let lhs_v = *lhs;
+                    let rhs_v = *rhs;
+                    let l_val = if captured.contains(&lhs_v) {
+                        &TrackedValue::Bottom
                     } else {
-                        state.get(&lhs).cloned().unwrap_or(TrackedValue::Bottom)
+                        state.get(&lhs_v).unwrap_or(&TrackedValue::Bottom)
                     };
-                    let r_val = if captured.contains(&rhs) {
-                        TrackedValue::Bottom
+                    let r_val = if captured.contains(&rhs_v) {
+                        &TrackedValue::Bottom
                     } else {
-                        state.get(&rhs).cloned().unwrap_or(TrackedValue::Bottom)
+                        state.get(&rhs_v).unwrap_or(&TrackedValue::Bottom)
                     };
-                    let res = eval_binop(op, &l_val, &r_val);
+                    let res = eval_binop(op_v, l_val, r_val);
                     let const_opt = if let TrackedValue::Const(ref c) = res {
                         Some(c.clone())
                     } else {
                         None
                     };
 
-                    if !captured.contains(&dst)
-                        && !captured.contains(&lhs)
-                        && !captured.contains(&rhs)
+                    if !captured.contains(&dst_v)
+                        && !captured.contains(&lhs_v)
+                        && !captured.contains(&rhs_v)
                         && let Some(c) = const_opt
                     {
                         changed = true;
-                        state.insert(dst, res);
-                        optimized_instructions.push(IrInst::LoadConst { dst, val: c });
+                        state.insert(dst_v, res);
+                        *inst = IrInst::LoadConst { dst: dst_v, val: c };
                     } else {
                         if !captured.is_empty() {
                             state.retain(|var, _| !captured.contains(var));
                         }
-                        state.insert(dst, res);
-                        optimized_instructions.push(IrInst::BinOp { dst, op, lhs, rhs });
+                        state.insert(dst_v, res);
                     }
                 }
                 IrInst::UnOp { dst, op, src } => {
-                    let s_val = if captured.contains(&src) {
-                        TrackedValue::Bottom
+                    let dst_v = *dst;
+                    let op_v = *op;
+                    let src_v = *src;
+                    let s_val = if captured.contains(&src_v) {
+                        &TrackedValue::Bottom
                     } else {
-                        state.get(&src).cloned().unwrap_or(TrackedValue::Bottom)
+                        state.get(&src_v).unwrap_or(&TrackedValue::Bottom)
                     };
-                    let res = eval_unop(op, &s_val);
+                    let res = eval_unop(op_v, s_val);
                     let const_opt = if let TrackedValue::Const(ref c) = res {
                         Some(c.clone())
                     } else {
                         None
                     };
 
-                    if !captured.contains(&dst)
-                        && !captured.contains(&src)
+                    if !captured.contains(&dst_v)
+                        && !captured.contains(&src_v)
                         && let Some(c) = const_opt
                     {
                         changed = true;
-                        state.insert(dst, res);
-                        optimized_instructions.push(IrInst::LoadConst { dst, val: c });
+                        state.insert(dst_v, res);
+                        *inst = IrInst::LoadConst { dst: dst_v, val: c };
                     } else {
-                        if op != IrUnaryOp::Not && !captured.is_empty() {
+                        if op_v != IrUnaryOp::Not && !captured.is_empty() {
                             state.retain(|var, _| !captured.contains(var));
                         }
-                        state.insert(dst, res);
-                        optimized_instructions.push(IrInst::UnOp { dst, op, src });
+                        state.insert(dst_v, res);
                     }
                 }
                 IrInst::Call { .. }
@@ -658,18 +669,14 @@ pub fn value_tracking_cfg(cfg: &mut ControlFlowGraph) -> bool {
                     inst.for_each_def(|d| {
                         state.remove(&d);
                     });
-                    optimized_instructions.push(inst);
                 }
                 other => {
                     other.for_each_def(|d| {
                         state.remove(&d);
                     });
-                    optimized_instructions.push(other);
                 }
             }
         }
-
-        block.instructions = optimized_instructions;
     }
 
     changed

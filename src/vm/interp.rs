@@ -1,12 +1,12 @@
 //! Bytecode interpreter dispatch loop and loop-control helpers.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use num_integer::Integer as _;
 
-use crate::bytecode::instruction::{Instruction, MULTRET};
-use crate::bytecode::proto::{QuickOp, TableCacheSlot};
+use crate::bytecode::exec::{AlignedExec, ExecInst, TableCacheSlot};
+use crate::bytecode::instruction::MULTRET;
 use crate::vm::frame::CallFrame;
 use crate::vm::machine::{HookEvent, RUNNING_FRAME, VM};
 use crate::vm::ops;
@@ -17,14 +17,14 @@ use crate::vm::value::{Upvalue, Value, VmClosure, VmTable};
 /// sizes the stack to cover that window before dispatching, so the bounds
 /// check is skipped.
 #[inline(always)]
-fn slot(stack: &[Value], idx: usize) -> &Value {
+pub(crate) fn slot(stack: &[Value], idx: usize) -> &Value {
     debug_assert!(idx < stack.len());
     // SAFETY: see above; the caller upholds `idx < stack.len()`.
     unsafe { stack.get_unchecked(idx) }
 }
 
 #[inline(always)]
-fn slot_mut(stack: &mut [Value], idx: usize) -> &mut Value {
+pub(crate) fn slot_mut(stack: &mut [Value], idx: usize) -> &mut Value {
     debug_assert!(idx < stack.len());
     // SAFETY: as for `slot`.
     unsafe { stack.get_unchecked_mut(idx) }
@@ -113,6 +113,10 @@ impl VM {
         if self.frames.len() <= target_depth {
             return Ok(Some(Value::Nil));
         }
+        #[cfg(not(debug_assertions))]
+        if !TRAP {
+            return crate::vm::threaded::run_fast_threaded(self, target_depth);
+        }
         let (closure, mut base, mut ip) = {
             let f = self.frames.last().expect(RUNNING_FRAME);
             (f.closure.clone(), f.base, f.ip)
@@ -131,7 +135,8 @@ impl VM {
             self.stack.resize(window_end, Value::Nil);
         }
         let mut current_closure = closure;
-        let mut code: &[Instruction] = &current_closure.proto.instructions;
+        let mut exec = current_closure.proto.exec();
+        let mut code: &[Cell<AlignedExec>] = &exec.ops;
         let mut consts: &[Value] = current_closure.proto.values();
 
         // Register access relative to this frame. `reg!` reads, `set!` writes.
@@ -485,16 +490,16 @@ impl VM {
         }
 
         loop {
-            let Some(&inst) = code.get(ip) else {
+            let cur_ip = ip;
+            let inst = unsafe { code.get_unchecked(cur_ip) }.get().0;
+            if matches!(inst, ExecInst::EndSentinel) {
                 // Fell off the end without a `Return`: treat as returning nothing.
                 sync_ip!();
-                if self.hook.is_some() {
+                if self.debug_active && self.hook.is_some() {
                     self.fire_hook(HookEvent::Return)?;
                 }
                 let frame = self.frames.pop().expect(RUNNING_FRAME);
-                if !self.open_upvalues.is_empty() {
-                    self.close_upvalues(frame.base);
-                }
+                self.close_upvalues_if_needed(frame.base);
                 if self.frames.len() == target_depth {
                     self.returned.clear();
                     return Ok(Some(Value::Nil));
@@ -507,10 +512,11 @@ impl VM {
                     sync_ip!();
                     return Ok(None);
                 }
-                code = &current_closure.proto.instructions;
+                exec = current_closure.proto.exec();
+                code = &exec.ops;
                 consts = current_closure.proto.values();
                 continue;
-            };
+            }
             if TRAP {
                 // The frame's ip points past the instruction about to run,
                 // as it does while that instruction executes.
@@ -521,264 +527,15 @@ impl VM {
                     return Ok(None);
                 }
             }
-            let cur_ip = ip;
             ip += 1;
 
-            let mut deopted = false;
-            match current_closure.proto.quick_op(cur_ip) {
-                QuickOp::None => {}
-                QuickOp::AddInt { dst, a, b } => {
-                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b))
-                        && let Some(r) = x.checked_add(*y)
-                    {
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Int(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Int(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::AddFloat { dst, a, b } => {
-                    if let (Value::Float(x), Value::Float(y)) = (&reg!(a), &reg!(b)) {
-                        let r = *x + *y;
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::SubInt { dst, a, b } => {
-                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b))
-                        && let Some(r) = x.checked_sub(*y)
-                    {
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Int(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Int(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::SubFloat { dst, a, b } => {
-                    if let (Value::Float(x), Value::Float(y)) = (&reg!(a), &reg!(b)) {
-                        let r = *x - *y;
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::MulInt { dst, a, b } => {
-                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b))
-                        && let Some(r) = x.checked_mul(*y)
-                    {
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Int(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Int(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::MulFloat { dst, a, b } => {
-                    if let (Value::Float(x), Value::Float(y)) = (&reg!(a), &reg!(b)) {
-                        let r = *x * *y;
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::AddIntK { dst, a, imm } => {
-                    if let Value::Int(x) = &reg!(a)
-                        && let Some(r) = x.checked_add(imm)
-                    {
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Int(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Int(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::AddFloatK { dst, a, imm } => {
-                    if let Value::Float(x) = &reg!(a) {
-                        let r = *x + imm;
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::SubIntK { dst, a, imm } => {
-                    if let Value::Int(x) = &reg!(a)
-                        && let Some(r) = x.checked_sub(imm)
-                    {
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Int(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Int(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::SubFloatK { dst, a, imm } => {
-                    if let Value::Float(x) = &reg!(a) {
-                        let r = *x - imm;
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::MulIntK { dst, a, imm } => {
-                    if let Value::Int(x) = &reg!(a)
-                        && let Some(r) = x.checked_mul(imm)
-                    {
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Int(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Int(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::MulFloatK { dst, a, imm } => {
-                    if let Value::Float(x) = &reg!(a) {
-                        let r = *x * imm;
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::LtInt {
-                    a,
-                    b,
-                    jump_if_false,
-                } => {
-                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b)) {
-                        if !(*x < *y) {
-                            jump!(jump_if_false);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::LeInt {
-                    a,
-                    b,
-                    jump_if_false,
-                } => {
-                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b)) {
-                        if !(*x <= *y) {
-                            jump!(jump_if_false);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::LtIntK {
-                    a,
-                    imm,
-                    jump_if_false,
-                } => {
-                    if let Value::Int(x) = &reg!(a) {
-                        if !(*x < imm) {
-                            jump!(jump_if_false);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::LeIntK {
-                    a,
-                    imm,
-                    jump_if_false,
-                } => {
-                    if let Value::Int(x) = &reg!(a) {
-                        if !(*x <= imm) {
-                            jump!(jump_if_false);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::EqIntK {
-                    a,
-                    imm,
-                    jump_if_false,
-                } => {
-                    if let Value::Int(x) = &reg!(a) {
-                        if *x != imm {
-                            jump!(jump_if_false);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-            }
-
             match inst {
-                Instruction::LoadNil { dst } => set!(dst, Value::Nil),
-                Instruction::LoadBool { dst, val } => set!(dst, Value::Bool(val)),
-                Instruction::LoadInt { dst, val } => set!(dst, Value::Int(val as i64)),
-                Instruction::LoadK { dst, k } => set!(dst, consts[k as usize].clone()),
-                Instruction::Move { dst, src } => {
+                ExecInst::EndSentinel => unreachable!(),
+                ExecInst::LoadNil { dst } => set!(dst, Value::Nil),
+                ExecInst::LoadBool { dst, val } => set!(dst, Value::Bool(val)),
+                ExecInst::LoadInt { dst, val } => set!(dst, Value::Int(val as i64)),
+                ExecInst::LoadK { dst, k } => set!(dst, consts[k as usize].clone()),
+                ExecInst::Move { dst, src } => {
                     let src_slot = slot(&self.stack, base + src as usize);
                     match src_slot {
                         Value::Int(i) => {
@@ -814,11 +571,8 @@ impl VM {
                         }
                     }
                 }
-                Instruction::GetGlobal { dst, name_k } => {
-                    if let Some(val) = current_closure
-                        .proto
-                        .global_cache_get(cur_ip, self.globals_epoch)
-                    {
+                ExecInst::GetGlobal { dst, name_k, site } => {
+                    if let Some(val) = exec.global_cache_get(site, self.globals_epoch) {
                         set!(dst, val);
                         continue;
                     }
@@ -826,12 +580,17 @@ impl VM {
                         throw!("global name must be string");
                     };
                     let val = self.globals.get(&**name).cloned().unwrap_or(Value::Nil);
-                    current_closure
-                        .proto
-                        .global_cache_set(cur_ip, self.globals_epoch, val.clone());
+                    exec.global_cache_set(site, self.globals_epoch, val.clone());
                     set!(dst, val);
                 }
-                Instruction::SetGlobal { src, name_k } => {
+                ExecInst::GetGlobalDynamic { dst, name_k } => {
+                    let Value::String(name) = &consts[name_k as usize] else {
+                        throw!("global name must be string");
+                    };
+                    let val = self.globals.get(&**name).cloned().unwrap_or(Value::Nil);
+                    set!(dst, val);
+                }
+                ExecInst::SetGlobal { src, name_k } => {
                     let Value::String(name) = &consts[name_k as usize] else {
                         throw!("global name must be string");
                     };
@@ -845,7 +604,7 @@ impl VM {
                     }
                     self.globals_epoch = self.globals_epoch.wrapping_add(1);
                 }
-                Instruction::GetUpval { dst, upval_idx } => {
+                ExecInst::GetUpval { dst, upval_idx } => {
                     let uv = &current_closure.upvalues[upval_idx as usize];
                     match uv.location.get() {
                         Some(idx) => {
@@ -885,16 +644,16 @@ impl VM {
                             }
                         }
                         None => {
-                            let val = uv.closed.borrow().clone();
+                            let val = uv.get_closed();
                             set!(dst, val);
                         }
                     }
                 }
-                Instruction::SetUpval { src, upval_idx } => {
+                ExecInst::SetUpval { src, upval_idx } => {
                     let val = reg!(src).clone();
                     self.upvalue_set(&current_closure.upvalues[upval_idx as usize], val);
                 }
-                Instruction::NewTable {
+                ExecInst::NewTable {
                     dst,
                     array_cap,
                     fields_cap,
@@ -914,7 +673,7 @@ impl VM {
                     self.gc.register_table_sized(&rc, size);
                     set!(dst, Value::Table(rc));
                 }
-                Instruction::GetTable { dst, table, key } => {
+                ExecInst::GetTable { dst, table, key } => {
                     let tbl_val = &reg!(table);
                     let k = &reg!(key);
                     if let (Value::Table(t), Value::Int(i)) = (tbl_val, k)
@@ -961,17 +720,22 @@ impl VM {
                     };
                     set!(dst, val);
                 }
-                Instruction::GetTableK { dst, table, key_k } => {
+                ExecInst::GetTableK {
+                    dst,
+                    table,
+                    key_k,
+                    site,
+                } => {
                     let tbl_val = &reg!(table);
                     let k = &consts[key_k as usize];
                     if let (Value::Table(t), Value::String(s)) = (tbl_val, k) {
                         let ptr = Rc::as_ptr(t) as usize;
                         let tbl = t.borrow();
                         let shape = tbl.fields.shape_version();
-                        if let Some(ic) = current_closure.proto.table_cache_get(cur_ip)
+                        if let Some(ic) = exec.table_cache_get(site)
                             && ic.table_ptr == ptr
                             && ic.shape_version == shape
-                            && let Some(v) = tbl.fields.get_slot_keyed(ic.slot_idx, s)
+                            && let Some(v) = tbl.fields.get_slot_keyed(ic.slot_idx as usize, s)
                         {
                             let val = match v {
                                 Value::Int(n) => Value::Int(*n),
@@ -993,12 +757,12 @@ impl VM {
                                 other => other.clone(),
                             };
                             drop(tbl);
-                            current_closure.proto.table_cache_set(
-                                cur_ip,
+                            exec.table_cache_set(
+                                site,
                                 TableCacheSlot {
                                     table_ptr: ptr,
                                     shape_version: shape,
-                                    slot_idx,
+                                    slot_idx: slot_idx as u32,
                                 },
                             );
                             set!(dst, val);
@@ -1019,7 +783,20 @@ impl VM {
                     };
                     set!(dst, val);
                 }
-                Instruction::GetImport {
+                ExecInst::GetTableKDynamic { dst, table, key_k } => {
+                    let tbl_val = &reg!(table);
+                    let k = &consts[key_k as usize];
+                    let val = match Self::table_get_fast(tbl_val, k) {
+                        Some(v) => v,
+                        None => {
+                            let tbl = tbl_val.clone();
+                            sync_ip!();
+                            self.table_get(&tbl, k)?
+                        }
+                    };
+                    set!(dst, val);
+                }
+                ExecInst::GetImport {
                     dst,
                     mod_k,
                     field_k,
@@ -1029,10 +806,7 @@ impl VM {
                     // Fast path: resolved under this epoch with the
                     // module still metatable-free. One epoch read, one
                     // pointer check, one clone instead of two hashes.
-                    if let Some(cached) = current_closure
-                        .proto
-                        .import_cached(site, self.globals_epoch)
-                    {
+                    if let Some(cached) = exec.import_cached(site, self.globals_epoch) {
                         set!(dst, cached);
                     } else {
                         let (mname, fname) =
@@ -1063,7 +837,7 @@ impl VM {
                                     && !matches!(value, Value::Nil)
                             };
                             if cacheable {
-                                current_closure.proto.import_store(
+                                exec.import_store(
                                     site,
                                     self.globals_epoch,
                                     t.clone(),
@@ -1074,7 +848,7 @@ impl VM {
                         set!(dst, value);
                     }
                 }
-                Instruction::SetTable { table, key, val } => {
+                ExecInst::SetTable { table, key, val } => {
                     let tbl_val = &reg!(table);
                     let k = &reg!(key);
                     let v = &reg!(val);
@@ -1121,7 +895,12 @@ impl VM {
                         self.table_set(&tbl, k, v)?;
                     }
                 }
-                Instruction::SetTableK { table, key_k, val } => {
+                ExecInst::SetTableK {
+                    table,
+                    key_k,
+                    val,
+                    site,
+                } => {
                     let tbl_val = &reg!(table);
                     let k = &consts[key_k as usize];
                     let v = &reg!(val);
@@ -1132,39 +911,39 @@ impl VM {
                         let mut tbl = t.borrow_mut();
                         if !tbl.frozen {
                             let shape = tbl.fields.shape_version();
-                            if let Some(ic) = current_closure.proto.table_cache_get(cur_ip)
+                            if let Some(ic) = exec.table_cache_get(site)
                                 && ic.table_ptr == ptr
                                 && ic.shape_version == shape
-                                && tbl.fields.set_slot_keyed(ic.slot_idx, s, v.clone())
+                                && tbl
+                                    .fields
+                                    .set_slot_keyed(ic.slot_idx as usize, s, v.clone())
                             {
                                 continue;
                             }
                             if let Some(slot_idx) = tbl.fields.find_index_by_strref(s) {
                                 tbl.fields.set_slot(slot_idx, v.clone());
                                 drop(tbl);
-                                current_closure.proto.table_cache_set(
-                                    cur_ip,
+                                exec.table_cache_set(
+                                    site,
                                     TableCacheSlot {
                                         table_ptr: ptr,
                                         shape_version: shape,
-                                        slot_idx,
+                                        slot_idx: slot_idx as u32,
                                     },
                                 );
                                 continue;
                             } else if tbl.metatable.is_none() {
-                                tbl.fields.insert(s.clone(), v.clone());
+                                let slot_idx = tbl.fields.insert_cached(s.clone(), v.clone());
                                 let new_shape = tbl.fields.shape_version();
-                                if let Some(slot_idx) = tbl.fields.find_index_by_strref(s) {
-                                    drop(tbl);
-                                    current_closure.proto.table_cache_set(
-                                        cur_ip,
-                                        TableCacheSlot {
-                                            table_ptr: ptr,
-                                            shape_version: new_shape,
-                                            slot_idx,
-                                        },
-                                    );
-                                }
+                                drop(tbl);
+                                exec.table_cache_set(
+                                    site,
+                                    TableCacheSlot {
+                                        table_ptr: ptr,
+                                        shape_version: new_shape,
+                                        slot_idx: slot_idx as u32,
+                                    },
+                                );
                                 continue;
                             }
                         }
@@ -1175,7 +954,17 @@ impl VM {
                         self.table_set(&tbl, k, v)?;
                     }
                 }
-                Instruction::AppendArray { table, src } => {
+                ExecInst::SetTableKDynamic { table, key_k, val } => {
+                    let tbl_val = &reg!(table);
+                    let k = &consts[key_k as usize];
+                    let v = &reg!(val);
+                    if !Self::table_set_fast(tbl_val, k, v) {
+                        let (tbl, k, v) = (tbl_val.clone(), k.clone(), v.clone());
+                        sync_ip!();
+                        self.table_set(&tbl, k, v)?;
+                    }
+                }
+                ExecInst::AppendArray { table, src } => {
                     let val = reg!(src).clone();
                     if let Value::Table(t) = &reg!(table) {
                         t.borrow_mut().array.push(val);
@@ -1183,7 +972,7 @@ impl VM {
                         throw!("cannot append to non-table");
                     }
                 }
-                Instruction::SetList {
+                ExecInst::SetList {
                     table,
                     base: list,
                     count,
@@ -1204,11 +993,11 @@ impl VM {
                         throw!("cannot SetList to non-table");
                     }
                 }
-                Instruction::TForCall { base: b, retc } => {
+                ExecInst::TForCall { base: b, retc } => {
                     sync_ip!();
                     self.tfor_call(base, b, retc)?;
                 }
-                Instruction::TForLoop { base: b, jump } => {
+                ExecInst::TForLoop { base: b, jump } => {
                     let first_var = reg!(b + 3).clone();
                     if matches!(first_var, Value::Nil) {
                         // Exit loop: jump forward past the back-jump
@@ -1218,172 +1007,562 @@ impl VM {
                         set!(b + 2, first_var);
                     }
                 }
-                Instruction::CloseUpval { reg } => {
+                ExecInst::CloseUpval { reg } => {
                     if !self.open_upvalues.is_empty() {
                         self.close_upvalue_at(base + reg as usize);
                     }
                 }
-                Instruction::Add { dst, a, b } => {
-                    if !deopted {
-                        match (&reg!(a), &reg!(b)) {
-                            (Value::Int(_), Value::Int(_)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::AddInt { dst, a, b }),
-                            (Value::Float(_), Value::Float(_)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::AddFloat { dst, a, b }),
-                            _ => {}
+                ExecInst::AddInt { dst, a, b } => {
+                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b))
+                        && let Some(r) = x.checked_add(*y)
+                    {
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Int(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Int(r);
                         }
+                        continue;
                     }
-                    arith!(
-                        dst,
-                        a,
-                        b,
-                        checked_add,
-                        +,
-                        ops::eval_add,
-                        "__add",
-                        into ops::eval_add_into
-                    )
+                    code[cur_ip].set(AlignedExec(ExecInst::AddGeneric { dst, a, b }));
+                    arith!(dst, a, b, checked_add, +, ops::eval_add, "__add", into ops::eval_add_into)
                 }
-                Instruction::AddI { dst, a, imm } => {
+                ExecInst::AddFloat { dst, a, b } => {
+                    if let (Value::Float(x), Value::Float(y)) = (&reg!(a), &reg!(b)) {
+                        let r = *x + *y;
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Float(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Float(r);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::AddGeneric { dst, a, b }));
+                    arith!(dst, a, b, checked_add, +, ops::eval_add, "__add", into ops::eval_add_into)
+                }
+                ExecInst::Add { dst, a, b } => {
+                    match (&reg!(a), &reg!(b)) {
+                        (Value::Int(_), Value::Int(_)) => {
+                            code[cur_ip].set(AlignedExec(ExecInst::AddInt { dst, a, b }));
+                        }
+                        (Value::Float(_), Value::Float(_)) => {
+                            code[cur_ip].set(AlignedExec(ExecInst::AddFloat { dst, a, b }));
+                        }
+                        _ => {}
+                    }
+                    arith!(dst, a, b, checked_add, +, ops::eval_add, "__add", into ops::eval_add_into)
+                }
+                ExecInst::AddGeneric { dst, a, b } => {
+                    arith!(dst, a, b, checked_add, +, ops::eval_add, "__add", into ops::eval_add_into)
+                }
+                ExecInst::AddIntI { dst, a, imm } => {
+                    if let Value::Int(x) = &reg!(a)
+                        && let Some(r) = x.checked_add(imm as i64)
+                    {
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Int(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Int(r);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::AddIGeneric { dst, a, imm }));
                     arith_imm!(dst, a, imm, checked_add, +, ops::eval_add, "__add")
                 }
-                Instruction::AddK { dst, a, k } => {
-                    if !deopted {
-                        match (&reg!(a), &consts[k as usize]) {
-                            (Value::Int(_), Value::Int(imm)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::AddIntK { dst, a, imm: *imm }),
-                            (Value::Float(_), Value::Float(imm)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::AddFloatK { dst, a, imm: *imm }),
-                            _ => {}
+                ExecInst::AddI { dst, a, imm } => {
+                    if matches!(&reg!(a), Value::Int(_)) {
+                        code[cur_ip].set(AlignedExec(ExecInst::AddIntI { dst, a, imm }));
+                    }
+                    arith_imm!(dst, a, imm, checked_add, +, ops::eval_add, "__add")
+                }
+                ExecInst::AddIGeneric { dst, a, imm } => {
+                    arith_imm!(dst, a, imm, checked_add, +, ops::eval_add, "__add")
+                }
+                ExecInst::AddIntK { dst, a, k } => {
+                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &consts[k as usize])
+                        && let Some(r) = x.checked_add(*y)
+                    {
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Int(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Int(r);
                         }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::AddKGeneric { dst, a, k }));
+                    arith_k!(dst, a, k, checked_add, +, ops::eval_add, "__add")
+                }
+                ExecInst::AddFloatK { dst, a, k } => {
+                    if let (Value::Float(x), Value::Float(y)) = (&reg!(a), &consts[k as usize]) {
+                        let r = *x + *y;
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Float(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Float(r);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::AddKGeneric { dst, a, k }));
+                    arith_k!(dst, a, k, checked_add, +, ops::eval_add, "__add")
+                }
+                ExecInst::AddK { dst, a, k } => {
+                    match (&reg!(a), &consts[k as usize]) {
+                        (Value::Int(_), Value::Int(_)) => {
+                            code[cur_ip].set(AlignedExec(ExecInst::AddIntK { dst, a, k }));
+                        }
+                        (Value::Float(_), Value::Float(_)) => {
+                            code[cur_ip].set(AlignedExec(ExecInst::AddFloatK { dst, a, k }));
+                        }
+                        _ => {}
                     }
                     arith_k!(dst, a, k, checked_add, +, ops::eval_add, "__add")
                 }
-                Instruction::Sub { dst, a, b } => {
-                    if !deopted {
-                        match (&reg!(a), &reg!(b)) {
-                            (Value::Int(_), Value::Int(_)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::SubInt { dst, a, b }),
-                            (Value::Float(_), Value::Float(_)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::SubFloat { dst, a, b }),
-                            _ => {}
-                        }
-                    }
-                    arith!(
-                        dst,
-                        a,
-                        b,
-                        checked_sub,
-                        -,
-                        ops::eval_sub,
-                        "__sub",
-                        into ops::eval_sub_into
-                    )
+                ExecInst::AddKGeneric { dst, a, k } => {
+                    arith_k!(dst, a, k, checked_add, +, ops::eval_add, "__add")
                 }
-                Instruction::SubI { dst, a, imm } => {
+                ExecInst::SubInt { dst, a, b } => {
+                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b))
+                        && let Some(r) = x.checked_sub(*y)
+                    {
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Int(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Int(r);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::SubGeneric { dst, a, b }));
+                    arith!(dst, a, b, checked_sub, -, ops::eval_sub, "__sub", into ops::eval_sub_into)
+                }
+                ExecInst::SubFloat { dst, a, b } => {
+                    if let (Value::Float(x), Value::Float(y)) = (&reg!(a), &reg!(b)) {
+                        let r = *x - *y;
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Float(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Float(r);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::SubGeneric { dst, a, b }));
+                    arith!(dst, a, b, checked_sub, -, ops::eval_sub, "__sub", into ops::eval_sub_into)
+                }
+                ExecInst::Sub { dst, a, b } => {
+                    match (&reg!(a), &reg!(b)) {
+                        (Value::Int(_), Value::Int(_)) => {
+                            code[cur_ip].set(AlignedExec(ExecInst::SubInt { dst, a, b }));
+                        }
+                        (Value::Float(_), Value::Float(_)) => {
+                            code[cur_ip].set(AlignedExec(ExecInst::SubFloat { dst, a, b }));
+                        }
+                        _ => {}
+                    }
+                    arith!(dst, a, b, checked_sub, -, ops::eval_sub, "__sub", into ops::eval_sub_into)
+                }
+                ExecInst::SubGeneric { dst, a, b } => {
+                    arith!(dst, a, b, checked_sub, -, ops::eval_sub, "__sub", into ops::eval_sub_into)
+                }
+                ExecInst::SubIntI { dst, a, imm } => {
+                    if let Value::Int(x) = &reg!(a)
+                        && let Some(r) = x.checked_sub(imm as i64)
+                    {
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Int(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Int(r);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::SubIGeneric { dst, a, imm }));
                     arith_imm!(dst, a, imm, checked_sub, -, ops::eval_sub, "__sub")
                 }
-                Instruction::SubK { dst, a, k } => {
-                    if !deopted {
-                        match (&reg!(a), &consts[k as usize]) {
-                            (Value::Int(_), Value::Int(imm)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::SubIntK { dst, a, imm: *imm }),
-                            (Value::Float(_), Value::Float(imm)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::SubFloatK { dst, a, imm: *imm }),
-                            _ => {}
+                ExecInst::SubI { dst, a, imm } => {
+                    if matches!(&reg!(a), Value::Int(_)) {
+                        code[cur_ip].set(AlignedExec(ExecInst::SubIntI { dst, a, imm }));
+                    }
+                    arith_imm!(dst, a, imm, checked_sub, -, ops::eval_sub, "__sub")
+                }
+                ExecInst::SubIGeneric { dst, a, imm } => {
+                    arith_imm!(dst, a, imm, checked_sub, -, ops::eval_sub, "__sub")
+                }
+                ExecInst::SubIntK { dst, a, k } => {
+                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &consts[k as usize])
+                        && let Some(r) = x.checked_sub(*y)
+                    {
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Int(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Int(r);
                         }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::SubKGeneric { dst, a, k }));
+                    arith_k!(dst, a, k, checked_sub, -, ops::eval_sub, "__sub")
+                }
+                ExecInst::SubFloatK { dst, a, k } => {
+                    if let (Value::Float(x), Value::Float(y)) = (&reg!(a), &consts[k as usize]) {
+                        let r = *x - *y;
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Float(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Float(r);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::SubKGeneric { dst, a, k }));
+                    arith_k!(dst, a, k, checked_sub, -, ops::eval_sub, "__sub")
+                }
+                ExecInst::SubK { dst, a, k } => {
+                    match (&reg!(a), &consts[k as usize]) {
+                        (Value::Int(_), Value::Int(_)) => {
+                            code[cur_ip].set(AlignedExec(ExecInst::SubIntK { dst, a, k }));
+                        }
+                        (Value::Float(_), Value::Float(_)) => {
+                            code[cur_ip].set(AlignedExec(ExecInst::SubFloatK { dst, a, k }));
+                        }
+                        _ => {}
                     }
                     arith_k!(dst, a, k, checked_sub, -, ops::eval_sub, "__sub")
                 }
-                Instruction::Mul { dst, a, b } => {
-                    if !deopted {
-                        match (&reg!(a), &reg!(b)) {
-                            (Value::Int(_), Value::Int(_)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::MulInt { dst, a, b }),
-                            (Value::Float(_), Value::Float(_)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::MulFloat { dst, a, b }),
-                            _ => {}
+                ExecInst::SubKGeneric { dst, a, k } => {
+                    arith_k!(dst, a, k, checked_sub, -, ops::eval_sub, "__sub")
+                }
+                ExecInst::MulInt { dst, a, b } => {
+                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b))
+                        && let Some(r) = x.checked_mul(*y)
+                    {
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Int(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Int(r);
                         }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::MulGeneric { dst, a, b }));
+                    arith!(dst, a, b, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::MulFloat { dst, a, b } => {
+                    if let (Value::Float(x), Value::Float(y)) = (&reg!(a), &reg!(b)) {
+                        let r = *x * *y;
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Float(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Float(r);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::MulGeneric { dst, a, b }));
+                    arith!(dst, a, b, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::Mul { dst, a, b } => {
+                    match (&reg!(a), &reg!(b)) {
+                        (Value::Int(_), Value::Int(_)) => {
+                            code[cur_ip].set(AlignedExec(ExecInst::MulInt { dst, a, b }));
+                        }
+                        (Value::Float(_), Value::Float(_)) => {
+                            code[cur_ip].set(AlignedExec(ExecInst::MulFloat { dst, a, b }));
+                        }
+                        _ => {}
                     }
                     arith!(dst, a, b, checked_mul, *, ops::eval_mul, "__mul")
                 }
-                Instruction::MulI { dst, a, imm } => {
+                ExecInst::MulGeneric { dst, a, b } => {
+                    arith!(dst, a, b, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::MulIntI { dst, a, imm } => {
+                    if let Value::Int(x) = &reg!(a)
+                        && let Some(r) = x.checked_mul(imm as i64)
+                    {
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Int(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Int(r);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::MulIGeneric { dst, a, imm }));
                     arith_imm!(dst, a, imm, checked_mul, *, ops::eval_mul, "__mul")
                 }
-                Instruction::MulK { dst, a, k } => {
-                    if !deopted {
-                        match (&reg!(a), &consts[k as usize]) {
-                            (Value::Int(_), Value::Int(imm)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::MulIntK { dst, a, imm: *imm }),
-                            (Value::Float(_), Value::Float(imm)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::MulFloatK { dst, a, imm: *imm }),
-                            _ => {}
+                ExecInst::MulI { dst, a, imm } => {
+                    if matches!(&reg!(a), Value::Int(_)) {
+                        code[cur_ip].set(AlignedExec(ExecInst::MulIntI { dst, a, imm }));
+                    }
+                    arith_imm!(dst, a, imm, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::MulIGeneric { dst, a, imm } => {
+                    arith_imm!(dst, a, imm, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::MulIntK { dst, a, k } => {
+                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &consts[k as usize])
+                        && let Some(r) = x.checked_mul(*y)
+                    {
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Int(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Int(r);
                         }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::MulKGeneric { dst, a, k }));
+                    arith_k!(dst, a, k, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::MulFloatK { dst, a, k } => {
+                    if let (Value::Float(x), Value::Float(y)) = (&reg!(a), &consts[k as usize]) {
+                        let r = *x * *y;
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Float(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Float(r);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::MulKGeneric { dst, a, k }));
+                    arith_k!(dst, a, k, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::MulK { dst, a, k } => {
+                    match (&reg!(a), &consts[k as usize]) {
+                        (Value::Int(_), Value::Int(_)) => {
+                            code[cur_ip].set(AlignedExec(ExecInst::MulIntK { dst, a, k }));
+                        }
+                        (Value::Float(_), Value::Float(_)) => {
+                            code[cur_ip].set(AlignedExec(ExecInst::MulFloatK { dst, a, k }));
+                        }
+                        _ => {}
                     }
                     arith_k!(dst, a, k, checked_mul, *, ops::eval_mul, "__mul")
                 }
-                Instruction::Div { dst, a, b } => {
+                ExecInst::MulKGeneric { dst, a, k } => {
+                    arith_k!(dst, a, k, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::Div { dst, a, b } => {
                     arith_slow!(dst, a, b, ops::eval_div, "__div")
                 }
-                Instruction::IDiv { dst, a, b } => {
-                    // Fast path for small ints; the zero divisor,
-                    // MIN/-1 overflow, floats, BigInts and metamethods
-                    // keep going through the generic evaluator so
-                    // semantics cannot drift.
+                ExecInst::IDiv { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    let res = match (ra, rb) {
+                    match (ra, rb) {
                         (Value::Int(x), Value::Int(y)) => {
-                            if *y == 0 || (*x == i64::MIN && *y == -1) {
-                                attempt!(ops::eval_idiv(ra, rb))
+                            let val = if *x >= 0 && *y > 0 {
+                                *x / *y
+                            } else if *y == 0 || (*x == i64::MIN && *y == -1) {
+                                let res = attempt!(ops::eval_idiv(ra, rb));
+                                set!(dst, res);
+                                continue;
                             } else {
-                                Value::Int(x.div_floor(y))
+                                x.div_floor(y)
+                            };
+                            let slot = slot_mut(&mut self.stack, base + dst as usize);
+                            if let Value::Int(old) = slot {
+                                *old = val;
+                            } else {
+                                *slot = Value::Int(val);
                             }
                         }
-                        _ => attempt!(ops::eval_idiv(ra, rb)),
-                    };
+                        _ => {
+                            let res = attempt!(ops::eval_idiv(ra, rb));
+                            set!(dst, res);
+                        }
+                    }
+                }
+                ExecInst::IDivIntPow2 { dst, a, shift } => {
+                    if let Value::Int(x) = &reg!(a) {
+                        let val = *x >> shift;
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Int(old) = slot {
+                            *old = val;
+                        } else {
+                            *slot = Value::Int(val);
+                        }
+                        continue;
+                    }
+                    let y = 1i64 << shift;
+                    let res = attempt!(ops::eval_idiv(&reg!(a), &Value::Int(y)));
                     set!(dst, res);
                 }
-                Instruction::Mod { dst, a, b } => {
+                ExecInst::IDivIntK { dst, a, k } => {
+                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &consts[k as usize]) {
+                        let val = if *x >= 0 { *x / *y } else { x.div_floor(y) };
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Int(old) = slot {
+                            *old = val;
+                        } else {
+                            *slot = Value::Int(val);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::IDivKGeneric { dst, a, k }));
+                    let res = attempt!(ops::eval_idiv(&reg!(a), &consts[k as usize]));
+                    set!(dst, res);
+                }
+                ExecInst::IDivK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    match (ra, rb) {
+                        (Value::Int(x), Value::Int(y)) if *y > 0 => {
+                            if (*y as u64).is_power_of_two() {
+                                let shift = y.trailing_zeros() as u8;
+                                code[cur_ip].set(AlignedExec(ExecInst::IDivIntPow2 {
+                                    dst,
+                                    a,
+                                    shift,
+                                }));
+                                let val = *x >> shift;
+                                let slot = slot_mut(&mut self.stack, base + dst as usize);
+                                if let Value::Int(old) = slot {
+                                    *old = val;
+                                } else {
+                                    *slot = Value::Int(val);
+                                }
+                            } else {
+                                code[cur_ip].set(AlignedExec(ExecInst::IDivIntK { dst, a, k }));
+                                let val = if *x >= 0 { *x / *y } else { x.div_floor(y) };
+                                let slot = slot_mut(&mut self.stack, base + dst as usize);
+                                if let Value::Int(old) = slot {
+                                    *old = val;
+                                } else {
+                                    *slot = Value::Int(val);
+                                }
+                            }
+                        }
+                        _ => {
+                            let res = attempt!(ops::eval_idiv(ra, rb));
+                            set!(dst, res);
+                        }
+                    }
+                }
+                ExecInst::IDivKGeneric { dst, a, k } => {
+                    let res = attempt!(ops::eval_idiv(&reg!(a), &consts[k as usize]));
+                    set!(dst, res);
+                }
+                ExecInst::ModIntPow2 { dst, a, shift } => {
+                    if let Value::Int(x) = &reg!(a) {
+                        let val = *x & ((1i64 << shift) - 1);
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Int(old) = slot {
+                            *old = val;
+                        } else {
+                            *slot = Value::Int(val);
+                        }
+                        continue;
+                    }
+                    let y = 1i64 << shift;
+                    let res = attempt!(ops::eval_mod(&reg!(a), &Value::Int(y)));
+                    set!(dst, res);
+                }
+                ExecInst::ModIntK { dst, a, k } => {
+                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &consts[k as usize]) {
+                        let val = if *x >= 0 { *x % *y } else { x.mod_floor(y) };
+                        let slot = slot_mut(&mut self.stack, base + dst as usize);
+                        if let Value::Int(old) = slot {
+                            *old = val;
+                        } else {
+                            *slot = Value::Int(val);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::ModKGeneric { dst, a, k }));
+                    let res = attempt!(ops::eval_mod(&reg!(a), &consts[k as usize]));
+                    set!(dst, res);
+                }
+                ExecInst::ModK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    match (ra, rb) {
+                        (Value::Int(x), Value::Int(y)) if *y > 0 => {
+                            if (*y as u64).is_power_of_two() {
+                                let shift = y.trailing_zeros() as u8;
+                                code[cur_ip].set(AlignedExec(ExecInst::ModIntPow2 {
+                                    dst,
+                                    a,
+                                    shift,
+                                }));
+                                let val = *x & ((1i64 << shift) - 1);
+                                let slot = slot_mut(&mut self.stack, base + dst as usize);
+                                if let Value::Int(old) = slot {
+                                    *old = val;
+                                } else {
+                                    *slot = Value::Int(val);
+                                }
+                            } else {
+                                code[cur_ip].set(AlignedExec(ExecInst::ModIntK { dst, a, k }));
+                                let val = if *x >= 0 { *x % *y } else { x.mod_floor(y) };
+                                let slot = slot_mut(&mut self.stack, base + dst as usize);
+                                if let Value::Int(old) = slot {
+                                    *old = val;
+                                } else {
+                                    *slot = Value::Int(val);
+                                }
+                            }
+                        }
+                        _ => {
+                            let res = attempt!(ops::eval_mod(ra, rb));
+                            set!(dst, res);
+                        }
+                    }
+                }
+                ExecInst::ModKGeneric { dst, a, k } => {
+                    let res = attempt!(ops::eval_mod(&reg!(a), &consts[k as usize]));
+                    set!(dst, res);
+                }
+                ExecInst::Mod { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    let res = match (ra, rb) {
+                    match (ra, rb) {
                         (Value::Int(x), Value::Int(y)) => {
-                            if *y == 0 {
-                                attempt!(ops::eval_mod(ra, rb))
+                            let val = if *y == 0 {
+                                match attempt!(ops::eval_mod(ra, rb)) {
+                                    Value::Int(n) => n,
+                                    other => {
+                                        set!(dst, other);
+                                        continue;
+                                    }
+                                }
                             } else if *y == -1 {
-                                Value::Int(0)
+                                0
+                            } else if *x >= 0 && *y > 0 {
+                                *x % *y
                             } else {
-                                Value::Int(x.mod_floor(y))
+                                x.mod_floor(y)
+                            };
+                            let slot = slot_mut(&mut self.stack, base + dst as usize);
+                            if let Value::Int(old) = slot {
+                                *old = val;
+                            } else {
+                                *slot = Value::Int(val);
                             }
                         }
                         (Value::BigInt(x), Value::Int(y)) => {
-                            if *y == 0 {
+                            let res = if *y == 0 {
                                 attempt!(ops::eval_mod(ra, rb))
                             } else {
                                 Value::Int(ops::bigint_mod_floor_i64(x, *y))
-                            }
+                            };
+                            set!(dst, res);
                         }
-                        _ => attempt!(ops::eval_mod(ra, rb)),
-                    };
-                    set!(dst, res);
+                        _ => {
+                            let res = attempt!(ops::eval_mod(ra, rb));
+                            set!(dst, res);
+                        }
+                    }
                 }
-                Instruction::Pow { dst, a, b } => {
+                ExecInst::Pow { dst, a, b } => {
                     arith_slow!(dst, a, b, ops::eval_pow, "__pow")
                 }
-                Instruction::BitAnd { dst, a, b } => {
+                ExecInst::BitAnd { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
                     if let (Value::Int(x), Value::Int(y)) = (ra, rb) {
@@ -1397,7 +1576,7 @@ impl VM {
                         ));
                     }
                 }
-                Instruction::BitOr { dst, a, b } => {
+                ExecInst::BitOr { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
                     if let (Value::Int(x), Value::Int(y)) = (ra, rb) {
@@ -1411,7 +1590,7 @@ impl VM {
                         ));
                     }
                 }
-                Instruction::BitXor { dst, a, b } => {
+                ExecInst::BitXor { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
                     if let (Value::Int(x), Value::Int(y)) = (ra, rb) {
@@ -1425,7 +1604,7 @@ impl VM {
                         ));
                     }
                 }
-                Instruction::Shl { dst, a, b } => {
+                ExecInst::Shl { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
                     match (ra, rb) {
@@ -1469,7 +1648,7 @@ impl VM {
                         }
                     }
                 }
-                Instruction::Shr { dst, a, b } => {
+                ExecInst::Shr { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
                     match (ra, rb) {
@@ -1502,7 +1681,7 @@ impl VM {
                     }
                 }
 
-                Instruction::ShlI { dst, a, imm } => {
+                ExecInst::ShlI { dst, a, imm } => {
                     let ra = &reg!(a);
                     match ra {
                         Value::Int(x) if *x >= 0 => {
@@ -1547,7 +1726,7 @@ impl VM {
                         }
                     }
                 }
-                Instruction::ShrI { dst, a, imm } => {
+                ExecInst::ShrI { dst, a, imm } => {
                     let ra = &reg!(a);
                     match ra {
                         Value::Int(x) => {
@@ -1574,7 +1753,7 @@ impl VM {
                     }
                 }
 
-                Instruction::LShl { dst, a, b } => {
+                ExecInst::LShl { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
                     let res = match (ra, rb) {
@@ -1588,7 +1767,7 @@ impl VM {
                     };
                     set!(dst, res);
                 }
-                Instruction::LShr { dst, a, b } => {
+                ExecInst::LShr { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
                     let res = match (ra, rb) {
@@ -1602,7 +1781,7 @@ impl VM {
                     };
                     set!(dst, res);
                 }
-                Instruction::Concat { dst, a, b } => {
+                ExecInst::Concat { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
                     let res = match (ra, rb) {
@@ -1625,7 +1804,7 @@ impl VM {
                     };
                     set!(dst, res);
                 }
-                Instruction::Unm { dst, src } => {
+                ExecInst::Unm { dst, src } => {
                     let v = &reg!(src);
                     match v {
                         Value::Int(i) if *i != i64::MIN => set!(dst, Value::Int(-i)),
@@ -1647,11 +1826,11 @@ impl VM {
                         )),
                     }
                 }
-                Instruction::Not { dst, src } => {
+                ExecInst::Not { dst, src } => {
                     let truthy = reg!(src).is_truthy();
                     set!(dst, Value::Bool(!truthy));
                 }
-                Instruction::Len { dst, src } => {
+                ExecInst::Len { dst, src } => {
                     let v = &reg!(src);
                     let len = match v {
                         Value::String(s) => s.len(),
@@ -1670,11 +1849,11 @@ impl VM {
                     };
                     set!(dst, Value::from_usize(len));
                 }
-                Instruction::BitNot { dst, src } => {
+                ExecInst::BitNot { dst, src } => {
                     let res = attempt!(ops::eval_bitnot(&reg!(src)));
                     set!(dst, res);
                 }
-                Instruction::Coalesce { dst, a, b } => {
+                ExecInst::Coalesce { dst, a, b } => {
                     let va = &reg!(a);
                     let res = if matches!(va, Value::Nil) {
                         reg!(b).clone()
@@ -1683,7 +1862,7 @@ impl VM {
                     };
                     set!(dst, res);
                 }
-                Instruction::Eq {
+                ExecInst::Eq {
                     a,
                     b,
                     jump_if_false,
@@ -1693,7 +1872,7 @@ impl VM {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::Ne {
+                ExecInst::Ne {
                     a,
                     b,
                     jump_if_false,
@@ -1703,77 +1882,153 @@ impl VM {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::Lt {
+                ExecInst::LtInt {
                     a,
                     b,
                     jump_if_false,
                 } => {
-                    if !deopted && matches!((&reg!(a), &reg!(b)), (Value::Int(_), Value::Int(_))) {
-                        current_closure.proto.set_quick_op(
-                            cur_ip,
-                            QuickOp::LtInt {
-                                a,
-                                b,
-                                jump_if_false,
-                            },
-                        );
+                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b)) {
+                        if !(*x < *y) {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::LtGeneric {
+                        a,
+                        b,
+                        jump_if_false,
+                    }));
+                    compare!(a, b, jump_if_false, <, ops::eval_lt, "__lt", false)
+                }
+                ExecInst::Lt {
+                    a,
+                    b,
+                    jump_if_false,
+                } => {
+                    if matches!((&reg!(a), &reg!(b)), (Value::Int(_), Value::Int(_))) {
+                        code[cur_ip].set(AlignedExec(ExecInst::LtInt {
+                            a,
+                            b,
+                            jump_if_false,
+                        }));
                     }
                     compare!(a, b, jump_if_false, <, ops::eval_lt, "__lt", false)
                 }
-                Instruction::Le {
+                ExecInst::LtGeneric {
                     a,
                     b,
                     jump_if_false,
                 } => {
-                    if !deopted && matches!((&reg!(a), &reg!(b)), (Value::Int(_), Value::Int(_))) {
-                        current_closure.proto.set_quick_op(
-                            cur_ip,
-                            QuickOp::LeInt {
-                                a,
-                                b,
-                                jump_if_false,
-                            },
-                        );
+                    compare!(a, b, jump_if_false, <, ops::eval_lt, "__lt", false)
+                }
+                ExecInst::LeInt {
+                    a,
+                    b,
+                    jump_if_false,
+                } => {
+                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b)) {
+                        if !(*x <= *y) {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::LeGeneric {
+                        a,
+                        b,
+                        jump_if_false,
+                    }));
+                    compare!(a, b, jump_if_false, <=, ops::eval_le, "__le", false)
+                }
+                ExecInst::Le {
+                    a,
+                    b,
+                    jump_if_false,
+                } => {
+                    if matches!((&reg!(a), &reg!(b)), (Value::Int(_), Value::Int(_))) {
+                        code[cur_ip].set(AlignedExec(ExecInst::LeInt {
+                            a,
+                            b,
+                            jump_if_false,
+                        }));
                     }
                     compare!(a, b, jump_if_false, <=, ops::eval_le, "__le", false)
                 }
-                Instruction::Gt {
+                ExecInst::LeGeneric {
+                    a,
+                    b,
+                    jump_if_false,
+                } => {
+                    compare!(a, b, jump_if_false, <=, ops::eval_le, "__le", false)
+                }
+                ExecInst::Gt {
                     a,
                     b,
                     jump_if_false,
                 } => {
                     compare!(a, b, jump_if_false, >, ops::eval_gt, "__lt", true)
                 }
-                Instruction::Ge {
+                ExecInst::Ge {
                     a,
                     b,
                     jump_if_false,
                 } => {
                     compare!(a, b, jump_if_false, >=, ops::eval_ge, "__le", true)
                 }
-                Instruction::EqK {
+                ExecInst::EqIntK {
+                    a,
+                    k,
+                    jump_if_false,
+                } => {
+                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &consts[k as usize]) {
+                        if *x != *y {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::EqKGeneric {
+                        a,
+                        k,
+                        jump_if_false,
+                    }));
+                    let va = self.stack[base + a as usize].clone();
+                    let vb = consts[k as usize].clone();
+                    let is_eq = self.values_equal_val(&va, &vb, ip)?;
+                    if !is_eq {
+                        jump!(jump_if_false);
+                    }
+                }
+                ExecInst::EqK {
                     a,
                     k,
                     jump_if_false,
                 } => {
                     let va = self.stack[base + a as usize].clone();
                     let vb = consts[k as usize].clone();
-                    if !deopted && let (Value::Int(_), Value::Int(imm)) = (&va, &vb) {
-                        current_closure.proto.set_quick_op(
-                            cur_ip,
-                            QuickOp::EqIntK {
-                                a,
-                                imm: *imm,
-                                jump_if_false,
-                            },
-                        );
+                    if matches!((&va, &vb), (Value::Int(_), Value::Int(_))) {
+                        code[cur_ip].set(AlignedExec(ExecInst::EqIntK {
+                            a,
+                            k,
+                            jump_if_false,
+                        }));
                     }
                     let is_eq = self.values_equal_val(&va, &vb, ip)?;
                     if !is_eq {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::NeK {
+                ExecInst::EqKGeneric {
+                    a,
+                    k,
+                    jump_if_false,
+                } => {
+                    let va = self.stack[base + a as usize].clone();
+                    let vb = consts[k as usize].clone();
+                    let is_eq = self.values_equal_val(&va, &vb, ip)?;
+                    if !is_eq {
+                        jump!(jump_if_false);
+                    }
+                }
+                ExecInst::NeK {
                     a,
                     k,
                     jump_if_false,
@@ -1785,59 +2040,105 @@ impl VM {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::LtK {
+                ExecInst::LtIntK {
                     a,
                     k,
                     jump_if_false,
                 } => {
-                    if !deopted
-                        && let (Value::Int(_), Value::Int(imm)) = (&reg!(a), &consts[k as usize])
-                    {
-                        current_closure.proto.set_quick_op(
-                            cur_ip,
-                            QuickOp::LtIntK {
-                                a,
-                                imm: *imm,
-                                jump_if_false,
-                            },
-                        );
+                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &consts[k as usize]) {
+                        if !(*x < *y) {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::LtKGeneric {
+                        a,
+                        k,
+                        jump_if_false,
+                    }));
+                    compare_k!(a, k, jump_if_false, <, ops::eval_lt, "__lt", false)
+                }
+                ExecInst::LtK {
+                    a,
+                    k,
+                    jump_if_false,
+                } => {
+                    if matches!(
+                        (&reg!(a), &consts[k as usize]),
+                        (Value::Int(_), Value::Int(_))
+                    ) {
+                        code[cur_ip].set(AlignedExec(ExecInst::LtIntK {
+                            a,
+                            k,
+                            jump_if_false,
+                        }));
                     }
                     compare_k!(a, k, jump_if_false, <, ops::eval_lt, "__lt", false)
                 }
-                Instruction::LeK {
+                ExecInst::LtKGeneric {
                     a,
                     k,
                     jump_if_false,
                 } => {
-                    if !deopted
-                        && let (Value::Int(_), Value::Int(imm)) = (&reg!(a), &consts[k as usize])
-                    {
-                        current_closure.proto.set_quick_op(
-                            cur_ip,
-                            QuickOp::LeIntK {
-                                a,
-                                imm: *imm,
-                                jump_if_false,
-                            },
-                        );
+                    compare_k!(a, k, jump_if_false, <, ops::eval_lt, "__lt", false)
+                }
+                ExecInst::LeIntK {
+                    a,
+                    k,
+                    jump_if_false,
+                } => {
+                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &consts[k as usize]) {
+                        if !(*x <= *y) {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::LeKGeneric {
+                        a,
+                        k,
+                        jump_if_false,
+                    }));
+                    compare_k!(a, k, jump_if_false, <=, ops::eval_le, "__le", false)
+                }
+                ExecInst::LeK {
+                    a,
+                    k,
+                    jump_if_false,
+                } => {
+                    if matches!(
+                        (&reg!(a), &consts[k as usize]),
+                        (Value::Int(_), Value::Int(_))
+                    ) {
+                        code[cur_ip].set(AlignedExec(ExecInst::LeIntK {
+                            a,
+                            k,
+                            jump_if_false,
+                        }));
                     }
                     compare_k!(a, k, jump_if_false, <=, ops::eval_le, "__le", false)
                 }
-                Instruction::GtK {
+                ExecInst::LeKGeneric {
+                    a,
+                    k,
+                    jump_if_false,
+                } => {
+                    compare_k!(a, k, jump_if_false, <=, ops::eval_le, "__le", false)
+                }
+                ExecInst::GtK {
                     a,
                     k,
                     jump_if_false,
                 } => {
                     compare_k!(a, k, jump_if_false, >, ops::eval_gt, "__lt", true)
                 }
-                Instruction::GeK {
+                ExecInst::GeK {
                     a,
                     k,
                     jump_if_false,
                 } => {
                     compare_k!(a, k, jump_if_false, >=, ops::eval_ge, "__le", true)
                 }
-                Instruction::EqI {
+                ExecInst::EqI {
                     a,
                     imm,
                     jump_if_false,
@@ -1851,7 +2152,7 @@ impl VM {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::NeI {
+                ExecInst::NeI {
                     a,
                     imm,
                     jump_if_false,
@@ -1865,46 +2166,110 @@ impl VM {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::LtI {
+                ExecInst::LtIntI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    if let Value::Int(x) = &reg!(a) {
+                        if !(*x < imm as i64) {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::LtIGeneric {
+                        a,
+                        imm,
+                        jump_if_false,
+                    }));
+                    compare_imm!(a, imm, jump_if_false, <, ops::eval_lt, "__lt", false)
+                }
+                ExecInst::LtI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    if matches!(&reg!(a), Value::Int(_)) {
+                        code[cur_ip].set(AlignedExec(ExecInst::LtIntI {
+                            a,
+                            imm,
+                            jump_if_false,
+                        }));
+                    }
+                    compare_imm!(a, imm, jump_if_false, <, ops::eval_lt, "__lt", false)
+                }
+                ExecInst::LtIGeneric {
                     a,
                     imm,
                     jump_if_false,
                 } => {
                     compare_imm!(a, imm, jump_if_false, <, ops::eval_lt, "__lt", false)
                 }
-                Instruction::LeI {
+                ExecInst::LeIntI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    if let Value::Int(x) = &reg!(a) {
+                        if !(*x <= imm as i64) {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::LeIGeneric {
+                        a,
+                        imm,
+                        jump_if_false,
+                    }));
+                    compare_imm!(a, imm, jump_if_false, <=, ops::eval_le, "__le", false)
+                }
+                ExecInst::LeI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    if matches!(&reg!(a), Value::Int(_)) {
+                        code[cur_ip].set(AlignedExec(ExecInst::LeIntI {
+                            a,
+                            imm,
+                            jump_if_false,
+                        }));
+                    }
+                    compare_imm!(a, imm, jump_if_false, <=, ops::eval_le, "__le", false)
+                }
+                ExecInst::LeIGeneric {
                     a,
                     imm,
                     jump_if_false,
                 } => {
                     compare_imm!(a, imm, jump_if_false, <=, ops::eval_le, "__le", false)
                 }
-                Instruction::GtI {
+                ExecInst::GtI {
                     a,
                     imm,
                     jump_if_false,
                 } => {
                     compare_imm!(a, imm, jump_if_false, >, ops::eval_gt, "__lt", true)
                 }
-                Instruction::GeI {
+                ExecInst::GeI {
                     a,
                     imm,
                     jump_if_false,
                 } => {
                     compare_imm!(a, imm, jump_if_false, >=, ops::eval_ge, "__le", true)
                 }
-                Instruction::Test { reg, jump_if_false } => {
+                ExecInst::Test { reg, jump_if_false } => {
                     if !reg!(reg).is_truthy() {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::Jump { offset } => {
+                ExecInst::Jump { offset } => {
                     if !TRAP && offset < 0 {
                         attempt!(self.limits.check_interrupt());
                     }
                     jump!(offset);
                 }
-                Instruction::ForPrep { base: b, jump } => {
+                ExecInst::ForPrep { base: b, jump } => {
                     let step = &reg!(b + 2);
                     match step {
                         Value::Int(0) => throw!("numeric for step cannot be zero"),
@@ -1914,6 +2279,47 @@ impl VM {
                         _ => {}
                     }
                     let init = &reg!(b);
+                    let limit = &reg!(b + 1);
+                    let target_ip = (ip as isize + jump as isize) as usize;
+                    if let (Value::Int(i), Value::Int(lim), Value::Int(s)) = (init, limit, step)
+                        && *s != 0
+                        && let Some(diff) = i.checked_sub(*s)
+                    {
+                        let iters: i128 = if (*s > 0 && *i <= *lim) || (*s < 0 && *i >= *lim) {
+                            ((*lim as i128 - *i as i128) / (*s as i128)) + 1
+                        } else {
+                            0
+                        };
+                        if (0..=i64::MAX as i128).contains(&iters)
+                            && let Some(
+                                ExecInst::ForLoop { base: fb, jump: fj }
+                                | ExecInst::ForLoopInt { base: fb, jump: fj }
+                                | ExecInst::ForLoopCount { base: fb, jump: fj }
+                                | ExecInst::ForLoopCount1 { base: fb, jump: fj }
+                                | ExecInst::ForLoopGeneric { base: fb, jump: fj },
+                            ) = code.get(target_ip).map(|c| c.get().0)
+                            && fb == b
+                        {
+                            let specialized = if *s == 1 {
+                                ExecInst::ForLoopCount1 { base: fb, jump: fj }
+                            } else {
+                                ExecInst::ForLoopCount { base: fb, jump: fj }
+                            };
+                            code[target_ip].set(AlignedExec(specialized));
+                            *slot_mut(&mut self.stack, base + b as usize) = Value::Int(diff);
+                            *slot_mut(&mut self.stack, base + b as usize + 1) =
+                                Value::Int(iters as i64);
+                            jump!(jump);
+                            continue;
+                        }
+                    }
+                    if let Some(
+                        ExecInst::ForLoopCount { base: fb, jump: fj }
+                        | ExecInst::ForLoopCount1 { base: fb, jump: fj },
+                    ) = code.get(target_ip).map(|c| c.get().0)
+                    {
+                        code[target_ip].set(AlignedExec(ExecInst::ForLoop { base: fb, jump: fj }));
+                    }
                     if let (Value::Int(i), Value::Int(s)) = (init, step)
                         && let Some(diff) = i.checked_sub(*s)
                     {
@@ -1930,12 +2336,181 @@ impl VM {
                     set!(b, init_minus_step);
                     jump!(jump);
                 }
-                Instruction::ForLoop { base: b, jump } => {
+                ExecInst::ForLoopCount { base: b, jump } => {
+                    let rem = match reg!(b + 1) {
+                        Value::Int(r) => r,
+                        _ => {
+                            code[cur_ip]
+                                .set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
+                            throw!("invalid loop state");
+                        }
+                    };
+                    if rem > 0 {
+                        let (Value::Int(i), Value::Int(st)) = (&reg!(b), &reg!(b + 2)) else {
+                            code[cur_ip]
+                                .set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
+                            throw!("invalid loop state");
+                        };
+                        let next = i.wrapping_add(*st);
+                        if let Value::Int(slot_rem) =
+                            slot_mut(&mut self.stack, base + (b + 1) as usize)
+                        {
+                            *slot_rem = rem - 1;
+                        }
+                        if let Value::Int(slot_b) = slot_mut(&mut self.stack, base + b as usize) {
+                            *slot_b = next;
+                        }
+                        let slot_v = slot_mut(&mut self.stack, base + (b + 3) as usize);
+                        if let Value::Int(old) = slot_v {
+                            *old = next;
+                        } else {
+                            *slot_v = Value::Int(next);
+                        }
+                        jump!(jump);
+                    }
+                    continue;
+                }
+                ExecInst::ForLoopCount1 { base: b, jump } => {
+                    let rem = match reg!(b + 1) {
+                        Value::Int(r) => r,
+                        _ => {
+                            code[cur_ip]
+                                .set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
+                            throw!("invalid loop state");
+                        }
+                    };
+                    if rem > 0 {
+                        let Value::Int(i) = &reg!(b) else {
+                            code[cur_ip]
+                                .set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
+                            throw!("invalid loop state");
+                        };
+                        let next = i.wrapping_add(1);
+                        if let Value::Int(slot_rem) =
+                            slot_mut(&mut self.stack, base + (b + 1) as usize)
+                        {
+                            *slot_rem = rem - 1;
+                        }
+                        if let Value::Int(slot_b) = slot_mut(&mut self.stack, base + b as usize) {
+                            *slot_b = next;
+                        }
+                        let slot_v = slot_mut(&mut self.stack, base + (b + 3) as usize);
+                        if let Value::Int(old) = slot_v {
+                            *old = next;
+                        } else {
+                            *slot_v = Value::Int(next);
+                        }
+                        jump!(jump);
+                    }
+                    continue;
+                }
+                ExecInst::ForLoopInt { base: b, jump } => {
+                    if let (Value::Int(i), Value::Int(lim), Value::Int(st)) =
+                        (&reg!(b), &reg!(b + 1), &reg!(b + 2))
+                        && let Some(next) = i.checked_add(*st)
+                    {
+                        let again = if *st >= 0 { next <= *lim } else { next >= *lim };
+                        let slot_b = slot_mut(&mut self.stack, base + b as usize);
+                        if let Value::Int(old) = slot_b {
+                            *old = next;
+                        } else {
+                            *slot_b = Value::Int(next);
+                        }
+                        if again {
+                            let slot_v = slot_mut(&mut self.stack, base + (b + 3) as usize);
+                            if let Value::Int(old) = slot_v {
+                                *old = next;
+                            } else {
+                                *slot_v = Value::Int(next);
+                            }
+                            jump!(jump);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
+                    let step = &reg!(b + 2);
+                    match step {
+                        Value::Int(0) => throw!("numeric for step cannot be zero"),
+                        Value::Float(f) if *f == 0.0 => {
+                            throw!("numeric for step cannot be zero")
+                        }
+                        _ => {}
+                    }
+                    let is_positive = match step {
+                        Value::Int(i) => *i >= 0,
+                        Value::BigInt(i) => num_traits::Signed::is_positive(&**i),
+                        Value::Float(f) => *f >= 0.0,
+                        _ => true,
+                    };
+                    let idx = &reg!(b);
+                    let limit = &reg!(b + 1);
+                    let next_idx = attempt!(ops::eval_add(idx, step));
+                    let loop_again = if is_positive {
+                        attempt!(ops::eval_le(&next_idx, limit))
+                    } else {
+                        attempt!(ops::eval_ge(&next_idx, limit))
+                    };
+                    set!(b, next_idx.clone());
+                    if loop_again {
+                        set!(b + 3, next_idx);
+                        jump!(jump);
+                    }
+                }
+                ExecInst::ForLoop { base: b, jump } => {
                     let idx = &reg!(b);
                     let limit = &reg!(b + 1);
                     let step = &reg!(b + 2);
-                    // All-integer loops are the common case and need no
-                    // allocation or generic dispatch at all.
+                    if let (Value::Int(i), Value::Int(lim), Value::Int(st)) = (idx, limit, step)
+                        && let Some(next) = i.checked_add(*st)
+                    {
+                        code[cur_ip].set(AlignedExec(ExecInst::ForLoopInt { base: b, jump }));
+                        let again = if *st >= 0 { next <= *lim } else { next >= *lim };
+                        let slot_b = slot_mut(&mut self.stack, base + b as usize);
+                        if let Value::Int(old) = slot_b {
+                            *old = next;
+                        } else {
+                            *slot_b = Value::Int(next);
+                        }
+                        if again {
+                            let slot_v = slot_mut(&mut self.stack, base + (b + 3) as usize);
+                            if let Value::Int(old) = slot_v {
+                                *old = next;
+                            } else {
+                                *slot_v = Value::Int(next);
+                            }
+                            jump!(jump);
+                        }
+                        continue;
+                    }
+                    match step {
+                        Value::Int(0) => throw!("numeric for step cannot be zero"),
+                        Value::Float(f) if *f == 0.0 => {
+                            throw!("numeric for step cannot be zero")
+                        }
+                        _ => {}
+                    }
+                    let is_positive = match step {
+                        Value::Int(i) => *i >= 0,
+                        Value::BigInt(i) => num_traits::Signed::is_positive(&**i),
+                        Value::Float(f) => *f >= 0.0,
+                        _ => true,
+                    };
+                    let next_idx = attempt!(ops::eval_add(idx, step));
+                    let loop_again = if is_positive {
+                        attempt!(ops::eval_le(&next_idx, limit))
+                    } else {
+                        attempt!(ops::eval_ge(&next_idx, limit))
+                    };
+                    set!(b, next_idx.clone());
+                    if loop_again {
+                        set!(b + 3, next_idx);
+                        jump!(jump);
+                    }
+                }
+                ExecInst::ForLoopGeneric { base: b, jump } => {
+                    let idx = &reg!(b);
+                    let limit = &reg!(b + 1);
+                    let step = &reg!(b + 2);
                     if let (Value::Int(i), Value::Int(lim), Value::Int(st)) = (idx, limit, step)
                         && let Some(next) = i.checked_add(*st)
                     {
@@ -1982,7 +2557,7 @@ impl VM {
                         jump!(jump);
                     }
                 }
-                Instruction::Closure { dst, proto_idx } => {
+                ExecInst::Closure { dst, proto_idx } => {
                     let child_proto = current_closure.proto.protos[proto_idx as usize].clone();
                     let mut upvalues = Vec::with_capacity(child_proto.upvalues.len());
                     for updesc in &child_proto.upvalues {
@@ -2003,7 +2578,318 @@ impl VM {
                     }));
                     set!(dst, new_closure);
                 }
-                Instruction::Call { callee, argc, retc } => {
+                ExecInst::TailCall { callee, argc } => {
+                    let args_start = base + callee as usize + 1;
+                    let args_end = if argc == MULTRET {
+                        self.top.max(args_start)
+                    } else {
+                        args_start + argc as usize
+                    };
+                    let actual_argc = args_end - args_start;
+                    if args_end > self.stack.len() {
+                        self.stack.resize(args_end, Value::Nil);
+                    }
+                    sync_ip!();
+
+                    if base >= 1 && matches!(&reg!(callee), Value::Closure(_)) {
+                        let Value::Closure(callee_closure) = &reg!(callee) else {
+                            unreachable!();
+                        };
+                        let same_closure = Rc::ptr_eq(&current_closure, callee_closure);
+                        let (max_registers, num_params, is_vararg) = {
+                            let proto = &callee_closure.proto;
+                            (
+                                proto.max_registers as usize,
+                                proto.num_params as usize,
+                                proto.is_vararg,
+                            )
+                        };
+                        if same_closure && !is_vararg && argc != MULTRET && !self.debug_active {
+                            if !TRAP {
+                                attempt!(self.limits.check_interrupt());
+                            }
+                            self.close_upvalues_if_needed(base);
+                            let needed = base + max_registers;
+                            if needed >= self.stack.len() {
+                                self.stack.resize(needed + 1, Value::Nil);
+                            }
+                            let copy_n = actual_argc.min(num_params);
+                            for k in 0..copy_n {
+                                let src_idx = args_start + k;
+                                let dst_idx = base + k;
+                                match slot(&self.stack, src_idx) {
+                                    Value::Int(n) => {
+                                        let val = *n;
+                                        let d = slot_mut(&mut self.stack, dst_idx);
+                                        if let Value::Int(old) = d {
+                                            *old = val;
+                                        } else {
+                                            *d = Value::Int(val);
+                                        }
+                                    }
+                                    Value::Float(f) => {
+                                        let val = *f;
+                                        let d = slot_mut(&mut self.stack, dst_idx);
+                                        if let Value::Float(old) = d {
+                                            *old = val;
+                                        } else {
+                                            *d = Value::Float(val);
+                                        }
+                                    }
+                                    Value::Bool(b) => {
+                                        let val = *b;
+                                        let d = slot_mut(&mut self.stack, dst_idx);
+                                        if let Value::Bool(old) = d {
+                                            *old = val;
+                                        } else {
+                                            *d = Value::Bool(val);
+                                        }
+                                    }
+                                    _ => {
+                                        let v = std::mem::replace(
+                                            slot_mut(&mut self.stack, src_idx),
+                                            Value::Nil,
+                                        );
+                                        *slot_mut(&mut self.stack, dst_idx) = v;
+                                    }
+                                }
+                            }
+                            for k in copy_n..num_params {
+                                *slot_mut(&mut self.stack, base + k) = Value::Nil;
+                            }
+                            ip = 0;
+                            continue;
+                        }
+
+                        if !TRAP {
+                            attempt!(self.limits.check_interrupt());
+                        }
+                        let mut next_closure = if same_closure {
+                            None
+                        } else {
+                            Some(Rc::clone(callee_closure))
+                        };
+                        self.close_upvalues_if_needed(base);
+                        let caller_dest = base - 1;
+                        let callee_abs = base + callee as usize;
+                        let shift = callee_abs - caller_dest;
+                        let len = args_end - callee_abs;
+                        for k in 0..len {
+                            let v = std::mem::replace(&mut self.stack[callee_abs + k], Value::Nil);
+                            self.stack[caller_dest + k] = v;
+                        }
+                        if self.top > callee_abs {
+                            self.top -= shift;
+                        }
+                        let needed = base + max_registers;
+                        if needed >= self.stack.len() {
+                            self.stack.resize(needed + 1, Value::Nil);
+                        }
+                        for i in actual_argc..num_params {
+                            self.stack[base + i] = Value::Nil;
+                        }
+                        if is_vararg && actual_argc > num_params {
+                            let varargs =
+                                self.stack[base + num_params..base + actual_argc].to_vec();
+                            let frame_closure = match &next_closure {
+                                Some(c) => Rc::clone(c),
+                                None => Rc::clone(&current_closure),
+                            };
+                            let want_ret = self.frames.last().expect(RUNNING_FRAME).want_ret;
+                            *self.frames.last_mut().expect(RUNNING_FRAME) =
+                                CallFrame::with_varargs(frame_closure, base, varargs)
+                                    .wanting(want_ret);
+                        } else if let Some(c) = &next_closure {
+                            let frame = self.frames.last_mut().expect(RUNNING_FRAME);
+                            frame.closure = Rc::clone(c);
+                            frame.ip = 0;
+                            frame.clear_varargs();
+                        } else {
+                            let frame = self.frames.last_mut().expect(RUNNING_FRAME);
+                            frame.ip = 0;
+                            frame.clear_varargs();
+                        }
+                        if self.debug_active {
+                            if self.hook.is_some() {
+                                self.fire_hook(HookEvent::TailCall)?;
+                            }
+                            if self.dap.is_some() {
+                                let active = next_closure.as_ref().unwrap_or(&current_closure);
+                                let func_name =
+                                    active.proto.name.as_deref().unwrap_or("<anonymous>");
+                                crate::dap::check_break(self, func_name)?;
+                            }
+                        }
+                        if let Some(next) = next_closure.take() {
+                            if !next.proto.is_verified() {
+                                crate::bytecode::verify_proto(&next.proto)
+                                    .map_err(|e| e.to_string())?;
+                                next.proto.mark_verified();
+                            }
+                            current_closure = next;
+                            exec = current_closure.proto.exec();
+                            code = &exec.ops;
+                            consts = current_closure.proto.values();
+                        }
+                        ip = 0;
+                        continue;
+                    }
+
+                    // Fallback when `base == 0` or callee is Native / Table: run regular Call with MULTRET
+                    // and let the trailing `Return { count: MULTRET }` at `ip` return results.
+                    match &reg!(callee) {
+                        Value::Closure(callee_closure) => {
+                            if self.call_depth() >= self.max_call_depth {
+                                throw!(
+                                    "call stack overflow: exceeded maximum call depth of {}",
+                                    self.max_call_depth
+                                );
+                            }
+                            let same_closure = Rc::ptr_eq(&current_closure, callee_closure);
+                            let (max_registers, num_params, is_vararg) = {
+                                let proto = &callee_closure.proto;
+                                (
+                                    proto.max_registers as usize,
+                                    proto.num_params as usize,
+                                    proto.is_vararg,
+                                )
+                            };
+                            let mut next_closure = if same_closure {
+                                None
+                            } else {
+                                Some(Rc::clone(callee_closure))
+                            };
+                            let new_base = args_start;
+                            let needed = new_base + max_registers;
+                            if needed >= self.stack.len() {
+                                self.stack.resize(needed + 1, Value::Nil);
+                            }
+                            for i in actual_argc..num_params {
+                                self.stack[new_base + i] = Value::Nil;
+                            }
+                            let frame_closure = match &next_closure {
+                                Some(c) => Rc::clone(c),
+                                None => Rc::clone(&current_closure),
+                            };
+                            let new_frame = if is_vararg && actual_argc > num_params {
+                                let varargs = self.stack
+                                    [new_base + num_params..new_base + actual_argc]
+                                    .to_vec();
+                                CallFrame::with_varargs(frame_closure, new_base, varargs)
+                            } else {
+                                CallFrame::new(frame_closure, new_base)
+                            }
+                            .wanting(MULTRET);
+                            self.frames.push(new_frame);
+                            if self.debug_active {
+                                if self.hook.is_some()
+                                    && let Err(err) = self.fire_hook(HookEvent::Call)
+                                {
+                                    self.frames.pop();
+                                    sync_ip!();
+                                    return Err(err);
+                                }
+                                if self.dap.is_some() {
+                                    let active = next_closure.as_ref().unwrap_or(&current_closure);
+                                    let func_name =
+                                        active.proto.name.as_deref().unwrap_or("<anonymous>");
+                                    if let Err(err) = crate::dap::check_break(self, func_name) {
+                                        self.frames.pop();
+                                        sync_ip!();
+                                        return Err(err);
+                                    }
+                                }
+                            }
+                            if let Some(next) = next_closure.take() {
+                                if !next.proto.is_verified() {
+                                    crate::bytecode::verify_proto(&next.proto)
+                                        .map_err(|e| e.to_string())?;
+                                    next.proto.mark_verified();
+                                }
+                                current_closure = next;
+                                exec = current_closure.proto.exec();
+                                code = &exec.ops;
+                                consts = current_closure.proto.values();
+                            }
+                            base = new_base;
+                            ip = 0;
+                            continue;
+                        }
+                        Value::Native(def) => {
+                            let func = def.func;
+                            const INLINE_NATIVE_ARGS: usize = 8;
+                            let mut inline_args = [const { Value::Nil }; INLINE_NATIVE_ARGS];
+                            let heap_args: Vec<Value>;
+                            let args: &[Value] = if actual_argc <= INLINE_NATIVE_ARGS {
+                                for (dst, src) in inline_args[..actual_argc]
+                                    .iter_mut()
+                                    .zip(&self.stack[args_start..args_end])
+                                {
+                                    *dst = src.clone();
+                                }
+                                &inline_args[..actual_argc]
+                            } else {
+                                heap_args = self.stack[args_start..args_end].to_vec();
+                                &heap_args
+                            };
+                            if self.debug_active
+                                && self.hook.is_some()
+                                && let Err(err) = self.fire_hook(HookEvent::Call)
+                            {
+                                sync_ip!();
+                                return Err(err);
+                            }
+                            match func(self, args) {
+                                Ok(results) => {
+                                    if self.debug_active
+                                        && self.hook.is_some()
+                                        && let Err(err) = self.fire_hook(HookEvent::Return)
+                                    {
+                                        sync_ip!();
+                                        return Err(err);
+                                    }
+                                    self.store_call_results(callee, MULTRET, results);
+                                    if self.trap != TRAP {
+                                        sync_ip!();
+                                        return Ok(None);
+                                    }
+                                }
+                                Err(err) if self.is_yielding => {
+                                    if let Some(co_id) = self.current_co
+                                        && let Some(co_rc) = self.co_state(co_id)
+                                    {
+                                        let mut cs = co_rc.borrow_mut();
+                                        cs.yield_callee = callee;
+                                        cs.yield_retc = MULTRET;
+                                    }
+                                    return Err(err);
+                                }
+                                Err(err) => return Err(err),
+                            }
+                        }
+                        Value::Table(t) => {
+                            let handler = t.borrow().metamethod("__call");
+                            let callee_val = reg!(callee).clone();
+                            if let Some(handler) = handler {
+                                let mut call_args = Vec::with_capacity(actual_argc + 1);
+                                call_args.push(callee_val);
+                                call_args.extend_from_slice(&self.stack[args_start..args_end]);
+                                let results = self.call_function(handler, &call_args)?;
+                                self.store_call_results(callee, MULTRET, results);
+                                if self.trap != TRAP {
+                                    sync_ip!();
+                                    return Ok(None);
+                                }
+                            } else {
+                                throw!("attempted to call non-function ({:?})", callee_val);
+                            }
+                        }
+                        other => {
+                            throw!("attempted to call non-function ({:?})", other);
+                        }
+                    }
+                }
+                ExecInst::Call { callee, argc, retc } => {
                     let args_start = base + callee as usize + 1;
                     // MULTRET args run from the first argument register up to
                     // whatever the previous instruction left on the stack.
@@ -2020,28 +2906,7 @@ impl VM {
 
                     match &reg!(callee) {
                         Value::Closure(callee_closure) => {
-                            // Tail call: this `Call` is immediately
-                            // followed by `Return` of its own results, so
-                            // the current frame is replaced instead of
-                            // pushing a new one, giving proper tail calls
-                            // constant stack space. Only the exact shape
-                            // the compilers emit for `return f(...)`
-                            // qualifies (MULTRET on both sides with the
-                            // results starting at the callee slot): any
-                            // extra value would need an instruction
-                            // between the two, which fails the adjacency
-                            // check. A frame with no caller (base 0)
-                            // cannot be replaced.
-                            let tail = retc == MULTRET
-                                && base >= 1
-                                && matches!(
-                                    code.get(ip),
-                                    Some(Instruction::Return {
-                                        base: ret,
-                                        count: MULTRET,
-                                    }) if *ret == callee
-                                );
-                            if !tail && self.call_depth() >= self.max_call_depth {
+                            if self.call_depth() >= self.max_call_depth {
                                 throw!(
                                     "call stack overflow: exceeded maximum call depth of {}",
                                     self.max_call_depth
@@ -2056,50 +2921,12 @@ impl VM {
                                     proto.is_vararg,
                                 )
                             };
-                            // On recursive calls (`same_closure`), `current_closure`
-                            // already owns the active reference so only the frame
-                            // needs a clone (1 bump instead of 2). On ordinary
-                            // calls, `next_closure` is moved into `current_closure`
-                            // after pushing a clone into the frame (2 bumps total,
-                            // zero extra refcount churn, and DAP borrows its name
-                            // without allocating).
                             let mut next_closure = if same_closure {
                                 None
                             } else {
                                 Some(Rc::clone(callee_closure))
                             };
-                            // For a tail call the callee window slides
-                            // down one slot so it sits exactly where a
-                            // call from our caller would put it, and the
-                            // callee inherits our return obligation.
-                            let (new_base, want_ret) = if tail {
-                                let cur = self.frames.pop().expect(RUNNING_FRAME);
-                                if !self.open_upvalues.is_empty() {
-                                    self.close_upvalues(cur.base);
-                                }
-                                // Relocate the whole callee window so the
-                                // callee sits where our caller put us
-                                // (`cur.base - 1`) and the arguments
-                                // follow; the new frame keeps our base so
-                                // its results land in our caller's slot.
-                                let caller_dest = cur.base - 1;
-                                let callee_abs = cur.base + callee as usize;
-                                let shift = callee_abs - caller_dest;
-                                let len = args_end - callee_abs;
-                                for k in 0..len {
-                                    let v = std::mem::replace(
-                                        &mut self.stack[callee_abs + k],
-                                        Value::Nil,
-                                    );
-                                    self.stack[caller_dest + k] = v;
-                                }
-                                if self.top > callee_abs {
-                                    self.top -= shift;
-                                }
-                                (cur.base, cur.want_ret)
-                            } else {
-                                (args_start, retc)
-                            };
+                            let new_base = args_start;
                             let needed = new_base + max_registers;
                             if needed >= self.stack.len() {
                                 self.stack.resize(needed + 1, Value::Nil);
@@ -2118,28 +2945,25 @@ impl VM {
                             } else {
                                 CallFrame::new(frame_closure, new_base)
                             }
-                            .wanting(want_ret);
+                            .wanting(retc);
                             self.frames.push(new_frame);
-                            if self.hook.is_some() {
-                                let event = if tail {
-                                    HookEvent::TailCall
-                                } else {
-                                    HookEvent::Call
-                                };
-                                if let Err(err) = self.fire_hook(event) {
+                            if self.debug_active {
+                                if self.hook.is_some()
+                                    && let Err(err) = self.fire_hook(HookEvent::Call)
+                                {
                                     self.frames.pop();
                                     sync_ip!();
                                     return Err(err);
                                 }
-                            }
-                            if self.dap.is_some() {
-                                let active = next_closure.as_ref().unwrap_or(&current_closure);
-                                let func_name =
-                                    active.proto.name.as_deref().unwrap_or("<anonymous>");
-                                if let Err(err) = crate::dap::check_break(self, func_name) {
-                                    self.frames.pop();
-                                    sync_ip!();
-                                    return Err(err);
+                                if self.dap.is_some() {
+                                    let active = next_closure.as_ref().unwrap_or(&current_closure);
+                                    let func_name =
+                                        active.proto.name.as_deref().unwrap_or("<anonymous>");
+                                    if let Err(err) = crate::dap::check_break(self, func_name) {
+                                        self.frames.pop();
+                                        sync_ip!();
+                                        return Err(err);
+                                    }
                                 }
                             }
                             if let Some(next) = next_closure.take() {
@@ -2149,7 +2973,8 @@ impl VM {
                                     next.proto.mark_verified();
                                 }
                                 current_closure = next;
-                                code = &current_closure.proto.instructions;
+                                exec = current_closure.proto.exec();
+                                code = &exec.ops;
                                 consts = current_closure.proto.values();
                             }
                             base = new_base;
@@ -2158,9 +2983,6 @@ impl VM {
                         }
                         Value::Native(def) => {
                             let func = def.func;
-                            // Natives take a slice of owned values; copy small
-                            // argument lists onto the stack to avoid a heap
-                            // allocation on every native call.
                             const INLINE_NATIVE_ARGS: usize = 8;
                             let mut inline_args = [const { Value::Nil }; INLINE_NATIVE_ARGS];
                             let heap_args: Vec<Value>;
@@ -2176,7 +2998,8 @@ impl VM {
                                 heap_args = self.stack[args_start..args_end].to_vec();
                                 &heap_args
                             };
-                            if self.hook.is_some()
+                            if self.debug_active
+                                && self.hook.is_some()
                                 && let Err(err) = self.fire_hook(HookEvent::Call)
                             {
                                 sync_ip!();
@@ -2184,13 +3007,14 @@ impl VM {
                             }
                             match func(self, args) {
                                 Ok(results) => {
-                                    if self.hook.is_some()
+                                    if self.debug_active
+                                        && self.hook.is_some()
                                         && let Err(err) = self.fire_hook(HookEvent::Return)
                                     {
                                         sync_ip!();
                                         return Err(err);
                                     }
-                                    self.store_call_results(callee, retc, &results);
+                                    self.store_call_results(callee, retc, results);
                                     if self.trap != TRAP {
                                         sync_ip!();
                                         return Ok(None);
@@ -2217,7 +3041,7 @@ impl VM {
                                 call_args.push(callee_val);
                                 call_args.extend_from_slice(&self.stack[args_start..args_end]);
                                 let results = self.call_function(handler, &call_args)?;
-                                self.store_call_results(callee, retc, &results);
+                                self.store_call_results(callee, retc, results);
                                 if self.trap != TRAP {
                                     sync_ip!();
                                     return Ok(None);
@@ -2231,14 +3055,57 @@ impl VM {
                         }
                     }
                 }
-                Instruction::Return { base: ret, count } => {
-                    if self.hook.is_some() {
+                ExecInst::Return { base: ret, count } => {
+                    if self.debug_active && self.hook.is_some() {
                         sync_ip!();
                         self.fire_hook(HookEvent::Return)?;
                     }
                     let frame = self.frames.pop().expect(RUNNING_FRAME);
                     if !self.open_upvalues.is_empty() {
                         self.close_upvalues(frame.base);
+                    }
+                    if count == 1 && frame.want_ret <= 1 && self.frames.len() > target_depth {
+                        let ret_idx = frame.base + ret as usize;
+                        let caller_dest = frame.base - 1;
+                        let src = slot_mut(&mut self.stack, ret_idx);
+                        match src {
+                            Value::Int(n) => {
+                                let val = *n;
+                                let dest_slot = slot_mut(&mut self.stack, caller_dest);
+                                if let Value::Int(old) = dest_slot {
+                                    *old = val;
+                                } else {
+                                    *dest_slot = Value::Int(val);
+                                }
+                            }
+                            Value::Float(f) => {
+                                let val = *f;
+                                let dest_slot = slot_mut(&mut self.stack, caller_dest);
+                                if let Value::Float(old) = dest_slot {
+                                    *old = val;
+                                } else {
+                                    *dest_slot = Value::Float(val);
+                                }
+                            }
+                            _ => {
+                                let v = std::mem::replace(src, Value::Nil);
+                                *slot_mut(&mut self.stack, caller_dest) = v;
+                            }
+                        }
+                        let caller_frame = self.frames.last().expect(RUNNING_FRAME);
+                        if !Rc::ptr_eq(&current_closure, &caller_frame.closure) {
+                            current_closure = caller_frame.closure.clone();
+                            exec = current_closure.proto.exec();
+                            code = &exec.ops;
+                            consts = current_closure.proto.values();
+                        }
+                        base = caller_frame.base;
+                        ip = caller_frame.ip;
+                        if self.trap != TRAP {
+                            sync_ip!();
+                            return Ok(None);
+                        }
+                        continue;
                     }
                     let ret_start = frame.base + ret as usize;
                     let ret_end = if count == MULTRET {
@@ -2267,9 +3134,6 @@ impl VM {
                     if needed > self.stack.len() {
                         self.stack.resize(needed, Value::Nil);
                     }
-                    // Values move down the stack in order; the source and
-                    // destination windows may overlap, which is fine when
-                    // copying front to back since caller_dest < ret_start.
                     if wanted == 1 && nret == 1 {
                         let src = &mut self.stack[ret_start];
                         match src {
@@ -2335,7 +3199,8 @@ impl VM {
                     let caller_frame = self.frames.last().expect(RUNNING_FRAME);
                     if !Rc::ptr_eq(&current_closure, &caller_frame.closure) {
                         current_closure = caller_frame.closure.clone();
-                        code = &current_closure.proto.instructions;
+                        exec = current_closure.proto.exec();
+                        code = &exec.ops;
                         consts = current_closure.proto.values();
                     }
                     base = caller_frame.base;
@@ -2346,7 +3211,7 @@ impl VM {
                     }
                     continue;
                 }
-                Instruction::Vararg { dst, count } => {
+                ExecInst::Vararg { dst, count } => {
                     let all = count == 0 || count == MULTRET;
                     let frame = self.frames.last().expect(RUNNING_FRAME);
                     let cnt = if all {
@@ -2374,7 +3239,13 @@ impl VM {
 
     /// `==` with the `__eq` metamethod fallback for two tables.
     #[inline]
-    fn values_equal(&mut self, base: usize, a: u8, b: u8, ip: usize) -> Result<bool, String> {
+    pub(crate) fn values_equal(
+        &mut self,
+        base: usize,
+        a: u8,
+        b: u8,
+        ip: usize,
+    ) -> Result<bool, String> {
         let va = &self.stack[base + a as usize];
         let vb = &self.stack[base + b as usize];
         if va == vb {
@@ -2391,7 +3262,12 @@ impl VM {
     }
 
     #[inline]
-    fn values_equal_val(&mut self, va: &Value, vb: &Value, ip: usize) -> Result<bool, String> {
+    pub(crate) fn values_equal_val(
+        &mut self,
+        va: &Value,
+        vb: &Value,
+        ip: usize,
+    ) -> Result<bool, String> {
         if va == vb {
             return Ok(true);
         }
@@ -2406,7 +3282,7 @@ impl VM {
 
     /// The generic-for step. `b` is the loop's base register: iterator,
     /// state, control, then the loop variables.
-    fn tfor_call(&mut self, base: usize, b: u8, retc: u8) -> Result<(), String> {
+    pub(crate) fn tfor_call(&mut self, base: usize, b: u8, retc: u8) -> Result<(), String> {
         let iter_idx = base + b as usize;
         let var_base = iter_idx + 3;
         let retc_usize = retc as usize;

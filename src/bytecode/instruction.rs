@@ -133,10 +133,20 @@ pub enum Instruction {
         a: u8,
         b: u8,
     },
+    IDivK {
+        dst: u8,
+        a: u8,
+        k: u16,
+    },
     Mod {
         dst: u8,
         a: u8,
         b: u8,
+    },
+    ModK {
+        dst: u8,
+        a: u8,
+        k: u16,
     },
     Pow {
         dst: u8,

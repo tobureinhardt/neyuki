@@ -72,6 +72,22 @@ pub fn parse_prefix(parser: &mut Parser) -> Result<Expr, String> {
 pub fn parse_prefix_inner(parser: &mut Parser) -> Result<Expr, String> {
     let start = parser.current_loc();
     if parser.check_keyword("function") {
+        if !parser
+            .tokens
+            .get(parser.pos + 1)
+            .is_some_and(|t| t.kind == "symbol" && t.value == "(")
+        {
+            let next_val = parser
+                .tokens
+                .get(parser.pos + 1)
+                .map(|t| t.value.as_str())
+                .unwrap_or("eof");
+            return Err(format!(
+                "[line {}] expected symbol \"(\" after 'function' (unexpected {:?})",
+                parser.peek().line,
+                next_val
+            ));
+        }
         parser.expect_keyword("function")?;
         parser.expect_symbol("(")?;
         let params = parse_param_list(parser)?;

@@ -12,20 +12,24 @@ pub fn copy_propagation(module: &mut IrModule) {
 
 pub fn copy_propagation_cfg(cfg: &mut ControlFlowGraph) -> bool {
     let captured = super::captured_vars(cfg);
+    copy_propagation_cfg_with(cfg, &captured)
+}
+
+pub fn copy_propagation_cfg_with(cfg: &mut ControlFlowGraph, captured: &FxHashSet<IrVar>) -> bool {
     let mut changed = false;
     for block in &mut cfg.blocks {
-        if propagate_copies_slice(&mut block.instructions, &captured) {
+        let block_changed = propagate_copies_slice(&mut block.instructions, captured);
+        if block_changed {
             changed = true;
         }
-        let before_len = block.instructions.len();
-        block.instructions.retain(|inst| {
-            if let IrInst::Move { dst, src } = inst {
-                dst != src
-            } else {
-                true
-            }
-        });
-        if block.instructions.len() != before_len {
+        if block
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, IrInst::Move { dst, src } if dst == src))
+        {
+            block
+                .instructions
+                .retain(|inst| !matches!(inst, IrInst::Move { dst, src } if dst == src));
             changed = true;
         }
     }

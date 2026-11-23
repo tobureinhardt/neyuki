@@ -142,10 +142,15 @@ impl ActionHelper {
                 token.value.as_str(),
                 "local"
                     | "const"
+                    | "global"
                     | "function"
+                    | "do"
                     | "if"
+                    | "else"
+                    | "elseif"
                     | "while"
                     | "repeat"
+                    | "until"
                     | "for"
                     | "return"
                     | "break"
@@ -154,7 +159,9 @@ impl ActionHelper {
                     | "end"
             )
         } else if token.kind == "symbol" {
-            token.value == ";"
+            matches!(token.value.as_str(), ";" | "@")
+        } else if token.kind == "name" {
+            matches!(token.value.as_str(), "enum" | "match" | "type" | "export")
         } else {
             token.kind == "eof"
         }

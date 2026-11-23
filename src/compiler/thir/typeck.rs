@@ -147,7 +147,14 @@ pub(crate) fn infer_binary_type(op: BinOp, left: &ThirExpr, right: &ThirExpr) ->
         }
         BinOp::Concat => NeyukiType::String,
         BinOp::Coalesce => left.ty.narrow_non_nil().lub(&right.ty),
-        BinOp::And | BinOp::Or => left.ty.lub(&right.ty),
+        BinOp::And => {
+            if !can_be_falsy(&left.ty) {
+                right.ty.clone()
+            } else {
+                left.ty.lub(&right.ty)
+            }
+        }
+        BinOp::Or => left.ty.lub(&right.ty),
         BinOp::BitAnd
         | BinOp::BitOr
         | BinOp::BitXor
@@ -169,6 +176,167 @@ pub(crate) fn infer_binary_type(op: BinOp, left: &ThirExpr, right: &ThirExpr) ->
                 NeyukiType::Number
             }
         }
+    }
+}
+
+fn can_be_falsy(ty: &NeyukiType) -> bool {
+    match ty {
+        NeyukiType::Nil | NeyukiType::Boolean | NeyukiType::Any | NeyukiType::Optional(_) => true,
+        NeyukiType::Union(parts) => parts.iter().any(can_be_falsy),
+        _ => false,
+    }
+}
+
+pub(crate) fn infer_for_var_types(source_ty: &NeyukiType, count: usize) -> Vec<NeyukiType> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut out = vec![NeyukiType::Any; count];
+    match source_ty {
+        NeyukiType::Array(elem) => {
+            out[0] = NeyukiType::Int;
+            if count > 1 {
+                out[1] = (**elem).clone();
+            }
+        }
+        NeyukiType::TableMap { key, val } => {
+            out[0] = (**key).clone();
+            if count > 1 {
+                out[1] = (**val).clone();
+            }
+        }
+        NeyukiType::Record(fields) if !fields.is_empty() => {
+            out[0] = NeyukiType::String;
+            if count > 1 {
+                out[1] = fields
+                    .iter()
+                    .fold(NeyukiType::Never, |acc, (_, t)| acc.lub(t));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+pub(crate) struct IfNarrowing {
+    pub(crate) then_branch: Option<(BindingId, NeyukiType)>,
+    pub(crate) else_branch: Option<(BindingId, NeyukiType)>,
+}
+
+pub(crate) fn extract_if_narrowing(cond: &ThirExpr) -> IfNarrowing {
+    let none = || IfNarrowing {
+        then_branch: None,
+        else_branch: None,
+    };
+    match &cond.kind {
+        ThirExprKind::Variable {
+            binding: Some(id), ..
+        } => IfNarrowing {
+            then_branch: Some((*id, cond.ty.narrow_non_nil())),
+            else_branch: None,
+        },
+        ThirExprKind::Unary {
+            op: UnOp::Not,
+            expr,
+        } => {
+            if let ThirExprKind::Variable {
+                binding: Some(id), ..
+            } = &expr.kind
+            {
+                IfNarrowing {
+                    then_branch: None,
+                    else_branch: Some((*id, expr.ty.narrow_non_nil())),
+                }
+            } else {
+                none()
+            }
+        }
+        ThirExprKind::Binary {
+            left,
+            op: op @ (BinOp::Eq | BinOp::Ne),
+            right,
+        } => {
+            let nil_var = match (&left.kind, &right.kind) {
+                (
+                    ThirExprKind::Variable {
+                        binding: Some(id), ..
+                    },
+                    ThirExprKind::Literal(Literal::Nil),
+                ) => Some((*id, left.ty.narrow_non_nil())),
+                (
+                    ThirExprKind::Literal(Literal::Nil),
+                    ThirExprKind::Variable {
+                        binding: Some(id), ..
+                    },
+                ) => Some((*id, right.ty.narrow_non_nil())),
+                _ => None,
+            };
+            if let Some(pair) = nil_var {
+                return if *op == BinOp::Ne {
+                    IfNarrowing {
+                        then_branch: Some(pair),
+                        else_branch: None,
+                    }
+                } else {
+                    IfNarrowing {
+                        then_branch: None,
+                        else_branch: Some(pair),
+                    }
+                };
+            }
+            if *op == BinOp::Eq {
+                let type_call = match (&left.kind, &right.kind) {
+                    (
+                        ThirExprKind::Call { callee, args },
+                        ThirExprKind::Literal(Literal::String(s)),
+                    )
+                    | (
+                        ThirExprKind::Literal(Literal::String(s)),
+                        ThirExprKind::Call { callee, args },
+                    ) if matches!(
+                        &callee.kind,
+                        ThirExprKind::Variable {
+                            name,
+                            binding: None
+                        } if name == "type"
+                    ) && args.len() == 1 =>
+                    {
+                        if let ThirExprKind::Variable {
+                            binding: Some(id), ..
+                        } = &args[0].kind
+                        {
+                            let narrowed = match s.as_str() {
+                                "number" => Some(NeyukiType::Number),
+                                "string" => Some(NeyukiType::String),
+                                "boolean" => Some(NeyukiType::Boolean),
+                                "table" => Some(NeyukiType::Table),
+                                "function" => Some(NeyukiType::Function {
+                                    params: Vec::new(),
+                                    return_type: Box::new(NeyukiType::Any),
+                                    is_vararg: true,
+                                }),
+                                "thread" => Some(NeyukiType::Thread),
+                                "buffer" => Some(NeyukiType::Buffer),
+                                "nil" => Some(NeyukiType::Nil),
+                                _ => None,
+                            };
+                            narrowed.map(|ty| (*id, ty))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(pair) = type_call {
+                    return IfNarrowing {
+                        then_branch: Some(pair),
+                        else_branch: None,
+                    };
+                }
+            }
+            none()
+        }
+        _ => none(),
     }
 }
 

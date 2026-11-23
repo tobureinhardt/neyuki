@@ -222,7 +222,7 @@ pub fn next_entry(table: &VmTable, key: &Value) -> Result<Option<(Value, Value)>
 /// Larger tables promote automatically to an open-addressing power-of-two hash
 /// table with Knuth backward-shift deletion (zero tombstones). Keys store their
 /// precomputed 64-bit hash, eliminating re-hashing across lookups and growth.
-const SMALL_FIELD_LIMIT: usize = 8;
+const SMALL_FIELD_LIMIT: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct FieldEntry {
@@ -249,7 +249,7 @@ pub(crate) fn assign_value(slot: &mut Value, val: &Value) {
 
 #[inline(always)]
 fn entry_matches_strref(entry: &FieldEntry, hash: u64, key: &StrRef) -> bool {
-    entry.hash == hash && (Rc::ptr_eq(&entry.key.0, &key.0) || entry.key.0.str == key.0.str)
+    Rc::ptr_eq(&entry.key.0, &key.0) || (entry.hash == hash && entry.key.0.str == key.0.str)
 }
 
 impl HashFieldMap {
@@ -568,8 +568,8 @@ impl FieldMap {
     }
 
     #[inline(always)]
-    pub fn shape_version(&self) -> u64 {
-        self.shape_version
+    pub fn shape_version(&self) -> u32 {
+        self.shape_version as u32
     }
 
     #[inline(always)]
@@ -640,6 +640,33 @@ impl FieldMap {
             FieldStorage::Hash(map) => map.entries.get(idx).and_then(|opt| opt.as_ref()),
         }?;
         entry_matches_strref(entry, key.0.hash, key).then_some(&entry.val)
+    }
+
+    #[inline(always)]
+    pub fn get_slot_keyed_ptr(&self, idx: usize, key: &StrRef) -> Option<&Value> {
+        let entry = match &self.inner {
+            FieldStorage::Small(entries) => entries.get(idx),
+            FieldStorage::Hash(map) => map.entries.get(idx).and_then(|opt| opt.as_ref()),
+        }?;
+        Rc::ptr_eq(&entry.key.0, &key.0).then_some(&entry.val)
+    }
+
+    #[inline(always)]
+    pub fn get_slot_keyed_mut(&mut self, idx: usize, key: &StrRef) -> Option<&mut Value> {
+        let entry = match &mut self.inner {
+            FieldStorage::Small(entries) => entries.get_mut(idx),
+            FieldStorage::Hash(map) => map.entries.get_mut(idx).and_then(|opt| opt.as_mut()),
+        }?;
+        entry_matches_strref(entry, key.0.hash, key).then_some(&mut entry.val)
+    }
+
+    #[inline(always)]
+    pub fn get_slot_keyed_mut_ptr(&mut self, idx: usize, key: &StrRef) -> Option<&mut Value> {
+        let entry = match &mut self.inner {
+            FieldStorage::Small(entries) => entries.get_mut(idx),
+            FieldStorage::Hash(map) => map.entries.get_mut(idx).and_then(|opt| opt.as_mut()),
+        }?;
+        Rc::ptr_eq(&entry.key.0, &key.0).then_some(&mut entry.val)
     }
 
     /// `set_slot`, but only if the slot still holds `key` (see `get_slot_keyed`).
@@ -774,6 +801,44 @@ impl FieldMap {
             FieldStorage::Hash(map) => map,
             FieldStorage::Small(_) => unreachable!("just promoted to Hash"),
         }
+    }
+
+    /// Single-probe insert-or-update returning the resulting slot index,
+    /// bumping `shape_version` only if the entry count grew.
+    #[inline]
+    pub fn insert_cached(&mut self, key: StrRef, val: Value) -> usize {
+        let before = self.len();
+        let slot_idx = match &mut self.inner {
+            FieldStorage::Small(entries) => {
+                let hash = key.0.hash;
+                if let Some(pos) = entries
+                    .iter()
+                    .position(|e| entry_matches_strref(e, hash, &key))
+                {
+                    entries[pos].val = val;
+                    pos
+                } else if entries.len() < SMALL_FIELD_LIMIT {
+                    let pos = entries.len();
+                    entries.push(FieldEntry { hash, key, val });
+                    pos
+                } else {
+                    let map = self.promote_to_hash();
+                    map.insert(key.clone(), val);
+                    map.find_slot(key.0.hash, |e| entry_matches_strref(e, key.0.hash, &key))
+                        .unwrap_or(0)
+                }
+            }
+            FieldStorage::Hash(map) => {
+                let hash = key.0.hash;
+                map.insert(key.clone(), val);
+                map.find_slot(hash, |e| entry_matches_strref(e, hash, &key))
+                    .unwrap_or(0)
+            }
+        };
+        if self.len() != before {
+            self.bump_shape();
+        }
+        slot_idx
     }
 
     pub fn insert(&mut self, key: StrRef, val: Value) -> Option<Value> {
@@ -1052,12 +1117,12 @@ mod tests {
         map.set_by_strref(&k2, &Value::Int(202));
         assert!(matches!(map.inner, FieldStorage::Small(_)));
 
-        // 9th distinct key promotes seamlessly to Hash mode.
-        let k8 = StrRef::from("k8");
-        map.set_by_strref(&k8, &Value::Int(800));
+        // `(SMALL_FIELD_LIMIT + 1)`-th distinct key promotes seamlessly to Hash mode.
+        let k_promote = StrRef::from(format!("k{SMALL_FIELD_LIMIT}"));
+        map.set_by_strref(&k_promote, &Value::Int(800));
         assert!(matches!(map.inner, FieldStorage::Hash(_)));
         assert_eq!(map.len(), SMALL_FIELD_LIMIT + 1);
-        assert_eq!(map.get_by_strref(&k8), Some(&Value::Int(800)));
+        assert_eq!(map.get_by_strref(&k_promote), Some(&Value::Int(800)));
         assert_eq!(map.get("k2"), Some(&Value::Int(202)));
         for i in 0..SMALL_FIELD_LIMIT {
             let expected = if i == 2 { 202 } else { i as i64 };
@@ -1065,14 +1130,14 @@ mod tests {
         }
 
         // Overwrite in Hash mode via set_by_strref.
-        map.set_by_strref(&k8, &Value::Float(8.5));
-        assert_eq!(map.get("k8"), Some(&Value::Float(8.5)));
+        map.set_by_strref(&k_promote, &Value::Float(8.5));
+        assert_eq!(map.get(&k_promote), Some(&Value::Float(8.5)));
 
         // Retain in both Small and Hash modes.
-        map.retain(|k, _| &**k == "k8" || &**k == "k2");
+        map.retain(|k, _| **k == *k_promote || &**k == "k2");
         assert_eq!(map.len(), 2);
         assert_eq!(map.get("k2"), Some(&Value::Int(202)));
-        assert_eq!(map.get("k8"), Some(&Value::Float(8.5)));
+        assert_eq!(map.get(&k_promote), Some(&Value::Float(8.5)));
 
         let mut small = FieldMap::with_capacity(4);
         small.insert(StrRef::from("a"), Value::Int(1));
@@ -1086,17 +1151,17 @@ mod tests {
 
     #[test]
     fn test_field_map_update_at_load_threshold_does_not_rehash() {
-        // 12 keys in a 16-slot hash map sits right at the 75% load limit
-        // (`(12 + 1) * 4 > 16 * 3`). Updating existing keys must not rehash.
+        // 24 keys in a 32-slot hash map sits right at the 75% load limit
+        // (`(24 + 1) * 4 > 32 * 3`). Updating existing keys must not rehash.
         let mut map = FieldMap::new();
-        for i in 0..12 {
+        for i in 0..24 {
             map.insert(StrRef::from(format!("k{i}")), Value::Int(i));
         }
         let cap_before = match &map.inner {
             FieldStorage::Hash(h) => h.entries.len(),
             FieldStorage::Small(_) => panic!("expected Hash storage"),
         };
-        assert_eq!(cap_before, 16);
+        assert_eq!(cap_before, 32);
 
         let k0 = StrRef::from("k0");
         map.set_by_strref(&k0, &Value::Int(999));

@@ -8,7 +8,7 @@ pub const MAGIC: &[u8; 7] = b"neyuki!";
 /// opcode or prototype layout, so v6 and v7 `.nykb` files stay loadable. The
 /// deserializer rejects a tag newer than the file's declared version.
 pub const MIN_SUPPORTED_BYTECODE_VERSION: u8 = 6;
-pub const BYTECODE_VERSION: u8 = 8;
+pub const BYTECODE_VERSION: u8 = 9;
 
 #[inline]
 pub fn is_supported_version(version: u8) -> bool {

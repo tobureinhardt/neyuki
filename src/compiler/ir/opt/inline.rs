@@ -57,11 +57,21 @@ fn build_candidates(func: &IrFunction) -> FxHashMap<usize, IrFunction> {
 }
 
 fn inline_func_tree(func: &mut IrFunction) -> bool {
+    if func.protos.is_empty() {
+        return false;
+    }
     let mut changed = false;
     for proto in &mut func.protos {
         if inline_func_tree(proto) {
             changed = true;
         }
+    }
+    if !func
+        .instructions
+        .iter()
+        .any(|inst| matches!(inst, IrInst::Call { .. }))
+    {
+        return changed;
     }
     let candidates = build_candidates(func);
     if !candidates.is_empty() && inline_in_func(func, &candidates) {

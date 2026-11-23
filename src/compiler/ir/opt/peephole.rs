@@ -66,23 +66,33 @@ fn cleanup_block_peepholes(cfg: &mut ControlFlowGraph) -> bool {
 
         // 2. Remove redundant self-moves (`Move { dst: x, src: x }`) and
         //    collapse adjacent `Line(a); Line(b)` markers with nothing between them.
-        let mut out: Vec<IrInst> = Vec::with_capacity(block.instructions.len());
-        for inst in block.instructions.drain(..) {
-            match inst {
-                IrInst::Move { dst, src } if dst == src => {
-                    changed = true;
-                }
-                IrInst::Line(line) => {
-                    if matches!(out.last(), Some(IrInst::Line(_))) {
-                        out.pop();
+        let needs_cleanup = block
+            .instructions
+            .windows(2)
+            .any(|w| matches!(w[0], IrInst::Line(_)) && matches!(w[1], IrInst::Line(_)))
+            || block
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, IrInst::Move { dst, src } if dst == src));
+        if needs_cleanup {
+            let mut out: Vec<IrInst> = Vec::with_capacity(block.instructions.len());
+            for inst in block.instructions.drain(..) {
+                match inst {
+                    IrInst::Move { dst, src } if dst == src => {
                         changed = true;
                     }
-                    out.push(IrInst::Line(line));
+                    IrInst::Line(line) => {
+                        if matches!(out.last(), Some(IrInst::Line(_))) {
+                            out.pop();
+                            changed = true;
+                        }
+                        out.push(IrInst::Line(line));
+                    }
+                    other => out.push(other),
                 }
-                other => out.push(other),
             }
+            block.instructions = out;
         }
-        block.instructions = out;
     }
 
     changed
@@ -92,7 +102,11 @@ fn cleanup_block_peepholes(cfg: &mut ControlFlowGraph) -> bool {
 /// folding, and duplicate line-marker cleanup over `cfg`.
 pub fn peephole_cfg(cfg: &mut ControlFlowGraph) -> bool {
     let captured = super::captured_vars(cfg);
-    let c1 = simplify_trivial_phis(cfg, &captured);
+    peephole_cfg_with(cfg, &captured)
+}
+
+pub fn peephole_cfg_with(cfg: &mut ControlFlowGraph, captured: &HashSet<IrVar>) -> bool {
+    let c1 = simplify_trivial_phis(cfg, captured);
     let c2 = cleanup_block_peepholes(cfg);
     c1 || c2
 }

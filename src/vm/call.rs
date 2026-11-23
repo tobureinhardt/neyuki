@@ -44,7 +44,7 @@ impl VM {
 
     /// Writes the results of a native (or `__call`) invocation back into the
     /// caller's registers, starting at the register that held the callee.
-    pub(crate) fn store_call_results(&mut self, callee: u8, retc: u8, results: &[Value]) {
+    pub(crate) fn store_call_results(&mut self, callee: u8, retc: u8, results: Vec<Value>) {
         let base = self.frames.last().map(|f| f.base).unwrap_or(0);
         let dest = base + callee as usize;
         let count = match retc {
@@ -55,8 +55,9 @@ impl VM {
         if dest + count > self.stack.len() {
             self.stack.resize(dest + count, Value::Nil);
         }
+        let mut iter = results.into_iter();
         for i in 0..count {
-            self.stack[dest + i] = results.get(i).cloned().unwrap_or(Value::Nil);
+            self.stack[dest + i] = iter.next().unwrap_or(Value::Nil);
         }
         if retc == MULTRET {
             self.top = dest + count;

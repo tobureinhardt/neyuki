@@ -523,6 +523,18 @@ fn write_instruction(buf: &mut Vec<u8>, inst: &Instruction) {
             write_u8(buf, *a);
             write_u16(buf, *k);
         }
+        Instruction::IDivK { dst, a, k } => {
+            write_u8(buf, 75);
+            write_u8(buf, *dst);
+            write_u8(buf, *a);
+            write_u16(buf, *k);
+        }
+        Instruction::ModK { dst, a, k } => {
+            write_u8(buf, 76);
+            write_u8(buf, *dst);
+            write_u8(buf, *a);
+            write_u16(buf, *k);
+        }
         Instruction::EqK {
             a,
             k,

@@ -12,6 +12,8 @@ pub mod metamethod;
 pub mod ops;
 pub mod permissions;
 pub mod table;
+#[cfg(not(debug_assertions))]
+mod threaded;
 pub mod traceback;
 pub mod upvalue;
 pub mod value;

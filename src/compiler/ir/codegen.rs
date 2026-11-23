@@ -217,7 +217,7 @@ fn emit_comparison(
     single_use_dst: bool,
     regs: &mut RegAlloc,
     jump_patches: &mut Vec<(usize, IrLabel)>,
-    skipped_indices: &mut FxHashSet<usize>,
+    skipped: &mut [bool],
 ) {
     if let Some((next_idx, IrInst::JumpIfFalse { cond, target })) = next_non_debug
         && *cond == dst
@@ -225,7 +225,7 @@ fn emit_comparison(
     {
         let ip = proto.emit(cmp_inst, 1);
         jump_patches.push((ip, *target));
-        skipped_indices.insert(next_idx);
+        skipped[next_idx] = true;
         return;
     }
 
@@ -339,13 +339,15 @@ fn ir_const_to_bytecode(proto: &mut Proto, val: &IrConstant) -> u16 {
     }
 }
 
-/// Whether `op` has a constant-operand form (`AddK`..`GeK`).
+/// Whether `op` has a constant-operand form (`AddK`..`GeK`, `IDivK`, `ModK`).
 fn has_const_form(op: IrBinaryOp) -> bool {
     matches!(
         op,
         IrBinaryOp::Add
             | IrBinaryOp::Sub
             | IrBinaryOp::Mul
+            | IrBinaryOp::IDiv
+            | IrBinaryOp::Mod
             | IrBinaryOp::Eq
             | IrBinaryOp::Ne
             | IrBinaryOp::Lt
@@ -502,13 +504,20 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
 
     // How often each variable is read. A temporary read exactly once, by the
     // very next instruction, can be folded into that instruction.
-    let mut use_count: FxHashMap<IrVar, usize> = new_map();
-    // Table keys that are always one constant string are read straight from
-    // the constant pool (`GetTableK`/`SetTableK`). Small constant integers
-    // used only in immediate-capable `BinOp`s fold into immediate opcodes
-    // (`AddI`, `SubI`, `MulI`, `ShlI`, `ShrI`, `EqI`..`GeI`). When a constant
-    // has no other uses, its `LoadK`/`LoadInt` is not emitted at all.
-    let mut def_count: FxHashMap<IrVar, usize> = new_map();
+    let mut max_var_id = func.num_params as usize;
+    for inst in &func.instructions {
+        inst.for_each_use(|var| {
+            max_var_id = max_var_id.max(var.0 as usize + 1);
+        });
+        inst.for_each_def(|var| {
+            max_var_id = max_var_id.max(var.0 as usize + 1);
+        });
+        if let IrInst::DebugLocal { var, .. } = inst {
+            max_var_id = max_var_id.max(var.0 as usize + 1);
+        }
+    }
+    let mut use_count = vec![0u32; max_var_id];
+    let mut def_count = vec![0u32; max_var_id];
     let mut const_keys: FxHashMap<IrVar, &str> = new_map();
     let mut const_ints: FxHashMap<IrVar, i16> = new_map();
     // Any other constant used only as the right operand of `Add`/`Sub`/`Mul`
@@ -516,10 +525,10 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
     let mut const_vals: FxHashMap<IrVar, &IrConstant> = new_map();
     for inst in &func.instructions {
         inst.for_each_use(|var| {
-            *use_count.entry(var).or_insert(0) += 1;
+            use_count[var.0 as usize] += 1;
         });
         inst.for_each_def(|var| {
-            *def_count.entry(var).or_insert(0) += 1;
+            def_count[var.0 as usize] += 1;
         });
         if let IrInst::LoadConst { dst, val } = inst {
             const_vals.insert(*dst, val);
@@ -542,39 +551,47 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
             _ => {}
         }
     }
-    let single_use = |var: IrVar| use_count.get(&var).copied().unwrap_or(0) == 1;
+    let single_use = |var: IrVar| use_count.get(var.0 as usize).copied().unwrap_or(0) == 1;
 
-    const_keys.retain(|var, _| def_count.get(var) == Some(&1));
-    const_ints.retain(|var, _| def_count.get(var) == Some(&1) && !pinned_vars.contains(var));
-    const_vals.retain(|var, _| def_count.get(var) == Some(&1) && !pinned_vars.contains(var));
-    let mut key_uses: FxHashMap<IrVar, usize> = new_map();
-    let mut imm_uses: FxHashMap<IrVar, usize> = new_map();
-    let mut k_uses: FxHashMap<IrVar, usize> = new_map();
+    const_keys.retain(|var, _| def_count.get(var.0 as usize) == Some(&1));
+    const_ints
+        .retain(|var, _| def_count.get(var.0 as usize) == Some(&1) && !pinned_vars.contains(var));
+    const_vals
+        .retain(|var, _| def_count.get(var.0 as usize) == Some(&1) && !pinned_vars.contains(var));
+    let mut key_uses = vec![0u32; max_var_id];
+    let mut imm_uses = vec![0u32; max_var_id];
+    let mut k_uses = vec![0u32; max_var_id];
     if !const_keys.is_empty() || !const_ints.is_empty() || !const_vals.is_empty() {
         for inst in &func.instructions {
             match inst {
                 IrInst::GetTable { table, key, .. } if table != key => {
                     if const_keys.contains_key(key) {
-                        *key_uses.entry(*key).or_insert(0) += 1;
+                        key_uses[key.0 as usize] += 1;
                     }
                 }
                 IrInst::SetTable { table, key, val } if table != key && val != key => {
                     if const_keys.contains_key(key) {
-                        *key_uses.entry(*key).or_insert(0) += 1;
+                        key_uses[key.0 as usize] += 1;
                     }
                 }
                 IrInst::BinOp { op, lhs, rhs, .. } => {
                     if let Some((_, imm_var, _)) = select_binop_imm(*op, *lhs, *rhs, &const_ints) {
-                        *imm_uses.entry(imm_var).or_insert(0) += 1;
+                        imm_uses[imm_var.0 as usize] += 1;
                     } else if lhs != rhs && has_const_form(*op) && const_vals.contains_key(rhs) {
-                        *k_uses.entry(*rhs).or_insert(0) += 1;
+                        k_uses[rhs.0 as usize] += 1;
                     }
                 }
                 IrInst::DebugLocal { var, .. } => {
-                    key_uses.remove(var);
+                    if let Some(slot) = key_uses.get_mut(var.0 as usize) {
+                        *slot = 0;
+                    }
                     const_keys.remove(var);
-                    imm_uses.remove(var);
-                    k_uses.remove(var);
+                    if let Some(slot) = imm_uses.get_mut(var.0 as usize) {
+                        *slot = 0;
+                    }
+                    if let Some(slot) = k_uses.get_mut(var.0 as usize) {
+                        *slot = 0;
+                    }
                     const_vals.remove(var);
                 }
                 _ => {}
@@ -583,21 +600,18 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
     }
     let key_only = |var: &IrVar| {
         const_keys.contains_key(var)
-            && key_uses
-                .get(var)
-                .is_some_and(|n| Some(n) == use_count.get(var))
+            && key_uses.get(var.0 as usize).copied().unwrap_or(0)
+                == use_count.get(var.0 as usize).copied().unwrap_or(0)
     };
     let imm_only = |var: &IrVar| {
         const_ints.contains_key(var)
-            && imm_uses
-                .get(var)
-                .is_some_and(|n| Some(n) == use_count.get(var))
+            && imm_uses.get(var.0 as usize).copied().unwrap_or(0)
+                == use_count.get(var.0 as usize).copied().unwrap_or(0)
     };
     let k_only = |var: &IrVar| {
         const_vals.contains_key(var)
-            && k_uses
-                .get(var)
-                .is_some_and(|n| Some(n) == use_count.get(var))
+            && k_uses.get(var.0 as usize).copied().unwrap_or(0)
+                == use_count.get(var.0 as usize).copied().unwrap_or(0)
     };
 
     // Whether an instruction may leave its result in any register at all.
@@ -643,7 +657,7 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                     let floor = last_window_use.map(|i| i + 1).unwrap_or(0);
                     for def in &func.instructions[floor..index] {
                         let Some(var) = def.def_var() else { continue };
-                        if !places_freely(def) || !single_use(var) {
+                        if !places_freely(def) || !single_use(var) || pinned_vars.contains(&var) {
                             continue;
                         }
                         if let Some(slot) = slot_of(var) {
@@ -652,7 +666,36 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                     }
                     last_window_use = Some(index);
                 }
-                IrInst::Spread { .. } => last_window_use = Some(index),
+                IrInst::Spread { source, sink } => {
+                    if let SpreadSource::Call {
+                        callee,
+                        args,
+                        trailing: None,
+                    } = source
+                        && matches!(sink, SpreadSink::Return | SpreadSink::List { .. })
+                    {
+                        let slot_of = |var: IrVar| -> Option<u8> {
+                            if var == *callee {
+                                return Some(0);
+                            }
+                            args.iter()
+                                .position(|a| *a == var)
+                                .map(|k| 1u8.saturating_add(k as u8))
+                        };
+                        let floor = last_window_use.map(|i| i + 1).unwrap_or(0);
+                        for def in &func.instructions[floor..index] {
+                            let Some(var) = def.def_var() else { continue };
+                            if !places_freely(def) || !single_use(var) || pinned_vars.contains(&var)
+                            {
+                                continue;
+                            }
+                            if let Some(slot) = slot_of(var) {
+                                regs.bind(var, cw.saturating_add(slot), &mut proto);
+                            }
+                        }
+                    }
+                    last_window_use = Some(index);
+                }
                 _ => {}
             }
         }
@@ -666,14 +709,15 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                 continue;
             };
             let [d] = dsts.as_slice() else { continue };
-            if def_count.get(d) != Some(&1) || !single_use(*d) || pinned_vars.contains(d) {
+            if def_count.get(d.0 as usize) != Some(&1) || !single_use(*d) || pinned_vars.contains(d)
+            {
                 continue;
             }
             for later in &func.instructions[index + 1..] {
                 if later.is_debug_marker() {
                     continue;
                 }
-                if later.use_vars().contains(d) {
+                if later.uses_var(*d) {
                     let safe_consumer = match later {
                         IrInst::Call { .. }
                         | IrInst::Spread { .. }
@@ -706,10 +750,12 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                 ) {
                     break;
                 }
-                let clobbers_cw = later
-                    .def_vars()
-                    .into_iter()
-                    .any(|def_v| regs.lookup(def_v) == Some(cw));
+                let mut clobbers_cw = false;
+                later.for_each_def(|def_v| {
+                    if regs.lookup(def_v) == Some(cw) {
+                        clobbers_cw = true;
+                    }
+                });
                 if clobbers_cw {
                     break;
                 }
@@ -717,12 +763,12 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
         }
     }
 
-    let mut skipped_indices: FxHashSet<usize> = new_set();
+    let mut skipped = vec![false; func.instructions.len()];
     let mut line = 1u32;
     // Locals whose scope is still open: their variable and debug-info entry.
     let mut open_locals: Vec<(IrVar, usize)> = Vec::new();
     for (index, inst) in func.instructions.iter().enumerate() {
-        if skipped_indices.contains(&index) {
+        if skipped[index] {
             continue;
         }
         let first_new = proto.instructions.len();
@@ -745,7 +791,7 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
         {
             let rv = regs.get(*v, &mut proto);
             regs.bind(*t, rv, &mut proto);
-            skipped_indices.insert(next_idx);
+            skipped[next_idx] = true;
         }
 
         match inst {
@@ -844,7 +890,7 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                                 single_use(*dst),
                                 &mut regs,
                                 &mut jump_patches,
-                                &mut skipped_indices,
+                                &mut skipped,
                             );
                         }
                         ImmOp::Add(imm) => {
@@ -917,6 +963,12 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                         IrBinaryOp::Mul => {
                             proto.emit(Instruction::MulK { dst: rd, a: ra, k }, 1);
                         }
+                        IrBinaryOp::IDiv => {
+                            proto.emit(Instruction::IDivK { dst: rd, a: ra, k }, 1);
+                        }
+                        IrBinaryOp::Mod => {
+                            proto.emit(Instruction::ModK { dst: rd, a: ra, k }, 1);
+                        }
                         _ => emit_comparison(
                             &mut proto,
                             compare_const_instruction(*op, ra, k),
@@ -925,7 +977,7 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                             single_use(*dst),
                             &mut regs,
                             &mut jump_patches,
-                            &mut skipped_indices,
+                            &mut skipped,
                         ),
                     }
                 } else {
@@ -950,7 +1002,7 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                                 single_use(*dst),
                                 &mut regs,
                                 &mut jump_patches,
-                                &mut skipped_indices,
+                                &mut skipped,
                             );
                         }
                         _ => {

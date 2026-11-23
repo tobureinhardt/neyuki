@@ -684,6 +684,7 @@ fn pause(vm: &mut VM, reason: &str) -> Result<(), String> {
 pub fn run_dap_session() -> Result<(), String> {
     let mut vm = VM::new();
     vm.dap = Some(DapSession::stdio());
+    vm.update_trap();
     serve(&mut vm);
     Ok(())
 }
@@ -744,6 +745,7 @@ mod tests {
             Box::new(io::Cursor::new(input)),
             Box::new(Shared(out.clone())),
         ));
+        vm.update_trap();
         serve(&mut vm);
         let bytes = out.lock().unwrap().clone();
         let mut reader = io::BufReader::new(io::Cursor::new(bytes));

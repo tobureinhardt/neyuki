@@ -8,12 +8,164 @@ use crate::ast::*;
 
 pub fn parse_statement(parser: &mut Parser) -> Result<Stmt, String> {
     let start = parser.current_loc();
+    let attrs = parse_leading_attributes(parser)?;
+    if !attrs.is_empty()
+        && (parser.is_eof()
+            || parser.check_keyword("end")
+            || parser.check_keyword("else")
+            || parser.check_keyword("elseif")
+            || parser.check_keyword("until")
+            || parser.check_word("case")
+            || (parser.check_word("default")
+                && parser
+                    .tokens
+                    .get(parser.pos + 1)
+                    .is_some_and(|t| t.value == ":")))
+    {
+        return Err(format!(
+            "[line {}] attribute must be followed by a statement or declaration",
+            parser.peek().line
+        ));
+    }
     parser.enter()?;
     let stmt = parse_statement_inner(parser);
     parser.depth -= 1;
     let stmt = stmt?;
     parser.record_span(stmt.node_id(), start);
+    if !attrs.is_empty() {
+        parser.attribute_pool.insert(stmt.node_id(), attrs);
+    }
     Ok(stmt)
+}
+
+fn has_leading_attribute(parser: &Parser) -> bool {
+    if parser.check_symbol("@") || parser.check_symbol("[") {
+        return true;
+    }
+    parser.check_symbol("#")
+        && parser
+            .tokens
+            .get(parser.pos + 1)
+            .is_some_and(|tok| tok.kind == "symbol" && tok.value == "[")
+}
+
+fn parse_leading_attributes(parser: &mut Parser) -> Result<Vec<Attribute>, String> {
+    let mut attrs = Vec::new();
+    while has_leading_attribute(parser) {
+        if parser.match_symbol("@") {
+            if parser.match_symbol("[") {
+                parse_bracketed_attribute_group(parser, &mut attrs)?;
+            } else {
+                attrs.push(parse_single_attribute(parser)?);
+            }
+        } else if parser.match_symbol("#") {
+            parser.expect_symbol("[")?;
+            parse_bracketed_attribute_group(parser, &mut attrs)?;
+        } else if parser.match_symbol("[") {
+            parse_bracketed_attribute_group(parser, &mut attrs)?;
+        }
+    }
+    Ok(attrs)
+}
+
+fn parse_bracketed_attribute_group(
+    parser: &mut Parser,
+    out: &mut Vec<Attribute>,
+) -> Result<(), String> {
+    if !parser.check_symbol("]") {
+        loop {
+            out.push(parse_single_attribute(parser)?);
+            if !parser.match_symbol(",") || parser.check_symbol("]") {
+                break;
+            }
+        }
+    }
+    parser.expect_symbol("]")?;
+    Ok(())
+}
+
+fn parse_single_attribute(parser: &mut Parser) -> Result<Attribute, String> {
+    let start = parser.current_loc();
+    let mut name = parser.expect_name()?;
+    while parser.match_symbol(".") {
+        name.push('.');
+        name.push_str(&parser.expect_name()?);
+    }
+    let args = if parser.match_symbol("(") {
+        parse_attribute_args(parser)?
+    } else {
+        Vec::new()
+    };
+    let end = parser.current_loc();
+    Ok(Attribute::new(name, args, Span::new(start, end)))
+}
+
+fn parse_attribute_args(parser: &mut Parser) -> Result<Vec<AttributeArg>, String> {
+    let mut args = Vec::new();
+    if !parser.check_symbol(")") {
+        loop {
+            let arg = if (parser.peek().kind == "name" || parser.peek().kind == "keyword")
+                && parser
+                    .tokens
+                    .get(parser.pos + 1)
+                    .is_some_and(|t| t.kind == "symbol" && t.value == "=")
+            {
+                let key = parser.expect_name()?;
+                parser.expect_symbol("=")?;
+                let value = parse_attribute_literal(parser)?;
+                AttributeArg::Named { key, value }
+            } else if matches!(parser.peek().kind, "string" | "number")
+                || parser.check_keyword("true")
+                || parser.check_keyword("false")
+                || parser.check_keyword("nil")
+            {
+                AttributeArg::Literal(parse_attribute_literal(parser)?)
+            } else {
+                AttributeArg::Ident(parser.expect_name()?)
+            };
+            args.push(arg);
+            if !parser.match_symbol(",") || parser.check_symbol(")") {
+                break;
+            }
+        }
+    }
+    parser.expect_symbol(")")?;
+    Ok(args)
+}
+
+fn parse_attribute_literal(parser: &mut Parser) -> Result<Literal, String> {
+    let tok = parser.peek().clone();
+    match tok.kind {
+        "string" => {
+            parser.pos += 1;
+            Ok(Literal::String(tok.value))
+        }
+        "number" => {
+            parser.pos += 1;
+            Literal::parse_number(&tok.value).ok_or_else(|| {
+                format!(
+                    "[line {}] invalid number literal '{}' in attribute",
+                    tok.line, tok.value
+                )
+            })
+        }
+        "keyword" if tok.value == "true" => {
+            parser.pos += 1;
+            Ok(Literal::Bool(true))
+        }
+        "keyword" if tok.value == "false" => {
+            parser.pos += 1;
+            Ok(Literal::Bool(false))
+        }
+        "keyword" if tok.value == "nil" => {
+            parser.pos += 1;
+            Ok(Literal::Nil)
+        }
+        _ => Err(format!(
+            "[line {}] expected literal in attribute, got {:?}",
+            tok.line, tok.value
+        )),
+    }
 }
 
 fn is_enum_statement(parser: &Parser) -> bool {
@@ -307,7 +459,6 @@ fn parse_expr_or_assign(parser: &mut Parser) -> Result<Stmt, String> {
             is_const: false,
         });
     }
-    parser.consume_bracket_attributes();
     Ok(Stmt::Expr {
         id: NodeId::next(),
         expr,
@@ -457,7 +608,7 @@ pub fn parse_function(
     };
 
     let body = parse_block_until(parser, "end")?;
-    parser.expect_keyword("end")?;
+    parser.expect_keyword_or_recover("end")?;
     Ok(Stmt::Function {
         id: NodeId::next(),
         name,
@@ -472,7 +623,7 @@ pub fn parse_function(
 pub fn parse_do(parser: &mut Parser) -> Result<Stmt, String> {
     parser.expect_keyword("do")?;
     let body = parse_block_until(parser, "end")?;
-    parser.expect_keyword("end")?;
+    parser.expect_keyword_or_recover("end")?;
     Ok(Stmt::if_stmt(
         Expr::bool(true),
         body,
@@ -485,7 +636,7 @@ pub fn parse_do(parser: &mut Parser) -> Result<Stmt, String> {
 pub fn parse_if(parser: &mut Parser) -> Result<Stmt, String> {
     parser.expect_keyword("if")?;
     let condition = parse_expr(parser)?;
-    parser.expect_keyword("then")?;
+    parser.expect_keyword_or_recover("then")?;
 
     let then_branch = parse_block_until_any(parser, &["else", "elseif", "end"])?;
     parse_if_rest(parser, condition, then_branch)
@@ -503,7 +654,7 @@ fn parse_if_rest(
     while parser.check_keyword("elseif") {
         parser.expect_keyword("elseif")?;
         let next_condition = parse_expr(parser)?;
-        parser.expect_keyword("then")?;
+        parser.expect_keyword_or_recover("then")?;
         let next_branch = parse_block_until_any(parser, &["else", "elseif", "end"])?;
         else_if_branches.push((next_condition, next_branch));
     }
@@ -513,7 +664,7 @@ fn parse_if_rest(
         else_branch = Some(parse_block_until(parser, "end")?);
     }
 
-    parser.expect_keyword("end")?;
+    parser.expect_keyword_or_recover("end")?;
 
     Ok(Stmt::if_stmt(
         condition,
@@ -544,9 +695,9 @@ fn parse_numeric_for(parser: &mut Parser, var: String, start: Expr) -> Result<St
     } else {
         None
     };
-    parser.expect_keyword("do")?;
+    parser.expect_keyword_or_recover("do")?;
     let body = parse_block_until(parser, "end")?;
-    parser.expect_keyword("end")?;
+    parser.expect_keyword_or_recover("end")?;
     Ok(Stmt::numeric_for(
         var,
         start,
@@ -565,9 +716,9 @@ fn parse_generic_for(parser: &mut Parser, first_name: String) -> Result<Stmt, St
     }
     parser.expect_keyword("in")?;
     let source = parse_expr(parser)?;
-    parser.expect_keyword("do")?;
+    parser.expect_keyword_or_recover("do")?;
     let body = parse_block_until(parser, "end")?;
-    parser.expect_keyword("end")?;
+    parser.expect_keyword_or_recover("end")?;
     Ok(Stmt::For {
         id: NodeId::next(),
         vars,
@@ -579,9 +730,9 @@ fn parse_generic_for(parser: &mut Parser, first_name: String) -> Result<Stmt, St
 pub fn parse_while(parser: &mut Parser) -> Result<Stmt, String> {
     parser.expect_keyword("while")?;
     let condition = parse_expr(parser)?;
-    parser.expect_keyword("do")?;
+    parser.expect_keyword_or_recover("do")?;
     let body = parse_block_until(parser, "end")?;
-    parser.expect_keyword("end")?;
+    parser.expect_keyword_or_recover("end")?;
     Ok(Stmt::While {
         id: NodeId::next(),
         condition,
@@ -592,8 +743,14 @@ pub fn parse_while(parser: &mut Parser) -> Result<Stmt, String> {
 pub fn parse_repeat(parser: &mut Parser) -> Result<Stmt, String> {
     parser.expect_keyword("repeat")?;
     let body = parse_block_until(parser, "until")?;
-    parser.expect_keyword("until")?;
-    let condition = parse_expr(parser)?;
+    let condition = if parser.recovering && !parser.check_keyword("until") {
+        let msg = format!("[line {}] expected keyword \"until\"", parser.peek().line);
+        parser.record_error_msg(&msg);
+        Expr::bool(true)
+    } else {
+        parser.expect_keyword("until")?;
+        parse_expr(parser)?
+    };
     Ok(Stmt::Repeat {
         id: NodeId::next(),
         body,
@@ -665,7 +822,15 @@ pub fn parse_block_until_any(parser: &mut Parser, end_words: &[&str]) -> Result<
         if hit {
             break;
         }
-        block.push(parse_statement(parser)?);
+        let stmt_start = parser.pos;
+        match parse_statement(parser) {
+            Ok(stmt) => block.push(stmt),
+            Err(err) if parser.recovering => {
+                parser.record_error_msg(&err);
+                parser.synchronize_from(stmt_start, end_words);
+            }
+            Err(err) => return Err(err),
+        }
     }
     Ok(block)
 }
@@ -787,7 +952,7 @@ pub fn parse_enum(parser: &mut Parser) -> Result<Stmt, String> {
         while parser.match_symbol(";") || parser.match_symbol(",") {}
     }
 
-    parser.expect_keyword("end")?;
+    parser.expect_keyword_or_recover("end")?;
 
     Ok(Stmt::Local {
         name: enum_name,
@@ -923,7 +1088,7 @@ pub fn parse_match(parser: &mut Parser) -> Result<Stmt, String> {
         }
     }
 
-    parser.expect_keyword("end")?;
+    parser.expect_keyword_or_recover("end")?;
 
     let inner_if = if cases.is_empty() {
         if let Some(def) = default_body {

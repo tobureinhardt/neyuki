@@ -129,4 +129,42 @@ end";
                 if matches!(vals[0].kind, HirExprKind::Literal(Literal::Int(_))))
         ));
     }
+
+    #[test]
+    fn test_hir_o1_folds_interp_concat_and_short_circuits() {
+        let code = "\
+local function f(x: string): string
+  local a = nil ?? x
+  local b = true and a
+  local c = false or `hi {b}`
+  return c
+end";
+        let stmts = compile_source(code).expect("syntax error");
+        let hir = lower_ast(&stmts, None, OptLevel::O1);
+        let HirStmtKind::Function { body, .. } = &hir.items[0].kind else {
+            panic!("expected function");
+        };
+        // `nil ?? x` -> `x`
+        assert!(matches!(
+            body[0].kind,
+            HirStmtKind::Local {
+                initializer: Some(HirExpr {
+                    kind: HirExprKind::Variable(ref v),
+                    ..
+                }),
+                ..
+            } if v == "x"
+        ));
+        // `true and a` -> `a`
+        assert!(matches!(
+            body[1].kind,
+            HirStmtKind::Local {
+                initializer: Some(HirExpr {
+                    kind: HirExprKind::Variable(ref v),
+                    ..
+                }),
+                ..
+            } if v == "a"
+        ));
+    }
 }

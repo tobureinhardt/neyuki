@@ -120,6 +120,8 @@ pub struct VM {
     /// hook, or a debugger stepping or holding line breakpoints). The
     /// dispatch loop tests only this.
     pub trap: bool,
+    /// True when either a debug hook or DAP session is attached (`Call`/`Return` fast guard).
+    pub debug_active: bool,
     /// Active DAP debug session, if any (`neyuki dap`). `None` keeps
     /// breakpoint checks to a single predictable branch.
     pub dap: Option<DapSession>,
@@ -156,6 +158,20 @@ pub struct VM {
     pub limits: ExecutionLimits,
     /// Capability-based sandbox permissions.
     pub permissions: Permissions,
+    #[cfg(not(debug_assertions))]
+    pub(crate) cur_consts: *const Value,
+    #[cfg(not(debug_assertions))]
+    pub(crate) cur_exec: *const crate::bytecode::exec::ExecProgram,
+    #[cfg(not(debug_assertions))]
+    pub(crate) cur_closure: *const VmClosure,
+    #[cfg(not(debug_assertions))]
+    pub(crate) cur_upvals: *const Rc<crate::vm::value::Upvalue>,
+    #[cfg(not(debug_assertions))]
+    pub(crate) run_target_depth: usize,
+    #[cfg(not(debug_assertions))]
+    pub(crate) run_result: Option<Value>,
+    #[cfg(not(debug_assertions))]
+    pub(crate) run_err: Option<String>,
 }
 
 impl Default for VM {
@@ -330,6 +346,7 @@ impl VM {
             in_hook: false,
             hook_countdown: 0,
             trap: false,
+            debug_active: false,
             dap: None,
             in_eval: false,
             open_upvalues: Vec::new(),
@@ -343,6 +360,20 @@ impl VM {
             tasks: Default::default(),
             limits: ExecutionLimits::new(),
             permissions: Permissions::allow_all(),
+            #[cfg(not(debug_assertions))]
+            cur_consts: std::ptr::null(),
+            #[cfg(not(debug_assertions))]
+            cur_exec: std::ptr::null(),
+            #[cfg(not(debug_assertions))]
+            cur_closure: std::ptr::null(),
+            #[cfg(not(debug_assertions))]
+            cur_upvals: std::ptr::null(),
+            #[cfg(not(debug_assertions))]
+            run_target_depth: 0,
+            #[cfg(not(debug_assertions))]
+            run_result: None,
+            #[cfg(not(debug_assertions))]
+            run_err: None,
         }
     }
 
@@ -490,11 +521,12 @@ impl VM {
         self.stack[idx] = val;
     }
 
-    /// Recomputes `trap` after a hook, debugger, or limit setting changed.
+    /// Recomputes `trap` and `debug_active` after a hook, debugger, or limit setting changed.
     pub fn update_trap(&mut self) {
         let hook_wants = self.hook.as_ref().is_some_and(|h| h.on_line || h.count > 0);
         let debugger_wants = self.dap.as_ref().is_some_and(|d| d.wants_lines());
         self.trap = hook_wants || debugger_wants || self.limits.is_active();
+        self.debug_active = self.hook.is_some() || self.dap.is_some();
     }
 
     /// Full collection with finalizers: mark, extract the finalizer queue,
@@ -591,7 +623,7 @@ impl VM {
         let dropped = self.gc.reap_young();
         if dropped > 0
             && self.gc.bytes_allocated <= self.gc.threshold * 3 / 4
-            && self.gc.nursery_reaps_since_cycle < 4
+            && self.gc.nursery_reaps_since_cycle < 12
         {
             self.gc.nursery_reaps_since_cycle += 1;
             self.gc.last_freed = dropped;

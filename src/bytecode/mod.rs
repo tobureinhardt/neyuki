@@ -1,5 +1,6 @@
 pub mod deserialize;
 pub mod disasm;
+pub mod exec;
 pub mod format;
 pub mod instruction;
 pub mod parser;
@@ -9,6 +10,7 @@ pub mod verify;
 
 pub use deserialize::deserialize;
 pub use disasm::disassemble_proto;
+pub use exec::{AlignedExec, ExecInst, ExecProgram, GlobalCacheSlot, ImportSlot, TableCacheSlot};
 pub use format::{
     BYTECODE_VERSION, BytecodeHeader, MAGIC, MIN_SUPPORTED_BYTECODE_VERSION, is_supported_version,
 };

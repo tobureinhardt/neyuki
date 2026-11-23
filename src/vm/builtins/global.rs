@@ -112,10 +112,26 @@ pub fn tostring(vm: &mut VM, val: &Value) -> Result<String, String> {
     Ok(val.to_string())
 }
 
+#[inline]
+fn cached_small_int_string(i: i64) -> Option<Value> {
+    if !(0..256).contains(&i) {
+        return None;
+    }
+    thread_local! {
+        static SMALL_INT_STRINGS: [Value; 256] = std::array::from_fn(|n| Value::string(n.to_string()));
+    }
+    SMALL_INT_STRINGS.with(|tbl| Some(tbl[i as usize].clone()))
+}
+
 pub fn builtin_tostring(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let val = args.first().unwrap_or(&Value::Nil);
     if let Value::String(_) = val {
         return Ok(vec![val.clone()]);
+    }
+    if let Value::Int(i) = val
+        && let Some(cached) = cached_small_int_string(*i)
+    {
+        return Ok(vec![cached]);
     }
     Ok(vec![Value::string(tostring(vm, val)?)])
 }

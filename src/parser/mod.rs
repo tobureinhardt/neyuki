@@ -42,6 +42,9 @@ pub struct Parser {
     pub(crate) pos: usize,
     pub(crate) depth: usize,
     pub(crate) span_pool: SpanPool,
+    pub(crate) attribute_pool: AttributePool,
+    pub(crate) errors: Vec<ParseError>,
+    pub(crate) recovering: bool,
     pub(crate) statements_count: usize,
     pub(crate) case_colon_pos: Option<usize>,
     /// Set while the next statement is one of the file's own, so `export type`
@@ -62,6 +65,9 @@ impl Parser {
             pos: 0,
             depth: 0,
             span_pool: SpanPool::new(),
+            attribute_pool: AttributePool::new(),
+            errors: Vec::new(),
+            recovering: false,
             statements_count: 0,
             case_colon_pos: None,
             top_level_stmt: false,
@@ -81,6 +87,9 @@ impl Parser {
                 pos: 0,
                 depth: 0,
                 span_pool: SpanPool::new(),
+                attribute_pool: AttributePool::new(),
+                errors: Vec::new(),
+                recovering: false,
                 statements_count: 0,
                 case_colon_pos: None,
                 top_level_stmt: false,
@@ -127,16 +136,79 @@ impl Parser {
     pub fn commit(&mut self, _snapshot: ParserSnapshot) {}
 
     pub fn synchronize(&mut self) {
+        self.synchronize_from(self.pos.saturating_add(1), &[]);
+    }
+
+    pub(crate) fn synchronize_from(&mut self, stmt_start: usize, stop_words: &[&str]) {
+        let err_line = self.peek().line;
         while !self.is_eof() {
             if self.check_symbol(";") {
                 self.pos += 1;
                 return;
             }
-            if ActionHelper::is_statement_sync_token(self.peek()) {
+            if stop_words.iter().any(|w| self.check_word(w)) {
+                return;
+            }
+            if self.pos > stmt_start
+                && (ActionHelper::is_statement_sync_token(self.peek())
+                    || (self.peek().line > err_line && self.starts_statement_on_new_line()))
+            {
                 return;
             }
             self.pos += 1;
         }
+    }
+
+    fn starts_statement_on_new_line(&self) -> bool {
+        let tok = self.peek();
+        if tok.kind == "name" {
+            return true;
+        }
+        if tok.kind == "symbol" && tok.value == "#" {
+            return self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|next| next.kind == "symbol" && next.value == "[");
+        }
+        false
+    }
+
+    pub fn record_error(&mut self, err: ParseError) {
+        let duplicate = self.errors.last().is_some_and(|prev| {
+            prev.line == err.line && prev.col == err.col && prev.message == err.message
+        });
+        if !duplicate {
+            self.errors.push(err);
+        }
+    }
+
+    pub fn record_error_msg(&mut self, msg: &str) {
+        let err = ParseError::from_parser_message(msg, self.peek());
+        self.record_error(err);
+    }
+
+    pub fn errors(&self) -> &[ParseError] {
+        &self.errors
+    }
+
+    pub fn attribute_pool(&self) -> &AttributePool {
+        &self.attribute_pool
+    }
+
+    pub fn take_attribute_pool(&mut self) -> AttributePool {
+        std::mem::take(&mut self.attribute_pool)
+    }
+
+    pub(crate) fn expect_keyword_or_recover(&mut self, value: &str) -> Result<(), String> {
+        if !self.recovering {
+            return self.expect_keyword(value);
+        }
+        if self.match_keyword(value) {
+            return Ok(());
+        }
+        let msg = format!("[line {}] expected keyword {:?}", self.peek().line, value);
+        self.record_error_msg(&msg);
+        Ok(())
     }
 
     pub fn stats(&self) -> ParserStats {
@@ -190,6 +262,68 @@ impl Parser {
         Ok((program, std::mem::take(&mut self.span_pool)))
     }
 
+    /// Parses the full program, collecting syntax errors and recovering at
+    /// statement and block boundaries so multiple errors and partial ASTs are
+    /// returned together (used by `neyuki lint` and `neyuki lsp`).
+    pub fn parse_program_with_recovery(
+        &mut self,
+    ) -> (Vec<Stmt>, SpanPool, AttributePool, Vec<ParseError>) {
+        if let Some(err) = self.lex_error.take() {
+            self.record_error_msg(&err);
+            return (
+                Vec::new(),
+                std::mem::take(&mut self.span_pool),
+                std::mem::take(&mut self.attribute_pool),
+                std::mem::take(&mut self.errors),
+            );
+        }
+
+        let prev_recovering = self.recovering;
+        self.recovering = true;
+        let mut program = Vec::new();
+        while !self.is_eof() {
+            if self.check_symbol(";") {
+                self.pos += 1;
+                continue;
+            }
+
+            if self.check_keyword("end")
+                || self.check_keyword("else")
+                || self.check_keyword("elseif")
+                || self.check_keyword("until")
+            {
+                let tok = self.peek().clone();
+                let msg = format!(
+                    "[line {}] unexpected '{}' outside block",
+                    tok.line, tok.value
+                );
+                self.record_error_msg(&msg);
+                self.pos += 1;
+                continue;
+            }
+
+            let stmt_start = self.pos;
+            self.top_level_stmt = true;
+            match self.parse_statement() {
+                Ok(stmt) => {
+                    program.push(stmt);
+                    self.consume_semicolon_if_any();
+                }
+                Err(err) => {
+                    self.record_error_msg(&err);
+                    self.synchronize_from(stmt_start, &[]);
+                }
+            }
+        }
+        self.recovering = prev_recovering;
+        (
+            program,
+            std::mem::take(&mut self.span_pool),
+            std::mem::take(&mut self.attribute_pool),
+            std::mem::take(&mut self.errors),
+        )
+    }
+
     pub fn parse_statement(&mut self) -> Result<Stmt, String> {
         let stmt = stmt::parse_statement(self)?;
         self.statements_count += 1;
@@ -208,19 +342,6 @@ impl Parser {
         let token = self.peek().clone();
         self.pos += 1;
         token
-    }
-
-    pub fn consume_bracket_attributes(&mut self) {
-        while self.match_symbol("[") {
-            while !self.is_eof() && !self.check_symbol("]") {
-                if self.check_symbol("[") {
-                    self.pos += 1;
-                    continue;
-                }
-                self.pos += 1;
-            }
-            let _ = self.match_symbol("]");
-        }
     }
 
     pub fn consume_semicolon_if_any(&mut self) {
@@ -615,5 +736,101 @@ mod tests {
         let diag = err.format_diagnostic(Some("local a b = 1, 2"));
         assert!(diag.contains("[line 10:5] unexpected identifier"));
         assert!(diag.contains("consider adding a comma"));
+    }
+
+    #[test]
+    fn parses_attributes_in_all_forms_and_attaches_to_statements() {
+        let source = "\
+@inline
+@deprecated(\"use fast_add\")
+function add(a: int, b: int): int
+    return a + b
+end
+
+@[pure, allow(unused)]
+#[tag(priority = 1, enabled = true)]
+[lint.allow(shadow)]
+local helper = 42
+";
+        let mut parser = Parser::new(source);
+        let (program, _spans) = parser.parse_program().expect("failed to parse attributes");
+        let attrs = parser.attribute_pool();
+        assert_eq!(program.len(), 2);
+
+        let fn_attrs = attrs.get(program[0].node_id());
+        assert_eq!(fn_attrs.len(), 2);
+        assert_eq!(fn_attrs[0].name, "inline");
+        assert!(fn_attrs[0].args.is_empty());
+        assert_eq!(fn_attrs[1].name, "deprecated");
+        assert_eq!(fn_attrs[1].first_string_arg(), Some("use fast_add"));
+
+        let local_attrs = attrs.get(program[1].node_id());
+        assert_eq!(local_attrs.len(), 4);
+        assert_eq!(local_attrs[0].name, "pure");
+        assert_eq!(local_attrs[1].name, "allow");
+        assert!(local_attrs[1].has_ident_arg("unused"));
+        assert_eq!(local_attrs[2].name, "tag");
+        assert_eq!(
+            local_attrs[2].args,
+            vec![
+                AttributeArg::Named {
+                    key: "priority".to_string(),
+                    value: Literal::Int(1.into()),
+                },
+                AttributeArg::Named {
+                    key: "enabled".to_string(),
+                    value: Literal::Bool(true),
+                },
+            ]
+        );
+        assert_eq!(local_attrs[3].name, "lint.allow");
+
+        let printed = pretty_print_stmt_with_attributes(&program[0], attrs, 0);
+        assert!(printed.starts_with("@inline\n@deprecated(\"use fast_add\")\nfunction add"));
+    }
+
+    #[test]
+    fn rejects_dangling_attribute_without_statement() {
+        let mut p1 = Parser::new("@inline");
+        assert!(p1.parse_program().is_err());
+
+        let mut p2 = Parser::new("function f()\n  @inline\nend");
+        assert!(p2.parse_program().is_err());
+    }
+
+    #[test]
+    fn parse_program_with_recovery_reports_multiple_errors_and_recovers() {
+        let source = "\
+local = 1
+local ok = 10
+if ok > 5
+    local inner = ok
+end
+function good(x)
+    local = 2
+    return x + 1
+end
+local after = good(ok)
+end
+";
+        let mut parser = Parser::new(source);
+        let (stmts, _spans, _attrs, errors) = parser.parse_program_with_recovery();
+        // Should report: (1) `local = 1`, (2) missing `then` on `if ok > 5`,
+        // (3) `local = 2` inside `good`, (4) stray top-level `end`.
+        assert!(
+            errors.len() >= 4,
+            "expected >= 4 recovered errors, got: {:?}",
+            errors
+        );
+        // Should still recover `local ok = 10`, `if`, `function good`, and `local after`.
+        let names: Vec<&str> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Local { name, .. } => Some(name.as_str()),
+                Stmt::Function { name: Some(n), .. } => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["ok", "good", "after"]);
     }
 }
