@@ -10,10 +10,12 @@ neyuki compile <file> [out]       compile to bytecode (default: <file>b)
 neyuki repl                       interactive session
 neyuki test [filter|path...]      run .nyk test scripts (default: tests/)
 neyuki build [project]            build a standalone app executable
+neyuki unpack <app> [-o dir]      extract a built app's scripts and assets
 neyuki pkg <command>              manage the project manifest and packages
 neyuki dap                        Debug Adapter Protocol server on stdio
 neyuki lsp                        Language Server Protocol server on stdio
 neyuki disasm <file>              print the bytecode the compiler emits
+neyuki decompile <file> [out]     turn .nykb bytecode back into source
 neyuki dump-ir <file>             print the IR before and after optimization
 neyuki help | --version
 ```
@@ -44,9 +46,13 @@ warning[W0001]: unused variable 'total'
 
 The bytecode format changes between Neyuki versions. A `.nykb` written by another version is rejected with an error naming both formats; recompile it with `neyuki compile`. When `require` meets such a file and the `.nyk` source sits next to it, it compiles the source instead.
 
+`neyuki decompile app.nykb` prints the bytecode as Neyuki source (or writes it to `[out]`). Bytecode keeps the names of locals, parameters and upvalues, but not comments, formatting, type annotations or the names of temporaries, so the result is equivalent source rather than the original text: temporaries are named `t1`, `t2`, ..., and loops come back as `while`, `for` or `while true` with `break` and `continue`. A function whose control flow does not fit those shapes, such as hand-written bytecode, keeps its signature and its disassembly in a comment, and calls `error` if it runs. Given a `.nyk` file, `decompile` compiles it first, which shows what the decompiler makes of the compiler's output.
+
 ### Building apps
 
 `neyuki build [project]` writes a standalone executable that holds the entry script, the modules it needs and an asset folder (default `assets`) in an embedded read-only file system, so `fs.read("assets/logo.png")` and `require` resolve inside the bundle. Options: `-o`/`--out`, `--name`, `--version`, `--icon`, `--asset` (repeatable), `--console` (keep the Windows console window) and `--runtime`. The `[app]` section of `neyuki.toml` sets `name`, `identifier`, `icon`, `assets`, `publisher` and `copyright`. A built app reads its own details with [`os.app()`](reference/os.md).
+
+`neyuki unpack <app>` extracts a built app into a directory (default `<app>-unpacked`, or `-o`/`--out`). It accepts the executable, a macOS `.app` or the `app.nykpak` inside one. Scripts are bundled as they are in the project, so `.nyk` files come back as their source; every `.nykb` file is also written next to itself as decompiled `.nyk` (unless the bundle already has that file, or with `--no-decompile`), and the app's metadata goes to `bundle.toml`. Building an app does not hide its code.
 
 ### Debugging
 

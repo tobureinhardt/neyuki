@@ -462,3 +462,62 @@ fn test_build_rejects_assets_outside_the_project() {
     assert!(err.contains("inside the project"), "{}", err);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_unpack_extracts_files_and_decompiles_bytecode() {
+    let dir = scratch_dir("unpack");
+    let proto = crate::compiler::compile_program(
+        "local function add(a, b) return a + b end\nreturn add(2, 3)\n",
+        "lib.nyk",
+        crate::compiler::Options::RUN,
+    )
+    .unwrap();
+    let mut files = sample_files();
+    files.push((
+        "lib/math.nykb".to_string(),
+        crate::bytecode::serialize(&proto),
+    ));
+    let payload = pack(&meta(), &files).unwrap();
+    let mut exe = b"\x7fELF not really a runtime".to_vec();
+    exe.extend_from_slice(&payload);
+    exe.extend_from_slice(&bundle::trailer(payload.len() as u64));
+    let exe_path = dir.join("app");
+    std::fs::write(&exe_path, &exe).unwrap();
+
+    let bundle = super::unpack::open(&exe_path).unwrap();
+    let out = dir.join("out");
+    let report = super::unpack::unpack(&bundle, &out, true).unwrap();
+    assert_eq!(report.files, files.len());
+    assert_eq!(report.decompiled, 1);
+    assert!(report.meta);
+    for (path, bytes) in &files {
+        assert_eq!(&std::fs::read(out.join(path)).unwrap(), bytes, "{}", path);
+    }
+    let source = std::fs::read_to_string(out.join("lib/math.nyk")).unwrap();
+    assert!(
+        source.contains("function(a, b)") && source.contains("a + b"),
+        "{}",
+        source
+    );
+    let meta = std::fs::read_to_string(out.join(super::unpack::META_FILE)).unwrap();
+    assert!(
+        meta.contains("[app]") && meta.contains("name = \"Test App\""),
+        "{}",
+        meta
+    );
+
+    // The output directory now has files, so a second run refuses it.
+    assert!(super::unpack::unpack(&bundle, &out, true).is_err());
+
+    // Without decompiling, only the bundled files are written.
+    let plain = dir.join("plain");
+    let report = super::unpack::unpack(&bundle, &plain, false).unwrap();
+    assert_eq!(report.decompiled, 0);
+    assert!(!plain.join("lib/math.nyk").exists());
+
+    // A file that is not an app is an error, not an empty directory.
+    let not_app = dir.join("not_app");
+    std::fs::write(&not_app, b"just text").unwrap();
+    assert!(super::unpack::open(&not_app).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

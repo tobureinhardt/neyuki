@@ -351,6 +351,11 @@ impl Bundle {
         self.meta.get(key).map(String::as_str)
     }
 
+    /// Every app metadata entry, sorted by key.
+    pub fn meta_entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.meta.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
     /// Every bundled file path, sorted.
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         self.files.keys().map(String::as_str)

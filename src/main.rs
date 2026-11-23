@@ -60,11 +60,14 @@ Commands:
   emit-llvm [-O0|-O1] <file> [out.ll]
                           Emit LLVM IR (.ll) from MIR
   build [project]         Build a standalone app executable
+  unpack <app> [-o dir]   Extract a built app's scripts and assets
   test [filter|path...]   Run .nyk test scripts (default: tests/)
   repl                    Start an interactive session
   pkg <command>           Manage packages
   dap                     Serve the Debug Adapter Protocol on stdio
   disasm [-O0|-O1] <file> Print the bytecode the compiler emits
+  decompile [-O0|-O1] <file> [out]
+                          Turn .nykb bytecode back into source
   dump-hir [-O0|-O1] <file>
                           Print the High-level IR (HIR)
   dump-thir [-O0|-O1] <file>
@@ -399,6 +402,16 @@ fn run_cli() {
                 process::exit(1);
             }
         }
+    } else if action == "decompile" {
+        if let Err(err) = run_decompile(&args[2..]) {
+            eprintln!("{}", err);
+            process::exit(1);
+        }
+    } else if action == "unpack" {
+        if let Err(err) = app::unpack::run_cli(&args[2..]) {
+            eprintln!("unpack error: {}", err);
+            process::exit(1);
+        }
     } else if action == "assemble" {
         let Some(path) = args.get(2) else {
             eprintln!("Usage: {} assemble <assembly_file> [output]", args[0]);
@@ -571,6 +584,42 @@ fn parse_opt_level_flag(arg: &str) -> Option<Result<compiler::OptLevel, String>>
                 other
             )),
         }),
+    }
+}
+
+/// `neyuki decompile [-O0|-O1] <file> [out]`: prints (or writes) a
+/// `.nykb` file as source. A `.nyk` file is compiled first, which shows what
+/// the decompiler makes of the compiler's output.
+fn run_decompile(args: &[String]) -> Result<(), String> {
+    let usage = "Usage: neyuki decompile [-O0|-O1] <file> [out]";
+    let (opt_level, rest) = parse_opt_level_prefix(args)?;
+    let (path, out) = match rest {
+        [path] => (path, None),
+        [path, out] => (path, Some(out)),
+        _ => return Err(usage.to_string()),
+    };
+    let bytes = std::fs::read(path).map_err(|err| format!("failed to read {}: {}", path, err))?;
+    let proto = if bytes.starts_with(bytecode::MAGIC) {
+        bytecode::deserialize(&bytes).map_err(|err| format!("{}: {}", path, err))?
+    } else {
+        let source =
+            String::from_utf8(bytes).map_err(|_| format!("{} is not valid UTF-8", path))?;
+        compiler::compile_program(
+            &source,
+            path,
+            compiler::Options::UNCHECKED.with_opt_level(opt_level),
+        )
+        .map_err(|err| format!("{}: {}", path, err))?
+    };
+    let text = bytecode::decompile(&proto);
+    match out {
+        Some(out) => {
+            std::fs::write(out, text).map_err(|err| format!("failed to write {}: {}", out, err))
+        }
+        None => {
+            print!("{}", text);
+            Ok(())
+        }
     }
 }
 

@@ -11,6 +11,7 @@
 pub mod build;
 pub mod bundle;
 pub mod icon;
+pub mod unpack;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};

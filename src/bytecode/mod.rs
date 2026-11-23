@@ -1,3 +1,4 @@
+pub mod decompile;
 pub mod deserialize;
 pub mod disasm;
 pub mod exec;
@@ -8,6 +9,7 @@ pub mod proto;
 pub mod serialize;
 pub mod verify;
 
+pub use decompile::decompile;
 pub use deserialize::deserialize;
 pub use disasm::disassemble_proto;
 pub use exec::{AlignedExec, ExecInst, ExecProgram, GlobalCacheSlot, ImportSlot, TableCacheSlot};
