@@ -364,6 +364,32 @@ impl<'a> MirBuilder<'a> {
         Some(dsts)
     }
 
+    /// Lowers a call or `...` into exactly `count` values, padding with nil,
+    /// or returns `None` if `expr` yields a single value.
+    fn lower_multi_results(&mut self, expr: &ThirExpr, count: usize) -> Option<Vec<LocalId>> {
+        if matches!(expr.kind, ThirExprKind::Vararg) {
+            let dsts: Vec<LocalId> = (0..count)
+                .map(|_| self.alloc_temp(NeyukiType::Any))
+                .collect();
+            self.push_stmt(StatementKind::VarargMany(dsts.clone()));
+            return Some(dsts);
+        }
+        self.lower_call_results(expr, count)
+    }
+
+    /// Lowers an expression list feeding `count` targets. All but the last
+    /// expression give one value each; a trailing call or `...` fills the
+    /// remaining targets. Returns `None` when no expansion is needed.
+    fn lower_expanded_list(&mut self, exprs: &[ThirExpr], count: usize) -> Option<Vec<LocalId>> {
+        let (last, fixed) = exprs.split_last()?;
+        if count <= fixed.len() + 1 || !Self::is_multi_value(last) {
+            return None;
+        }
+        let mut vals: Vec<LocalId> = fixed.iter().map(|e| self.lower_expr(e, None)).collect();
+        vals.extend(self.lower_multi_results(last, count - fixed.len())?);
+        Some(vals)
+    }
+
     fn captures_of(&self, fn_idx: usize) -> Vec<Option<LocalId>> {
         self.functions
             .get(fn_idx)
@@ -431,6 +457,10 @@ impl<'a> MirBuilder<'a> {
     }
 
     fn lower_expr(&mut self, expr: &ThirExpr, target: Option<LocalId>) -> LocalId {
+        // Lowered as a single value, which keeps only the first result.
+        if let ThirExprKind::Paren(inner) = &expr.kind {
+            return self.lower_expr(inner, target);
+        }
         let dst = target.unwrap_or_else(|| self.alloc_temp(expr.ty.clone()));
         match &expr.kind {
             ThirExprKind::Literal(lit) => {
@@ -439,6 +469,7 @@ impl<'a> MirBuilder<'a> {
                     Rvalue::Use(Operand::Constant(Self::lower_literal(lit))),
                 );
             }
+            ThirExprKind::Paren(_) => unreachable!("handled above"),
             ThirExprKind::Vararg => {
                 self.emit_assign(dst, Rvalue::Vararg);
             }
@@ -956,10 +987,7 @@ impl<'a> MirBuilder<'a> {
                 is_global,
                 initializers,
             } => {
-                if initializers.len() == 1
-                    && names.len() > 1
-                    && let Some(vars) = self.lower_call_results(&initializers[0], names.len())
-                {
+                if let Some(vars) = self.lower_expanded_list(initializers, names.len()) {
                     for ((name, &binding), var) in names.iter().zip(bindings.iter()).zip(vars) {
                         let ty = self.binding_type(Some(binding), &NeyukiType::Any);
                         if let Some(decl) = self.locals.get_mut(var.0 as usize) {
@@ -1003,10 +1031,7 @@ impl<'a> MirBuilder<'a> {
                 self.lower_assign(target, v);
             }
             ThirStmtKind::AssignMany { targets, values } => {
-                if values.len() == 1
-                    && targets.len() > 1
-                    && let Some(vars) = self.lower_call_results(&values[0], targets.len())
-                {
+                if let Some(vars) = self.lower_expanded_list(values, targets.len()) {
                     for (t, v) in targets.iter().zip(vars) {
                         self.lower_assign(t, v);
                     }
@@ -1461,10 +1486,16 @@ impl<'a> MirBuilder<'a> {
                 }
             }
             ThirStmtKind::Return(exprs) => {
-                if exprs.len() == 1 && Self::is_multi_value(&exprs[0]) {
-                    let src = self.lower_spread_source(&exprs[0]);
+                if let Some((last, fixed)) = exprs.split_last()
+                    && Self::is_multi_value(last)
+                {
+                    let values = fixed
+                        .iter()
+                        .map(|e| Operand::Copy(Place::local(self.lower_expr(e, None))))
+                        .collect();
+                    let source = self.lower_spread_source(last);
                     let dead = self.alloc_bb();
-                    self.finish_and_switch(TerminatorKind::SpreadReturn(src), dead);
+                    self.finish_and_switch(TerminatorKind::SpreadReturn { values, source }, dead);
                     return;
                 }
                 let ret_ops: Vec<Operand> = exprs

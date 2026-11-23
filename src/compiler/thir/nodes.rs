@@ -147,6 +147,8 @@ pub enum ThirExprKind {
         binding: Option<BindingId>,
     },
     Vararg,
+    /// A call or `...` cut down to its first value.
+    Paren(Box<ThirExpr>),
     Member {
         object: Box<ThirExpr>,
         field: String,

@@ -551,6 +551,20 @@ impl<'a> FunctionEmitter<'a> {
                             t, v
                         );
                     }
+                    StatementKind::VarargMany(dsts) => {
+                        // This backend models `...` as its first value only.
+                        for (i, d) in dsts.iter().enumerate() {
+                            let v = self.tmp();
+                            let helper = if i == 0 {
+                                "__nyk_vararg"
+                            } else {
+                                "__nyk_mk_nil"
+                            };
+                            let _ = writeln!(self.out, "  {} = call %NykVal @{}()", v, helper);
+                            let _ =
+                                writeln!(self.out, "  store %NykVal {}, ptr {}", v, Self::slot(*d));
+                        }
+                    }
                     StatementKind::CloseUpvals(_)
                     | StatementKind::DebugLocal { .. }
                     | StatementKind::DebugScopeEnd { .. } => {}
@@ -742,9 +756,11 @@ impl<'a> FunctionEmitter<'a> {
                 TerminatorKind::SpreadList { target, .. } => {
                     let _ = writeln!(self.out, "  br label %{}", Self::bb_name(*target));
                 }
-                TerminatorKind::SpreadReturn(src) => {
-                    let ret_val = match src {
-                        MirSpreadSource::Call { callee, .. } => {
+                TerminatorKind::SpreadReturn { values, source } => {
+                    // Functions here return one value, so the first one wins.
+                    let ret_val = match (values.first(), source) {
+                        (Some(first), _) => self.eval_operand(first),
+                        (None, MirSpreadSource::Call { callee, .. }) => {
                             let c_val = self.eval_operand(callee);
                             let res = self.tmp();
                             let _ = writeln!(
@@ -754,7 +770,7 @@ impl<'a> FunctionEmitter<'a> {
                             );
                             res
                         }
-                        MirSpreadSource::Vararg => {
+                        (None, MirSpreadSource::Vararg) => {
                             let res = self.tmp();
                             let _ = writeln!(self.out, "  {} = call %NykVal @__nyk_vararg()", res);
                             res

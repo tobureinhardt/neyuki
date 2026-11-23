@@ -91,10 +91,17 @@ impl RegAlloc {
     }
 }
 
-/// Lays a producer out starting at register `at` and leaves every value it
-/// yields on the stack from there. A trailing producer is emitted just above
+/// Lays a producer out starting at register `at` and leaves the values it
+/// yields on the stack from there: all of them when `want` is `MULTRET`, or
+/// exactly `want`, padded with nil. A trailing producer is emitted just above
 /// this call's own arguments, so the two runs are contiguous.
-fn emit_spread_source(source: &SpreadSource, at: u8, regs: &mut RegAlloc, proto: &mut Proto) {
+fn emit_spread_source(
+    source: &SpreadSource,
+    at: u8,
+    want: u8,
+    regs: &mut RegAlloc,
+    proto: &mut Proto,
+) {
     match source {
         SpreadSource::Call {
             callee,
@@ -120,7 +127,7 @@ fn emit_spread_source(source: &SpreadSource, at: u8, regs: &mut RegAlloc, proto:
             }
             let argc = match trailing {
                 Some(inner) => {
-                    emit_spread_source(inner, at + 1 + args.len() as u8, regs, proto);
+                    emit_spread_source(inner, at + 1 + args.len() as u8, MULTRET, regs, proto);
                     MULTRET
                 }
                 None => args.len() as u8,
@@ -129,13 +136,15 @@ fn emit_spread_source(source: &SpreadSource, at: u8, regs: &mut RegAlloc, proto:
                 Instruction::Call {
                     callee: at,
                     argc,
-                    retc: MULTRET,
+                    retc: want,
                 },
                 1,
             );
         }
         SpreadSource::Vararg => {
-            proto.emit(Instruction::Vararg { dst: at, count: 0 }, 1);
+            // A count of 0 also copies every vararg.
+            let count = if want == MULTRET { 0 } else { want };
+            proto.emit(Instruction::Vararg { dst: at, count }, 1);
         }
     }
 }
@@ -479,7 +488,12 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                     } => 1u8
                         .saturating_add(fixed_args.len() as u8)
                         .max(1u8.saturating_add(*retc)),
-                    SpreadSink::List { .. } | SpreadSink::Return => 0,
+                    SpreadSink::Return { values } => values.len() as u8,
+                    SpreadSink::List { .. } => 0,
+                    // The values land where the producer starts.
+                    SpreadSink::Values { dsts } => {
+                        return Some(produced.max(dsts.len() as u8));
+                    }
                 };
                 Some(consumed.saturating_add(produced))
             }
@@ -1218,12 +1232,16 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                 // The consuming call sits at the base of the window with its
                 // fixed arguments after it; the produced values must follow
                 // immediately, so the producer is placed right after them.
-                let produce_at = match sink {
-                    SpreadSink::Call { fixed_args, .. } => cw + 1 + fixed_args.len() as u8,
-                    SpreadSink::List { .. } | SpreadSink::Return => cw,
+                let (produce_at, want) = match sink {
+                    SpreadSink::Call { fixed_args, .. } => {
+                        (cw + 1 + fixed_args.len() as u8, MULTRET)
+                    }
+                    SpreadSink::Return { values } => (cw + values.len() as u8, MULTRET),
+                    SpreadSink::List { .. } => (cw, MULTRET),
+                    SpreadSink::Values { dsts } => (cw, dsts.len() as u8),
                 };
 
-                emit_spread_source(source, produce_at, &mut regs, &mut proto);
+                emit_spread_source(source, produce_at, want, &mut regs, &mut proto);
 
                 match sink {
                     SpreadSink::Call {
@@ -1273,14 +1291,31 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
                             1,
                         );
                     }
-                    SpreadSink::Return => {
+                    SpreadSink::Return { values } => {
+                        // The fixed values go just below the produced ones.
+                        for (i, v) in values.iter().enumerate() {
+                            let rv = regs.get(*v, &mut proto);
+                            let dst = cw + i as u8;
+                            if rv != dst {
+                                proto.emit(Instruction::Move { dst, src: rv }, 1);
+                            }
+                        }
                         proto.emit(
                             Instruction::Return {
-                                base: produce_at,
+                                base: cw,
                                 count: MULTRET,
                             },
                             1,
                         );
+                    }
+                    SpreadSink::Values { dsts } => {
+                        for (slot, d) in dsts.iter().enumerate() {
+                            let rd = regs.get(*d, &mut proto);
+                            let src = cw + slot as u8;
+                            if rd != src {
+                                proto.emit(Instruction::Move { dst: rd, src }, 1);
+                            }
+                        }
                     }
                 }
             }

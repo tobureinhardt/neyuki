@@ -91,8 +91,22 @@ pub fn parse_prefix_inner(parser: &mut Parser) -> Result<Expr, String> {
 
     if parser.check_symbol("(") {
         parser.expect_symbol("(")?;
-        let expr = parse_expr(parser)?;
+        let inner = parse_expr(parser)?;
         parser.expect_symbol(")")?;
+        // Parentheses cut a call or `...` down to its first value.
+        let expr = if matches!(
+            inner,
+            Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Vararg { .. }
+        ) {
+            let expr = Expr::Paren {
+                id: NodeId::next(),
+                expr: Box::new(inner),
+            };
+            parser.record_span(expr.node_id(), start);
+            expr
+        } else {
+            inner
+        };
         return parse_postfix(parser, expr);
     }
 

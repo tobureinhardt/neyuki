@@ -265,6 +265,7 @@ fn test_repository_tests_survive_a_roundtrip() {
         "for_loops.nyk",
         "metatable.nyk",
         "methods.nyk",
+        "multiple_values.nyk",
         "repeat_until.nyk",
         "string_literals.nyk",
         "table_sort_cmp.nyk",

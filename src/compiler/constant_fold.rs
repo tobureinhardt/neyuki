@@ -460,6 +460,21 @@ fn fold_assign_target_scoped(target: AssignTarget, shadowed: &HashSet<String>) -
 fn fold_expr_scoped(expr: Expr, shadowed: &HashSet<String>) -> Expr {
     match expr {
         Expr::Literal { .. } | Expr::Variable { .. } | Expr::Vararg { .. } => expr,
+        Expr::Paren { expr: inner, id } => {
+            let inner = fold_expr_scoped(*inner, shadowed);
+            // A call folded to a constant is already one value.
+            if matches!(
+                inner,
+                Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Vararg { .. }
+            ) {
+                Expr::Paren {
+                    expr: Box::new(inner),
+                    id,
+                }
+            } else {
+                inner
+            }
+        }
         Expr::Interp { parts, id } => {
             let folded_parts: Vec<InterpPart> = parts
                 .into_iter()

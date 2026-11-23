@@ -144,6 +144,8 @@ pub enum StatementKind {
         value: Operand,
     },
     CloseUpvals(Vec<LocalId>),
+    /// Copies the first `dsts.len()` varargs into `dsts`, padding with nil.
+    VarargMany(Vec<LocalId>),
     DebugLocal {
         name: String,
         local: LocalId,
@@ -182,7 +184,11 @@ pub enum TerminatorKind {
         source: MirSpreadSource,
         target: BasicBlockId,
     },
-    SpreadReturn(MirSpreadSource),
+    /// Returns `values` followed by every value `source` produces.
+    SpreadReturn {
+        values: Vec<Operand>,
+        source: MirSpreadSource,
+    },
     ForPrep {
         base: LocalId,
         limit: LocalId,

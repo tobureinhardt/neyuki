@@ -1,0 +1,88 @@
+-- A call or `...` at the end of a list keeps all its values; anywhere else,
+-- or wrapped in parentheses, it gives exactly one.
+
+local function three() return 1, 2, 3 end
+
+-- `local a, b = ...` gives each name one vararg (#104).
+local function two(...)
+    local a, b = ...
+    return b
+end
+assert(two(1, 2) == 2, "the second name should get the second vararg")
+
+local function pad(...)
+    local a, b, c = ...
+    return a, b, c
+end
+local p1, p2, p3 = pad(7)
+assert(p1 == 7 and p2 == nil and p3 == nil, "missing varargs should become nil")
+
+-- A trailing call or `...` fills the names after the fixed values.
+local function shifted(...)
+    local first, second, third = 0, ...
+    return first, second, third
+end
+local s1, s2, s3 = shifted(1, 2, 3)
+assert(s1 == 0 and s2 == 1 and s3 == 2, "a trailing ... should fill the rest")
+
+local l1, l2, l3, l4 = 0, three()
+assert(l1 == 0 and l2 == 1 and l3 == 2 and l4 == 3, "a trailing call should fill the rest")
+
+local function reassign(...)
+    local x, y, z = "x", "y", "z"
+    x, y, z = ...
+    return x, y, z
+end
+local r1, r2, r3 = reassign("a", "b")
+assert(r1 == "a" and r2 == "b" and r3 == nil, "assigning ... should spread and pad")
+
+local t = {}
+t.a, t.b, t.c = 0, three()
+assert(t.a == 0 and t.b == 1 and t.c == 2, "member targets should take spread values")
+
+-- `...` or a call at the end of a `return` list keeps every value (#104).
+local obj = {}
+function obj:pass(x, ...)
+    return self, x, ...
+end
+assert(select("#", obj:pass(1, 2, 3)) == 4, "return should keep every vararg")
+local same, x, extra1, extra2 = obj:pass(1, 2, 3)
+assert(same == obj and x == 1 and extra1 == 2 and extra2 == 3)
+
+local function prefixed() return "p", three() end
+assert(select("#", prefixed()) == 4, "return should keep every result of a trailing call")
+
+local function nothing(...) return 1, ... end
+assert(select("#", nothing()) == 1, "an empty ... adds no values")
+
+-- Only the last expression spreads.
+local function middle() return three(), "end" end
+local m1, m2, m3 = middle()
+assert(m1 == 1 and m2 == "end" and m3 == nil, "a call before the end gives one value")
+
+-- Parentheses cut a call or `...` down to one value (#105).
+assert(select("#", (three())) == 1, "a parenthesized call gives one value")
+local function first(...) return (...) end
+assert(select("#", first(4, 5, 6)) == 1, "a parenthesized ... gives one value")
+assert(first(4, 5, 6) == 4)
+local function none() end
+assert(select("#", (none())) == 1, "a parenthesized empty call gives nil")
+assert((none()) == nil)
+
+local q1, q2 = (three())
+assert(q1 == 1 and q2 == nil, "parentheses stop a call filling several names")
+
+local packed = { (three()) }
+assert(#packed == 1, "parentheses stop a call filling a table")
+
+local function wrapped() return (three()) end
+assert(select("#", wrapped()) == 1, "parentheses stop a return spreading")
+
+local obj2 = { get = function(self) return self, 1 end }
+assert(select("#", (obj2:get())) == 1, "a parenthesized method call gives one value")
+
+-- Parentheses around other expressions change nothing.
+assert((1 + 2) * 3 == 9)
+assert(select("#", ((three()))) == 1)
+
+print("multiple values ok")

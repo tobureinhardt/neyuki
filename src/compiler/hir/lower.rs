@@ -309,6 +309,7 @@ impl<'a> HirLowerer<'a> {
                 params: params.clone(),
                 body: self.lower_block(body),
             },
+            Expr::Paren { expr, .. } => HirExprKind::Paren(Box::new(self.lower_expr(expr))),
             Expr::Unary { op, expr, .. } => HirExprKind::Unary {
                 op: *op,
                 expr: Box::new(self.lower_expr(expr)),

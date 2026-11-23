@@ -29,7 +29,7 @@ fn term_successors(term: &TerminatorKind) -> Vec<BasicBlockId> {
         | TerminatorKind::TForStep {
             body_bb, exit_bb, ..
         } => vec![*body_bb, *exit_bb],
-        TerminatorKind::SpreadReturn(_)
+        TerminatorKind::SpreadReturn { .. }
         | TerminatorKind::Return(_)
         | TerminatorKind::Unreachable => Vec::new(),
     }

@@ -136,7 +136,7 @@ pub fn build_cfg(instructions: &[IrInst]) -> ControlFlowGraph {
             }
             Some(IrInst::Return(_))
             | Some(IrInst::Spread {
-                sink: SpreadSink::Return,
+                sink: SpreadSink::Return { .. },
                 ..
             }) => {
                 // Exit block, no successors

@@ -181,7 +181,15 @@ pub fn format_inst(inst: &IrInst) -> String {
                 crate::compiler::ir::inst::SpreadSink::List { table } => {
                     format!("append_all(v{}, {})", table.0, src)
                 }
-                crate::compiler::ir::inst::SpreadSink::Return => format!("return {}", src),
+                crate::compiler::ir::inst::SpreadSink::Return { values } => {
+                    let mut all: Vec<String> = values.iter().map(|v| format!("v{}", v.0)).collect();
+                    all.push(src);
+                    format!("return {}", all.join(", "))
+                }
+                crate::compiler::ir::inst::SpreadSink::Values { dsts } => {
+                    let dsts_str: Vec<String> = dsts.iter().map(|d| format!("v{}", d.0)).collect();
+                    format!("{} = {}", dsts_str.join(", "), src)
+                }
             }
         }
         IrInst::Return(vars) => {
