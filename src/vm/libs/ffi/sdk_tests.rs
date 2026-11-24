@@ -116,10 +116,8 @@ fn run(src: &str) -> (VM, Result<HostValue, String>) {
     let (id, map) = init_extension_with_fn(&mut vm, sdk_init, None).expect("SDK init");
     vm.globals
         .insert(StrRef::from("EXT"), HostValue::from_usize(id as usize));
-    vm.globals.insert(
-        StrRef::from("F"),
-        HostValue::table(std::rc::Rc::new(RefCell::new(map))),
-    );
+    let map_val = vm.alloc_table(map);
+    vm.globals.insert(StrRef::from("F"), map_val);
     let prelude = "local ext = setmetatable({}, { __index = function(_, k)\n\
                    return function(...) return __ffi_ext_call(EXT, F[k], ...) end\n\
                    end })\n";

@@ -9,8 +9,7 @@ use crate::vm::machine::{CoroutineState, VM};
 use crate::vm::value::{Value, ValueView, VmTable};
 
 pub fn create_coroutine_lib() -> Value {
-    let t = Rc::new(RefCell::new(VmTable::new()));
-    let mut b = t.borrow_mut();
+    let mut b = VmTable::new();
 
     b.set_str(
         "create",
@@ -35,10 +34,7 @@ pub fn create_coroutine_lib() -> Value {
         crate::native!("coroutine.isyieldable", coroutine_isyieldable),
     );
     b.set_str("close", crate::native!("coroutine.close", coroutine_close));
-    b.frozen = true;
-
-    drop(b);
-    Value::table(t)
+    crate::vm::libs::args::frozen(b)
 }
 
 pub(crate) fn coroutine_create(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -443,18 +439,22 @@ fn coroutine_wrap(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         .next()
         .expect("coroutine.create returns the coroutine");
 
-    let wrapper_table = Rc::new(RefCell::new(VmTable::new()));
-    wrapper_table.borrow_mut().set_str("_co", co_table);
-    wrapper_table.borrow_mut().frozen = true;
+    let mut wrapper_table = VmTable::new();
+    wrapper_table.set_str("_co", co_table);
+    let wrapper_val = vm.alloc_table(wrapper_table);
 
-    let mt = Rc::new(RefCell::new(VmTable::new()));
-    mt.borrow_mut().set_str(
+    let mut mt = VmTable::new();
+    mt.set_str(
         "__call",
         crate::native!("wrapped_coroutine_call", wrapped_coroutine_call),
     );
-    wrapper_table.borrow_mut().metatable = Some(mt);
+    let mt_val = vm.alloc_table(mt);
+    vm.table_set_metatable(&wrapper_val, Some(mt_val))?;
+    if let Some(t) = wrapper_val.as_table() {
+        t.borrow_mut().frozen = true;
+    }
 
-    Ok(vec![Value::table(wrapper_table)])
+    Ok(vec![wrapper_val])
 }
 
 /// Whether `coroutine.yield` would succeed here: inside a coroutine and not

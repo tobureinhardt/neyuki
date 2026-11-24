@@ -179,16 +179,13 @@ fn coroutine_id(thread: &Rc<RefCell<VmTable>>) -> Option<usize> {
 }
 
 pub fn create_task_lib() -> Value {
-    let t = Rc::new(RefCell::new(VmTable::new()));
-    let mut b = t.borrow_mut();
+    let mut b = VmTable::new();
     b.set_str("spawn", crate::native!("task.spawn", task_spawn));
     b.set_str("defer", crate::native!("task.defer", task_defer));
     b.set_str("delay", crate::native!("task.delay", task_delay));
     b.set_str("wait", crate::native!("task.wait", task_wait));
     b.set_str("cancel", crate::native!("task.cancel", task_cancel));
-    b.frozen = true;
-    drop(b);
-    Value::table(t)
+    crate::vm::libs::args::frozen(b)
 }
 
 /// The thread for a `spawn`/`defer`/`delay` argument: a function becomes a
@@ -454,7 +451,7 @@ fn drain_completions(vm: &mut VM) {
 // SCHEDULING -----------------------------------------------------------------
 
 fn empty_events() -> Value {
-    Value::table(Rc::new(RefCell::new(VmTable::new())))
+    crate::vm::heap::VmHeap::alloc_table_untracked(VmTable::new())
 }
 
 /// Serves the parked pollers: pumps the event loop for up to `wait`, wakes

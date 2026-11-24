@@ -5,7 +5,6 @@
 //! function (level 1) outwards. Native functions have no frames of their
 //! own.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::bytecode::proto::{LocalVarInfo, Proto};
@@ -171,7 +170,7 @@ fn debug_getinfo(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     if let Some(f) = args.first().filter(|v| v.is_callable()) {
         table.set_str("func", f.clone());
     }
-    Ok(vec![Value::table(Rc::new(RefCell::new(table)))])
+    Ok(vec![vm.alloc_table(table)])
 }
 
 /// The locals in scope at the frame's current instruction, in declaration

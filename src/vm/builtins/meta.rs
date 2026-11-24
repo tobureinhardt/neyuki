@@ -20,36 +20,13 @@ pub fn builtin_setmetatable(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, S
     {
         return Err("cannot change a protected metatable".to_string());
     }
-    let t_rc = t.to_rc();
-    // Pin tables carrying a finalizer so refcounting alone can
-    // never destroy them before a sweep runs their `__gc`; unpin
-    // as soon as the metatable stops providing one.
-    let pinned_now = mt_val.as_table().is_some_and(|mt| {
-        mt.borrow()
-            .fields
-            .get("__gc")
-            .is_some_and(|h| h.is_callable())
-    });
-    match mt_val.view() {
-        ValueView::Nil => {
-            t_rc.borrow_mut().metatable = None;
-            vm.gc.unpin_table(&t_rc);
-            Ok(vec![tbl_val.clone()])
-        }
-        ValueView::Table(mt) => {
-            t_rc.borrow_mut().metatable = Some(mt.to_rc());
-            if pinned_now {
-                vm.gc.pin_table(&t_rc);
-            } else {
-                vm.gc.unpin_table(&t_rc);
-            }
-            if crate::vm::gc::table_weak_values(&t_rc) {
-                vm.gc.has_weak_tables = true;
-            }
-            Ok(vec![tbl_val.clone()])
-        }
-        _ => Err("metatable must be a table or nil".to_string()),
-    }
+    let mt = match mt_val.view() {
+        ValueView::Nil => None,
+        ValueView::Table(_) => Some(mt_val.clone()),
+        _ => return Err("metatable must be a table or nil".to_string()),
+    };
+    vm.table_set_metatable(tbl_val, mt)?;
+    Ok(vec![tbl_val.clone()])
 }
 
 pub fn builtin_getmetatable(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {

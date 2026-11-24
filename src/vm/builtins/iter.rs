@@ -122,5 +122,5 @@ pub fn globals_table() -> Value {
     );
     let mut table = crate::vm::value::VmTable::new();
     table.metatable = Some(Rc::new(RefCell::new(meta)));
-    Value::table(Rc::new(RefCell::new(table)))
+    crate::vm::heap::VmHeap::alloc_table_untracked(table)
 }

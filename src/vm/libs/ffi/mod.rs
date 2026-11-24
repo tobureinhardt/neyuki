@@ -18,7 +18,6 @@ mod sdk_tests;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::rc::Rc;
 
 use libloading::Library;
 
@@ -317,7 +316,7 @@ fn builtin_open(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
     Ok(vec![
         Value::from_usize(id as usize),
-        Value::table(Rc::new(RefCell::new(sym_map))),
+        vm.alloc_table(sym_map),
     ])
 }
 
@@ -468,10 +467,7 @@ fn builtin_load_extension(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Str
     let path = str_arg(args, 0, "path")?;
     let resolved = vm.permissions.resolve_ffi_library(path)?;
     let (id, fn_map) = ext::load_extension(vm, &resolved, path)?;
-    Ok(vec![
-        Value::from_usize(id as usize),
-        Value::table(Rc::new(RefCell::new(fn_map))),
-    ])
+    Ok(vec![Value::from_usize(id as usize), vm.alloc_table(fn_map)])
 }
 
 fn builtin_ext_call(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -884,14 +880,11 @@ mod tests {
         abs_sig.set_str("returns", Value::str("i32"));
 
         let mut sigs = VmTable::new();
-        sigs.set_str("strlen", Value::table(Rc::new(RefCell::new(strlen_sig))));
-        sigs.set_str("abs", Value::table(Rc::new(RefCell::new(abs_sig))));
+        sigs.set_str("strlen", vm.alloc_table(strlen_sig));
+        sigs.set_str("abs", vm.alloc_table(abs_sig));
 
-        let opened = builtin_open(
-            &mut vm,
-            &[Value::NIL, Value::table(Rc::new(RefCell::new(sigs)))],
-        )
-        .unwrap();
+        let sigs_val = vm.alloc_table(sigs);
+        let opened = builtin_open(&mut vm, &[Value::NIL, sigs_val]).unwrap();
         let lib_id = opened[0].clone();
         let Some(sym_map) = opened[1].as_table() else {
             panic!("expected symbol map");
@@ -1031,8 +1024,8 @@ mod tests {
         vm
     }
 
-    fn empty_sigs() -> Value {
-        Value::table(Rc::new(RefCell::new(VmTable::new())))
+    fn empty_sigs(vm: &mut VM) -> Value {
+        vm.alloc_table(VmTable::new())
     }
 
     #[cfg(unix)]
@@ -1042,12 +1035,12 @@ mod tests {
         // Resolves to ./libc.so.6 (inside "."), which does not exist; dlopen
         // must not fall back to the system search path.
         for name in ["libc.so.6", "libm.so.6", "libdl.so.2"] {
-            let err = builtin_open(&mut vm, &[Value::str(name), empty_sigs()]).err();
+            let empty = empty_sigs(&mut vm);
+            let err = builtin_open(&mut vm, &[Value::str(name), empty]).err();
             assert!(err.is_some(), "{name} must not load by search path");
         }
-        let err = builtin_open(&mut vm, &[Value::NIL, empty_sigs()])
-            .err()
-            .unwrap();
+        let empty = empty_sigs(&mut vm);
+        let err = builtin_open(&mut vm, &[Value::NIL, empty]).err().unwrap();
         assert!(err.contains("permission denied"), "{err}");
         let err = builtin_load_extension(&mut vm, &[Value::str("libc.so.6")])
             .err()

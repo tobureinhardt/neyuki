@@ -439,7 +439,7 @@ fn load_native_package(
         Some(t) => t.borrow().get_str("_bindExtension"),
         None => Value::NIL,
     };
-    let fn_map = Value::table(std::rc::Rc::new(std::cell::RefCell::new(fn_map)));
+    let fn_map = vm.alloc_table(fn_map);
     let mut out = vm.call_function(bind, &[Value::from_usize(id as usize), fn_map])?;
     Ok(if out.is_empty() {
         Value::NIL
@@ -513,9 +513,7 @@ pub fn builtin_require(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
     let proto = loader.compile_bytes(&resolved_path, &bytes, pkg)?;
     // While the module runs, a `require` cycle back into it gets an empty
     // table instead of running it again (docs/modules.md, §3.2).
-    let pending = Value::table(std::rc::Rc::new(std::cell::RefCell::new(
-        crate::vm::value::VmTable::new(),
-    )));
+    let pending = vm.alloc_table(crate::vm::value::VmTable::new());
     vm.modules.insert(key.clone(), pending);
     // Run on top of the current frames: `execute` would reset the
     // stack out from under whatever called `require`.

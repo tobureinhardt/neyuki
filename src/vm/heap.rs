@@ -54,6 +54,11 @@ impl VmHeap {
     }
 
     #[inline]
+    pub fn alloc_buffer_untracked(buf: VmBuffer) -> Value {
+        Value::buffer(Rc::new(RefCell::new(buf)))
+    }
+
+    #[inline]
     pub fn alloc_closure(proto: Rc<Proto>, upvalues: Vec<Rc<Upvalue>>) -> Value {
         Value::closure(Rc::new(VmClosure { proto, upvalues }))
     }
@@ -152,9 +157,6 @@ impl VM {
         };
         let had_gc = {
             let mut tbl = t.borrow_mut();
-            if tbl.frozen {
-                return Err("cannot change metatable of a frozen table".to_string());
-            }
             tbl.metatable = mt_rc.clone();
             mt_rc
                 .as_ref()
@@ -166,6 +168,9 @@ impl VM {
             self.gc.pin_table(&rc);
         } else {
             self.gc.unpin_table(&rc);
+        }
+        if crate::vm::gc::table_weak_values(&rc) {
+            self.gc.has_weak_tables = true;
         }
         Ok(true)
     }

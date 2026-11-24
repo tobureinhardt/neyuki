@@ -570,8 +570,10 @@ unsafe extern "C" fn api_handle_kind(value: NeyukiExtValue) -> u32 {
 
 unsafe extern "C" fn api_new_table(array_hint: usize, field_hint: usize) -> NeyukiExtValue {
     api_value(|s| {
+        let mut vm_ptr = s.vm()?;
         let t = VmTable::with_capacity(array_hint.min(1 << 16), field_hint.min(1 << 16));
-        Ok(s.new_handle(Value::table(Rc::new(RefCell::new(t)))))
+        let val = unsafe { vm_ptr.as_mut() }.alloc_table(t);
+        Ok(s.new_handle(val))
     })
 }
 
@@ -703,12 +705,14 @@ unsafe extern "C" fn api_new_buffer(data: *const u8, len: usize) -> NeyukiExtVal
         if len > 64 * 1024 * 1024 {
             return Err("buffer too large (at most 64 MiB)".to_string());
         }
+        let mut vm_ptr = s.vm()?;
         let buf = if data.is_null() {
             VmBuffer::new(len)
         } else {
             VmBuffer::from_bytes(unsafe { std::slice::from_raw_parts(data, len) }.to_vec())
         };
-        Ok(s.new_handle(Value::buffer(Rc::new(RefCell::new(buf)))))
+        let val = unsafe { vm_ptr.as_mut() }.alloc_buffer(buf);
+        Ok(s.new_handle(val))
     })
 }
 
@@ -1417,7 +1421,7 @@ pub(super) mod tests {
             t.array.push(Value::int(i));
         }
         t.set_str("name", Value::str("nums"));
-        let t = Value::table(Rc::new(RefCell::new(t)));
+        let t = vm.alloc_table(t);
         let res = call_ext(&mut vm, id, idx(&map, "inspect"), &[t]).unwrap();
         assert_eq!(res, vec![Value::int(18), Value::int(3), Value::str("nums")]);
 
@@ -1470,7 +1474,7 @@ pub(super) mod tests {
     fn persistent_handles_outlive_the_call_and_local_ones_do_not() {
         let mut vm = VM::new();
         let (id, map) = load(&mut vm);
-        let t = Value::table(Rc::new(RefCell::new(VmTable::new())));
+        let t = vm.alloc_table(VmTable::new());
         call_ext(&mut vm, id, idx(&map, "keep"), std::slice::from_ref(&t)).unwrap();
         let res = call_ext(&mut vm, id, idx(&map, "kept"), &[]).unwrap();
         assert_eq!(res, vec![t]);
@@ -1502,10 +1506,8 @@ pub(super) mod tests {
         let (id, map) = load(&mut vm);
         vm.globals
             .insert(StrRef::from("EXT"), Value::from_usize(id as usize));
-        vm.globals.insert(
-            StrRef::from("F"),
-            Value::table(Rc::new(RefCell::new(map.clone()))),
-        );
+        let f_table = vm.alloc_table(map.clone());
+        vm.globals.insert(StrRef::from("F"), f_table);
         (vm, id, map)
     }
 

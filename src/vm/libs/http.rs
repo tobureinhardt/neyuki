@@ -23,7 +23,6 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -333,12 +332,12 @@ fn multi_headers_table<'a>(headers: impl Iterator<Item = (&'a str, &'a [u8])>) -
     for (name, values) in grouped {
         let mut arr = VmTable::with_capacity(values.len(), 0);
         arr.array = values;
-        arr.frozen = true;
-        table
-            .fields
-            .insert(StrRef::from(name), Value::table(Rc::new(RefCell::new(arr))));
+        table.fields.insert(
+            StrRef::from(name),
+            crate::vm::heap::VmHeap::alloc_frozen(arr),
+        );
     }
-    Value::table(Rc::new(RefCell::new(table)))
+    crate::vm::heap::VmHeap::alloc_table_untracked(table)
 }
 
 fn optional_body_arg(args: &[Value], index: usize, name: &str) -> Result<Option<Vec<u8>>, String> {
@@ -375,7 +374,7 @@ fn headers_table<'a>(headers: impl Iterator<Item = (&'a str, &'a [u8])>) -> Valu
             .fields
             .insert(StrRef::from(name), Value::string(value));
     }
-    Value::table(Rc::new(RefCell::new(table)))
+    crate::vm::heap::VmHeap::alloc_table_untracked(table)
 }
 
 /// Neyuki strings are UTF-8, so bodies that are not valid UTF-8 have their
@@ -390,7 +389,7 @@ fn record(fields: Vec<(&str, Value)>) -> Value {
     for (name, value) in fields {
         table.fields.insert(StrRef::from(name), value);
     }
-    Value::table(Rc::new(RefCell::new(table)))
+    crate::vm::heap::VmHeap::alloc_table_untracked(table)
 }
 
 fn integer(value: u64) -> Value {
@@ -552,7 +551,7 @@ fn builtin_request(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 /// Builds the table `__http_request` returns, parking a streamed body.
-fn finish_request(_vm: &mut VM, raw: RawResponse) -> Result<Vec<Value>, String> {
+fn finish_request(vm: &mut VM, raw: RawResponse) -> Result<Vec<Value>, String> {
     let headers = headers_table(
         raw.headers
             .iter()
@@ -578,10 +577,7 @@ fn finish_request(_vm: &mut VM, raw: RawResponse) -> Result<Vec<Value>, String> 
                 let raw_bytes = err.into_bytes();
                 let lossy = String::from_utf8_lossy(&raw_bytes).into_owned();
                 fields.push(("body", Value::string(lossy)));
-                fields.push((
-                    "bytes",
-                    Value::buffer(Rc::new(RefCell::new(VmBuffer::from_bytes(raw_bytes)))),
-                ));
+                fields.push(("bytes", vm.alloc_buffer(VmBuffer::from_bytes(raw_bytes))));
             }
         },
         ResponseBody::Stream(reader) => {
@@ -636,7 +632,7 @@ fn builtin_read(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 }),
             ))
         },
-        move |_vm, (reader, chunk)| {
+        move |vm, (reader, chunk)| {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(err) => {
@@ -657,9 +653,9 @@ fn builtin_read(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             if chunk.is_empty() {
                 return Ok(vec![Value::NIL]);
             }
-            Ok(vec![Value::buffer(Rc::new(RefCell::new(
+            Ok(vec![vm.alloc_buffer(
                 crate::vm::buffer::VmBuffer::from_bytes(chunk),
-            )))])
+            )])
         },
     )
 }
@@ -1788,7 +1784,7 @@ fn insert_multi_field(table: &mut VmTable, key: &str, value: Value) {
         let mut list = VmTable::with_capacity(2, 0);
         list.array.push(existing);
         list.array.push(value);
-        table.set_str(key, Value::table(Rc::new(RefCell::new(list))));
+        table.set_str(key, crate::vm::heap::VmHeap::alloc_table_untracked(list));
     }
 }
 
@@ -1919,9 +1915,9 @@ fn parse_multipart_bytes_with_limits(
                 ("size", integer(payload.len() as u64)),
                 (
                     "data",
-                    Value::buffer(Rc::new(RefCell::new(VmBuffer::from_bytes(
+                    crate::vm::heap::VmHeap::alloc_buffer_untracked(VmBuffer::from_bytes(
                         payload.to_vec(),
-                    )))),
+                    )),
                 ),
             ]);
             insert_multi_field(&mut files, &field_name, file_record.clone());
@@ -1946,8 +1942,14 @@ fn parse_multipart_bytes_with_limits(
     }
 
     Ok(record(vec![
-        ("fields", Value::table(Rc::new(RefCell::new(fields)))),
-        ("files", Value::table(Rc::new(RefCell::new(files)))),
+        (
+            "fields",
+            crate::vm::heap::VmHeap::alloc_table_untracked(fields),
+        ),
+        (
+            "files",
+            crate::vm::heap::VmHeap::alloc_table_untracked(files),
+        ),
         ("parts", crate::vm::libs::args::array(parts_list)),
     ]))
 }
@@ -2376,8 +2378,16 @@ mod tests {
         let mut cookies = VmTable::new();
         cookies.array.push(Value::str("a=1; HttpOnly"));
         cookies.array.push(Value::str("b=2; Path=/"));
-        h.set_str("set-cookie", Value::table(Rc::new(RefCell::new(cookies))));
-        let parsed = headers_arg(&[Value::table(Rc::new(RefCell::new(h)))], 0, "headers").unwrap();
+        h.set_str(
+            "set-cookie",
+            crate::vm::heap::VmHeap::alloc_table_untracked(cookies),
+        );
+        let parsed = headers_arg(
+            &[crate::vm::heap::VmHeap::alloc_table_untracked(h)],
+            0,
+            "headers",
+        )
+        .unwrap();
         assert_eq!(
             parsed,
             vec![
@@ -2389,7 +2399,12 @@ mod tests {
         let mut bad = VmTable::new();
         bad.set_str("x-test", Value::str("ok\r\nSet-Cookie: evil=1"));
         assert!(
-            headers_arg(&[Value::table(Rc::new(RefCell::new(bad)))], 0, "headers").is_err(),
+            headers_arg(
+                &[crate::vm::heap::VmHeap::alloc_table_untracked(bad)],
+                0,
+                "headers"
+            )
+            .is_err(),
             "CRLF header injection must be rejected"
         );
     }
