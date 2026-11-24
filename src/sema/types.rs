@@ -95,6 +95,17 @@ impl NeyukiType {
         }
     }
 
+    /// The type of the first value, for a multi-value result (`_0`, `_1`, ...)
+    /// cut down to one value, as by parentheses.
+    pub fn first_value(&self) -> NeyukiType {
+        match self {
+            NeyukiType::Record(fields) if fields.first().is_some_and(|(k, _)| k == "_0") => {
+                fields[0].1.clone()
+            }
+            other => other.clone(),
+        }
+    }
+
     pub fn is_assignable_to(&self, target: &NeyukiType) -> bool {
         if *self == NeyukiType::Any || *target == NeyukiType::Any {
             return true;

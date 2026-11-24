@@ -147,7 +147,7 @@ fn push_term_successors(term: &TerminatorKind, out: &mut Vec<BasicBlockId>) {
             out.push(*body_bb);
             out.push(*exit_bb);
         }
-        TerminatorKind::SpreadReturn(_)
+        TerminatorKind::SpreadReturn { .. }
         | TerminatorKind::Return(_)
         | TerminatorKind::Unreachable => {}
     }
@@ -187,7 +187,7 @@ fn remap_term_target(term: &mut TerminatorKind, from: BasicBlockId, to: BasicBlo
             replace(body_bb);
             replace(exit_bb);
         }
-        TerminatorKind::SpreadReturn(_)
+        TerminatorKind::SpreadReturn { .. }
         | TerminatorKind::Return(_)
         | TerminatorKind::Unreachable => {}
     }
@@ -212,6 +212,14 @@ fn fold_constants_and_branches(body: &mut MirBody) -> bool {
     for bb in &mut body.blocks {
         consts.fill(None);
         for stmt in &mut bb.statements {
+            if let StatementKind::VarargMany(dsts) = &stmt.kind {
+                for d in dsts {
+                    if let Some(slot) = consts.get_mut(d.0 as usize) {
+                        *slot = None;
+                    }
+                }
+                continue;
+            }
             let StatementKind::Assign(place, rvalue) = &mut stmt.kind else {
                 continue;
             };
@@ -366,7 +374,9 @@ fn eliminate_dead_temps(body: &mut MirBody) -> bool {
                         }
                     }
                 }
-                StatementKind::DebugLocal { .. } | StatementKind::DebugScopeEnd { .. } => {}
+                StatementKind::VarargMany(_)
+                | StatementKind::DebugLocal { .. }
+                | StatementKind::DebugScopeEnd { .. } => {}
             }
         }
         match &bb.terminator {
@@ -396,7 +406,12 @@ fn eliminate_dead_temps(body: &mut MirBody) -> bool {
                 }
                 mark_spread_reads(source, &mut reads);
             }
-            TerminatorKind::SpreadReturn(src) => mark_spread_reads(src, &mut reads),
+            TerminatorKind::SpreadReturn { values, source } => {
+                for v in values {
+                    mark_operand_reads(v, &mut reads);
+                }
+                mark_spread_reads(source, &mut reads);
+            }
             TerminatorKind::ForPrep {
                 base,
                 limit,

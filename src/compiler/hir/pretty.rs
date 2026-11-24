@@ -239,6 +239,11 @@ fn write_expr(out: &mut String, expr: &HirExpr) {
         }
         HirExprKind::Variable(name) => out.push_str(name),
         HirExprKind::Vararg => out.push_str("..."),
+        HirExprKind::Paren(inner) => {
+            out.push('(');
+            write_expr(out, inner);
+            out.push(')');
+        }
         HirExprKind::Member { object, field } => {
             write_expr(out, object);
             let _ = write!(out, ".{}", field);

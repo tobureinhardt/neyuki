@@ -263,6 +263,11 @@ fn write_expr(out: &mut String, expr: &ThirExpr) {
             let _ = write!(out, "{}[{}]", name, fmt_binding(*binding));
         }
         ThirExprKind::Vararg => out.push_str("..."),
+        ThirExprKind::Paren(inner) => {
+            out.push('(');
+            write_expr(out, inner);
+            out.push(')');
+        }
         ThirExprKind::Member {
             object,
             field,

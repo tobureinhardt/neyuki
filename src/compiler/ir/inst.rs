@@ -16,8 +16,10 @@ pub enum SpreadSink {
     },
     /// Appended to a table constructor's array part.
     List { table: IrVar },
-    /// Returned from the enclosing function.
-    Return,
+    /// Returned from the enclosing function after the fixed `values`.
+    Return { values: Vec<IrVar> },
+    /// Cut to exactly `dsts.len()` values, padded with nil, and copied out.
+    Values { dsts: Vec<IrVar> },
 }
 
 /// What produces a run of values: a call keeping all its results, or `...`.
@@ -264,7 +266,7 @@ impl IrInst {
             }
             Self::Call { dsts, .. }
             | Self::Spread {
-                sink: SpreadSink::Call { dsts, .. },
+                sink: SpreadSink::Call { dsts, .. } | SpreadSink::Values { dsts },
                 ..
             } => {
                 for &d in dsts {
@@ -365,7 +367,12 @@ impl IrInst {
                         }
                     }
                     SpreadSink::List { table } => f(*table),
-                    SpreadSink::Return => {}
+                    SpreadSink::Return { values } => {
+                        for &v in values {
+                            f(v);
+                        }
+                    }
+                    SpreadSink::Values { .. } => {}
                 }
             }
             Self::Phi { incoming, .. } => {
@@ -416,7 +423,7 @@ impl IrInst {
             self,
             Self::Return(_)
                 | Self::Spread {
-                    sink: SpreadSink::Return,
+                    sink: SpreadSink::Return { .. },
                     ..
                 }
                 | Self::Jump(_)

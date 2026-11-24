@@ -103,6 +103,7 @@ fn optimize_expr(expr: &mut HirExpr, opt_level: OptLevel) {
         HirExprKind::Function { body, .. } => {
             optimize_block(body, opt_level);
         }
+        HirExprKind::Paren(inner) => optimize_expr(inner, opt_level),
         HirExprKind::Unary { op, expr: inner } => {
             optimize_expr(inner, opt_level);
             if opt_level != OptLevel::O1 {

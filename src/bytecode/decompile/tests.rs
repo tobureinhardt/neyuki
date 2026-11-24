@@ -8,6 +8,8 @@ use crate::compiler::{OptLevel, Options, compile_program};
 use crate::vm::VM;
 
 const LOST: &str = "could not be recovered";
+/// What a generic `for` falls back to when its source isn't one expression.
+const PASS_THROUGH: &str = " in (function(...)";
 
 /// Compiles `source`, decompiles it, and checks that the decompiled source
 /// compiles again and returns what the original returns. Returns the
@@ -237,7 +239,7 @@ return `{greeting} {#quoted} {bits} {-(-3)} {2 ^ 10} {7 // 2} {1.5}`
 
 #[test]
 fn test_generic_for_sources() {
-    roundtrip(
+    let text = roundtrip(
         r##"
 local sum = 0
 for v in { 1, 2, 3, extra = 4 } do
@@ -267,6 +269,39 @@ end
 return `{sum} {keys} {table.concat(seen, ",")} {#ip}`
 "##,
     );
+    assert!(!text.contains(PASS_THROUGH), "{}", text);
+}
+
+/// The optimizer hoists the loop body's copy of `ip` between the `ipairs`
+/// call and the loop. `ip`'s register is later reused for `step`, which
+/// `each` captures, but no closure exists while the call runs, so the call
+/// can still become the loop's source (#106).
+#[test]
+fn test_generic_for_source_past_a_hoisted_copy() {
+    let text = roundtrip(
+        r##"
+for k, v in pairs({ a = 1, b = 2, 3 }) do
+end
+local ip = {}
+for i, v in ipairs({ "a", "b", nil, "d" }) do
+    ip[i] = v
+end
+local count = #ip
+local function step(state, i)
+    i = i + 1
+    if i > #state then return nil end
+    return i, state[i]
+end
+local function each(t)
+    return step, t, 0
+end
+local seen = 0
+for _ in each({ "p", "q" }) do seen += 1 end
+return `{count} {seen}`
+"##,
+    );
+    assert!(!text.contains(PASS_THROUGH), "{}", text);
+    assert!(text.contains("in ipairs({"), "{}", text);
 }
 
 /// The repository's own self-checking tests still pass after a round trip
@@ -284,6 +319,7 @@ fn test_repository_tests_survive_a_roundtrip() {
         "for_loops.nyk",
         "metatable.nyk",
         "methods.nyk",
+        "multiple_values.nyk",
         "repeat_until.nyk",
         "string_literals.nyk",
         "table_sort_cmp.nyk",
@@ -299,6 +335,13 @@ fn test_repository_tests_survive_a_roundtrip() {
         assert!(
             !text.contains(LOST),
             "{}: a function was not recovered:\n{}",
+            file,
+            text
+        );
+        // Every loop in these files is an ordinary `for ... in <expr>`.
+        assert!(
+            !text.contains(PASS_THROUGH),
+            "{}: a generic for loop fell back to a pass-through call:\n{}",
             file,
             text
         );

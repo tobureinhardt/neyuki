@@ -410,6 +410,10 @@ impl ThirLowerer {
                 )
             }
             HirExprKind::Vararg => (NeyukiType::Any, ThirExprKind::Vararg),
+            HirExprKind::Paren(inner) => {
+                let inner = self.lower_expr(inner);
+                (inner.ty.first_value(), ThirExprKind::Paren(Box::new(inner)))
+            }
             HirExprKind::Member { object, field } => {
                 let obj = self.lower_expr(object);
                 let is_module_import = is_module_import_member(&obj.kind);

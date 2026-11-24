@@ -66,6 +66,12 @@ pub enum Expr {
         entries: Vec<TableEntry>,
         id: NodeId,
     },
+    /// A call or `...` in parentheses, which yields exactly one value.
+    /// Other parenthesized expressions need no node of their own.
+    Paren {
+        expr: Box<Expr>,
+        id: NodeId,
+    },
 }
 
 impl PartialEq for Expr {
@@ -160,6 +166,7 @@ impl PartialEq for Expr {
                 },
             ) => la == lb && oa == ob && ra == rb,
             (Expr::Table { entries: a, .. }, Expr::Table { entries: b, .. }) => a == b,
+            (Expr::Paren { expr: a, .. }, Expr::Paren { expr: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -179,7 +186,8 @@ impl Expr {
             | Expr::Function { id, .. }
             | Expr::Unary { id, .. }
             | Expr::Binary { id, .. }
-            | Expr::Table { id, .. } => *id,
+            | Expr::Table { id, .. }
+            | Expr::Paren { id, .. } => *id,
         }
     }
 

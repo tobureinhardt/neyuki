@@ -581,7 +581,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 self.analyze_expr(object);
                 self.analyze_expr(index);
             }
-            Expr::Unary { expr, .. } => {
+            Expr::Unary { expr, .. } | Expr::Paren { expr, .. } => {
                 self.analyze_expr(expr);
             }
             Expr::Binary { left, right, .. } => {

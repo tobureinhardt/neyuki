@@ -261,6 +261,7 @@ pub fn pretty_print_expr(expr: &Expr) -> String {
         Expr::Literal { value: lit, .. } => lit.to_string(),
         Expr::Variable { name: v, .. } => v.clone(),
         Expr::Vararg { .. } => "...".to_string(),
+        Expr::Paren { expr, .. } => format!("({})", pretty_print_expr(expr)),
         Expr::Interp { parts, .. } => {
             let mut out = String::from("`");
             for part in parts {
@@ -355,6 +356,7 @@ pub fn to_sexpr(expr: &Expr) -> String {
         Expr::Literal { value: lit, .. } => lit.to_string(),
         Expr::Variable { name: v, .. } => v.clone(),
         Expr::Vararg { .. } => "...".to_string(),
+        Expr::Paren { expr, .. } => format!("(paren {})", to_sexpr(expr)),
         Expr::Unary {
             op, expr: inner, ..
         } => format!("({} {})", op, to_sexpr(inner)),

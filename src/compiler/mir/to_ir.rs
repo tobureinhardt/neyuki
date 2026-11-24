@@ -326,6 +326,14 @@ impl MirToIr {
                             vars: vars.iter().copied().map(Self::var).collect(),
                         });
                     }
+                    StatementKind::VarargMany(dsts) => {
+                        self.instructions.push(IrInst::Spread {
+                            source: SpreadSource::Vararg,
+                            sink: SpreadSink::Values {
+                                dsts: dsts.iter().copied().map(Self::var).collect(),
+                            },
+                        });
+                    }
                     StatementKind::DebugLocal { name, local } => {
                         self.instructions.push(IrInst::DebugLocal {
                             name: name.clone(),
@@ -423,11 +431,12 @@ impl MirToIr {
                         self.instructions.push(IrInst::Jump(Self::label(*target)));
                     }
                 }
-                TerminatorKind::SpreadReturn(src) => {
-                    let source = self.convert_spread_source(src);
+                TerminatorKind::SpreadReturn { values, source } => {
+                    let values = values.iter().map(|v| self.materialize_operand(v)).collect();
+                    let source = self.convert_spread_source(source);
                     self.instructions.push(IrInst::Spread {
                         source,
-                        sink: SpreadSink::Return,
+                        sink: SpreadSink::Return { values },
                     });
                 }
                 TerminatorKind::ForPrep {

@@ -116,6 +116,8 @@ pub enum HirExprKind {
     Literal(Literal),
     Variable(String),
     Vararg,
+    /// A call or `...` cut down to its first value.
+    Paren(Box<HirExpr>),
     Member {
         object: Box<HirExpr>,
         field: String,

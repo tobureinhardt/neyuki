@@ -23,6 +23,7 @@ impl<'a> SemanticAnalyzer<'a> {
     /// (used when inferring unannotated function return types before entering scope).
     fn infer_expr_with_env(&self, expr: &Expr, env: &HashMap<String, NeyukiType>) -> NeyukiType {
         match expr {
+            Expr::Paren { expr: inner, .. } => self.infer_expr_with_env(inner, env).first_value(),
             Expr::Literal { value: val, .. } => match val {
                 Literal::Nil => NeyukiType::Nil,
                 Literal::Bool(_) => NeyukiType::Boolean,

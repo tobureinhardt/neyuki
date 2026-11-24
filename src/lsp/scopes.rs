@@ -612,7 +612,7 @@ impl Resolver<'_> {
                 self.stmts(body);
                 self.scopes.pop();
             }
-            Expr::Unary { expr, .. } => self.expr(expr),
+            Expr::Unary { expr, .. } | Expr::Paren { expr, .. } => self.expr(expr),
             Expr::Binary { left, right, .. } => {
                 self.expr(left);
                 self.expr(right);

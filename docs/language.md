@@ -209,6 +209,16 @@ local function sum(...: number): number
 end
 ```
 
+A call or `...` at the end of an argument list, a `return` list, a table constructor or the right side of an assignment keeps all of its values. Anywhere else it gives only the first one. Wrapping it in parentheses also keeps just the first value:
+
+```lua
+local function three() return 1, 2, 3 end
+local a, b, c, d = 0, three()   -- 0  1  2  3
+local x, y = three(), "end"     -- 1  "end"
+print(select("#", (three())))   --> 1
+local function first(...) return (...) end
+```
+
 ## Methods and objects
 
 `object:method(args)` calls `object.method(object, args)`, and `function T:method()` defines a function whose first parameter is `self`. With metatables this gives classes:

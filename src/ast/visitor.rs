@@ -162,7 +162,7 @@ pub fn walk_expr<V: AstVisitor + ?Sized>(visitor: &mut V, expr: &Expr) {
                 visitor.visit_stmt(s);
             }
         }
-        Expr::Unary { expr, .. } => {
+        Expr::Unary { expr, .. } | Expr::Paren { expr, .. } => {
             visitor.visit_expr(expr);
         }
         Expr::Binary { left, right, .. } => {

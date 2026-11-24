@@ -1100,7 +1100,7 @@ impl Lifter<'_> {
             let p = self.pending.remove(idx);
             return self.finish_source(p.expr, p.seq, p.effect);
         }
-        if let Some(source) = self.copied_call(&vars)? {
+        if let Some(source) = self.copied_call(tpc, &vars)? {
             return Ok(source);
         }
         // The state and control slots must hold nil: a pending nil, or a
@@ -1164,7 +1164,7 @@ impl Lifter<'_> {
 
     /// The call of `a, b, c = f()` just before, when the three loop
     /// registers are copies of `a`, `b` and `c` and nothing else reads them.
-    fn copied_call(&mut self, vars: &[VarId]) -> Result<Option<Expr>, String> {
+    fn copied_call(&mut self, pc: usize, vars: &[VarId]) -> Result<Option<Expr>, String> {
         let mut copies = Vec::with_capacity(vars.len());
         for &v in vars {
             match self
@@ -1201,7 +1201,32 @@ impl Lifter<'_> {
             return self.finish_source(p.expr, p.seq, p.effect).map(Some);
         }
         let targets: Vec<Target> = copies.iter().map(|x| Target::Var(*x)).collect();
-        let fits = matches!(self.out.last(), Some(Stmt::Assign(t, vals)) if *t == targets && vals.len() == 1)
+        // The optimizer may hoist copies of locals the loop body reads, such
+        // as `t = list`, between the call and the loop. Moving the call past
+        // them is safe while each copy is its target's only definition, so
+        // the call cannot read it, and reads a local no closure can change.
+        let hoisted = self
+            .out
+            .iter()
+            .rev()
+            .take_while(|s| match s {
+                Stmt::Assign(t, vals) => match (t.as_slice(), vals.as_slice()) {
+                    ([Target::Var(dst)], [Expr::Var(src)]) => {
+                        let var = &self.cx.vars.list[*src];
+                        !copies.contains(dst)
+                            && !copies.contains(src)
+                            && self.cx.vars.list[*dst].defs.len() == 1
+                            && !(var.captured && self.closure_reaches(var.reg, pc))
+                    }
+                    _ => false,
+                },
+                _ => false,
+            })
+            .count();
+        let Some(at) = self.out.len().checked_sub(hoisted + 1) else {
+            return Ok(None);
+        };
+        let fits = matches!(&self.out[at], Stmt::Assign(t, vals) if *t == targets && vals.len() == 1)
             && !self.pending.iter().any(|p| p.effect);
         if !fits {
             return Ok(None);
@@ -1211,11 +1236,54 @@ impl Lifter<'_> {
                 self.pending.remove(i);
             }
         }
-        let Some(Stmt::Assign(_, mut vals)) = self.out.pop() else {
+        let Stmt::Assign(_, mut vals) = self.out.remove(at) else {
             return Ok(None);
         };
         self.flush_all()?;
         Ok(vals.pop())
+    }
+
+    /// Whether a closure capturing `reg` can have been created by the time
+    /// `pc` runs, so that a call there could change the register.
+    fn closure_reaches(&self, reg: Reg, pc: usize) -> bool {
+        let flow = &self.cx.flow;
+        let target = flow.block_of[pc];
+        self.cx
+            .proto
+            .instructions
+            .iter()
+            .enumerate()
+            .filter(|(_, inst)| match **inst {
+                Instruction::Closure { proto_idx, .. } => self
+                    .cx
+                    .proto
+                    .protos
+                    .get(usize::from(proto_idx))
+                    .is_some_and(|child| {
+                        child
+                            .upvalues
+                            .iter()
+                            .any(|up| up.in_stack && up.index == reg)
+                    }),
+                _ => false,
+            })
+            .any(|(c, _)| {
+                let from = flow.block_of[c];
+                if from == target && c < pc {
+                    return true;
+                }
+                let mut seen = vec![false; flow.blocks.len()];
+                let mut stack = flow.blocks[from].succs.clone();
+                while let Some(b) = stack.pop() {
+                    if b == target {
+                        return true;
+                    }
+                    if !std::mem::replace(&mut seen[b], true) {
+                        stack.extend(&flow.blocks[b].succs);
+                    }
+                }
+                false
+            })
     }
 
     fn finish_source(&mut self, expr: Expr, seq: u64, effect: bool) -> Result<Expr, String> {

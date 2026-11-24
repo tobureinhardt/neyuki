@@ -161,7 +161,7 @@ pub fn walk_expr_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, expr: &mut Expr
                 visitor.visit_stmt_mut(s);
             }
         }
-        Expr::Unary { expr: inner, .. } => {
+        Expr::Unary { expr: inner, .. } | Expr::Paren { expr: inner, .. } => {
             visitor.visit_expr_mut(inner);
         }
         Expr::Binary { left, right, .. } => {

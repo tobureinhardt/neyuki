@@ -107,6 +107,10 @@ fn write_stmt(out: &mut String, stmt: &Statement, depth: usize) {
             let ids: Vec<String> = vars.iter().map(|v| format!("_{}", v.0)).collect();
             let _ = writeln!(out, "close_upvals [{}]", ids.join(", "));
         }
+        StatementKind::VarargMany(dsts) => {
+            let ids: Vec<String> = dsts.iter().map(|v| format!("_{}", v.0)).collect();
+            let _ = writeln!(out, "{} = vararg", ids.join(", "));
+        }
         StatementKind::DebugLocal { name, local } => {
             let _ = writeln!(out, "debug_local {} = _{}", name, local.0);
         }
@@ -304,9 +308,13 @@ fn write_term(out: &mut String, term: &TerminatorKind) {
             write_spread(out, source);
             let _ = write!(out, " -> bb{}", target.0);
         }
-        TerminatorKind::SpreadReturn(src) => {
+        TerminatorKind::SpreadReturn { values, source } => {
             out.push_str("spread_return ");
-            write_spread(out, src);
+            for v in values {
+                write_operand(out, v);
+                out.push_str(", ");
+            }
+            write_spread(out, source);
         }
         TerminatorKind::ForPrep {
             base,
