@@ -186,6 +186,10 @@ static DISPATCH_FAST: [FastHandler; NUM_EXEC_OPS] = [
     op_end_sentinel,       // 126
     op_for_loop_count,     // 127
     op_for_loop_count1,    // 128
+    op_for_prep_beat,      // 129
+    op_for_loop_beat,      // 130
+    op_tfor_loop_beat,     // 131
+    op_jump_beat,          // 132
 ];
 
 macro_rules! dispatch {
@@ -5060,6 +5064,34 @@ fn cold_jump_interrupt(
     }
 }
 
+fn op_jump_beat(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    dtbl: DispatchTbl,
+    raw: AlignedExec,
+) -> u8 {
+    let inst = raw.0;
+    let ExecInst::JumpBeat { offset, .. } = inst else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
+    if offset < 0 && vm.limits.is_tripped() {
+        return cold_jump_interrupt(
+            vm,
+            regs,
+            pc,
+            consts,
+            dtbl,
+            AlignedExec(ExecInst::Jump { offset }),
+        );
+    }
+    unsafe {
+        let next_pc = pc.offset(offset as isize);
+        dispatch!(vm, regs, next_pc, consts, dtbl);
+    }
+}
+
 fn op_jump(
     vm: &mut VM,
     regs: *mut Value,
@@ -5308,6 +5340,72 @@ fn op_for_loop(
             let st = step.as_inline_int_unchecked();
             if let Some(next) = i.checked_add(st) {
                 (&*pc.sub(1)).set(AlignedExec(ExecInst::ForLoopInt { base: b, jump }));
+                let again = if st >= 0 { next <= lim } else { next >= lim };
+                write_int(regs.add(b as usize), next);
+                if again {
+                    write_int(regs.add(b as usize + 3), next);
+                    let next_pc = pc.offset(jump as isize);
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
+                }
+                dispatch!(vm, regs, pc, consts, dtbl);
+            }
+        }
+    }
+    cold_for_loop(vm, regs, pc, consts, dtbl, b, jump)
+}
+
+fn op_for_prep_beat(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    dtbl: DispatchTbl,
+    raw: AlignedExec,
+) -> u8 {
+    let inst = raw.0;
+    let ExecInst::ForPrepBeat { base: b, jump, .. } = inst else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
+    unsafe {
+        let init = &*regs.add(b as usize);
+        let step = &*regs.add(b as usize + 2);
+        if init.is_inline_int()
+            && step.is_inline_int()
+            && step.as_inline_int_unchecked() != 0
+            && let Some(diff) = init
+                .as_inline_int_unchecked()
+                .checked_sub(step.as_inline_int_unchecked())
+            && fits_inline_int(diff)
+        {
+            let target_pc = pc.offset(jump as isize);
+            write_int(regs.add(b as usize), diff);
+            dispatch!(vm, regs, target_pc, consts, dtbl);
+        }
+    }
+    cold_for_prep(vm, regs, pc, consts, dtbl, b, jump)
+}
+
+fn op_for_loop_beat(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    dtbl: DispatchTbl,
+    raw: AlignedExec,
+) -> u8 {
+    let inst = raw.0;
+    let ExecInst::ForLoopBeat { base: b, jump, .. } = inst else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
+    unsafe {
+        let idx = &*regs.add(b as usize);
+        let limit = &*regs.add(b as usize + 1);
+        let step = &*regs.add(b as usize + 2);
+        if idx.is_inline_int() && limit.is_inline_int() && step.is_inline_int() {
+            let i = idx.as_inline_int_unchecked();
+            let lim = limit.as_inline_int_unchecked();
+            let st = step.as_inline_int_unchecked();
+            if let Some(next) = i.checked_add(st) {
                 let again = if st >= 0 { next <= lim } else { next >= lim };
                 write_int(regs.add(b as usize), next);
                 if again {
@@ -6332,6 +6430,29 @@ fn op_tfor_call(
     unsafe {
         let new_regs = vm.stack.as_mut_ptr().add(base);
         dispatch!(vm, new_regs, pc, consts, dtbl);
+    }
+}
+
+fn op_tfor_loop_beat(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    dtbl: DispatchTbl,
+    raw: AlignedExec,
+) -> u8 {
+    let inst = raw.0;
+    let ExecInst::TForLoopBeat { base: b, jump, .. } = inst else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
+    unsafe {
+        let src = regs.add(b as usize + 3);
+        if (&*src).is_nil() {
+            let next_pc = pc.offset(jump as isize);
+            dispatch!(vm, regs, next_pc, consts, dtbl);
+        }
+        copy_slot(regs.add(b as usize + 2), src);
+        dispatch!(vm, regs, pc, consts, dtbl);
     }
 }
 

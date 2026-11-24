@@ -193,7 +193,7 @@ impl Proto {
     pub fn exec(&self) -> &ExecProgram {
         self.cache
             .exec
-            .get_or_init(|| ExecProgram::compile(&self.instructions))
+            .get_or_init(|| ExecProgram::compile(&self.instructions, self.max_registers))
     }
 
     // Add a constant, deduplicating if identical constant already exists

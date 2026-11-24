@@ -4,6 +4,7 @@ pub mod disasm;
 pub mod exec;
 pub mod format;
 pub mod instruction;
+pub mod liveness;
 pub mod parser;
 pub mod proto;
 pub mod serialize;
@@ -17,6 +18,7 @@ pub use format::{
     BYTECODE_VERSION, BytecodeHeader, MAGIC, MIN_SUPPORTED_BYTECODE_VERSION, is_supported_version,
 };
 pub use instruction::Instruction;
+pub use liveness::LoopSafepoint;
 pub use parser::parse_assembly;
 pub use proto::{Constant, Proto, UpvalueDesc};
 pub use serialize::serialize;

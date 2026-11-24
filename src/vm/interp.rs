@@ -837,7 +837,8 @@ impl VM {
                     sync_ip!();
                     self.tfor_call(base, b, retc)?;
                 }
-                ExecInst::TForLoop { base: b, jump } => {
+                ExecInst::TForLoop { base: b, jump }
+                | ExecInst::TForLoopBeat { base: b, jump, .. } => {
                     let first_var = reg!(b + 3).clone();
                     if first_var.is_nil() {
                         // Exit loop: jump forward past the back-jump
@@ -2031,11 +2032,33 @@ impl VM {
                         jump!(jump_if_false);
                     }
                 }
-                ExecInst::Jump { offset } => {
+                ExecInst::Jump { offset } | ExecInst::JumpBeat { offset, .. } => {
                     if !TRAP && offset < 0 {
                         attempt!(self.limits.check_interrupt());
                     }
                     jump!(offset);
+                }
+                ExecInst::ForPrepBeat { base: b, jump, .. } => {
+                    let step = &reg!(b + 2);
+                    match step.view() {
+                        ValueView::Int(0) => throw!("numeric for step cannot be zero"),
+                        ValueView::Float(0.0) => throw!("numeric for step cannot be zero"),
+                        _ => {}
+                    }
+                    let init = &reg!(b);
+                    if init.is_inline_int()
+                        && step.is_inline_int()
+                        && let Some(diff) = init
+                            .as_inline_int_unchecked()
+                            .checked_sub(step.as_inline_int_unchecked())
+                    {
+                        set!(b, Value::int(diff));
+                        jump!(jump);
+                        continue;
+                    }
+                    let init_minus_step = attempt!(ops::eval_sub(init, step));
+                    set!(b, init_minus_step);
+                    jump!(jump);
                 }
                 ExecInst::ForPrep { base: b, jump } => {
                     let step = &reg!(b + 2);
@@ -2245,7 +2268,8 @@ impl VM {
                         jump!(jump);
                     }
                 }
-                ExecInst::ForLoopGeneric { base: b, jump } => {
+                ExecInst::ForLoopGeneric { base: b, jump }
+                | ExecInst::ForLoopBeat { base: b, jump, .. } => {
                     let idx = &reg!(b);
                     let limit = &reg!(b + 1);
                     let step = &reg!(b + 2);

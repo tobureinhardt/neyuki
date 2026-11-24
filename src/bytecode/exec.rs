@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
 
 use crate::bytecode::instruction::{Instruction, MULTRET};
+use crate::bytecode::liveness::{LoopSafepoint, analyze_loop_safepoints};
 use crate::vm::value::{Value, VmTable};
 
 /// Inline cache entry for `GetGlobal` at a specific `GetGlobal` site.
@@ -712,11 +713,38 @@ pub enum ExecInst {
         base: u8,
         jump: i16,
     },
+
+    /// Beat-guarded numeric `ForPrep` matching a [`ExecInst::ForLoopBeat`].
+    ForPrepBeat {
+        base: u8,
+        jump: i16,
+        site: u16,
+    },
+
+    /// Beat-guarded numeric `ForLoop` indexing [`ExecProgram::safepoint`].
+    ForLoopBeat {
+        base: u8,
+        jump: i16,
+        site: u16,
+    },
+
+    /// Beat-guarded generic `TForLoop` indexing [`ExecProgram::safepoint`].
+    TForLoopBeat {
+        base: u8,
+        jump: i16,
+        site: u16,
+    },
+
+    /// Beat-guarded backward `Jump` indexing [`ExecProgram::safepoint`].
+    JumpBeat {
+        offset: i16,
+        site: u16,
+    },
 }
 
 const _: () = assert!(std::mem::size_of::<ExecInst>() == 8);
 
-pub const NUM_EXEC_OPS: usize = 129;
+pub const NUM_EXEC_OPS: usize = 133;
 
 impl ExecInst {
     #[inline(always)]
@@ -851,6 +879,10 @@ impl ExecInst {
             ExecInst::EndSentinel => 126,
             ExecInst::ForLoopCount { .. } => 127,
             ExecInst::ForLoopCount1 { .. } => 128,
+            ExecInst::ForPrepBeat { .. } => 129,
+            ExecInst::ForLoopBeat { .. } => 130,
+            ExecInst::TForLoopBeat { .. } => 131,
+            ExecInst::JumpBeat { .. } => 132,
         }
     }
 }
@@ -868,17 +900,28 @@ const _: () = assert!(std::mem::align_of::<AlignedExec>() == 8);
 pub struct ExecProgram {
     pub ops: Box<[Cell<AlignedExec>]>,
     pub table_caches: Box<[Cell<TableCacheSlot>]>,
+    pub loop_safepoints: Box<[LoopSafepoint]>,
     global_caches: UnsafeCell<Box<[GlobalCacheSlot]>>,
     import_caches: UnsafeCell<Box<[ImportSlot]>>,
 }
 
 impl ExecProgram {
     /// Builds the execution stream and dense cache tables from verified bytecode.
-    pub fn compile(instructions: &[Instruction]) -> Self {
+    pub fn compile(instructions: &[Instruction], max_registers: u8) -> Self {
         let mut ops = Vec::with_capacity(instructions.len() + 1);
         let mut table_sites: u16 = 0;
         let mut global_sites: u16 = 0;
         let mut import_len: usize = 0;
+        let safepoint_map = analyze_loop_safepoints(instructions, max_registers);
+        let mut loop_safepoints = Vec::with_capacity(safepoint_map.len());
+        let mut site_by_ip: Vec<Option<u16>> = vec![None; instructions.len()];
+        for (ip, sp) in safepoint_map {
+            if loop_safepoints.len() < u16::MAX as usize {
+                let site = loop_safepoints.len() as u16;
+                loop_safepoints.push(sp);
+                site_by_ip[ip] = Some(site);
+            }
+        }
 
         for (ip, &inst) in instructions.iter().enumerate() {
             let exec = match inst {
@@ -1087,7 +1130,15 @@ impl ExecProgram {
                     jump_if_false,
                 },
                 Instruction::Test { reg, jump_if_false } => ExecInst::Test { reg, jump_if_false },
-                Instruction::Jump { offset } => ExecInst::Jump { offset },
+                Instruction::Jump { offset } => {
+                    if offset < 0
+                        && let Some(site) = site_by_ip[ip]
+                    {
+                        ExecInst::JumpBeat { offset, site }
+                    } else {
+                        ExecInst::Jump { offset }
+                    }
+                }
                 Instruction::Call {
                     callee,
                     argc,
@@ -1106,13 +1157,35 @@ impl ExecProgram {
                 Instruction::Return { base, count } => ExecInst::Return { base, count },
                 Instruction::Closure { dst, proto_idx } => ExecInst::Closure { dst, proto_idx },
                 Instruction::Vararg { dst, count } => ExecInst::Vararg { dst, count },
-                Instruction::ForPrep { base, jump } => ExecInst::ForPrep { base, jump },
-                Instruction::ForLoop { base, jump } => ExecInst::ForLoop { base, jump },
+                Instruction::ForPrep { base, jump } => {
+                    let target_ip = ip as isize + 1 + jump as isize;
+                    if target_ip >= 0
+                        && (target_ip as usize) < site_by_ip.len()
+                        && let Some(site) = site_by_ip[target_ip as usize]
+                    {
+                        ExecInst::ForPrepBeat { base, jump, site }
+                    } else {
+                        ExecInst::ForPrep { base, jump }
+                    }
+                }
+                Instruction::ForLoop { base, jump } => {
+                    if let Some(site) = site_by_ip[ip] {
+                        ExecInst::ForLoopBeat { base, jump, site }
+                    } else {
+                        ExecInst::ForLoop { base, jump }
+                    }
+                }
                 Instruction::SetList { table, base, count } => {
                     ExecInst::SetList { table, base, count }
                 }
                 Instruction::TForCall { base, retc } => ExecInst::TForCall { base, retc },
-                Instruction::TForLoop { base, jump } => ExecInst::TForLoop { base, jump },
+                Instruction::TForLoop { base, jump } => {
+                    if let Some(site) = site_by_ip[ip] {
+                        ExecInst::TForLoopBeat { base, jump, site }
+                    } else {
+                        ExecInst::TForLoop { base, jump }
+                    }
+                }
                 Instruction::CloseUpval { reg } => ExecInst::CloseUpval { reg },
                 Instruction::AddI { dst, a, imm } => ExecInst::AddI { dst, a, imm },
                 Instruction::SubI { dst, a, imm } => ExecInst::SubI { dst, a, imm },
@@ -1189,9 +1262,16 @@ impl ExecProgram {
         Self {
             ops: ops.into_boxed_slice(),
             table_caches,
+            loop_safepoints: loop_safepoints.into_boxed_slice(),
             global_caches,
             import_caches,
         }
+    }
+
+    /// Loop liveness safepoint metadata for `ForPrepBeat` / `*Beat` opcodes.
+    #[inline(always)]
+    pub fn safepoint(&self, site: u16) -> Option<&LoopSafepoint> {
+        self.loop_safepoints.get(site as usize)
     }
 
     #[inline(always)]
