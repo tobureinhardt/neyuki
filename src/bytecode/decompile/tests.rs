@@ -8,8 +8,21 @@ use crate::compiler::{OptLevel, Options, compile_program};
 use crate::vm::VM;
 
 const LOST: &str = "could not be recovered";
-/// What a generic `for` falls back to when its source isn't one expression.
-const PASS_THROUGH: &str = " in (function(...)";
+/// Whether `text` holds the call a generic `for` falls back to when its
+/// source isn't one expression: `(function(...) return ... end)(f, s, c)`.
+/// Other inline vararg functions are ordinary output, so the body must be
+/// exactly `return ...`.
+fn has_pass_through(text: &str) -> bool {
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_end().ends_with("(function(...)")
+            && lines.clone().next().map(str::trim) == Some("return ...")
+        {
+            return true;
+        }
+    }
+    false
+}
 
 /// Compiles `source`, decompiles it, and checks that the decompiled source
 /// compiles again and returns what the original returns. Returns the
@@ -269,7 +282,7 @@ end
 return `{sum} {keys} {table.concat(seen, ",")} {#ip}`
 "##,
     );
-    assert!(!text.contains(PASS_THROUGH), "{}", text);
+    assert!(!has_pass_through(&text), "{}", text);
 }
 
 /// The optimizer hoists the loop body's copy of `ip` between the `ipairs`
@@ -300,7 +313,7 @@ for _ in each({ "p", "q" }) do seen += 1 end
 return `{count} {seen}`
 "##,
     );
-    assert!(!text.contains(PASS_THROUGH), "{}", text);
+    assert!(!has_pass_through(&text), "{}", text);
     assert!(text.contains("in ipairs({"), "{}", text);
 }
 
@@ -340,7 +353,7 @@ fn test_repository_tests_survive_a_roundtrip() {
         );
         // Every loop in these files is an ordinary `for ... in <expr>`.
         assert!(
-            !text.contains(PASS_THROUGH),
+            !has_pass_through(&text),
             "{}: a generic for loop fell back to a pass-through call:\n{}",
             file,
             text
@@ -369,4 +382,26 @@ fn test_damaged_functions_keep_their_disassembly() {
     assert!(text.contains(LOST), "{}", text);
     assert!(text.contains("JUMP"), "{}", text);
     assert!(text.contains("return function(arg1)"), "{}", text);
+}
+
+/// `has_pass_through` recognizes the call `lift` builds when a generic
+/// `for` has no single source, wherever it is printed.
+#[test]
+fn test_has_pass_through_sees_the_fallback() {
+    use super::ast::{Body, Expr, Func, Printer, Stmt};
+    let pass = Func {
+        params: Vec::new(),
+        vararg: true,
+        body: Body::Code(vec![Stmt::Return(vec![Expr::Vararg])]),
+        names: Vec::new(),
+        captures: Vec::new(),
+    };
+    let call = Expr::Call(
+        Box::new(Expr::Function(Box::new(pass))),
+        vec![Expr::Name("next".to_string()), Expr::Nil, Expr::Nil],
+    );
+    for depth in 0..3 {
+        let text = Printer::default().expr(&call, &[], depth);
+        assert!(has_pass_through(&text), "{}", text);
+    }
 }
