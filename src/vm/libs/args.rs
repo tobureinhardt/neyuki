@@ -1,10 +1,10 @@
 //! Argument checks and result builders shared by the native libraries.
 
 use std::cell::RefCell;
-use std::rc::Rc;
 
 use num_traits::ToPrimitive;
 
+use crate::vm::heap::VmHeap;
 use crate::vm::value::{BorrowedRc, Value, ValueView, VmTable};
 
 /// A number as a float. Integers too large for an `f64` are an error rather
@@ -120,11 +120,10 @@ pub(crate) fn table_arg<'a>(
 pub(crate) fn array(values: Vec<Value>) -> Value {
     let mut table = VmTable::new();
     table.array = values;
-    Value::table(Rc::new(RefCell::new(table)))
+    VmHeap::alloc_table_untracked(table)
 }
 
 /// Wraps a frozen library table.
-pub(crate) fn frozen(mut table: VmTable) -> Value {
-    table.frozen = true;
-    Value::table(Rc::new(RefCell::new(table)))
+pub(crate) fn frozen(table: VmTable) -> Value {
+    VmHeap::alloc_frozen(table)
 }

@@ -62,20 +62,28 @@ fn null_tostring(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
 
 /// `json.array(t?)`: marks `t` (or a new table) so it always encodes as an
 /// array, even when empty.
-fn json_array(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let table = match args.first() {
-        None => Rc::new(RefCell::new(VmTable::new())),
-        Some(v) if v.is_nil() => Rc::new(RefCell::new(VmTable::new())),
-        _ => table_arg(args, 0, "t")?.to_rc(),
+fn json_array(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+    let tbl_val = match args.first() {
+        None => vm.alloc_table(VmTable::new()),
+        Some(v) if v.is_nil() => vm.alloc_table(VmTable::new()),
+        _ => {
+            let _ = table_arg(args, 0, "t")?;
+            args[0].clone()
+        }
     };
-    let meta = table.borrow().metatable.clone();
-    let meta = meta.unwrap_or_else(|| {
-        let meta = Rc::new(RefCell::new(VmTable::new()));
-        table.borrow_mut().metatable = Some(meta.clone());
-        meta
-    });
-    meta.borrow_mut().set_str(ARRAY_MARK, Value::TRUE);
-    Ok(vec![Value::table(table)])
+    let has_meta = tbl_val
+        .as_table()
+        .is_some_and(|t| t.borrow().metatable.is_some());
+    if !has_meta {
+        let meta = vm.alloc_table(VmTable::new());
+        vm.table_set_metatable(&tbl_val, Some(meta))?;
+    }
+    if let Some(t) = tbl_val.as_table()
+        && let Some(ref mt) = t.borrow().metatable
+    {
+        mt.borrow_mut().set_str(ARRAY_MARK, Value::TRUE);
+    }
+    Ok(vec![tbl_val])
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +297,7 @@ pub(crate) fn write_string(out: &mut String, s: &str) {
 
 /// `json.decode(text, options?)`. With `keepNull`, `null` becomes
 /// `json.null` instead of nil, so object keys holding it stay present.
-fn json_decode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn json_decode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let text = match args.first() {
         Some(v) if v.is_string() => v.as_str().unwrap(),
         Some(other) => {
@@ -301,16 +309,17 @@ fn json_decode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         Some(opts) => opts.borrow().get_str("keepNull").is_truthy(),
         _ => false,
     };
-    Ok(vec![decode_with(text, keep_null)?])
+    Ok(vec![decode_with(Some(vm), text, keep_null)?])
 }
 
 /// Parses a whole JSON text.
 pub fn decode_from_str(text: &str) -> Result<Value, String> {
-    decode_with(text, false)
+    decode_with(None, text, false)
 }
 
-fn decode_with(text: &str, keep_null: bool) -> Result<Value, String> {
+fn decode_with(vm: Option<&mut VM>, text: &str, keep_null: bool) -> Result<Value, String> {
     let mut parser = Parser {
+        vm,
         bytes: text.as_bytes(),
         pos: 0,
         depth: 0,
@@ -325,14 +334,15 @@ fn decode_with(text: &str, keep_null: bool) -> Result<Value, String> {
     Ok(value)
 }
 
-struct Parser<'a> {
+struct Parser<'a, 'vm> {
+    vm: Option<&'vm mut VM>,
     bytes: &'a [u8],
     pos: usize,
     depth: usize,
     keep_null: bool,
 }
 
-impl Parser<'_> {
+impl Parser<'_, '_> {
     fn error(&self, message: &str) -> String {
         let before = &self.bytes[..self.pos.min(self.bytes.len())];
         let line = before.iter().filter(|b| **b == b'\n').count() + 1;
@@ -544,7 +554,14 @@ impl Parser<'_> {
         }
         let mut table = VmTable::new();
         table.array = items;
-        Ok(Value::table(Rc::new(RefCell::new(table))))
+        Ok(self.alloc_table(table))
+    }
+
+    fn alloc_table(&mut self, table: VmTable) -> Value {
+        match self.vm.as_deref_mut() {
+            Some(vm) => vm.alloc_table(table),
+            None => crate::vm::heap::VmHeap::alloc_table_untracked(table),
+        }
     }
 
     fn object(&mut self) -> Result<Value, String> {
@@ -553,7 +570,7 @@ impl Parser<'_> {
         self.skip_whitespace();
         if self.peek() == Some(b'}') {
             self.pos += 1;
-            return Ok(Value::table(Rc::new(RefCell::new(table))));
+            return Ok(self.alloc_table(table));
         }
         loop {
             self.skip_whitespace();
@@ -581,6 +598,6 @@ impl Parser<'_> {
                 _ => return Err(self.error("expected ',' or '}'")),
             }
         }
-        Ok(Value::table(Rc::new(RefCell::new(table))))
+        Ok(self.alloc_table(table))
     }
 }

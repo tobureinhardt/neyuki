@@ -9,7 +9,6 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 
 use num_bigint::BigInt;
 use num_traits::{Num, ToPrimitive};
@@ -56,16 +55,16 @@ fn builtin_null(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![json::null_sentinel()])
 }
 
-fn builtin_decode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn builtin_decode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let text = str_arg(args, 0, "text")?;
     let keep_null = bool_arg(args, 1, "keepNull")?;
-    Ok(vec![decode_single(text, keep_null)?])
+    Ok(vec![decode_single(Some(vm), text, keep_null)?])
 }
 
-fn builtin_decode_all(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn builtin_decode_all(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let text = str_arg(args, 0, "text")?;
     let keep_null = bool_arg(args, 1, "keepNull")?;
-    Ok(vec![decode_all(text, keep_null)?])
+    Ok(vec![decode_all(Some(vm), text, keep_null)?])
 }
 
 fn builtin_encode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -91,12 +90,12 @@ fn builtin_encode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
 /// Parses a single YAML 1.2 document (for fuzzing and internal callers).
 pub fn decode_from_str(text: &str) -> Result<Value, String> {
-    decode_single(text, false)
+    decode_single(None, text, false)
 }
 
 /// Parses a multi-document YAML 1.2 stream into an array value.
 pub fn decode_all_from_str(text: &str) -> Result<Value, String> {
-    decode_all(text, false)
+    decode_all(None, text, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -676,7 +675,25 @@ impl StreamBuilder {
     }
 }
 
-fn node_to_value(node: YamlNode, keep_null: bool) -> Result<Value, String> {
+fn alloc_yaml_table(vm: Option<&mut VM>, tbl: VmTable) -> Value {
+    match vm {
+        Some(vm) => vm.alloc_table(tbl),
+        None => crate::vm::heap::VmHeap::alloc_table_untracked(tbl),
+    }
+}
+
+fn alloc_yaml_array(vm: Option<&mut VM>, out: Vec<Value>) -> Value {
+    match vm {
+        Some(vm) => vm.alloc_array(out),
+        None => array(out),
+    }
+}
+
+fn node_to_value(
+    mut vm: Option<&mut VM>,
+    node: YamlNode,
+    keep_null: bool,
+) -> Result<Value, String> {
     match node {
         YamlNode::Null => Ok(if keep_null {
             json::null_sentinel()
@@ -691,22 +708,22 @@ fn node_to_value(node: YamlNode, keep_null: bool) -> Result<Value, String> {
         YamlNode::Seq(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(node_to_value(item, keep_null)?);
+                out.push(node_to_value(vm.as_deref_mut(), item, keep_null)?);
             }
-            Ok(array(out))
+            Ok(alloc_yaml_array(vm, out))
         }
         YamlNode::Map(entries) => {
             let mut tbl = VmTable::with_capacity(0, entries.len());
             for (k, v) in entries {
-                let val = node_to_value(v, keep_null)?;
+                let val = node_to_value(vm.as_deref_mut(), v, keep_null)?;
                 tbl.raw_set(k.into_value(), val)?;
             }
-            Ok(Value::table(Rc::new(RefCell::new(tbl))))
+            Ok(alloc_yaml_table(vm, tbl))
         }
     }
 }
 
-fn decode_single(text: &str, keep_null: bool) -> Result<Value, String> {
+fn decode_single(vm: Option<&mut VM>, text: &str, keep_null: bool) -> Result<Value, String> {
     let docs = StreamBuilder::new().parse(text)?;
     match docs.len() {
         0 => Ok(if keep_null {
@@ -716,7 +733,7 @@ fn decode_single(text: &str, keep_null: bool) -> Result<Value, String> {
         }),
         1 => {
             let doc = docs.into_iter().next().unwrap_or(YamlNode::Null);
-            node_to_value(doc, keep_null)
+            node_to_value(vm, doc, keep_null)
         }
         _ => {
             Err("expected a single YAML document, found multiple (use yaml.decodeAll)".to_string())
@@ -724,13 +741,13 @@ fn decode_single(text: &str, keep_null: bool) -> Result<Value, String> {
     }
 }
 
-fn decode_all(text: &str, keep_null: bool) -> Result<Value, String> {
+fn decode_all(mut vm: Option<&mut VM>, text: &str, keep_null: bool) -> Result<Value, String> {
     let docs = StreamBuilder::new().parse(text)?;
     let mut out = Vec::with_capacity(docs.len());
     for doc in docs {
-        out.push(node_to_value(doc, keep_null)?);
+        out.push(node_to_value(vm.as_deref_mut(), doc, keep_null)?);
     }
-    Ok(array(out))
+    Ok(alloc_yaml_array(vm, out))
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,7 +1195,7 @@ neg_inf: -.inf
 nan_val: .nan
 forced_str: !!str 123
 "#;
-        let val = decode_single(doc, true).unwrap();
+        let val = decode_single(None, doc, true).unwrap();
         let Some(t) = val.as_table() else {
             panic!("expected table");
         };
@@ -1226,7 +1243,7 @@ d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c]
 e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d]
 f: &f [*e, *e, *e, *e, *e, *e, *e, *e, *e]
 "#;
-        let err = decode_single(bomb, false).unwrap_err();
+        let err = decode_single(None, bomb, false).unwrap_err();
         assert!(
             err.contains("limit"),
             "expected node/alias limit error, got: {}",
@@ -1244,7 +1261,7 @@ f: &f [*e, *e, *e, *e, *e, *e, *e, *e, *e]
         for _ in 0..140 {
             yaml.push(']');
         }
-        let err = decode_single(&yaml, false).unwrap_err();
+        let err = decode_single(None, &yaml, false).unwrap_err();
         assert!(err.contains("nesting"), "unexpected error: {}", err);
     }
 
@@ -1258,7 +1275,7 @@ service:
   <<: *def
   port: 6432
 "#;
-        let val = decode_single(doc, false).unwrap();
+        let val = decode_single(None, doc, false).unwrap();
         let Some(root) = val.as_table() else {
             panic!("expected table");
         };
@@ -1270,14 +1287,18 @@ service:
         assert_eq!(svc.borrow().get_str("host"), Value::str("localhost"));
 
         let dup = "a: 1\na: 2\n";
-        assert!(decode_single(dup, false).unwrap_err().contains("duplicate"));
+        assert!(
+            decode_single(None, dup, false)
+                .unwrap_err()
+                .contains("duplicate")
+        );
     }
 
     #[test]
     fn test_multi_doc_handling() {
         let stream = "---\na: 1\n---\nb: 2\n";
-        assert!(decode_single(stream, false).is_err());
-        let all = decode_all(stream, false).unwrap();
+        assert!(decode_single(None, stream, false).is_err());
+        let all = decode_all(None, stream, false).unwrap();
         let Some(arr) = all.as_table() else {
             panic!("expected array");
         };

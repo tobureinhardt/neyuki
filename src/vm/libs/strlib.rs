@@ -9,8 +9,6 @@
 //! (`unpack` reverses that mapping).
 
 use std::borrow::Cow;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 use num_bigint::{BigInt, Sign};
 use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
@@ -821,17 +819,19 @@ fn gmatch_step(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
 /// `gmatch(s, pattern)`: an iterator over every match, yielding its captures
 /// (or the whole match). Works in a generic `for` and when called directly.
-pub(crate) fn builtin_gmatch(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+pub(crate) fn builtin_gmatch(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = string_arg(args, 0, "s")?;
     let pattern = string_arg(args, 1, "pattern")?;
     let mut meta = VmTable::new();
     meta.set_str("__call", crate::native!("gmatch iterator", gmatch_step));
+    let meta_val = vm.alloc_table(meta);
     let mut state = VmTable::new();
     state.set_str("s", Value::string(s.into_owned()));
     state.set_str("p", Value::string(pattern.into_owned()));
     state.set_str("pos", Value::int(0));
-    state.metatable = Some(Rc::new(RefCell::new(meta)));
-    Ok(vec![Value::table(Rc::new(RefCell::new(state)))])
+    let state_val = vm.alloc_table(state);
+    vm.table_set_metatable(&state_val, Some(meta_val))?;
+    Ok(vec![state_val])
 }
 
 // ---------------------------------------------------------------------------

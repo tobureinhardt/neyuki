@@ -145,14 +145,16 @@ fn utf8_sub(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
 /// An iterator over `s`: a table holding the string and the next byte
 /// offset, called through `__call`.
-fn iterator(s: &str, step: Value) -> Value {
+fn iterator(vm: &mut VM, s: &str, step: Value) -> Result<Value, String> {
     let mut meta = VmTable::new();
     meta.set_str("__call", step);
+    let meta_val = vm.alloc_table(meta);
     let mut state = VmTable::new();
     state.set_str("s", Value::str(s));
     state.set_str("pos", Value::small_int(0));
-    state.metatable = Some(Rc::new(RefCell::new(meta)));
-    Value::table(Rc::new(RefCell::new(state)))
+    let state_val = vm.alloc_table(state);
+    vm.table_set_metatable(&state_val, Some(meta_val))?;
+    Ok(state_val)
 }
 
 /// The string and next byte offset an iterator table carries.
@@ -200,19 +202,21 @@ fn chars_step(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 /// `utf8.codes(s)`: iterates `position, code point` for each character.
-fn utf8_codes(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn utf8_codes(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = str_arg(args, 0, "s")?;
     Ok(vec![iterator(
+        vm,
         s,
         crate::native!("utf8.codes iterator", codes_step),
-    )])
+    )?])
 }
 
 /// `utf8.chars(s)`: iterates each character as a string.
-fn utf8_chars(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn utf8_chars(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = str_arg(args, 0, "s")?;
     Ok(vec![iterator(
+        vm,
         s,
         crate::native!("utf8.chars iterator", chars_step),
-    )])
+    )?])
 }

@@ -5,7 +5,6 @@
 //! an integer that does not fit, as in Luau.
 
 use std::cell::RefCell;
-use std::rc::Rc;
 
 use base64::Engine;
 use num_bigint::BigInt;
@@ -91,9 +90,7 @@ pub(crate) fn new_buffer(vm: &mut VM, data: Vec<u8>) -> Result<Vec<Value>, Strin
     if vm.gc.should_collect() || vm.gc.sweeping {
         vm.gc_auto_step()?;
     }
-    let rc = Rc::new(RefCell::new(VmBuffer::from_bytes(data)));
-    vm.gc.register_buffer(&rc);
-    Ok(vec![Value::buffer(rc)])
+    Ok(vec![vm.alloc_buffer(VmBuffer::from_bytes(data))])
 }
 
 fn check_size(size: usize) -> Result<(), String> {
@@ -379,7 +376,7 @@ fn buf_resize(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let size = size_arg(args, 1, "size")?;
     check_size(size)?;
     b.borrow_mut().data.resize(size, 0);
-    Ok(vec![Value::buffer(b.to_rc())])
+    Ok(vec![args[0].clone()])
 }
 
 /// `buffer.equal(a, b)`: whether two buffers hold the same bytes.

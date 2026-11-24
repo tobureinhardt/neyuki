@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::vm::libs::args::{array, str_arg};
+use crate::vm::libs::args::str_arg;
 use crate::vm::machine::VM;
 use crate::vm::value::{NativeDef, StrRef, Value, ValueView, VmTable};
 
@@ -35,27 +35,20 @@ pub(crate) const NATIVES: &[NativeDef] = &[
 ];
 
 /// `__toml_decode(text)`: the document as a table.
-fn builtin_decode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn builtin_decode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let text = str_arg(args, 0, "text")?;
     let root = decode(text)?;
-    Ok(vec![table_value(root)])
+    Ok(vec![table_value(vm, root)])
 }
 
 /// `__toml_encode(value)`: a table as TOML text.
 fn builtin_encode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let root = match args.first() {
-        Some(v) if v.is_table() => v.to_table().unwrap(),
-        None => return Err("value must be provided".to_string()),
-        Some(v) if v.is_nil() => return Err("value must be provided".to_string()),
-        Some(other) => {
-            return Err(format!("value must be a table, got {}", other.type_name()));
-        }
-    };
+    let root = crate::vm::libs::args::table_arg(args, 0, "value")?;
     let mut encoder = Encoder {
         out: String::new(),
         open: Vec::new(),
     };
-    encoder.section(&root, &mut Vec::new(), 0, Header::None)?;
+    encoder.section(&root.to_rc(), &mut Vec::new(), 0, Header::None)?;
     Ok(vec![Value::string(encoder.out)])
 }
 
@@ -117,24 +110,30 @@ fn decode(text: &str) -> Result<Table, String> {
     parser.document()
 }
 
-fn node_value(node: Node) -> Value {
+fn node_value(vm: &mut VM, node: Node) -> Value {
     match node {
         Node::String(s) | Node::Datetime(s) => Value::string(s),
         Node::Integer(i) => Value::int(i),
         Node::Float(f) => Value::float(f),
         Node::Boolean(b) => Value::bool(b),
-        Node::Array(items) => array(items.into_iter().map(node_value).collect()),
-        Node::Table(table) => table_value(table),
-        Node::TableArray(tables) => array(tables.into_iter().map(table_value).collect()),
+        Node::Array(items) => {
+            let vals: Vec<_> = items.into_iter().map(|n| node_value(vm, n)).collect();
+            vm.alloc_array(vals)
+        }
+        Node::Table(table) => table_value(vm, table),
+        Node::TableArray(tables) => {
+            let vals: Vec<_> = tables.into_iter().map(|t| table_value(vm, t)).collect();
+            vm.alloc_array(vals)
+        }
     }
 }
 
-fn table_value(table: Table) -> Value {
+fn table_value(vm: &mut VM, table: Table) -> Value {
     let mut out = VmTable::new();
     for (key, node) in table.entries {
-        out.fields.insert(StrRef::from(key), node_value(node));
+        out.fields.insert(StrRef::from(key), node_value(vm, node));
     }
-    Value::table(Rc::new(RefCell::new(out)))
+    vm.alloc_table(out)
 }
 
 /// Steps from `table` into `key` for a header, making the table when it is

@@ -2,8 +2,6 @@
 
 use num_bigint::BigInt;
 use num_traits::{ToPrimitive, Zero};
-use std::cell::RefCell;
-use std::rc::Rc;
 
 use crate::vm::machine::VM;
 use crate::vm::value::{Value, ValueView, VmTable};
@@ -242,6 +240,5 @@ pub fn create_bit_lib() -> Value {
     table.set_str("replace", crate::native!("bit.replace", bit_replace));
     table.set_str("tohex", crate::native!("bit.tohex", bit_tohex));
     table.set_str("tobit", crate::native!("bit.tobit", bit_tobit));
-    table.frozen = true;
-    Value::table(Rc::new(RefCell::new(table)))
+    crate::vm::libs::args::frozen(table)
 }

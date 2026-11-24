@@ -6,11 +6,9 @@
 //! ignored. Fields are always strings when read; `lib/csv.nyk` checks the
 //! options.
 
-use std::cell::RefCell;
 use std::collections::{BTreeSet, HashSet};
-use std::rc::Rc;
 
-use crate::vm::libs::args::{array, bool_arg, str_arg, table_arg};
+use crate::vm::libs::args::{bool_arg, str_arg, table_arg};
 use crate::vm::machine::VM;
 use crate::vm::value::{NativeDef, StrRef, Value, ValueView, VmTable};
 
@@ -152,14 +150,10 @@ fn parse(text: &str, delimiter: u8) -> Result<Vec<Record>, String> {
     }
 }
 
-fn new_table(table: VmTable) -> Value {
-    Value::table(Rc::new(RefCell::new(table)))
-}
-
 /// `__csv_decode(text, delimiter, header)`: an array of records, each an
 /// array of strings, or with `header` an array of tables keyed by the
 /// names on the first line.
-fn builtin_decode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn builtin_decode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let text = str_arg(args, 0, "text")?;
     let delimiter = delimiter_arg(args, 1)?;
     let header = bool_arg(args, 2, "header")?;
@@ -167,12 +161,12 @@ fn builtin_decode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let mut records = records.into_iter();
     if !header {
         let rows = records
-            .map(|record| array(record.fields.into_iter().map(Value::string).collect()))
+            .map(|record| vm.alloc_array(record.fields.into_iter().map(Value::string).collect()))
             .collect();
-        return Ok(vec![array(rows)]);
+        return Ok(vec![vm.alloc_array(rows)]);
     }
     let Some(names) = records.next() else {
-        return Ok(vec![array(Vec::new())]);
+        return Ok(vec![vm.alloc_array(Vec::new())]);
     };
     let mut seen = HashSet::new();
     for name in &names.fields {
@@ -198,9 +192,9 @@ fn builtin_decode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             row.fields
                 .insert(StrRef::from(name.as_str()), Value::string(field));
         }
-        rows.push(new_table(row));
+        rows.push(vm.alloc_table(row));
     }
-    Ok(vec![array(rows)])
+    Ok(vec![vm.alloc_array(rows)])
 }
 
 /// Whether a row is keyed by column names rather than an array.

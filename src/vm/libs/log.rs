@@ -1104,15 +1104,11 @@ mod tests {
     #[test]
     fn test_json_line_reserved_key_collision_and_cycle() {
         let mut vm = VM::new();
-        let fields = Rc::new(RefCell::new(VmTable::new()));
-        fields
-            .borrow_mut()
-            .set_str("msg", Value::str("user override"));
-        fields.borrow_mut().set_str("port", Value::int(8080));
-        fields
-            .borrow_mut()
-            .set_str("self", Value::table(fields.clone()));
-        fields.borrow_mut().set_str("nan", Value::float(f64::NAN));
+        let fields = vm.alloc_table(VmTable::new());
+        vm.table_set_str(&fields, "msg", Value::str("user override"));
+        vm.table_set_str(&fields, "port", Value::int(8080));
+        vm.table_set_str(&fields, "self", fields.clone());
+        vm.table_set_str(&fields, "nan", Value::float(f64::NAN));
 
         let out = builtin_json_line(
             &mut vm,
@@ -1121,7 +1117,7 @@ mod tests {
                 Value::str("info"),
                 Value::str("hello\nworld"),
                 Value::str("api"),
-                Value::table(fields),
+                fields,
             ],
         )
         .unwrap();

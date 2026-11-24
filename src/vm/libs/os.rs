@@ -2,8 +2,6 @@
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jiff::fmt::strtime::{BrokenDownTime, Config, PosixCustom};
@@ -90,7 +88,7 @@ fn os_time(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 /// A time as the table `date("*t")` returns.
-fn date_table(time: &Zoned) -> Value {
+fn date_table(vm: &mut VM, time: &Zoned) -> Value {
     let mut table = VmTable::new();
     table.set_str("year", Value::int(time.year() as i64));
     table.set_str("month", Value::int(time.month() as i64));
@@ -104,7 +102,7 @@ fn date_table(time: &Zoned) -> Value {
         Value::int(time.weekday().to_sunday_one_offset() as i64),
     );
     table.set_str("yday", Value::int(time.day_of_year() as i64));
-    Value::table(Rc::new(RefCell::new(table)))
+    vm.alloc_table(table)
 }
 
 /// Formats a time with strftime codes, with `%c`, `%x` and `%X` laid out as
@@ -119,7 +117,7 @@ fn format_time(time: &Zoned, format: &str) -> Result<String, String> {
 /// `date(format?, time?)`: formats `time` (default now, in seconds since the
 /// epoch) in local time with strftime codes (default "%c"). A leading "!"
 /// uses UTC instead, and "*t" returns a table of the fields.
-fn os_date(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+fn os_date(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let format = match args.first() {
         None => "%c",
         Some(v) if v.is_nil() => "%c",
@@ -160,7 +158,7 @@ fn os_date(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     };
     let time = timestamp.to_zoned(zone);
     let value = match format {
-        "*t" => date_table(&time),
+        "*t" => date_table(vm, &time),
         _ => Value::string(format_time(&time, format)?),
     };
     Ok(vec![value])
@@ -345,12 +343,12 @@ fn os_run(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 .wait_with_output()
                 .map_err(|err| format!("cannot run command: {}", err))
         },
-        |_vm, output| Ok(vec![run_result(output)]),
+        |vm, output| Ok(vec![run_result(vm, output)]),
     )
 }
 
 /// The `{ ok, code, stdout, stderr }` table `run` returns.
-fn run_result(output: std::process::Output) -> Value {
+fn run_result(vm: &mut VM, output: std::process::Output) -> Value {
     let mut result = VmTable::new();
     result.set_str("ok", Value::bool(output.status.success()));
     result.set_str(
@@ -368,7 +366,7 @@ fn run_result(output: std::process::Output) -> Value {
         "stderr",
         Value::string(String::from_utf8_lossy(&output.stderr).into_owned()),
     );
-    Value::table(Rc::new(RefCell::new(result)))
+    vm.alloc_table(result)
 }
 
 /// Blocks the script for `seconds` (fractions allowed).
@@ -466,8 +464,7 @@ pub fn create_os_lib() -> Value {
         "unprotect",
         crate::native!("os.unprotect", storage::os_unprotect),
     );
-    table.frozen = true;
-    Value::table(Rc::new(RefCell::new(table)))
+    crate::vm::libs::args::frozen(table)
 }
 
 #[cfg(all(test, unix))]
@@ -492,16 +489,17 @@ mod run_sandbox_tests {
         for (k, v) in opts {
             o.set_str(k, v.clone());
         }
-        let wrap = |t: VmTable| Value::table(std::rc::Rc::new(std::cell::RefCell::new(t)));
-        os_run(vm, &[wrap(list), wrap(o)])
+        let o_val = vm.alloc_table(o);
+        let l_val = vm.alloc_table(list);
+        os_run(vm, &[l_val, o_val])
     }
 
-    fn table(pairs: &[(&str, &str)]) -> Value {
+    fn table(vm: &mut VM, pairs: &[(&str, &str)]) -> Value {
         let mut t = VmTable::new();
         for (k, v) in pairs {
             t.set_str(k, Value::str(v));
         }
-        Value::table(std::rc::Rc::new(std::cell::RefCell::new(t)))
+        vm.alloc_table(t)
     }
 
     fn vm_with_run(list: &[&str]) -> VM {
@@ -521,7 +519,7 @@ mod run_sandbox_tests {
         let marker = base.join("evil_ran");
         script(&base.join("bin/true"), &marker);
         let mut vm = vm_with_run(&["true"]);
-        let env = table(&[("PATH", &base.join("bin").to_string_lossy())]);
+        let env = table(&mut vm, &[("PATH", &base.join("bin").to_string_lossy())]);
         let _ = call(&mut vm, &["true"], &[("env", env)]);
         assert!(
             !marker.exists(),

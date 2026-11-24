@@ -1,7 +1,6 @@
 //! The `table` library.
 
 use std::cell::RefCell;
-use std::rc::Rc;
 
 use crate::vm::libs::args::{frozen, int_arg, opt_int_arg, table_arg};
 use crate::vm::machine::VM;
@@ -18,9 +17,7 @@ fn writable<'a>(args: &'a [Value], name: &str) -> Result<BorrowedRc<'a, RefCell<
 }
 
 fn new_table(vm: &mut VM, table: VmTable) -> Value {
-    let rc = Rc::new(RefCell::new(table));
-    vm.gc.register_table(&rc);
-    Value::table(rc)
+    vm.alloc_table(table)
 }
 
 /// Every key and value of a table in iteration order: the array part, then
@@ -236,7 +233,7 @@ fn table_unpack(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn table_freeze(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let t = table_arg(args, 0, "t")?;
     t.borrow_mut().frozen = true;
-    Ok(vec![Value::table(t.to_rc())])
+    Ok(vec![args[0].clone()])
 }
 
 fn table_isfrozen(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -351,14 +348,17 @@ fn sort_default(items: &mut Vec<Value>) -> Result<(), String> {
 /// `move(a1, f, e, t, a2?)`: copies `a1[f..e]` to `a2[t..]` (or within
 /// `a1`), handling overlap, and returns the destination.
 fn table_move(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let src = table_arg(args, 0, "a1")?.to_rc();
+    let src_ptr = table_arg(args, 0, "a1")?.as_ptr();
     let f = int_arg(args, 1, "f")?;
     let e = int_arg(args, 2, "e")?;
     let t = int_arg(args, 3, "t")?;
-    let dest = match args.get(4) {
-        None => src.clone(),
-        Some(v) if v.is_nil() => src.clone(),
-        _ => table_arg(args, 4, "a2")?.to_rc(),
+    let (target, dest_ptr) = match args.get(4) {
+        None => (args[0].clone(), src_ptr),
+        Some(v) if v.is_nil() => (args[0].clone(), src_ptr),
+        _ => {
+            let p = table_arg(args, 4, "a2")?.as_ptr();
+            (args[4].clone(), p)
+        }
     };
     if e >= f {
         if f < 1 && e >= i64::MAX + f {
@@ -368,9 +368,8 @@ fn table_move(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         if t > i64::MAX - count + 1 {
             return Err("destination wrap around".to_string());
         }
-        let overlapping = Rc::ptr_eq(&src, &dest) && t > f && t <= e;
-        let source = Value::table(src);
-        let target = Value::table(dest.clone());
+        let overlapping = std::ptr::eq(src_ptr, dest_ptr) && t > f && t <= e;
+        let source = args[0].clone();
         let order: Box<dyn Iterator<Item = i64>> = if overlapping {
             Box::new((0..count).rev())
         } else {
@@ -381,7 +380,7 @@ fn table_move(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             vm.table_set(&target, Value::int(t + k), v)?;
         }
     }
-    Ok(vec![Value::table(dest)])
+    Ok(vec![target])
 }
 
 pub fn create_table_lib() -> Value {
