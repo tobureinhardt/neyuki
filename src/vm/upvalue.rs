@@ -32,7 +32,7 @@ impl VM {
                 .open_upvalues
                 .pop()
                 .expect("the loop condition saw an open upvalue");
-            let val = self.stack.get(idx).cloned().unwrap_or(Value::Nil);
+            let val = self.stack.get(idx).cloned().unwrap_or(Value::NIL);
             uv.close(val);
         }
     }
@@ -43,7 +43,7 @@ impl VM {
         let pos = self.open_upvalues.partition_point(|(i, _)| *i < idx);
         if self.open_upvalues.get(pos).is_some_and(|(i, _)| *i == idx) {
             let (_, uv) = self.open_upvalues.remove(pos);
-            let val = self.stack.get(idx).cloned().unwrap_or(Value::Nil);
+            let val = self.stack.get(idx).cloned().unwrap_or(Value::NIL);
             uv.close(val);
         }
     }
@@ -51,7 +51,7 @@ impl VM {
     /// Finds or creates the open upvalue for stack slot `idx`.
     pub(crate) fn capture_upvalue(&mut self, idx: usize) -> Rc<Upvalue> {
         if idx >= self.stack.len() {
-            self.stack.resize(idx + 1, Value::Nil);
+            self.stack.resize(idx + 1, Value::NIL);
         }
         let pos = self.open_upvalues.partition_point(|(i, _)| *i < idx);
         if let Some((i, uv)) = self.open_upvalues.get(pos)
@@ -70,7 +70,7 @@ impl VM {
     pub fn park_upvalues(&mut self) -> Vec<ParkedUpvalue> {
         let parked = std::mem::take(&mut self.open_upvalues);
         for (idx, uv) in &parked {
-            let val = self.stack.get(*idx).cloned().unwrap_or(Value::Nil);
+            let val = self.stack.get(*idx).cloned().unwrap_or(Value::NIL);
             uv.close(val);
         }
         parked
@@ -91,7 +91,7 @@ impl VM {
     #[inline]
     pub fn upvalue_get(&self, uv: &Upvalue) -> Value {
         match uv.location.get() {
-            Some(idx) => self.stack.get(idx).cloned().unwrap_or(Value::Nil),
+            Some(idx) => self.stack.get(idx).cloned().unwrap_or(Value::NIL),
             None => uv.get_closed(),
         }
     }

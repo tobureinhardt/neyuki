@@ -203,7 +203,8 @@ fn period_key(ts: Timestamp, mode: RotationMode, utc: bool) -> String {
 /// `__log_now(utc?)`: current RFC 3339 timestamp with millisecond precision.
 fn builtin_now(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let utc = match args.first() {
-        None | Some(Value::Nil) => true,
+        None => true,
+        Some(v) if v.is_nil() => true,
         _ => bool_arg(args, 0, "utc")?,
     };
     Ok(vec![Value::string(format_timestamp(Timestamp::now(), utc))])
@@ -227,19 +228,19 @@ fn builtin_color_auto(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String>
     if vm.permissions.check_env("NO_COLOR").is_ok()
         && std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
     {
-        return Ok(vec![Value::Bool(false)]);
+        return Ok(vec![Value::FALSE]);
     }
     if vm.permissions.check_env("FORCE_COLOR").is_ok()
         && std::env::var_os("FORCE_COLOR").is_some_and(|v| !v.is_empty() && v != "0")
     {
-        return Ok(vec![Value::Bool(true)]);
+        return Ok(vec![Value::TRUE]);
     }
     if vm.permissions.check_env("TERM").is_ok()
         && std::env::var_os("TERM").is_some_and(|v| v == "dumb")
     {
-        return Ok(vec![Value::Bool(false)]);
+        return Ok(vec![Value::FALSE]);
     }
-    Ok(vec![Value::Bool(is_tty)])
+    Ok(vec![Value::bool(is_tty)])
 }
 
 /// `__log_write_console(stream, line)`: writes one complete log line followed
@@ -271,7 +272,7 @@ fn builtin_write_console(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Str
         }
     };
     result.map_err(|err| format!("cannot write to {}: {}", stream, err))?;
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 // ---------------------------------------------------------------------------
@@ -301,56 +302,61 @@ impl LogJsonEncoder<'_> {
             json::write_string(&mut self.out, "<max depth>");
             return Ok(());
         }
-        match value {
-            Value::Nil => self.out.push_str("null"),
-            Value::Bool(b) => self.out.push_str(if *b { "true" } else { "false" }),
-            Value::Int(i) => self.out.push_str(&i.to_string()),
-            Value::BigInt(i) => self.out.push_str(&i.to_string()),
-            Value::Float(f) => match json::format_float(*f) {
+        match value.view() {
+            crate::vm::value::ValueView::Nil => self.out.push_str("null"),
+            crate::vm::value::ValueView::Bool(b) => {
+                self.out.push_str(if b { "true" } else { "false" })
+            }
+            crate::vm::value::ValueView::Int(i) => self.out.push_str(&i.to_string()),
+            crate::vm::value::ValueView::BigInt(i) => self.out.push_str(&i.to_string()),
+            crate::vm::value::ValueView::Float(f) => match json::format_float(f) {
                 Some(text) => self.out.push_str(&text),
                 None if f.is_nan() => json::write_string(&mut self.out, "NaN"),
                 None if f.is_sign_positive() => json::write_string(&mut self.out, "Infinity"),
                 None => json::write_string(&mut self.out, "-Infinity"),
             },
-            Value::String(s) => json::write_string(&mut self.out, s),
-            Value::Buffer(buf) => {
+            crate::vm::value::ValueView::String(s) => json::write_string(&mut self.out, &s),
+            crate::vm::value::ValueView::Buffer(buf) => {
                 let len = buf.borrow().len();
                 json::write_string(&mut self.out, &format!("<buffer: {} bytes>", len));
             }
-            Value::Table(_) if json::is_null(value) => self.out.push_str("null"),
-            Value::Table(t) => {
+            crate::vm::value::ValueView::Table(_) if json::is_null(value) => {
+                self.out.push_str("null")
+            }
+            crate::vm::value::ValueView::Table(t) => {
                 let custom = t.borrow().metamethod("__tojson");
                 if let Some(handler) = custom {
                     let result = self
                         .vm
                         .call_function(handler, std::slice::from_ref(value))?;
-                    let result = result.into_iter().next().unwrap_or(Value::Nil);
-                    if let Value::Table(r) = &result
-                        && Rc::ptr_eq(r, t)
+                    let result = result.into_iter().next().unwrap_or(Value::NIL);
+                    if result
+                        .table_ptr()
+                        .is_some_and(|p| std::ptr::eq(p, t.as_ptr()))
                     {
                         json::write_string(&mut self.out, "<cycle>");
                         return Ok(());
                     }
                     return self.value(&result, depth + 1);
                 }
-                let ptr = Rc::as_ptr(t);
+                let ptr = t.as_ptr();
                 if self.open.contains(&ptr) {
                     json::write_string(&mut self.out, "<cycle>");
                     return Ok(());
                 }
                 self.open.push(ptr);
-                let result = self.table(t, depth);
+                let result = self.table(&t, depth);
                 self.open.pop();
                 result?;
             }
-            other => {
-                json::write_string(&mut self.out, &format!("<{}>", other.type_name()));
+            _ => {
+                json::write_string(&mut self.out, &format!("<{}>", value.type_name()));
             }
         }
         self.check_limit()
     }
 
-    fn table(&mut self, t: &Rc<RefCell<VmTable>>, depth: usize) -> Result<(), String> {
+    fn table(&mut self, t: &RefCell<VmTable>, depth: usize) -> Result<(), String> {
         let (is_array, items, entries) = {
             let tbl = t.borrow();
             let marked = tbl
@@ -397,11 +403,15 @@ impl LogJsonEncoder<'_> {
 }
 
 fn key_to_string(key: &Value) -> String {
-    match key {
-        Value::String(s) => s.to_string(),
-        Value::Int(_) | Value::BigInt(_) | Value::Bool(_) => key.to_string(),
-        Value::Float(f) => json::format_float(*f).unwrap_or_else(|| f.to_string()),
-        other => format!("<{}>", other.type_name()),
+    match key.view() {
+        crate::vm::value::ValueView::String(s) => s.to_string(),
+        crate::vm::value::ValueView::Int(_)
+        | crate::vm::value::ValueView::BigInt(_)
+        | crate::vm::value::ValueView::Bool(_) => key.to_string(),
+        crate::vm::value::ValueView::Float(f) => {
+            json::format_float(f).unwrap_or_else(|| f.to_string())
+        }
+        _ => format!("<{}>", key.type_name()),
     }
 }
 
@@ -422,12 +432,14 @@ fn builtin_json_line(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> 
     let level = str_arg(args, 1, "level")?;
     let msg = str_arg(args, 2, "msg")?;
     let name = match args.get(3) {
-        None | Some(Value::Nil) => None,
+        None => None,
+        Some(v) if v.is_nil() => None,
         _ => Some(str_arg(args, 3, "name")?),
     };
     let fields = match args.get(4) {
-        None | Some(Value::Nil) => None,
-        Some(Value::Table(t)) => Some(t.clone()),
+        None => None,
+        Some(v) if v.is_nil() => None,
+        Some(v) if v.is_table() => Some(v.as_table().unwrap().to_rc()),
         Some(other) => {
             return Err(format!("fields must be a table, got {}", other.type_name()));
         }
@@ -548,12 +560,14 @@ fn builtin_format_pretty(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Stri
     let level = str_arg(args, 1, "level")?;
     let msg = str_arg(args, 2, "msg")?;
     let name = match args.get(3) {
-        None | Some(Value::Nil) => None,
+        None => None,
+        Some(v) if v.is_nil() => None,
         _ => Some(str_arg(args, 3, "name")?),
     };
     let fields = match args.get(4) {
-        None | Some(Value::Nil) => None,
-        Some(Value::Table(t)) => Some(t.clone()),
+        None => None,
+        Some(v) if v.is_nil() => None,
+        Some(v) if v.is_table() => Some(v.as_table().unwrap().to_rc()),
         Some(other) => {
             return Err(format!("fields must be a table, got {}", other.type_name()));
         }
@@ -616,23 +630,27 @@ fn builtin_format_pretty(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Stri
                 write_sanitized_message(&mut out, &key);
                 out.push('=');
             }
-            match &value {
-                Value::String(s) => {
-                    if is_bare_logfmt(s) {
-                        out.push_str(s);
+            match value.view() {
+                crate::vm::value::ValueView::String(s) => {
+                    if is_bare_logfmt(&s) {
+                        out.push_str(&s);
                     } else {
-                        json::write_string(&mut out, s);
+                        json::write_string(&mut out, &s);
                     }
                 }
-                Value::Nil => out.push_str("null"),
-                Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-                Value::Int(i) => out.push_str(&i.to_string()),
-                Value::BigInt(i) => out.push_str(&i.to_string()),
-                Value::Float(f) => match json::format_float(*f) {
+                crate::vm::value::ValueView::Nil => out.push_str("null"),
+                crate::vm::value::ValueView::Bool(b) => {
+                    out.push_str(if b { "true" } else { "false" })
+                }
+                crate::vm::value::ValueView::Int(i) => out.push_str(&i.to_string()),
+                crate::vm::value::ValueView::BigInt(i) => out.push_str(&i.to_string()),
+                crate::vm::value::ValueView::Float(f) => match json::format_float(f) {
                     Some(text) => out.push_str(&text),
                     None => out.push_str(&f.to_string()),
                 },
-                Value::Table(_) if json::is_null(&value) => out.push_str("null"),
+                crate::vm::value::ValueView::Table(_) if json::is_null(&value) => {
+                    out.push_str("null")
+                }
                 _ => {
                     let mut encoder = LogJsonEncoder {
                         vm,
@@ -922,7 +940,8 @@ fn builtin_file_open(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> 
         return Err("maxSize must be non-negative".to_string());
     }
     let rotation_str = match args.get(2) {
-        None | Some(Value::Nil) => "none",
+        None => "none",
+        Some(v) if v.is_nil() => "none",
         _ => str_arg(args, 2, "rotation")?,
     };
     let rotation = RotationMode::parse(rotation_str)?;
@@ -931,7 +950,8 @@ fn builtin_file_open(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> 
         return Err("maxFiles must be non-negative".to_string());
     }
     let utc = match args.get(4) {
-        None | Some(Value::Nil) => true,
+        None => true,
+        Some(v) if v.is_nil() => true,
         _ => bool_arg(args, 4, "utc")?,
     };
     let compress = bool_arg(args, 5, "compress")?;
@@ -1007,7 +1027,7 @@ fn builtin_file_write(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String>
         file.write_all(&payload)
             .map_err(|err| io_error("write", &sink.path, err))?;
         sink.current_bytes = sink.current_bytes.saturating_add(line_len);
-        Ok(vec![Value::Nil])
+        Ok(vec![Value::NIL])
     })
 }
 
@@ -1023,7 +1043,7 @@ fn builtin_file_flush(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
             file.flush()
                 .map_err(|err| io_error("flush", &sink.path, err))?;
         }
-        Ok(vec![Value::Nil])
+        Ok(vec![Value::NIL])
     })
 }
 
@@ -1037,7 +1057,7 @@ fn builtin_file_rotate(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
             .ok_or_else(|| "log file sink is closed".to_string())?;
         let now_period = period_key(Timestamp::now(), sink.rotation, sink.utc);
         rotate_sink(vm, sink, &now_period)?;
-        Ok(vec![Value::Nil])
+        Ok(vec![Value::NIL])
     })
 }
 
@@ -1050,9 +1070,9 @@ fn builtin_file_close(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
         if let Some(mut file) = sink.file.take() {
             let _ = file.flush();
         }
-        return Ok(vec![Value::Bool(true)]);
+        return Ok(vec![Value::TRUE]);
     }
-    Ok(vec![Value::Bool(false)])
+    Ok(vec![Value::FALSE])
 }
 
 #[cfg(test)]
@@ -1088,11 +1108,11 @@ mod tests {
         fields
             .borrow_mut()
             .set_str("msg", Value::str("user override"));
-        fields.borrow_mut().set_str("port", Value::Int(8080));
+        fields.borrow_mut().set_str("port", Value::int(8080));
         fields
             .borrow_mut()
-            .set_str("self", Value::Table(fields.clone()));
-        fields.borrow_mut().set_str("nan", Value::Float(f64::NAN));
+            .set_str("self", Value::table(fields.clone()));
+        fields.borrow_mut().set_str("nan", Value::float(f64::NAN));
 
         let out = builtin_json_line(
             &mut vm,
@@ -1101,11 +1121,11 @@ mod tests {
                 Value::str("info"),
                 Value::str("hello\nworld"),
                 Value::str("api"),
-                Value::Table(fields),
+                Value::table(fields),
             ],
         )
         .unwrap();
-        let Value::String(line) = &out[0] else {
+        let Some(line) = out[0].as_str() else {
             panic!("expected string");
         };
         assert!(!line.contains('\n'), "JSON line must stay single-line");
@@ -1128,13 +1148,13 @@ mod tests {
                 Value::str("2026-11-22T09:00:00.000Z"),
                 Value::str("warn"),
                 Value::str("bad \x1b[31minput\r\nforged"),
-                Value::Nil,
-                Value::Nil,
-                Value::Bool(false),
+                Value::NIL,
+                Value::NIL,
+                Value::FALSE,
             ],
         )
         .unwrap();
-        let Value::String(line) = &out[0] else {
+        let Some(line) = out[0].as_str() else {
             panic!("expected string");
         };
         assert!(!line.contains('\x1b'));
@@ -1151,11 +1171,11 @@ mod tests {
             &mut vm,
             &[
                 Value::string(path.to_string_lossy().into_owned()),
-                Value::Int(20),
+                Value::int(20),
                 Value::str("none"),
-                Value::Int(2),
-                Value::Bool(true),
-                Value::Bool(true),
+                Value::int(2),
+                Value::TRUE,
+                Value::TRUE,
             ],
         )
         .unwrap();
@@ -1194,11 +1214,11 @@ mod tests {
             &mut vm,
             &[
                 Value::string(path.to_string_lossy().into_owned()),
-                Value::Int(0),
+                Value::int(0),
                 Value::str("daily"),
-                Value::Int(2),
-                Value::Bool(true),
-                Value::Bool(false),
+                Value::int(2),
+                Value::TRUE,
+                Value::FALSE,
             ],
         )
         .unwrap();
@@ -1255,11 +1275,11 @@ mod tests {
             &mut vm,
             &[
                 Value::string(path.to_string_lossy().into_owned()),
-                Value::Int(0),
+                Value::int(0),
                 Value::str("none"),
-                Value::Int(2),
-                Value::Bool(true),
-                Value::Bool(false),
+                Value::int(2),
+                Value::TRUE,
+                Value::FALSE,
             ],
         )
         .unwrap();
@@ -1286,9 +1306,6 @@ mod tests {
     }
 
     fn id_from_val(v: &Value) -> u64 {
-        match v {
-            Value::Int(i) => *i as u64,
-            _ => panic!("expected int handle"),
-        }
+        v.as_int().expect("expected int handle") as u64
     }
 }

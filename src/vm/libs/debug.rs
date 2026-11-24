@@ -38,14 +38,14 @@ pub fn create_debug_lib() -> Value {
 
 /// A non-negative level or index argument.
 fn count_arg(args: &[Value], index: usize, name: &str, default: i64) -> Result<i64, String> {
-    match args.get(index) {
-        None | Some(Value::Nil) => Ok(default),
-        Some(Value::Int(i)) => Ok(*i),
-        Some(Value::Float(f)) if f.fract() == 0.0 => Ok(*f as i64),
-        Some(other) => Err(format!(
+    match args.get(index).map(crate::vm::value::Value::view) {
+        None | Some(crate::vm::value::ValueView::Nil) => Ok(default),
+        Some(crate::vm::value::ValueView::Int(i)) => Ok(i),
+        Some(crate::vm::value::ValueView::Float(f)) if f.fract() == 0.0 => Ok(f as i64),
+        Some(_) => Err(format!(
             "{} must be an integer, got {}",
             name,
-            other.type_name()
+            args[index].type_name()
         )),
     }
 }
@@ -77,8 +77,9 @@ fn current_line(frame: &CallFrame) -> i64 {
 /// one `file:line in function` entry per frame.
 fn debug_traceback(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let message = match args.first() {
-        None | Some(Value::Nil) => None,
-        Some(Value::String(s)) => Some(s.to_string()),
+        None => None,
+        Some(v) if v.is_nil() => None,
+        Some(v) if v.is_string() => Some(v.as_str().unwrap().to_string()),
         // A non-string message is passed through untouched, as in Lua.
         Some(other) => return Ok(vec![other.clone()]),
     };
@@ -101,7 +102,7 @@ fn proto_info(table: &mut VmTable, proto: &Proto) {
     table.set_str(
         "name",
         match name {
-            Some("main") | None => Value::Nil,
+            Some("main") | None => Value::NIL,
             Some(n) => Value::str(n),
         },
     );
@@ -121,11 +122,11 @@ fn proto_info(table: &mut VmTable, proto: &Proto) {
     );
     let first = proto.lines.iter().copied().filter(|l| *l > 0).min();
     let last = proto.lines.iter().copied().max();
-    table.set_str("linedefined", Value::Int(first.unwrap_or(0) as i64));
-    table.set_str("lastlinedefined", Value::Int(last.unwrap_or(0) as i64));
-    table.set_str("numparams", Value::Int(proto.num_params as i64));
-    table.set_str("isvararg", Value::Bool(proto.is_vararg));
-    table.set_str("nups", Value::Int(proto.upvalues.len() as i64));
+    table.set_str("linedefined", Value::int(first.unwrap_or(0) as i64));
+    table.set_str("lastlinedefined", Value::int(last.unwrap_or(0) as i64));
+    table.set_str("numparams", Value::int(proto.num_params as i64));
+    table.set_str("isvararg", Value::bool(proto.is_vararg));
+    table.set_str("nups", Value::int(proto.upvalues.len() as i64));
 }
 
 fn native_info(table: &mut VmTable, name: &str) {
@@ -133,12 +134,12 @@ fn native_info(table: &mut VmTable, name: &str) {
     table.set_str("what", Value::str("native"));
     table.set_str("source", Value::str("=[native]"));
     table.set_str("short_src", Value::str("[native]"));
-    table.set_str("linedefined", Value::Int(-1));
-    table.set_str("lastlinedefined", Value::Int(-1));
-    table.set_str("currentline", Value::Int(-1));
-    table.set_str("numparams", Value::Int(0));
-    table.set_str("isvararg", Value::Bool(true));
-    table.set_str("nups", Value::Int(0));
+    table.set_str("linedefined", Value::int(-1));
+    table.set_str("lastlinedefined", Value::int(-1));
+    table.set_str("currentline", Value::int(-1));
+    table.set_str("numparams", Value::int(0));
+    table.set_str("isvararg", Value::TRUE);
+    table.set_str("nups", Value::int(0));
 }
 
 /// `debug.getinfo(level | function)`: a table describing a running frame or
@@ -146,31 +147,31 @@ fn native_info(table: &mut VmTable, name: &str) {
 /// currentline (frames only), numparams, isvararg, nups and func.
 fn debug_getinfo(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let mut table = VmTable::new();
-    match args.first() {
-        Some(Value::Closure(c)) => {
+    match args.first().map(crate::vm::value::Value::view) {
+        Some(crate::vm::value::ValueView::Closure(c)) => {
             proto_info(&mut table, &c.proto);
-            table.set_str("currentline", Value::Int(-1));
+            table.set_str("currentline", Value::int(-1));
         }
-        Some(Value::Native(def)) => native_info(&mut table, def.name),
-        Some(level @ (Value::Int(_) | Value::Float(_))) => {
-            let level = count_arg(std::slice::from_ref(level), 0, "level", 1)?;
+        Some(crate::vm::value::ValueView::Native(def)) => native_info(&mut table, def.name),
+        Some(crate::vm::value::ValueView::Int(_) | crate::vm::value::ValueView::Float(_)) => {
+            let level = count_arg(args, 0, "level", 1)?;
             if level == 0 {
                 native_info(&mut table, "debug.getinfo");
             } else {
                 let Some(frame) = frame_at(vm, level) else {
-                    return Ok(vec![Value::Nil]);
+                    return Ok(vec![Value::NIL]);
                 };
                 proto_info(&mut table, &frame.closure.proto);
-                table.set_str("currentline", Value::Int(current_line(frame)));
-                table.set_str("func", Value::Closure(frame.closure.clone()));
+                table.set_str("currentline", Value::int(current_line(frame)));
+                table.set_str("func", Value::closure(frame.closure.clone()));
             }
         }
         _ => return Err("getinfo expects a level or a function".to_string()),
     }
-    if let Some(f @ (Value::Closure(_) | Value::Native(_))) = args.first() {
+    if let Some(f) = args.first().filter(|v| v.is_callable()) {
         table.set_str("func", f.clone());
     }
-    Ok(vec![Value::Table(Rc::new(RefCell::new(table)))])
+    Ok(vec![Value::table(Rc::new(RefCell::new(table)))])
 }
 
 /// The locals in scope at the frame's current instruction, in declaration
@@ -191,7 +192,7 @@ fn active_locals(frame: &CallFrame) -> Vec<&LocalVarInfo> {
 /// names a function's `n`th parameter.
 fn debug_getlocal(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let n = count_arg(args, 1, "n", 1)?;
-    if let Some(Value::Closure(c)) = args.first() {
+    if let Some(c) = args.first().and_then(Value::as_closure) {
         let name = c
             .proto
             .local_names
@@ -200,7 +201,7 @@ fn debug_getlocal(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             .nth((n - 1).max(0) as usize)
             .filter(|_| n >= 1)
             .map(|info| Value::str(&info.name));
-        return Ok(vec![name.unwrap_or(Value::Nil)]);
+        return Ok(vec![name.unwrap_or(Value::NIL)]);
     }
     let level = count_arg(args, 0, "level", 1)?;
     let Some(frame) = frame_at(vm, level) else {
@@ -210,18 +211,18 @@ fn debug_getlocal(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         let index = (-n - 1) as usize;
         return Ok(match frame.varargs().get(index) {
             Some(v) => vec![Value::str("(vararg)"), v.clone()],
-            None => vec![Value::Nil],
+            None => vec![Value::NIL],
         });
     }
     let locals = active_locals(frame);
     let Some(info) = (n >= 1).then(|| locals.get(n as usize - 1)).flatten() else {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     };
     let value = vm
         .stack
         .get(frame.base + info.reg as usize)
         .cloned()
-        .unwrap_or(Value::Nil);
+        .unwrap_or(Value::NIL);
     Ok(vec![Value::str(&info.name), value])
 }
 
@@ -230,7 +231,7 @@ fn debug_getlocal(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn debug_setlocal(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let level = count_arg(args, 0, "level", 1)?;
     let n = count_arg(args, 1, "n", 1)?;
-    let value = args.get(2).cloned().unwrap_or(Value::Nil);
+    let value = args.get(2).cloned().unwrap_or(Value::NIL);
     let Some(frame) = frame_at(vm, level) else {
         return Err("level out of range".to_string());
     };
@@ -242,7 +243,7 @@ fn debug_setlocal(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 *slot = value;
                 vec![Value::str("(vararg)")]
             }
-            None => vec![Value::Nil],
+            None => vec![Value::NIL],
         });
     }
     let target = active_locals(frame)
@@ -250,10 +251,10 @@ fn debug_setlocal(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         .filter(|_| n >= 1)
         .map(|info| (info.name.clone(), frame.base + info.reg as usize));
     let Some((name, slot)) = target else {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     };
     if slot >= vm.stack.len() {
-        vm.stack.resize(slot + 1, Value::Nil);
+        vm.stack.resize(slot + 1, Value::NIL);
     }
     vm.stack[slot] = value;
     Ok(vec![Value::string(name)])
@@ -268,67 +269,68 @@ fn upvalue_name(c: &crate::vm::value::VmClosure, index: usize) -> Value {
 
 /// `debug.getupvalue(f, n)`: the name and value of `f`'s `n`th upvalue.
 fn debug_getupvalue(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let Some(Value::Closure(c)) = args.first() else {
-        return Ok(vec![Value::Nil]);
+    let Some(c) = args.first().and_then(Value::as_closure) else {
+        return Ok(vec![Value::NIL]);
     };
     let n = count_arg(args, 1, "n", 1)?;
     if n < 1 || n as usize > c.upvalues.len() {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
     let value = vm.upvalue_get(&c.upvalues[n as usize - 1]);
-    Ok(vec![upvalue_name(c, n as usize - 1), value])
+    Ok(vec![upvalue_name(&c, n as usize - 1), value])
 }
 
 /// `debug.setupvalue(f, n, value)`: assigns `f`'s `n`th upvalue and returns
 /// its name.
 fn debug_setupvalue(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let Some(Value::Closure(c)) = args.first() else {
-        return Ok(vec![Value::Nil]);
+    let Some(c) = args.first().and_then(Value::as_closure) else {
+        return Ok(vec![Value::NIL]);
     };
     let n = count_arg(args, 1, "n", 1)?;
     if n < 1 || n as usize > c.upvalues.len() {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
-    let value = args.get(2).cloned().unwrap_or(Value::Nil);
+    let value = args.get(2).cloned().unwrap_or(Value::NIL);
     let uv = c.upvalues[n as usize - 1].clone();
     vm.upvalue_set(&uv, value);
-    Ok(vec![upvalue_name(c, n as usize - 1)])
+    Ok(vec![upvalue_name(&c, n as usize - 1)])
 }
 
 /// `debug.upvalueid(f, n)`: a number identifying the variable behind `f`'s
 /// `n`th upvalue, equal for closures that share it.
 fn debug_upvalueid(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let Some(Value::Closure(c)) = args.first() else {
+    let Some(c) = args.first().and_then(Value::as_closure) else {
         return Err("upvalueid expects a function".to_string());
     };
     let n = count_arg(args, 1, "n", 1)?;
     match (n >= 1).then(|| c.upvalues.get(n as usize - 1)).flatten() {
-        Some(uv) => Ok(vec![Value::Int(Rc::as_ptr(uv) as i64)]),
-        None => Ok(vec![Value::Nil]),
+        Some(uv) => Ok(vec![Value::int(Rc::as_ptr(uv) as i64)]),
+        None => Ok(vec![Value::NIL]),
     }
 }
 
 /// `debug.getmetatable(t)`, ignoring a `__metatable` field.
 fn debug_getmetatable(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    Ok(vec![match args.first() {
-        Some(Value::Table(t)) => t
+    Ok(vec![match args.first().and_then(Value::as_table) {
+        Some(t) => t
             .borrow()
             .metatable
             .clone()
-            .map(Value::Table)
-            .unwrap_or(Value::Nil),
-        _ => Value::Nil,
+            .map(Value::table)
+            .unwrap_or(Value::NIL),
+        _ => Value::NIL,
     }])
 }
 
 /// `debug.setmetatable(t, mt)`, ignoring a `__metatable` field.
 fn debug_setmetatable(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let Some(Value::Table(t)) = args.first() else {
+    let Some(t) = args.first().and_then(Value::as_table) else {
         return Err("setmetatable expects a table".to_string());
     };
     let mt = match args.get(1) {
-        None | Some(Value::Nil) => None,
-        Some(Value::Table(mt)) => Some(mt.clone()),
+        None => None,
+        Some(v) if v.is_nil() => None,
+        Some(v) if v.is_table() => Some(v.as_table().unwrap().to_rc()),
         Some(other) => {
             return Err(format!(
                 "metatable must be a table or nil, got {}",
@@ -336,19 +338,17 @@ fn debug_setmetatable(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String>
             ));
         }
     };
-    let gc_handler = mt.as_ref().is_some_and(|mt| {
-        matches!(
-            mt.borrow().get_str("__gc"),
-            Value::Closure(_) | Value::Native(_)
-        )
-    });
+    let gc_handler = mt
+        .as_ref()
+        .is_some_and(|mt| mt.borrow().get_str("__gc").is_callable());
     t.borrow_mut().metatable = mt;
+    let t_rc = t.to_rc();
     if gc_handler {
-        vm.gc.pin_table(t);
+        vm.gc.pin_table(&t_rc);
     } else {
-        vm.gc.unpin_table(t);
+        vm.gc.unpin_table(&t_rc);
     }
-    if crate::vm::gc::table_weak_values(t) {
+    if crate::vm::gc::table_weak_values(&t_rc) {
         vm.gc.has_weak_tables = true;
     }
     Ok(vec![args[0].clone()])
@@ -361,20 +361,22 @@ fn debug_setmetatable(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String>
 /// the event name, and the line number for line events. Hooks never trigger
 /// hooks.
 fn debug_sethook(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let func = args.first().cloned().unwrap_or(Value::Nil);
-    if matches!(func, Value::Nil) {
+    let func = args.first().cloned().unwrap_or(Value::NIL);
+    if func.is_nil() {
         vm.hook = None;
         vm.update_trap();
         return Ok(Vec::new());
     }
-    if !matches!(func, Value::Closure(_) | Value::Native(_)) {
+    if !func.is_callable() {
         return Err(format!("hook must be a function, got {}", func.type_name()));
     }
     let mask = match args.get(1) {
         // Without a mask or count, report calls and returns.
-        None | Some(Value::Nil) if args.get(2).is_none() => "cr",
-        None | Some(Value::Nil) => "",
-        Some(Value::String(s)) => s,
+        None if args.get(2).is_none() => "cr",
+        Some(v) if v.is_nil() && args.get(2).is_none() => "cr",
+        None => "",
+        Some(v) if v.is_nil() => "",
+        Some(v) if v.is_string() => v.as_str().unwrap(),
         Some(other) => {
             return Err(format!("mask must be a string, got {}", other.type_name()));
         }
@@ -410,7 +412,7 @@ fn debug_sethook(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// `debug.gethook()`: the hook function, its mask and its count.
 fn debug_gethook(vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
     let Some(hook) = &vm.hook else {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     };
     let mut mask = String::new();
     if hook.on_call {
@@ -425,6 +427,6 @@ fn debug_gethook(vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![
         hook.func.clone(),
         Value::string(mask),
-        Value::Int(hook.count as i64),
+        Value::int(hook.count as i64),
     ])
 }

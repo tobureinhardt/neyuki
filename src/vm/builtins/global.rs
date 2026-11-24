@@ -10,7 +10,7 @@ use std::str::FromStr;
 use crate::bytecode::Proto;
 use crate::vm::hash::FxHashMap;
 use crate::vm::machine::VM;
-use crate::vm::value::{StrRef, Value};
+use crate::vm::value::{StrRef, Value, ValueView};
 
 pub fn builtin_print(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     use std::io::Write;
@@ -19,9 +19,9 @@ pub fn builtin_print(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> 
         if i > 0 {
             out.push('\t');
         }
-        match arg {
-            Value::String(s) => out.push_str(s),
-            other => out.push_str(&tostring(vm, other)?),
+        match arg.as_str() {
+            Some(s) => out.push_str(s),
+            None => out.push_str(&tostring(vm, arg)?),
         }
     }
     out.push('\n');
@@ -35,7 +35,7 @@ pub fn builtin_print(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> 
 }
 
 pub fn builtin_assert(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let cond = args.first().cloned().unwrap_or(Value::Nil);
+    let cond = args.first().cloned().unwrap_or(Value::NIL);
     if !cond.is_truthy() {
         let msg = args
             .get(1)
@@ -56,35 +56,37 @@ fn static_type_str(name: &'static str) -> Value {
     CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
         let s = map.entry(name).or_insert_with(|| StrRef::from(name));
-        Value::String(s.clone())
+        Value::str_ref(s.clone())
     })
 }
 
 pub fn builtin_type(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let val = args.first().unwrap_or(&Value::Nil);
+    let nil = Value::NIL;
+    let val = args.first().unwrap_or(&nil);
     Ok(vec![static_type_str(val.type_name())])
 }
 
 pub fn builtin_typeof(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let val = args.first().unwrap_or(&Value::Nil);
+    let nil = Value::NIL;
+    let val = args.first().unwrap_or(&nil);
     Ok(vec![static_type_str(val.typeof_name())])
 }
 
 pub fn builtin_checktype(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let val = args.first().unwrap_or(&Value::Nil);
-    let ty_str = match args.get(1) {
-        Some(Value::String(s)) => &**s,
-        _ => return Err("checktype expects a type string as argument #2".to_string()),
+    let nil = Value::NIL;
+    let val = args.first().unwrap_or(&nil);
+    let Some(ty_str) = args.get(1).and_then(|v| v.as_str()) else {
+        return Err("checktype expects a type string as argument #2".to_string());
     };
     let ty = crate::ast::ty::TypeExpr::parse(ty_str);
-    Ok(vec![Value::Bool(val.matches_type_expr(&ty))])
+    Ok(vec![Value::bool(val.matches_type_expr(&ty))])
 }
 
 pub fn builtin_asserttype(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let val = args.first().unwrap_or(&Value::Nil);
-    let ty_str = match args.get(1) {
-        Some(Value::String(s)) => &**s,
-        _ => return Err("asserttype expects a type string as argument #2".to_string()),
+    let nil = Value::NIL;
+    let val = args.first().unwrap_or(&nil);
+    let Some(ty_str) = args.get(1).and_then(|v| v.as_str()) else {
+        return Err("asserttype expects a type string as argument #2".to_string());
     };
     let ty = crate::ast::ty::TypeExpr::parse(ty_str);
     if !val.matches_type_expr(&ty) {
@@ -102,11 +104,11 @@ pub fn builtin_asserttype(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, St
 
 /// A value as `tostring` prints it, honoring `__tostring`.
 pub fn tostring(vm: &mut VM, val: &Value) -> Result<String, String> {
-    if let Value::Table(t) = val {
+    if let Some(t) = val.as_table() {
         let handler = t.borrow().metamethod("__tostring");
         if let Some(h) = handler {
             let res = vm.call_function(h, std::slice::from_ref(val))?;
-            return Ok(res.into_iter().next().unwrap_or(Value::Nil).to_string());
+            return Ok(res.into_iter().next().unwrap_or(Value::NIL).to_string());
         }
     }
     Ok(val.to_string())
@@ -124,12 +126,13 @@ fn cached_small_int_string(i: i64) -> Option<Value> {
 }
 
 pub fn builtin_tostring(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let val = args.first().unwrap_or(&Value::Nil);
-    if let Value::String(_) = val {
+    let nil = Value::NIL;
+    let val = args.first().unwrap_or(&nil);
+    if val.is_string() {
         return Ok(vec![val.clone()]);
     }
-    if let Value::Int(i) = val
-        && let Some(cached) = cached_small_int_string(*i)
+    if let Some(i) = val.as_int()
+        && let Some(cached) = cached_small_int_string(i)
     {
         return Ok(vec![cached]);
     }
@@ -137,26 +140,26 @@ pub fn builtin_tostring(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Strin
 }
 
 pub fn builtin_tonumber(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let val = args.first().unwrap_or(&Value::Nil);
+    let nil = Value::NIL;
+    let val = args.first().unwrap_or(&nil);
     let base_opt = args.get(1);
 
     if let Some(base_val) = base_opt
-        && !matches!(base_val, Value::Nil)
+        && !base_val.is_nil()
     {
-        let base = match base_val {
-            Value::Int(i) => i.to_i64().unwrap_or(0),
-            Value::Float(f) => *f as i64,
+        let base = match base_val.view() {
+            ValueView::Int(i) => i,
+            ValueView::Float(f) => f as i64,
             _ => return Err("bad argument #2 to 'tonumber' (base out of range)".to_string()),
         };
         if !(2..=36).contains(&base) {
             return Err("bad argument #2 to 'tonumber' (base out of range)".to_string());
         }
-        let s = match val {
-            Value::String(s) => &**s,
-            _ => return Ok(vec![Value::Nil]),
+        let Some(s) = val.as_str() else {
+            return Ok(vec![Value::NIL]);
         };
         if s.len() > 65_536 {
-            return Ok(vec![Value::Nil]);
+            return Ok(vec![Value::NIL]);
         }
         let s_trimmed = s.trim();
         let (sign, s_digits) = if let Some(stripped) = s_trimmed.strip_prefix('-') {
@@ -179,24 +182,24 @@ pub fn builtin_tonumber(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Stri
             s_digits
         };
         if s_digits.is_empty() {
-            return Ok(vec![Value::Nil]);
+            return Ok(vec![Value::NIL]);
         }
         return match BigInt::parse_bytes(s_digits.as_bytes(), base as u32) {
             Some(bi) => {
                 let bi = if sign < 0 { -bi } else { bi };
                 Ok(vec![Value::from_bigint(bi)])
             }
-            None => Ok(vec![Value::Nil]),
+            None => Ok(vec![Value::NIL]),
         };
     }
 
-    match val {
-        Value::Int(i) => Ok(vec![Value::Int(*i)]),
-        Value::BigInt(_) => Ok(vec![val.clone()]),
-        Value::Float(f) => Ok(vec![Value::Float(*f)]),
-        Value::String(s) => {
+    match val.view() {
+        ValueView::Int(i) => Ok(vec![Value::int(i)]),
+        ValueView::BigInt(_) => Ok(vec![val.clone()]),
+        ValueView::Float(f) => Ok(vec![Value::float(f)]),
+        ValueView::String(s) => {
             if s.len() > 65_536 {
-                return Ok(vec![Value::Nil]);
+                return Ok(vec![Value::NIL]);
             }
             let s_trimmed = s.trim();
             let (sign, s_rest) = if let Some(stripped) = s_trimmed.strip_prefix('-') {
@@ -220,24 +223,25 @@ pub fn builtin_tonumber(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Stri
             } else if let Ok(bi) = BigInt::from_str(s_trimmed) {
                 Ok(vec![Value::from_bigint(bi)])
             } else if let Ok(f) = s_trimmed.parse::<f64>() {
-                Ok(vec![Value::Float(f)])
+                Ok(vec![Value::float(f)])
             } else {
-                Ok(vec![Value::Nil])
+                Ok(vec![Value::NIL])
             }
         }
-        _ => Ok(vec![Value::Nil]),
+        _ => Ok(vec![Value::NIL]),
     }
 }
 
 pub fn builtin_int(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let val = args.first().unwrap_or(&Value::Nil);
-    match val {
-        Value::Int(i) => Ok(vec![Value::Int(*i)]),
-        Value::BigInt(_) => Ok(vec![val.clone()]),
-        Value::Float(f) => Ok(vec![Value::from_bigint(
+    let nil = Value::NIL;
+    let val = args.first().unwrap_or(&nil);
+    match val.view() {
+        ValueView::Int(i) => Ok(vec![Value::int(i)]),
+        ValueView::BigInt(_) => Ok(vec![val.clone()]),
+        ValueView::Float(f) => Ok(vec![Value::from_bigint(
             BigInt::from_f64(f.trunc()).unwrap_or_default(),
         )]),
-        Value::String(s) => {
+        ValueView::String(s) => {
             if s.len() > 65_536 {
                 return Err("integer string exceeds maximum length limit (65536 bytes)".to_string());
             }
@@ -250,15 +254,16 @@ pub fn builtin_int(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 pub fn builtin_float(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let val = args.first().unwrap_or(&Value::Nil);
-    match val {
-        Value::Float(f) => Ok(vec![Value::Float(*f)]),
-        Value::Int(i) => Ok(vec![Value::Float(i.to_f64().unwrap_or(0.0))]),
-        Value::String(s) => {
+    let nil = Value::NIL;
+    let val = args.first().unwrap_or(&nil);
+    match val.view() {
+        ValueView::Float(f) => Ok(vec![Value::float(f)]),
+        ValueView::Int(i) => Ok(vec![Value::float(i.to_f64().unwrap_or(0.0))]),
+        ValueView::String(s) => {
             let f = s
                 .parse::<f64>()
                 .map_err(|_| "invalid float string".to_string())?;
-            Ok(vec![Value::Float(f)])
+            Ok(vec![Value::float(f)])
         }
         _ => Err("float expects number or string".to_string()),
     }
@@ -278,7 +283,7 @@ pub fn builtin_pcall(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> 
         .ok_or_else(|| "pcall expects at least 1 argument".to_string())?;
     match vm.call_function(func.clone(), &args[1..]) {
         Ok(mut res) => {
-            res.insert(0, Value::Bool(true));
+            res.insert(0, Value::TRUE);
             Ok(res)
         }
         Err(err) => {
@@ -286,7 +291,7 @@ pub fn builtin_pcall(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> 
                 return Err(err);
             }
             vm.error_trace = None;
-            Ok(vec![Value::Bool(false), Value::string(err)])
+            Ok(vec![Value::FALSE, Value::string(err)])
         }
     }
 }
@@ -299,7 +304,7 @@ pub fn builtin_try(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         .ok_or_else(|| "try expects a function".to_string())?;
     match vm.call_function(func.clone(), &args[1..]) {
         Ok(mut res) => {
-            res.insert(0, Value::Bool(true));
+            res.insert(0, Value::TRUE);
             Ok(res)
         }
         Err(err) => {
@@ -307,7 +312,7 @@ pub fn builtin_try(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 return Err(err);
             }
             vm.error_trace = None;
-            Ok(vec![Value::Bool(false), Value::string(err)])
+            Ok(vec![Value::FALSE, Value::string(err)])
         }
     }
 }
@@ -322,7 +327,7 @@ pub fn builtin_xpcall(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String>
     let call_args = if args.len() > 2 { &args[2..] } else { &[] };
     match vm.call_function(func.clone(), call_args) {
         Ok(mut res) => {
-            res.insert(0, Value::Bool(true));
+            res.insert(0, Value::TRUE);
             Ok(res)
         }
         Err(err) => {
@@ -334,15 +339,15 @@ pub fn builtin_xpcall(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String>
             match vm.call_function(err_handler.clone(), std::slice::from_ref(&err_val)) {
                 Ok(h_res) => {
                     let ret = h_res.into_iter().next().unwrap_or(err_val);
-                    Ok(vec![Value::Bool(false), ret])
+                    Ok(vec![Value::FALSE, ret])
                 }
                 Err(h_err) => {
                     if vm.limits.is_tripped() {
                         return Err(h_err);
                     }
                     Ok(vec![
-                        Value::Bool(false),
-                        Value::String((format!("error in error handling: {}", h_err)).into()),
+                        Value::FALSE,
+                        Value::string(format!("error in error handling: {}", h_err)),
                     ])
                 }
             }
@@ -430,26 +435,26 @@ fn load_native_package(
         .map_err(|e| format!("cannot load {}'s native library: {}", package, e))?;
     let ffi = load_bundled_module(vm, "@neyuki/ffi")?
         .ok_or_else(|| "@neyuki/ffi is not available".to_string())?;
-    let bind = match &ffi {
-        Value::Table(t) => t.borrow().get_str("_bindExtension"),
-        _ => Value::Nil,
+    let bind = match ffi.as_table() {
+        Some(t) => t.borrow().get_str("_bindExtension"),
+        None => Value::NIL,
     };
-    let fn_map = Value::Table(std::rc::Rc::new(std::cell::RefCell::new(fn_map)));
+    let fn_map = Value::table(std::rc::Rc::new(std::cell::RefCell::new(fn_map)));
     let mut out = vm.call_function(bind, &[Value::from_usize(id as usize), fn_map])?;
     Ok(if out.is_empty() {
-        Value::Nil
+        Value::NIL
     } else {
         out.swap_remove(0)
     })
 }
 
 pub fn builtin_require(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let pkg = match args
+    let Some(pkg) = args
         .first()
         .ok_or_else(|| "require expects a module path".to_string())?
-    {
-        Value::String(s) => &**s,
-        _ => return Err("require expects string argument".to_string()),
+        .as_str()
+    else {
+        return Err("require expects string argument".to_string());
     };
     if let Some(val) = load_bundled_module(vm, pkg)? {
         return Ok(vec![val]);
@@ -508,7 +513,7 @@ pub fn builtin_require(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
     let proto = loader.compile_bytes(&resolved_path, &bytes, pkg)?;
     // While the module runs, a `require` cycle back into it gets an empty
     // table instead of running it again (docs/modules.md, §3.2).
-    let pending = Value::Table(std::rc::Rc::new(std::cell::RefCell::new(
+    let pending = Value::table(std::rc::Rc::new(std::cell::RefCell::new(
         crate::vm::value::VmTable::new(),
     )));
     vm.modules.insert(key.clone(), pending);
@@ -536,27 +541,27 @@ mod tests {
         let mut vm = VM::new();
 
         // checktype
-        let res = builtin_checktype(&mut vm, &[Value::Int(42), Value::str("int")]).unwrap();
-        assert_eq!(res, vec![Value::Bool(true)]);
+        let res = builtin_checktype(&mut vm, &[Value::int(42), Value::str("int")]).unwrap();
+        assert_eq!(res, vec![Value::TRUE]);
 
         let res = builtin_checktype(&mut vm, &[Value::str("hello"), Value::str("int")]).unwrap();
-        assert_eq!(res, vec![Value::Bool(false)]);
+        assert_eq!(res, vec![Value::FALSE]);
 
         let res =
             builtin_checktype(&mut vm, &[Value::str("hello"), Value::str("int | string")]).unwrap();
-        assert_eq!(res, vec![Value::Bool(true)]);
+        assert_eq!(res, vec![Value::TRUE]);
 
         // void maps to Never, so it never matches
-        let res = builtin_checktype(&mut vm, &[Value::Nil, Value::str("void")]).unwrap();
-        assert_eq!(res, vec![Value::Bool(false)]);
+        let res = builtin_checktype(&mut vm, &[Value::NIL, Value::str("void")]).unwrap();
+        assert_eq!(res, vec![Value::FALSE]);
 
         // unknown named type must return false, not true
-        let res = builtin_checktype(&mut vm, &[Value::Int(42), Value::str("UnknownType")]).unwrap();
-        assert_eq!(res, vec![Value::Bool(false)]);
+        let res = builtin_checktype(&mut vm, &[Value::int(42), Value::str("UnknownType")]).unwrap();
+        assert_eq!(res, vec![Value::FALSE]);
 
         // asserttype success
-        let res = builtin_asserttype(&mut vm, &[Value::Int(42), Value::str("int")]).unwrap();
-        assert_eq!(res, vec![Value::Int(42)]);
+        let res = builtin_asserttype(&mut vm, &[Value::int(42), Value::str("int")]).unwrap();
+        assert_eq!(res, vec![Value::int(42)]);
 
         // asserttype failure
         let err =
@@ -579,14 +584,14 @@ mod tests {
         .expect("compile");
         let (weak_crypto_table, weak_crypto_mod) = {
             let mut vm = VM::new();
-            let weak_table = match vm.globals.get("table") {
-                Some(Value::Table(t)) => Rc::downgrade(t),
-                _ => panic!("missing table global"),
+            let weak_table = match vm.globals.get("table").and_then(|v| v.as_table()) {
+                Some(t) => Rc::downgrade(&t.to_rc()),
+                None => panic!("missing table global"),
             };
             let _ = vm.execute(crypto_proto).expect("exec");
-            let weak_mod = match vm.modules.get("crypto") {
-                Some(Value::Table(t)) => Rc::downgrade(t),
-                _ => panic!("missing crypto module"),
+            let weak_mod = match vm.modules.get("crypto").and_then(|v| v.as_table()) {
+                Some(t) => Rc::downgrade(&t.to_rc()),
+                None => panic!("missing crypto module"),
             };
             (weak_table, weak_mod)
         };
@@ -615,16 +620,16 @@ mod tests {
         .expect("compile");
         let weak_debug = {
             let mut vm = VM::new();
-            let weak_debug = match vm.globals.get("debug") {
-                Some(Value::Table(t)) => Rc::downgrade(t),
-                _ => panic!("missing debug global"),
+            let weak_debug = match vm.globals.get("debug").and_then(|v| v.as_table()) {
+                Some(t) => Rc::downgrade(&t.to_rc()),
+                None => panic!("missing debug global"),
             };
             let out = vm.execute(profile_proto).expect("exec");
             assert!(out.to_string().contains("work"));
             // Break `profile`'s internal table<->closure cycle (`tracer`
             // captures `profile`); any remaining strong ref to `debug` would
             // come from a leaked `ImportSlot` in `BUNDLED_PROTOS`.
-            if let Some(Value::Table(profile_tbl)) = vm.modules.get("profile") {
+            if let Some(profile_tbl) = vm.modules.get("profile").and_then(|v| v.as_table()) {
                 profile_tbl.borrow_mut().fields.clear();
             }
             weak_debug
@@ -669,29 +674,29 @@ mod tests {
         let (mut vm2, run2) = setup(10);
         assert_eq!(
             vm1.call_function(run1.clone(), &[]).unwrap(),
-            vec![Value::Int(2)]
+            vec![Value::int(2)]
         );
         assert_eq!(
             vm2.call_function(run2.clone(), &[]).unwrap(),
-            vec![Value::Int(20)]
+            vec![Value::int(20)]
         );
         assert_eq!(
             vm1.call_function(run1.clone(), &[]).unwrap(),
-            vec![Value::Int(4)]
+            vec![Value::int(4)]
         );
-        assert_eq!(vm2.call_function(run2, &[]).unwrap(), vec![Value::Int(40)]);
-        assert_eq!(vm1.call_function(run1, &[]).unwrap(), vec![Value::Int(6)]);
+        assert_eq!(vm2.call_function(run2, &[]).unwrap(), vec![Value::int(40)]);
+        assert_eq!(vm1.call_function(run1, &[]).unwrap(), vec![Value::int(6)]);
 
         // Verify the two VMs' `profile.start` closures own distinct `Proto`s
         // (and thus unshared `ImportSlot` vectors).
         let proto_ptr = |vm: &VM| -> *const Proto {
-            let Value::Table(t) = vm.modules.get("profile").expect("profile module") else {
-                panic!("profile not a table");
-            };
-            let Value::Closure(c) = t.borrow().fields.get("start").expect("start fn").clone()
-            else {
-                panic!("start not a closure");
-            };
+            let t = vm
+                .modules
+                .get("profile")
+                .and_then(|v| v.as_table())
+                .expect("profile not a table");
+            let start = t.borrow().fields.get("start").expect("start fn").clone();
+            let c = start.as_closure().expect("start not a closure");
             Rc::as_ptr(&c.proto)
         };
         assert_ne!(proto_ptr(&vm1), proto_ptr(&vm2));

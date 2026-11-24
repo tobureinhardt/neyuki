@@ -11,7 +11,7 @@ use jiff::tz::{AmbiguousOffset, TimeZone};
 use jiff::{SignedDuration, Timestamp, Zoned, civil};
 
 use crate::vm::machine::VM;
-use crate::vm::value::{Value, VmTable};
+use crate::vm::value::{Value, ValueView, VmTable};
 
 mod storage;
 
@@ -19,7 +19,7 @@ fn os_clock(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    Ok(vec![Value::Float(now.as_secs_f64())])
+    Ok(vec![Value::float(now.as_secs_f64())])
 }
 
 /// `time()` is the current time in whole seconds since the Unix epoch;
@@ -27,8 +27,8 @@ fn os_clock(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
 /// optionally `hour` (default 12), `min` and `sec`) the same way, with
 /// out-of-range fields carried over as in Lua (month 13 is next January).
 fn os_time(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let Some(Value::Table(fields)) = args.first() else {
-        if let Some(other) = args.first().filter(|v| !matches!(v, Value::Nil)) {
+    let Some(fields) = args.first().and_then(Value::as_table) else {
+        if let Some(other) = args.first().filter(|v| !v.is_nil()) {
             return Err(format!("t must be a table, got {}", other.type_name()));
         }
         let now = SystemTime::now()
@@ -38,14 +38,15 @@ fn os_time(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     };
     let fields = fields.borrow();
     let field = |name: &str, default: Option<i64>| -> Result<i64, String> {
-        match fields.get_str(name) {
-            Value::Nil => default.ok_or_else(|| format!("field '{}' is missing", name)),
-            Value::Int(i) => Ok(i),
-            Value::Float(f) if f.fract() == 0.0 && f.abs() < 1e15 => Ok(f as i64),
-            other => Err(format!(
+        let v = fields.get_str(name);
+        match v.view() {
+            ValueView::Nil => default.ok_or_else(|| format!("field '{}' is missing", name)),
+            ValueView::Int(i) => Ok(i),
+            ValueView::Float(f) if f.fract() == 0.0 && f.abs() < 1e15 => Ok(f as i64),
+            _ => Err(format!(
                 "field '{}' must be an integer, got {}",
                 name,
-                other.type_name()
+                v.type_name()
             )),
         }
     };
@@ -85,25 +86,25 @@ fn os_time(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         return Err("that local time does not exist".to_string());
     }
     let local = local.earlier().map_err(|_| "date is out of range")?;
-    Ok(vec![Value::Int(local.as_second())])
+    Ok(vec![Value::int(local.as_second())])
 }
 
 /// A time as the table `date("*t")` returns.
 fn date_table(time: &Zoned) -> Value {
     let mut table = VmTable::new();
-    table.set_str("year", Value::Int(time.year() as i64));
-    table.set_str("month", Value::Int(time.month() as i64));
-    table.set_str("day", Value::Int(time.day() as i64));
-    table.set_str("hour", Value::Int(time.hour() as i64));
-    table.set_str("min", Value::Int(time.minute() as i64));
-    table.set_str("sec", Value::Int(time.second() as i64));
+    table.set_str("year", Value::int(time.year() as i64));
+    table.set_str("month", Value::int(time.month() as i64));
+    table.set_str("day", Value::int(time.day() as i64));
+    table.set_str("hour", Value::int(time.hour() as i64));
+    table.set_str("min", Value::int(time.minute() as i64));
+    table.set_str("sec", Value::int(time.second() as i64));
     // Lua counts weekdays from Sunday = 1.
     table.set_str(
         "wday",
-        Value::Int(time.weekday().to_sunday_one_offset() as i64),
+        Value::int(time.weekday().to_sunday_one_offset() as i64),
     );
-    table.set_str("yday", Value::Int(time.day_of_year() as i64));
-    Value::Table(Rc::new(RefCell::new(table)))
+    table.set_str("yday", Value::int(time.day_of_year() as i64));
+    Value::table(Rc::new(RefCell::new(table)))
 }
 
 /// Formats a time with strftime codes, with `%c`, `%x` and `%X` laid out as
@@ -120,8 +121,9 @@ fn format_time(time: &Zoned, format: &str) -> Result<String, String> {
 /// uses UTC instead, and "*t" returns a table of the fields.
 fn os_date(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let format = match args.first() {
-        None | Some(Value::Nil) => "%c",
-        Some(Value::String(s)) => &**s,
+        None => "%c",
+        Some(v) if v.is_nil() => "%c",
+        Some(v) if v.is_string() => v.as_str().unwrap(),
         Some(other) => {
             return Err(format!(
                 "format must be a string, got {}",
@@ -130,7 +132,8 @@ fn os_date(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         }
     };
     let seconds = match args.get(1) {
-        None | Some(Value::Nil) => None,
+        None => None,
+        Some(v) if v.is_nil() => None,
         Some(value) => Some(
             crate::vm::libs::args::number(value)
                 .map_err(|_| format!("time must be a number, got {}", value.type_name()))?,
@@ -167,20 +170,22 @@ fn os_difftime(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let t2 = match args
         .first()
         .ok_or_else(|| "os.difftime expects 2 arguments".to_string())?
+        .view()
     {
-        Value::Int(i) => i.to_f64().unwrap_or(0.0),
-        Value::Float(f) => *f,
+        ValueView::Int(i) => i.to_f64().unwrap_or(0.0),
+        ValueView::Float(f) => f,
         _ => return Err("os.difftime expects numbers".to_string()),
     };
     let t1 = match args
         .get(1)
         .ok_or_else(|| "os.difftime expects 2 arguments".to_string())?
+        .view()
     {
-        Value::Int(i) => i.to_f64().unwrap_or(0.0),
-        Value::Float(f) => *f,
+        ValueView::Int(i) => i.to_f64().unwrap_or(0.0),
+        ValueView::Float(f) => f,
         _ => return Err("os.difftime expects numbers".to_string()),
     };
-    Ok(vec![Value::Float(t2 - t1)])
+    Ok(vec![Value::float(t2 - t1)])
 }
 
 static SCRIPT_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -200,14 +205,11 @@ fn os_args(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn string_field(table: &VmTable, name: &str) -> Result<Option<String>, String> {
-    match table.get_str(name) {
-        Value::Nil => Ok(None),
-        Value::String(s) => Ok(Some(s.to_string())),
-        other => Err(format!(
-            "{} must be a string, got {}",
-            name,
-            other.type_name()
-        )),
+    let v = table.get_str(name);
+    match v.view() {
+        ValueView::Nil => Ok(None),
+        ValueView::String(s) => Ok(Some(s.to_string())),
+        _ => Err(format!("{} must be a string, got {}", name, v.type_name())),
     }
 }
 
@@ -221,9 +223,9 @@ fn os_run(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let mut command = match args.first() {
-        Some(Value::String(line)) => {
-            vm.permissions.check_run_shell(line)?;
+    let mut command = match args.first().map(Value::view) {
+        Some(ValueView::String(line)) => {
+            vm.permissions.check_run_shell(&line)?;
             let mut command = if cfg!(windows) {
                 Command::new("cmd")
             } else {
@@ -231,22 +233,21 @@ fn os_run(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             };
             command
                 .arg(if cfg!(windows) { "/C" } else { "-c" })
-                .arg(&**line);
+                .arg(line.as_str());
             command
         }
-        Some(Value::Table(list)) => {
+        Some(ValueView::Table(list)) => {
             let list = list.borrow();
             let mut parts = Vec::with_capacity(list.array.len());
             for (index, part) in list.array.iter().enumerate() {
-                match part {
-                    Value::String(s) => parts.push(s.to_string()),
-                    other => {
-                        return Err(format!(
-                            "command[{}] must be a string, got {}",
-                            index + 1,
-                            other.type_name()
-                        ));
-                    }
+                if let Some(s) = part.as_str() {
+                    parts.push(s.to_string());
+                } else {
+                    return Err(format!(
+                        "command[{}] must be a string, got {}",
+                        index + 1,
+                        part.type_name()
+                    ));
                 }
             }
             let (program, rest) = parts.split_first().ok_or("command must not be empty")?;
@@ -255,62 +256,61 @@ fn os_run(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             command.args(rest);
             command
         }
-        None | Some(Value::Nil) => return Err("command must be provided".to_string()),
-        Some(other) => {
+        None | Some(ValueView::Nil) => return Err("command must be provided".to_string()),
+        Some(_) => {
             return Err(format!(
                 "command must be a string or a list of strings, got {}",
-                other.type_name()
+                args[0].type_name()
             ));
         }
     };
 
     let mut capture = true;
     let mut input = None;
-    match args.get(1) {
-        None | Some(Value::Nil) => {}
-        Some(Value::Table(options)) => {
+    match args.get(1).map(Value::view) {
+        None | Some(ValueView::Nil) => {}
+        Some(ValueView::Table(options)) => {
             let options = options.borrow();
             if let Some(cwd) = string_field(&options, "cwd")? {
                 command.current_dir(cwd);
             }
             input = string_field(&options, "stdin")?;
-            match options.get_str("capture") {
-                Value::Nil => {}
-                Value::Bool(b) => capture = b,
-                other => {
+            let cap_val = options.get_str("capture");
+            match cap_val.view() {
+                ValueView::Nil => {}
+                ValueView::Bool(b) => capture = b,
+                _ => {
                     return Err(format!(
                         "capture must be a boolean, got {}",
-                        other.type_name()
+                        cap_val.type_name()
                     ));
                 }
             }
-            match options.get_str("env") {
-                Value::Nil => {}
-                Value::Table(env) => {
+            let env_val = options.get_str("env");
+            match env_val.view() {
+                ValueView::Nil => {}
+                ValueView::Table(env) => {
                     for (key, value) in env.borrow().fields.iter() {
-                        match value {
-                            Value::String(v) => {
-                                command.env(&**key, &**v);
-                            }
-                            other => {
-                                return Err(format!(
-                                    "env.{} must be a string, got {}",
-                                    &**key,
-                                    other.type_name()
-                                ));
-                            }
+                        if let Some(v) = value.as_str() {
+                            command.env(&**key, v);
+                        } else {
+                            return Err(format!(
+                                "env.{} must be a string, got {}",
+                                &**key,
+                                value.type_name()
+                            ));
                         }
                     }
                 }
-                other => {
-                    return Err(format!("env must be a table, got {}", other.type_name()));
+                _ => {
+                    return Err(format!("env must be a table, got {}", env_val.type_name()));
                 }
             }
         }
-        Some(other) => {
+        Some(_) => {
             return Err(format!(
                 "options must be a table, got {}",
-                other.type_name()
+                args[1].type_name()
             ));
         }
     }
@@ -352,13 +352,13 @@ fn os_run(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// The `{ ok, code, stdout, stderr }` table `run` returns.
 fn run_result(output: std::process::Output) -> Value {
     let mut result = VmTable::new();
-    result.set_str("ok", Value::Bool(output.status.success()));
+    result.set_str("ok", Value::bool(output.status.success()));
     result.set_str(
         "code",
         output
             .status
             .code()
-            .map_or(Value::Nil, |c| Value::Int(c as i64)),
+            .map_or(Value::NIL, |c| Value::int(c as i64)),
     );
     result.set_str(
         "stdout",
@@ -368,7 +368,7 @@ fn run_result(output: std::process::Output) -> Value {
         "stderr",
         Value::string(String::from_utf8_lossy(&output.stderr).into_owned()),
     );
-    Value::Table(Rc::new(RefCell::new(result)))
+    Value::table(Rc::new(RefCell::new(result)))
 }
 
 /// Blocks the script for `seconds` (fractions allowed).
@@ -384,14 +384,14 @@ fn os_sleep(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// Ends the process. `true` or nothing exits with 0, `false` with 1 and an
 /// integer with that code. Standard output is flushed first.
 fn os_exit(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let code = match args.first() {
-        None | Some(Value::Nil) | Some(Value::Bool(true)) => 0,
-        Some(Value::Bool(false)) => 1,
-        Some(Value::Int(i)) => i32::try_from(*i).map_err(|_| "exit code is out of range")?,
-        Some(other) => {
+    let code = match args.first().map(Value::view) {
+        None | Some(ValueView::Nil | ValueView::Bool(true)) => 0,
+        Some(ValueView::Bool(false)) => 1,
+        Some(ValueView::Int(i)) => i32::try_from(i).map_err(|_| "exit code is out of range")?,
+        Some(_) => {
             return Err(format!(
                 "code must be a boolean or an integer, got {}",
-                other.type_name()
+                args[0].type_name()
             ));
         }
     };
@@ -404,17 +404,15 @@ fn os_exit(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// The value of an environment variable, or nil when it is unset or not
 /// valid Unicode.
 fn os_getenv(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let varname = match args
+    let varname = args
         .first()
         .ok_or_else(|| "os.getenv expects variable name".to_string())?
-    {
-        Value::String(s) => s,
-        _ => return Err("os.getenv expects string".to_string()),
-    };
+        .as_str()
+        .ok_or_else(|| "os.getenv expects string".to_string())?;
     vm.permissions.check_env(varname)?;
-    match std::env::var(&**varname) {
+    match std::env::var(varname) {
         Ok(v) => Ok(vec![Value::string(v)]),
-        Err(_) => Ok(vec![Value::Nil]),
+        Err(_) => Ok(vec![Value::NIL]),
     }
 }
 
@@ -424,7 +422,7 @@ fn os_getenv(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn os_app(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
     let mut table = VmTable::new();
     let bundle = crate::app::installed();
-    table.set_str("bundled", Value::Bool(bundle.is_some()));
+    table.set_str("bundled", Value::bool(bundle.is_some()));
     if let Some(bundle) = bundle {
         for key in ["name", "version", "identifier"] {
             if let Some(value) = bundle.meta(key) {
@@ -469,7 +467,7 @@ pub fn create_os_lib() -> Value {
         crate::native!("os.unprotect", storage::os_unprotect),
     );
     table.frozen = true;
-    Value::Table(Rc::new(RefCell::new(table)))
+    Value::table(Rc::new(RefCell::new(table)))
 }
 
 #[cfg(all(test, unix))]
@@ -494,7 +492,7 @@ mod run_sandbox_tests {
         for (k, v) in opts {
             o.set_str(k, v.clone());
         }
-        let wrap = |t: VmTable| Value::Table(std::rc::Rc::new(std::cell::RefCell::new(t)));
+        let wrap = |t: VmTable| Value::table(std::rc::Rc::new(std::cell::RefCell::new(t)));
         os_run(vm, &[wrap(list), wrap(o)])
     }
 
@@ -503,7 +501,7 @@ mod run_sandbox_tests {
         for (k, v) in pairs {
             t.set_str(k, Value::str(v));
         }
-        Value::Table(std::rc::Rc::new(std::cell::RefCell::new(t)))
+        Value::table(std::rc::Rc::new(std::cell::RefCell::new(t)))
     }
 
     fn vm_with_run(list: &[&str]) -> VM {
@@ -531,7 +529,7 @@ mod run_sandbox_tests {
         );
         // The legitimate binary still runs.
         let res = call(&mut vm, &["true"], &[]).unwrap();
-        assert!(matches!(&res[0], Value::Table(_)));
+        assert!(res[0].is_table());
         let _ = std::fs::remove_dir_all(&base);
     }
 

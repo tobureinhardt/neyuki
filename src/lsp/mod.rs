@@ -2185,13 +2185,13 @@ end
     fn exists_in(root: &Value, path: &str) -> bool {
         let mut current = root.clone();
         for part in path.split('.') {
-            let next = match &current {
-                Value::Table(table) => table.borrow().get_str(part),
-                _ => return false,
+            let next = match current.as_table() {
+                Some(table) => table.borrow().get_str(part),
+                None => return false,
             };
             current = next;
         }
-        !matches!(current, Value::Nil)
+        !current.is_nil()
     }
 
     /// What `require(module)` returns in a fresh VM.
@@ -2242,10 +2242,10 @@ end
                     .globals
                     .get(&crate::vm::value::StrRef::from(first))
                     .cloned()
-                    .unwrap_or(Value::Nil);
+                    .unwrap_or(Value::NIL);
                 match rest {
                     Some(rest) => exists_in(&root, rest),
-                    None => !matches!(root, Value::Nil),
+                    None => !root.is_nil(),
                 }
             } else if let Some(module) = modules.get(page) {
                 // `fs.read` is the field `read` of what `require` returns.

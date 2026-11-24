@@ -1,16 +1,16 @@
 //! Metamethod lookups, metamethod dispatch, and table/buffer indexing paths.
 
 use crate::vm::machine::VM;
-use crate::vm::value::Value;
+use crate::vm::value::{Value, ValueView};
 
 impl VM {
     pub(crate) fn get_binop_metamethod(&self, a: &Value, b: &Value, event: &str) -> Option<Value> {
-        if let Value::Table(t) = a
+        if let Some(t) = a.as_table()
             && let Some(h) = t.borrow().metamethod(event)
         {
             return Some(h);
         }
-        if let Value::Table(t) = b
+        if let Some(t) = b.as_table()
             && let Some(h) = t.borrow().metamethod(event)
         {
             return Some(h);
@@ -19,7 +19,7 @@ impl VM {
     }
 
     pub(crate) fn get_unop_metamethod(&self, val: &Value, event: &str) -> Option<Value> {
-        if let Value::Table(t) = val {
+        if let Some(t) = val.as_table() {
             return t.borrow().metamethod(event);
         }
         None
@@ -37,7 +37,7 @@ impl VM {
         let res = self.call_function(mm, &[va, vb])?;
         self.set_reg_grow(
             base + dst as usize,
-            res.into_iter().next().unwrap_or(Value::Nil),
+            res.into_iter().next().unwrap_or(Value::NIL),
         );
         Ok(())
     }
@@ -52,19 +52,26 @@ impl VM {
     /// (metamethods, buffers, strings, errors) has to decide.
     #[inline]
     pub(crate) fn table_get_fast(table: &Value, key: &Value) -> Option<Value> {
-        let Value::Table(t) = table else {
-            return None;
-        };
+        let t = table.as_table()?;
         let tbl = t.borrow();
-        let found = match key {
-            Value::Int(i) if *i >= 1 && (*i as u64) <= tbl.array.len() as u64 => {
-                tbl.array[*i as usize - 1].clone()
+        let found = if key.is_inline_int() {
+            let i = key.as_inline_int_unchecked();
+            if i >= 1 && (i as u64) <= tbl.array.len() as u64 {
+                tbl.array[i as usize - 1].clone()
+            } else {
+                tbl.raw_get(key)
             }
-            Value::String(k) => tbl.fields.get_by_strref(k).cloned().unwrap_or(Value::Nil),
-            Value::BigInt(_) => return None,
-            other => tbl.raw_get(other),
+        } else if let Some(k) = key.as_str_ref() {
+            tbl.fields
+                .get_by_vmstr(k.as_ptr(), k.vm_str())
+                .cloned()
+                .unwrap_or(Value::NIL)
+        } else if key.is_bigint() {
+            return None;
+        } else {
+            tbl.raw_get(key)
         };
-        if matches!(found, Value::Nil) && tbl.metatable.is_some() {
+        if found.is_nil() && tbl.metatable.is_some() {
             return None;
         }
         Some(found)
@@ -75,48 +82,41 @@ impl VM {
     /// path, which also handles nil (removal) and reports errors.
     #[inline]
     pub(crate) fn table_set_fast(table: &Value, key: &Value, val: &Value) -> bool {
-        let Value::Table(t) = table else {
+        let Some(t) = table.as_table() else {
             return false;
         };
-        if matches!(val, Value::Nil) {
+        if val.is_nil() {
             return false;
         }
         let mut tbl = t.borrow_mut();
         if tbl.frozen {
             return false;
         }
-        match key {
-            Value::Int(i) if *i >= 1 => {
-                let idx = *i as usize - 1;
+        if key.is_inline_int() {
+            let i = key.as_inline_int_unchecked();
+            if i >= 1 {
+                let idx = i as usize - 1;
                 if idx < tbl.array.len() {
-                    match (val, &mut tbl.array[idx]) {
-                        (Value::Int(n), Value::Int(o)) => *o = *n,
-                        (Value::Float(n), Value::Float(o)) => *o = *n,
-                        (Value::Bool(n), Value::Bool(o)) => *o = *n,
-                        (v, slot) => *slot = v.clone(),
-                    }
-                    true
+                    tbl.array[idx].assign_ref(val);
+                    return true;
                 } else if idx == tbl.array.len() && tbl.metatable.is_none() && tbl.general.is_none()
                 {
                     tbl.array.push(val.clone());
-                    true
-                } else {
-                    false
+                    return true;
                 }
             }
-            Value::String(k) => {
-                if tbl.metatable.is_none() {
-                    tbl.fields.set_by_strref(k, val);
-                    true
-                } else if let Some(slot) = tbl.fields.get_mut_by_strref(k) {
-                    *slot = val.clone();
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => false,
+            return false;
         }
+        if let Some(k) = key.as_str_ref() {
+            if tbl.metatable.is_none() {
+                tbl.fields.set_by_vmstr(k.as_ptr(), k.vm_str(), val);
+                return true;
+            } else if let Some(slot) = tbl.fields.get_mut_by_vmstr(k.as_ptr(), k.vm_str()) {
+                slot.assign_ref(val);
+                return true;
+            }
+        }
+        false
     }
 
     pub fn table_get(&mut self, table: &Value, key: &Value) -> Result<Value, String> {
@@ -132,56 +132,55 @@ impl VM {
         if depth > 100 {
             return Err("loop in gettable / __index chain".to_string());
         }
-        match table {
-            Value::Table(t) => {
-                if let Value::BigInt(b) = key
-                    && num_traits::Signed::is_positive(&**b)
+        match table.view() {
+            ValueView::Table(t) => {
+                if let Some(b) = key.as_bigint()
+                    && num_traits::Signed::is_positive(b)
                 {
                     return Err("table index too large".to_string());
                 }
                 let val = t.borrow().raw_get(key);
-                if !matches!(val, Value::Nil) {
+                if !val.is_nil() {
                     return Ok(val);
                 }
 
                 // Check __index metamethod
                 let index_handler = t.borrow().metamethod("__index");
-                match index_handler {
-                    Some(handler @ Value::Table(_)) => {
+                if let Some(handler) = index_handler {
+                    if handler.is_table() {
                         return self.table_get_depth(&handler, key, depth + 1);
                     }
-                    Some(handler @ (Value::Native(_) | Value::Closure(_))) => {
+                    if handler.is_callable() {
                         let res = self.call_function(handler, &[table.clone(), key.clone()])?;
-                        return Ok(res.into_iter().next().unwrap_or(Value::Nil));
+                        return Ok(res.into_iter().next().unwrap_or(Value::NIL));
                     }
-                    _ => {}
                 }
-                Ok(Value::Nil)
+                Ok(Value::NIL)
             }
-            Value::Buffer(b) => {
+            ValueView::Buffer(b) => {
                 let buf = b.borrow();
-                match key {
-                    Value::Int(idx) => {
-                        let i = usize::try_from(*idx)
+                match key.view() {
+                    ValueView::Int(idx) => {
+                        let i = usize::try_from(idx)
                             .map_err(|_| "buffer index too large".to_string())?;
                         let val = buf.read_u8(i)?;
-                        Ok(Value::Int(val as i64))
+                        Ok(Value::int(val as i64))
                     }
-                    Value::BigInt(_) => Err("buffer index too large".to_string()),
-                    _ => Ok(Value::Nil),
+                    ValueView::BigInt(_) => Err("buffer index too large".to_string()),
+                    _ => Ok(Value::NIL),
                 }
             }
             // Strings index the string library, so `s:upper()` works.
-            Value::String(_) => match (&self.string_lib, key) {
-                (Value::Table(lib), Value::String(name)) => Ok(lib
+            ValueView::String(_) => match (self.string_lib.as_table(), key.as_str_ref()) {
+                (Some(lib), Some(name)) => Ok(lib
                     .borrow()
                     .fields
-                    .get_by_strref(name)
+                    .get_by_vmstr(name.as_ptr(), name.vm_str())
                     .cloned()
-                    .unwrap_or(Value::Nil)),
-                _ => Ok(Value::Nil),
+                    .unwrap_or(Value::NIL)),
+                _ => Ok(Value::NIL),
             },
-            other => Err(format!("attempted to index a {} value", other.type_name())),
+            _ => Err(format!("attempted to index a {} value", table.type_name())),
         }
     }
 
@@ -200,55 +199,54 @@ impl VM {
             return Err("loop in settable / __newindex chain".to_string());
         }
         self.gc.write_barrier(table, &val);
-        match table {
-            Value::Table(t) => {
+        match table.view() {
+            ValueView::Table(t) => {
                 if t.borrow().frozen {
                     return Err("attempted to mutate a frozen table".to_string());
                 }
 
-                if let Value::BigInt(b) = &key
-                    && num_traits::Signed::is_positive(&**b)
+                if let Some(b) = key.as_bigint()
+                    && num_traits::Signed::is_positive(b)
                 {
                     return Err("table index too large".to_string());
                 }
-                let key_exists = !matches!(t.borrow().raw_get(&key), Value::Nil);
+                let key_exists = !t.borrow().raw_get(&key).is_nil();
                 if !key_exists {
                     let newindex_handler = t.borrow().metamethod("__newindex");
-                    match newindex_handler {
-                        Some(handler @ Value::Table(_)) => {
+                    if let Some(handler) = newindex_handler {
+                        if handler.is_table() {
                             return self.table_set_depth(&handler, key, val, depth + 1);
                         }
-                        Some(handler @ (Value::Native(_) | Value::Closure(_))) => {
+                        if handler.is_callable() {
                             self.call_function(handler, &[table.clone(), key, val])?;
                             return Ok(());
                         }
-                        _ => {}
                     }
                 }
                 t.borrow_mut().raw_set(key, val)
             }
-            Value::Buffer(b) => {
+            ValueView::Buffer(b) => {
                 let mut buf = b.borrow_mut();
-                match key {
-                    Value::Int(idx) => {
+                match key.view() {
+                    ValueView::Int(idx) => {
                         let i = usize::try_from(idx)
                             .map_err(|_| "buffer index too large".to_string())?;
-                        let byte_val = match val {
-                            Value::Int(v) => u8::try_from(v)
+                        let byte_val = match val.view() {
+                            ValueView::Int(v) => u8::try_from(v)
                                 .map_err(|_| "value out of byte range".to_string())?,
-                            Value::Float(f) => f as u8,
+                            ValueView::Float(f) => f as u8,
                             _ => return Err("buffer value expects byte".to_string()),
                         };
                         buf.write_u8(i, byte_val)?;
                         Ok(())
                     }
-                    Value::BigInt(_) => Err("buffer index too large".to_string()),
+                    ValueView::BigInt(_) => Err("buffer index too large".to_string()),
                     _ => Err("invalid buffer index".to_string()),
                 }
             }
-            other => Err(format!(
+            _ => Err(format!(
                 "attempted to set a field on a {} value",
-                other.type_name()
+                table.type_name()
             )),
         }
     }

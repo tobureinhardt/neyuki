@@ -267,7 +267,7 @@ unsafe fn call_raw(_ptr: *const c_void, _args: &[AbiArg], _float_ret: bool) -> R
 
 fn unsigned(v: u64) -> Value {
     if v <= i64::MAX as u64 {
-        Value::Int(v as i64)
+        Value::int(v as i64)
     } else {
         Value::from_bigint(num_bigint::BigInt::from(v))
     }
@@ -287,30 +287,30 @@ pub(super) unsafe fn call(
     let float_ret = matches!(ret, FfiType::F32 | FfiType::F64);
     let raw = unsafe { call_raw(ptr, args, float_ret) };
     Ok(match (ret, raw) {
-        (FfiType::Void, _) => Value::Nil,
+        (FfiType::Void, _) => Value::NIL,
         (FfiType::F32, RawRet::Float(f)) => {
-            Value::Float(f64::from(f32::from_bits(f.to_bits() as u32)))
+            Value::float(f64::from(f32::from_bits(f.to_bits() as u32)))
         }
-        (FfiType::F64, RawRet::Float(f)) => Value::Float(f),
+        (FfiType::F64, RawRet::Float(f)) => Value::float(f),
         (_, RawRet::Float(_)) => unreachable!("float return for an integer type"),
         (ty, RawRet::Int(r)) => match ty {
-            FfiType::Bool => Value::Bool(r as u8 != 0),
-            FfiType::I8 => Value::Int(i64::from(r as i8)),
-            FfiType::U8 => Value::Int(i64::from(r as u8)),
-            FfiType::I16 => Value::Int(i64::from(r as i16)),
-            FfiType::U16 => Value::Int(i64::from(r as u16)),
-            FfiType::I32 => Value::Int(i64::from(r as i32)),
-            FfiType::U32 => Value::Int(i64::from(r as u32)),
-            FfiType::I64 => Value::Int(r as i64),
-            FfiType::ISize => Value::Int(r as usize as isize as i64),
+            FfiType::Bool => Value::bool(r as u8 != 0),
+            FfiType::I8 => Value::int(i64::from(r as i8)),
+            FfiType::U8 => Value::int(i64::from(r as u8)),
+            FfiType::I16 => Value::int(i64::from(r as i16)),
+            FfiType::U16 => Value::int(i64::from(r as u16)),
+            FfiType::I32 => Value::int(i64::from(r as i32)),
+            FfiType::U32 => Value::int(i64::from(r as u32)),
+            FfiType::I64 => Value::int(r as i64),
+            FfiType::ISize => Value::int(r as usize as isize as i64),
             FfiType::U64 => unsigned(r),
             FfiType::USize => unsigned(r as usize as u64),
-            FfiType::Ptr if r as usize == 0 => Value::Nil,
-            FfiType::Ptr => Value::Int(r as usize as i64),
+            FfiType::Ptr if r as usize == 0 => Value::NIL,
+            FfiType::Ptr => Value::int(r as usize as i64),
             FfiType::CStr => {
                 let p = r as usize as *const c_char;
                 if p.is_null() {
-                    Value::Nil
+                    Value::NIL
                 } else {
                     // SAFETY: the signature declared a C string return.
                     Value::string(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())

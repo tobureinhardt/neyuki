@@ -14,7 +14,7 @@ use num_traits::ToPrimitive;
 use crate::vm::buffer::VmBuffer;
 use crate::vm::libs::args::{bool_arg, str_arg};
 use crate::vm::machine::VM;
-use crate::vm::value::{Value, VmTable};
+use crate::vm::value::{BorrowedRc, Value, ValueView, VmTable};
 
 pub(crate) const MAX_SIZE: usize = 1024 * 1024 * 1024;
 
@@ -22,10 +22,11 @@ fn buffer_arg<'a>(
     args: &'a [Value],
     index: usize,
     name: &str,
-) -> Result<&'a Rc<RefCell<VmBuffer>>, String> {
+) -> Result<BorrowedRc<'a, RefCell<VmBuffer>>, String> {
     match args.get(index) {
-        Some(Value::Buffer(b)) => Ok(b),
-        None | Some(Value::Nil) => Err(format!("{} must be provided", name)),
+        Some(v) if v.is_buffer() => Ok(v.as_buffer().unwrap()),
+        None => Err(format!("{} must be provided", name)),
+        Some(v) if v.is_nil() => Err(format!("{} must be provided", name)),
         Some(other) => Err(format!(
             "{} must be a buffer, got {}",
             name,
@@ -35,42 +36,49 @@ fn buffer_arg<'a>(
 }
 
 fn size_arg(args: &[Value], index: usize, name: &str) -> Result<usize, String> {
-    match args.get(index) {
-        Some(Value::Int(i)) if *i >= 0 => Ok(*i as usize),
-        Some(Value::Float(f)) if *f >= 0.0 && f.fract() == 0.0 && *f < 9e15 => Ok(*f as usize),
-        Some(Value::Int(_) | Value::Float(_) | Value::BigInt(_)) => {
+    let Some(val) = args.get(index) else {
+        return Err(format!("{} must be provided", name));
+    };
+    match val.view() {
+        ValueView::Int(i) if i >= 0 => Ok(i as usize),
+        ValueView::Float(f) if f >= 0.0 && f.fract() == 0.0 && f < 9e15 => Ok(f as usize),
+        ValueView::Int(_) | ValueView::Float(_) | ValueView::BigInt(_) => {
             Err(format!("{} must be a non-negative integer", name))
         }
-        None | Some(Value::Nil) => Err(format!("{} must be provided", name)),
-        Some(other) => Err(format!(
+        ValueView::Nil => Err(format!("{} must be provided", name)),
+        _ => Err(format!(
             "{} must be a number, got {}",
             name,
-            other.type_name()
+            val.type_name()
         )),
     }
 }
 
 fn opt_size_arg(args: &[Value], index: usize, name: &str, default: usize) -> Result<usize, String> {
     match args.get(index) {
-        None | Some(Value::Nil) => Ok(default),
+        None => Ok(default),
+        Some(v) if v.is_nil() => Ok(default),
         _ => size_arg(args, index, name),
     }
 }
 
 /// The low 64 bits of an integer argument, in two's complement.
 fn bits_arg(args: &[Value], index: usize, name: &str) -> Result<u64, String> {
-    match args.get(index) {
-        Some(Value::Int(i)) => Ok(*i as u64),
-        Some(Value::BigInt(b)) => {
-            let low = (&**b & BigInt::from(u64::MAX)).to_u64().unwrap_or(0);
+    let Some(val) = args.get(index) else {
+        return Err(format!("{} must be provided", name));
+    };
+    match val.view() {
+        ValueView::Int(i) => Ok(i as u64),
+        ValueView::BigInt(b) => {
+            let low = (b & BigInt::from(u64::MAX)).to_u64().unwrap_or(0);
             Ok(low)
         }
-        Some(Value::Float(f)) if f.fract() == 0.0 && f.is_finite() => Ok(*f as i64 as u64),
-        None | Some(Value::Nil) => Err(format!("{} must be provided", name)),
-        Some(other) => Err(format!(
+        ValueView::Float(f) if f.fract() == 0.0 && f.is_finite() => Ok(f as i64 as u64),
+        ValueView::Nil => Err(format!("{} must be provided", name)),
+        _ => Err(format!(
             "{} must be an integer, got {}",
             name,
-            other.type_name()
+            val.type_name()
         )),
     }
 }
@@ -85,7 +93,7 @@ pub(crate) fn new_buffer(vm: &mut VM, data: Vec<u8>) -> Result<Vec<Value>, Strin
     }
     let rc = Rc::new(RefCell::new(VmBuffer::from_bytes(data)));
     vm.gc.register_buffer(&rc);
-    Ok(vec![Value::Buffer(rc)])
+    Ok(vec![Value::buffer(rc)])
 }
 
 fn check_size(size: usize) -> Result<(), String> {
@@ -115,7 +123,8 @@ fn bytes_to_string(bytes: &[u8]) -> Value {
 /// `buffer.tostring(b)`: the bytes as text; bytes that are not valid UTF-8
 /// become U+FFFD.
 fn buf_tostring(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let b = buffer_arg(args, 0, "b")?.borrow();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let b = b_handle.borrow();
     Ok(vec![bytes_to_string(&b.data)])
 }
 
@@ -126,7 +135,8 @@ fn buf_len(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn read_int(args: &[Value], size: usize, signed: bool) -> Result<Vec<Value>, String> {
-    let b = buffer_arg(args, 0, "b")?.borrow();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let b = b_handle.borrow();
     let offset = size_arg(args, 1, "offset")?;
     let big_endian = bool_arg(args, 2, "bigEndian")?;
     let range = b.range(offset, size)?;
@@ -140,7 +150,7 @@ fn read_int(args: &[Value], size: usize, signed: bool) -> Result<Vec<Value>, Str
     let unsigned = u64::from_le_bytes(raw);
     let value = if signed {
         let shift = 64 - size * 8;
-        Value::Int(((unsigned << shift) as i64) >> shift)
+        Value::int(((unsigned << shift) as i64) >> shift)
     } else {
         Value::from_u64(unsigned)
     };
@@ -148,7 +158,8 @@ fn read_int(args: &[Value], size: usize, signed: bool) -> Result<Vec<Value>, Str
 }
 
 fn write_int(args: &[Value], size: usize) -> Result<Vec<Value>, String> {
-    let mut b = buffer_arg(args, 0, "b")?.borrow_mut();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let mut b = b_handle.borrow_mut();
     let offset = size_arg(args, 1, "offset")?;
     let value = bits_arg(args, 2, "value")?;
     let big_endian = bool_arg(args, 3, "bigEndian")?;
@@ -187,7 +198,8 @@ ints! {
 }
 
 fn buf_readf32(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let b = buffer_arg(args, 0, "b")?.borrow();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let b = b_handle.borrow();
     let range = b.range(size_arg(args, 1, "offset")?, 4)?;
     let raw: [u8; 4] = b.data[range].try_into().expect("range() returned 4 bytes");
     let value = if bool_arg(args, 2, "bigEndian")? {
@@ -195,11 +207,12 @@ fn buf_readf32(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     } else {
         f32::from_le_bytes(raw)
     };
-    Ok(vec![Value::Float(value as f64)])
+    Ok(vec![Value::float(value as f64)])
 }
 
 fn buf_writef32(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let mut b = buffer_arg(args, 0, "b")?.borrow_mut();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let mut b = b_handle.borrow_mut();
     let range = b.range(size_arg(args, 1, "offset")?, 4)?;
     let value = float_arg(args, 2, "value")? as f32;
     let raw = if bool_arg(args, 3, "bigEndian")? {
@@ -212,7 +225,8 @@ fn buf_writef32(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn buf_readf64(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let b = buffer_arg(args, 0, "b")?.borrow();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let b = b_handle.borrow();
     let range = b.range(size_arg(args, 1, "offset")?, 8)?;
     let raw: [u8; 8] = b.data[range].try_into().expect("range() returned 8 bytes");
     let value = if bool_arg(args, 2, "bigEndian")? {
@@ -220,11 +234,12 @@ fn buf_readf64(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     } else {
         f64::from_le_bytes(raw)
     };
-    Ok(vec![Value::Float(value)])
+    Ok(vec![Value::float(value)])
 }
 
 fn buf_writef64(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let mut b = buffer_arg(args, 0, "b")?.borrow_mut();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let mut b = b_handle.borrow_mut();
     let range = b.range(size_arg(args, 1, "offset")?, 8)?;
     let value = float_arg(args, 2, "value")?;
     let raw = if bool_arg(args, 3, "bigEndian")? {
@@ -238,7 +253,8 @@ fn buf_writef64(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
 /// `buffer.readstring(b, offset, count)`.
 fn buf_readstring(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let b = buffer_arg(args, 0, "b")?.borrow();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let b = b_handle.borrow();
     let range = b.range(size_arg(args, 1, "offset")?, size_arg(args, 2, "count")?)?;
     Ok(vec![bytes_to_string(&b.data[range])])
 }
@@ -246,7 +262,8 @@ fn buf_readstring(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// `buffer.writestring(b, offset, s, count?)`: the first `count` bytes of
 /// `s` (all of them by default).
 fn buf_writestring(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let mut b = buffer_arg(args, 0, "b")?.borrow_mut();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let mut b = b_handle.borrow_mut();
     let offset = size_arg(args, 1, "offset")?;
     let s = str_arg(args, 2, "s")?.as_bytes();
     let count = opt_size_arg(args, 3, "count", s.len())?;
@@ -261,7 +278,8 @@ fn buf_writestring(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// `buffer.readbits(b, bitOffset, bitCount)`: up to 32 bits starting at
 /// any bit, least significant bit first.
 fn buf_readbits(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let b = buffer_arg(args, 0, "b")?.borrow();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let b = b_handle.borrow();
     let bit_offset = size_arg(args, 1, "bitOffset")?;
     let bit_count = size_arg(args, 2, "bitCount")?;
     if bit_count > 32 {
@@ -275,12 +293,13 @@ fn buf_readbits(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             value |= 1 << i;
         }
     }
-    Ok(vec![Value::Int(value as i64)])
+    Ok(vec![Value::int(value as i64)])
 }
 
 /// `buffer.writebits(b, bitOffset, bitCount, value)`.
 fn buf_writebits(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let mut b = buffer_arg(args, 0, "b")?.borrow_mut();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let mut b = b_handle.borrow_mut();
     let bit_offset = size_arg(args, 1, "bitOffset")?;
     let bit_count = size_arg(args, 2, "bitCount")?;
     let value = bits_arg(args, 3, "value")?;
@@ -308,7 +327,7 @@ fn buf_copy(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let target_offset = size_arg(args, 1, "targetOffset")?;
     let source = buffer_arg(args, 2, "source")?;
     let source_offset = opt_size_arg(args, 3, "sourceOffset", 0)?;
-    if Rc::ptr_eq(target, source) {
+    if BorrowedRc::ptr_eq(target, source) {
         let mut b = target.borrow_mut();
         let rest = b.len().saturating_sub(source_offset);
         let count = opt_size_arg(args, 4, "count", rest)?;
@@ -329,7 +348,8 @@ fn buf_copy(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
 /// `buffer.fill(b, offset, value, count?)`.
 fn buf_fill(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let mut b = buffer_arg(args, 0, "b")?.borrow_mut();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let mut b = b_handle.borrow_mut();
     let offset = size_arg(args, 1, "offset")?;
     let value = bits_arg(args, 2, "value")? as u8;
     let rest = b.len().saturating_sub(offset);
@@ -343,7 +363,8 @@ fn buf_fill(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// `b`.
 fn buf_slice(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let data = {
-        let b = buffer_arg(args, 0, "b")?.borrow();
+        let b_handle = buffer_arg(args, 0, "b")?;
+        let b = b_handle.borrow();
         let offset = opt_size_arg(args, 1, "offset", 0)?;
         let count = opt_size_arg(args, 2, "count", b.len().saturating_sub(offset))?;
         let range = b.range(offset, count)?;
@@ -358,20 +379,21 @@ fn buf_resize(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let size = size_arg(args, 1, "size")?;
     check_size(size)?;
     b.borrow_mut().data.resize(size, 0);
-    Ok(vec![Value::Buffer(b.clone())])
+    Ok(vec![Value::buffer(b.to_rc())])
 }
 
 /// `buffer.equal(a, b)`: whether two buffers hold the same bytes.
 fn buf_equal(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let a = buffer_arg(args, 0, "a")?;
     let b = buffer_arg(args, 1, "b")?;
-    Ok(vec![Value::Bool(
-        Rc::ptr_eq(a, b) || a.borrow().data == b.borrow().data,
+    Ok(vec![Value::bool(
+        BorrowedRc::ptr_eq(a, b) || a.borrow().data == b.borrow().data,
     )])
 }
 
 fn buf_tohex(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let b = buffer_arg(args, 0, "b")?.borrow();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let b = b_handle.borrow();
     let mut out = String::with_capacity(b.len() * 2);
     for byte in &b.data {
         out.push_str(&format!("{:02x}", byte));
@@ -396,7 +418,8 @@ fn buf_fromhex(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn buf_tobase64(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let b = buffer_arg(args, 0, "b")?.borrow();
+    let b_handle = buffer_arg(args, 0, "b")?;
+    let b = b_handle.borrow();
     Ok(vec![Value::string(
         base64::engine::general_purpose::STANDARD.encode(&b.data),
     )])

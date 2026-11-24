@@ -12,7 +12,7 @@ use num_bigint::BigInt;
 
 use crate::vm::libs::args::table_arg;
 use crate::vm::machine::VM;
-use crate::vm::value::{StrRef, Value, VmTable};
+use crate::vm::value::{StrRef, Value, ValueView, VmTable};
 
 const MAX_DEPTH: usize = 256;
 
@@ -47,11 +47,13 @@ thread_local! {
 /// `json.null`: a value that encodes as `null`, and what `decode` produces
 /// for `null` with `keepNull`, so the key stays present.
 pub(crate) fn null_sentinel() -> Value {
-    NULL.with(|n| Value::Table(n.clone()))
+    NULL.with(|n| Value::table(n.clone()))
 }
 
 pub(crate) fn is_null(value: &Value) -> bool {
-    matches!(value, Value::Table(t) if NULL.with(|n| Rc::ptr_eq(n, t)))
+    value
+        .table_ptr()
+        .is_some_and(|p| NULL.with(|n| std::ptr::eq(p, Rc::as_ptr(n))))
 }
 
 fn null_tostring(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
@@ -62,8 +64,9 @@ fn null_tostring(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
 /// array, even when empty.
 fn json_array(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let table = match args.first() {
-        None | Some(Value::Nil) => Rc::new(RefCell::new(VmTable::new())),
-        _ => table_arg(args, 0, "t")?.clone(),
+        None => Rc::new(RefCell::new(VmTable::new())),
+        Some(v) if v.is_nil() => Rc::new(RefCell::new(VmTable::new())),
+        _ => table_arg(args, 0, "t")?.to_rc(),
     };
     let meta = table.borrow().metatable.clone();
     let meta = meta.unwrap_or_else(|| {
@@ -71,8 +74,8 @@ fn json_array(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         table.borrow_mut().metatable = Some(meta.clone());
         meta
     });
-    meta.borrow_mut().set_str(ARRAY_MARK, Value::Bool(true));
-    Ok(vec![Value::Table(table)])
+    meta.borrow_mut().set_str(ARRAY_MARK, Value::TRUE);
+    Ok(vec![Value::table(table)])
 }
 
 // ---------------------------------------------------------------------------
@@ -91,24 +94,24 @@ struct Encoder<'a> {
 /// `json.encode(value, options?)` with `indent` (a number of spaces or a
 /// string; compact by default) and `sortKeys` (true by default).
 fn json_encode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let value = args.first().cloned().unwrap_or(Value::Nil);
-    let (indent, sort_keys) = match args.get(1) {
-        None | Some(Value::Nil) => (String::new(), true),
-        Some(Value::Table(opts)) => {
+    let value = args.first().cloned().unwrap_or(Value::NIL);
+    let (indent, sort_keys) = match args.get(1).map(Value::view) {
+        None | Some(ValueView::Nil) => (String::new(), true),
+        Some(ValueView::Table(opts)) => {
             let opts = opts.borrow();
-            let indent = match opts.get_str("indent") {
-                Value::Nil => String::new(),
-                Value::Int(n) if (0..=16).contains(&n) => " ".repeat(n as usize),
-                Value::String(s) => s.to_string(),
+            let indent = match opts.get_str("indent").view() {
+                ValueView::Nil => String::new(),
+                ValueView::Int(n) if (0..=16).contains(&n) => " ".repeat(n as usize),
+                ValueView::String(s) => s.to_string(),
                 _ => return Err("indent must be a number from 0 to 16 or a string".to_string()),
             };
-            let sort_keys = !matches!(opts.get_str("sortKeys"), Value::Bool(false));
+            let sort_keys = opts.get_str("sortKeys").as_bool() != Some(false);
             (indent, sort_keys)
         }
-        Some(other) => {
+        Some(_) => {
             return Err(format!(
                 "options must be a table, got {}",
-                other.type_name()
+                args[1].type_name()
             ));
         }
     };
@@ -153,48 +156,49 @@ impl Encoder<'_> {
                 MAX_OUTPUT / (1024 * 1024)
             ));
         }
-        match value {
-            Value::Nil => self.out.push_str("null"),
-            Value::Bool(b) => self.out.push_str(if *b { "true" } else { "false" }),
-            Value::Int(i) => self.out.push_str(&i.to_string()),
-            Value::BigInt(i) => self.out.push_str(&i.to_string()),
-            Value::Float(f) => match format_float(*f) {
+        match value.view() {
+            ValueView::Nil => self.out.push_str("null"),
+            ValueView::Bool(b) => self.out.push_str(if b { "true" } else { "false" }),
+            ValueView::Int(i) => self.out.push_str(&i.to_string()),
+            ValueView::BigInt(i) => self.out.push_str(&i.to_string()),
+            ValueView::Float(f) => match format_float(f) {
                 Some(text) => self.out.push_str(&text),
                 None => return Err(format!("cannot encode {} as JSON", f)),
             },
-            Value::String(s) => write_string(&mut self.out, s),
-            Value::Table(_) if is_null(value) => self.out.push_str("null"),
-            Value::Table(t) => {
+            ValueView::String(s) => write_string(&mut self.out, &s),
+            ValueView::Table(_) if is_null(value) => self.out.push_str("null"),
+            ValueView::Table(t) => {
                 let custom = t.borrow().metamethod("__tojson");
                 if let Some(handler) = custom {
                     let result = self
                         .vm
                         .call_function(handler, std::slice::from_ref(value))?;
-                    let result = result.into_iter().next().unwrap_or(Value::Nil);
-                    if let Value::Table(r) = &result
-                        && Rc::ptr_eq(r, t)
+                    let result = result.into_iter().next().unwrap_or(Value::NIL);
+                    if result
+                        .table_ptr()
+                        .is_some_and(|p| std::ptr::eq(p, t.as_ptr()))
                     {
                         return Err("__tojson returned its own table".to_string());
                     }
                     return self.value(&result, depth + 1);
                 }
-                let ptr = Rc::as_ptr(t);
+                let ptr = t.as_ptr();
                 if self.open.contains(&ptr) {
                     return Err("cannot encode a table that contains itself".to_string());
                 }
                 self.open.push(ptr);
-                let result = self.table(t, depth);
+                let result = self.table(&t, depth);
                 self.open.pop();
                 result?;
             }
-            other => {
-                return Err(format!("cannot encode a {} as JSON", other.type_name()));
+            _ => {
+                return Err(format!("cannot encode a {} as JSON", value.type_name()));
             }
         }
         Ok(())
     }
 
-    fn table(&mut self, t: &Rc<RefCell<VmTable>>, depth: usize) -> Result<(), String> {
+    fn table(&mut self, t: &RefCell<VmTable>, depth: usize) -> Result<(), String> {
         let (is_array, items, entries) = {
             let tbl = t.borrow();
             let marked = tbl
@@ -226,14 +230,14 @@ impl Encoder<'_> {
         }
         let mut pairs = Vec::with_capacity(entries.len());
         for (key, value) in entries {
-            let key = match key {
-                Value::String(s) => s.to_string(),
-                Value::Int(_) | Value::BigInt(_) => key.to_string(),
-                Value::Float(f) => format_float(f).unwrap_or_default(),
-                other => {
+            let key = match key.view() {
+                ValueView::String(s) => s.to_string(),
+                ValueView::Int(_) | ValueView::BigInt(_) => key.to_string(),
+                ValueView::Float(f) => format_float(f).unwrap_or_default(),
+                _ => {
                     return Err(format!(
                         "cannot encode a table key of type {} as JSON",
-                        other.type_name()
+                        key.type_name()
                     ));
                 }
             };
@@ -287,14 +291,14 @@ pub(crate) fn write_string(out: &mut String, s: &str) {
 /// `json.null` instead of nil, so object keys holding it stay present.
 fn json_decode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let text = match args.first() {
-        Some(Value::String(s)) => s,
+        Some(v) if v.is_string() => v.as_str().unwrap(),
         Some(other) => {
             return Err(format!("text must be a string, got {}", other.type_name()));
         }
         None => return Err("text must be provided".to_string()),
     };
-    let keep_null = match args.get(1) {
-        Some(Value::Table(opts)) => opts.borrow().get_str("keepNull").is_truthy(),
+    let keep_null = match args.get(1).and_then(Value::as_table) {
+        Some(opts) => opts.borrow().get_str("keepNull").is_truthy(),
         _ => false,
     };
     Ok(vec![decode_with(text, keep_null)?])
@@ -365,12 +369,12 @@ impl Parser<'_> {
                 let null = if self.keep_null {
                     null_sentinel()
                 } else {
-                    Value::Nil
+                    Value::NIL
                 };
                 self.expect_literal("null", null)
             }
-            Some(b't') => self.expect_literal("true", Value::Bool(true)),
-            Some(b'f') => self.expect_literal("false", Value::Bool(false)),
+            Some(b't') => self.expect_literal("true", Value::TRUE),
+            Some(b'f') => self.expect_literal("false", Value::FALSE),
             Some(b'"') => self.string().map(Value::string),
             Some(b'[') => self.nested(Self::array),
             Some(b'{') => self.nested(Self::object),
@@ -430,10 +434,10 @@ impl Parser<'_> {
         let text = std::str::from_utf8(&self.bytes[start..self.pos]).unwrap_or("0");
         if is_float {
             text.parse::<f64>()
-                .map(Value::Float)
+                .map(Value::float)
                 .map_err(|_| self.error("invalid number"))
         } else if let Ok(i) = text.parse::<i64>() {
-            Ok(Value::Int(i))
+            Ok(Value::int(i))
         } else {
             text.parse::<BigInt>()
                 .map(Value::from_bigint)
@@ -535,12 +539,12 @@ impl Parser<'_> {
             }
         }
         // Trailing nulls would leave the array with a nil end.
-        while matches!(items.last(), Some(Value::Nil)) {
+        while items.last().is_some_and(Value::is_nil) {
             items.pop();
         }
         let mut table = VmTable::new();
         table.array = items;
-        Ok(Value::Table(Rc::new(RefCell::new(table))))
+        Ok(Value::table(Rc::new(RefCell::new(table))))
     }
 
     fn object(&mut self) -> Result<Value, String> {
@@ -549,7 +553,7 @@ impl Parser<'_> {
         self.skip_whitespace();
         if self.peek() == Some(b'}') {
             self.pos += 1;
-            return Ok(Value::Table(Rc::new(RefCell::new(table))));
+            return Ok(Value::table(Rc::new(RefCell::new(table))));
         }
         loop {
             self.skip_whitespace();
@@ -564,7 +568,7 @@ impl Parser<'_> {
             self.pos += 1;
             self.skip_whitespace();
             let value = self.value()?;
-            if !matches!(value, Value::Nil) {
+            if !value.is_nil() {
                 table.fields.insert(StrRef::from(key), value);
             }
             self.skip_whitespace();
@@ -577,6 +581,6 @@ impl Parser<'_> {
                 _ => return Err(self.error("expected ',' or '}'")),
             }
         }
-        Ok(Value::Table(Rc::new(RefCell::new(table))))
+        Ok(Value::table(Rc::new(RefCell::new(table))))
     }
 }

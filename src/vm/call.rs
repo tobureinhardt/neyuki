@@ -6,7 +6,7 @@ use crate::bytecode::instruction::MULTRET;
 use crate::bytecode::proto::Proto;
 use crate::vm::frame::CallFrame;
 use crate::vm::machine::{HookEvent, VM};
-use crate::vm::value::{Value, VmClosure};
+use crate::vm::value::{Value, ValueView, VmClosure};
 
 /// How many callable tables a call follows through `__call` before giving
 /// up, like the `__index` chain limit.
@@ -30,7 +30,7 @@ impl VM {
         let base = prev_stack_len + 1;
         let needed = base + closure.proto.max_registers as usize + 1;
         if needed >= self.stack.len() {
-            self.stack.resize(needed + 1, Value::Nil);
+            self.stack.resize(needed + 1, Value::NIL);
         }
         self.frames.push(CallFrame::new(closure, base));
         let result = self.run_to_depth(depth);
@@ -53,11 +53,11 @@ impl VM {
             n => n as usize,
         };
         if dest + count > self.stack.len() {
-            self.stack.resize(dest + count, Value::Nil);
+            self.stack.resize(dest + count, Value::NIL);
         }
         let mut iter = results.into_iter();
         for i in 0..count {
-            self.stack[dest + i] = iter.next().unwrap_or(Value::Nil);
+            self.stack[dest + i] = iter.next().unwrap_or(Value::NIL);
         }
         if retc == MULTRET {
             self.top = dest + count;
@@ -80,8 +80,8 @@ impl VM {
                 self.max_call_depth
             ));
         }
-        match func {
-            Value::Native(def) => {
+        match func.view() {
+            ValueView::Native(def) => {
                 self.fire_hook(HookEvent::Call)?;
                 match (def.func)(self, args) {
                     Ok(results) => {
@@ -91,20 +91,21 @@ impl VM {
                     Err(err) => Err(err),
                 }
             }
-            Value::Closure(c) => {
+            ValueView::Closure(c) => {
+                let c = c.to_rc();
                 let depth = self.frames.len();
                 let prev_stack_len = self.stack.len();
                 let base = prev_stack_len + 1;
                 let needed = base + c.proto.max_registers as usize + args.len() + 1;
                 if needed >= self.stack.len() {
-                    self.stack.resize(needed + 1, Value::Nil);
+                    self.stack.resize(needed + 1, Value::NIL);
                 }
                 for (i, arg) in args.iter().enumerate() {
                     self.stack[base + i] = arg.clone();
                 }
                 let num_params = c.proto.num_params as usize;
                 for i in args.len()..num_params {
-                    self.stack[base + i] = Value::Nil;
+                    self.stack[base + i] = Value::NIL;
                 }
                 let varargs = if args.len() > num_params {
                     args[num_params..].to_vec()
@@ -160,7 +161,7 @@ impl VM {
                     }
                 }
             }
-            Value::Table(_) => {
+            ValueView::Table(_) => {
                 // A `__call` handler may itself be a table with `__call`:
                 // follow the chain, each table becoming the first argument
                 // of the next. A loop would otherwise recurse forever,
@@ -168,9 +169,9 @@ impl VM {
                 let mut callee = func;
                 let mut call_args = args.to_vec();
                 for _ in 0..MAX_CALL_CHAIN {
-                    let handler = match &callee {
-                        Value::Table(t) => t.borrow().metamethod("__call"),
-                        _ => return self.call_function_inner(callee, &call_args),
+                    let handler = match callee.as_table() {
+                        Some(t) => t.borrow().metamethod("__call"),
+                        None => return self.call_function_inner(callee, &call_args),
                     };
                     let Some(handler) = handler else {
                         return Err(

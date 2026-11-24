@@ -38,23 +38,23 @@ impl FoldVal {
     fn to_value(&self) -> crate::vm::Value {
         use crate::vm::Value;
         match self {
-            FoldVal::Nil => Value::Nil,
-            FoldVal::Bool(b) => Value::Bool(*b),
+            FoldVal::Nil => Value::NIL,
+            FoldVal::Bool(b) => Value::bool(*b),
             FoldVal::Int(i) => Value::from_bigint(i.clone()),
-            FoldVal::Float(f) => Value::Float(*f),
+            FoldVal::Float(f) => Value::float(*f),
             FoldVal::Str(s) => Value::str(s),
         }
     }
 
     fn from_value(value: &crate::vm::Value) -> Option<FoldVal> {
-        use crate::vm::Value;
-        Some(match value {
-            Value::Nil => FoldVal::Nil,
-            Value::Bool(b) => FoldVal::Bool(*b),
-            Value::Int(i) => FoldVal::Int(BigInt::from(*i)),
-            Value::BigInt(i) => FoldVal::Int((**i).clone()),
-            Value::Float(f) => FoldVal::Float(*f),
-            Value::String(s) => FoldVal::Str(s.to_string()),
+        use crate::vm::value::ValueView;
+        Some(match value.view() {
+            ValueView::Nil => FoldVal::Nil,
+            ValueView::Bool(b) => FoldVal::Bool(b),
+            ValueView::Int(i) => FoldVal::Int(BigInt::from(i)),
+            ValueView::BigInt(i) => FoldVal::Int(i.clone()),
+            ValueView::Float(f) => FoldVal::Float(f),
+            ValueView::String(s) => FoldVal::Str(s.to_string()),
             _ => return None,
         })
     }

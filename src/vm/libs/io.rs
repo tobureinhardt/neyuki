@@ -43,7 +43,7 @@ pub(crate) const NATIVES: &[NativeDef] = &[
 ];
 
 fn count_arg(args: &[Value], index: usize, name: &str) -> Result<usize, String> {
-    let count = number(args.get(index).unwrap_or(&Value::Nil))
+    let count = number(args.get(index).unwrap_or(&Value::NIL))
         .map_err(|_| format!("{} must be a number", name))?;
     if count < 0.0 || count.fract() != 0.0 {
         return Err(format!("{} must be a non-negative integer", name));
@@ -79,7 +79,7 @@ fn builtin_read_line(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String>
         .read_line(&mut line)
         .map_err(|err| io_error("read", "stdin", err))?;
     if read == 0 {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
     if !keep_newline && line.ends_with('\n') {
         line.pop();
@@ -112,7 +112,7 @@ fn builtin_read_chars(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
             .fill_buf()
             .map_err(|err| io_error("read", "stdin", err))?;
         return Ok(vec![if buffer.is_empty() {
-            Value::Nil
+            Value::NIL
         } else {
             Value::str("")
         }]);
@@ -141,7 +141,7 @@ fn builtin_read_chars(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
         return Err("stdin is not valid UTF-8".to_string());
     }
     if text.is_empty() {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
     Ok(vec![Value::string(text)])
 }
@@ -179,7 +179,7 @@ fn builtin_read_number(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, Stri
         }
     }
     if token.is_empty() {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
     let token = String::from_utf8_lossy(&token).replace('_', "");
     let integer = if let Some(hex) = token
@@ -198,9 +198,9 @@ fn builtin_read_number(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, Stri
     Ok(vec![if let Some(value) = integer {
         Value::from_bigint(value)
     } else if let Ok(value) = token.parse::<f64>() {
-        Value::Float(value)
+        Value::float(value)
     } else {
-        Value::Nil
+        Value::NIL
     }])
 }
 
@@ -210,12 +210,12 @@ fn builtin_write(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     if vm.dap.is_some() {
         writer(stream)?;
         crate::dap::output(vm, stream, text);
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
     writer(stream)?
         .write_all(text.as_bytes())
         .map_err(|err| io_error("write to", stream, err))?;
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 fn builtin_flush(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -223,7 +223,7 @@ fn builtin_flush(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     writer(stream)?
         .flush()
         .map_err(|err| io_error("flush", stream, err))?;
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 fn builtin_isatty(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -239,5 +239,5 @@ fn builtin_isatty(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             ));
         }
     };
-    Ok(vec![Value::Bool(is_terminal)])
+    Ok(vec![Value::bool(is_terminal)])
 }

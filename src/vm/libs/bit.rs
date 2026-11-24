@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::vm::machine::VM;
-use crate::vm::value::{Value, VmTable};
+use crate::vm::value::{Value, ValueView, VmTable};
 
 /// The low 32 bits of an integer, so negative and oversized values wrap
 /// modulo 2^32 as in Lua's bit32.
@@ -15,10 +15,10 @@ fn low_bits(value: &BigInt) -> u32 {
 }
 
 fn to_u32(val: &Value) -> Result<u32, String> {
-    match val {
-        Value::Int(i) => Ok(*i as u32),
-        Value::BigInt(b) => Ok(low_bits(b)),
-        Value::Float(f) if f.is_finite() => Ok(*f as i64 as u32),
+    match val.view() {
+        ValueView::Int(i) => Ok(i as u32),
+        ValueView::BigInt(b) => Ok(low_bits(b)),
+        ValueView::Float(f) if f.is_finite() => Ok(f as i64 as u32),
         _ => Err("bit library expects a finite number".to_string()),
     }
 }
@@ -142,10 +142,10 @@ fn bit_ror(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
 fn bit_btest(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let res = bit_band(_vm, args)?;
-    if let Some(Value::Int(i)) = res.first() {
-        Ok(vec![Value::Bool(!i.is_zero())])
+    if let Some(i) = res.first().and_then(|v| v.as_int()) {
+        Ok(vec![Value::bool(!i.is_zero())])
     } else {
-        Ok(vec![Value::Bool(false)])
+        Ok(vec![Value::FALSE])
     }
 }
 
@@ -211,9 +211,11 @@ fn bit_tohex(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     } else {
         format!("{:0width$x}", u, width = len)
     };
-    Ok(vec![Value::String(
-        (if n < 0 { res.to_uppercase() } else { res }).into(),
-    )])
+    Ok(vec![Value::string(if n < 0 {
+        res.to_uppercase()
+    } else {
+        res
+    })])
 }
 
 fn bit_tobit(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -241,5 +243,5 @@ pub fn create_bit_lib() -> Value {
     table.set_str("tohex", crate::native!("bit.tohex", bit_tohex));
     table.set_str("tobit", crate::native!("bit.tobit", bit_tobit));
     table.frozen = true;
-    Value::Table(Rc::new(RefCell::new(table)))
+    Value::table(Rc::new(RefCell::new(table)))
 }

@@ -134,10 +134,10 @@ impl Proto {
             self.constants
                 .iter()
                 .map(|c| match c {
-                    Constant::Nil => Value::Nil,
-                    Constant::Bool(b) => Value::Bool(*b),
+                    Constant::Nil => Value::NIL,
+                    Constant::Bool(b) => Value::bool(*b),
                     Constant::Int(i) => Value::from_bigint(i.clone()),
-                    Constant::Float(f) => Value::Float(*f),
+                    Constant::Float(f) => Value::float(*f),
                     Constant::String(s) => Value::str(s),
                 })
                 .collect()

@@ -143,23 +143,13 @@ pub fn fold_call(module: &str, name: &str, args: &[crate::vm::Value]) -> Option<
     FOLD_VM.with(|cell| {
         let mut slot = cell.borrow_mut();
         let vm = slot.get_or_insert_with(VM::new);
-        let Some(Value::Table(lib)) = vm.modules.get(module).cloned() else {
-            return None;
-        };
-        let Value::Native(def) = lib.borrow().get_str(name) else {
-            return None;
-        };
+        let lib = vm.modules.get(module).and_then(Value::as_table)?;
+        let fn_val = lib.borrow().get_str(name);
+        let def = fn_val.as_native()?;
         let results = (def.func)(vm, args).ok()?;
         match results.as_slice() {
-            [Value::String(s)] if s.len() > MAX_FOLDED_STRING => None,
-            [
-                v @ (Value::Nil
-                | Value::Bool(_)
-                | Value::Int(_)
-                | Value::BigInt(_)
-                | Value::Float(_)
-                | Value::String(_)),
-            ] => Some(v.clone()),
+            [v] if v.as_str().is_some_and(|s| s.len() > MAX_FOLDED_STRING) => None,
+            [v] if v.is_nil() || v.is_bool() || v.is_number() || v.is_string() => Some(v.clone()),
             _ => None,
         }
     })

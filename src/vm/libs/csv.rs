@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use crate::vm::libs::args::{array, bool_arg, str_arg, table_arg};
 use crate::vm::machine::VM;
-use crate::vm::value::{NativeDef, StrRef, Value, VmTable};
+use crate::vm::value::{NativeDef, StrRef, Value, ValueView, VmTable};
 
 /// The longest text `encode` produces, as for `json.encode`.
 const MAX_OUTPUT: usize = 64 * 1024 * 1024;
@@ -153,7 +153,7 @@ fn parse(text: &str, delimiter: u8) -> Result<Vec<Record>, String> {
 }
 
 fn new_table(table: VmTable) -> Value {
-    Value::Table(Rc::new(RefCell::new(table)))
+    Value::table(Rc::new(RefCell::new(table)))
 }
 
 /// `__csv_decode(text, delimiter, header)`: an array of records, each an
@@ -230,16 +230,16 @@ fn write_record(out: &mut String, cells: &[String], delimiter: u8, newline: &str
 }
 
 fn cell_text(vm: &mut VM, value: &Value, row: usize) -> Result<String, String> {
-    match value {
-        Value::Nil => Ok(String::new()),
-        Value::String(s) => Ok(s.to_string()),
-        Value::Bool(_) | Value::Int(_) | Value::BigInt(_) | Value::Float(_) => {
+    match value.view() {
+        ValueView::Nil => Ok(String::new()),
+        ValueView::String(s) => Ok(s.to_string()),
+        ValueView::Bool(_) | ValueView::Int(_) | ValueView::BigInt(_) | ValueView::Float(_) => {
             crate::vm::builtins::global::tostring(vm, value)
         }
-        other => Err(format!(
+        _ => Err(format!(
             "row {}: cannot write a {} as a CSV field",
             row,
-            other.type_name()
+            value.type_name()
         )),
     }
 }
@@ -253,13 +253,15 @@ fn builtin_encode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let rows = table_arg(args, 0, "rows")?.borrow().array.clone();
     let delimiter = delimiter_arg(args, 1)?;
     let columns = match args.get(2) {
-        None | Some(Value::Nil) => None,
-        Some(Value::Table(t)) => {
+        None => None,
+        Some(v) if v.is_nil() => None,
+        Some(v) if v.is_table() => {
+            let t = v.as_table().unwrap();
             let mut names = Vec::new();
             for value in t.borrow().array.iter() {
-                match value {
-                    Value::String(s) => names.push(s.to_string()),
-                    _ => return Err("columns must be an array of strings".to_string()),
+                match value.as_str() {
+                    Some(s) => names.push(s.to_string()),
+                    None => return Err("columns must be an array of strings".to_string()),
                 }
             }
             Some(names)
@@ -271,22 +273,23 @@ fn builtin_encode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             ));
         }
     };
-    let header = !matches!(args.get(3), Some(Value::Bool(false)));
+    let header = args.get(3).and_then(|v| v.as_bool()) != Some(false);
     let newline = match args.get(4) {
-        None | Some(Value::Nil) => "\n".to_string(),
-        Some(Value::String(s)) if matches!(&**s, "\n" | "\r\n") => s.to_string(),
+        None => "\n".to_string(),
+        Some(v) if v.is_nil() => "\n".to_string(),
+        Some(v) if matches!(v.as_str(), Some("\n" | "\r\n")) => v.as_str().unwrap().to_string(),
         _ => return Err("newline must be \"\\n\" or \"\\r\\n\"".to_string()),
     };
 
     let mut keyed = false;
     for (i, row) in rows.iter().enumerate() {
-        match row {
-            Value::Table(t) => keyed |= is_keyed(&t.borrow()),
-            other => {
+        match row.as_table() {
+            Some(t) => keyed |= is_keyed(&t.borrow()),
+            None => {
                 return Err(format!(
                     "row {} must be a table, got {}",
                     i + 1,
-                    other.type_name()
+                    row.type_name()
                 ));
             }
         }
@@ -296,7 +299,7 @@ fn builtin_encode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         None if keyed => {
             let mut names = BTreeSet::new();
             for row in &rows {
-                if let Value::Table(t) = row {
+                if let Some(t) = row.as_table() {
                     for (key, _) in t.borrow().fields.iter() {
                         names.insert(key.to_string());
                     }
@@ -312,7 +315,7 @@ fn builtin_encode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         write_record(&mut out, columns, delimiter, &newline);
     }
     for (i, row) in rows.iter().enumerate() {
-        let Value::Table(t) = row else {
+        let Some(t) = row.as_table() else {
             continue;
         };
         let values: Vec<Value> = {

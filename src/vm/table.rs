@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use crate::vm::buffer::VmBuffer;
-use crate::vm::value::{NativeDef, StrRef, Value, VmClosure, VmTable};
+use crate::vm::value::{NativeDef, StrRef, Value, ValueView, VmClosure, VmString, VmTable};
 
 #[derive(Clone, Debug)]
 pub enum TableKey {
@@ -55,34 +55,34 @@ impl Hash for TableKey {
 
 impl TableKey {
     pub fn from_value(val: &Value) -> Result<Self, &'static str> {
-        match val {
-            Value::Nil => Err("table index is nil"),
-            Value::Bool(b) => Ok(TableKey::Bool(*b)),
-            Value::Int(i) => Ok(TableKey::Int(*i)),
-            Value::Float(f) => {
+        match val.view() {
+            ValueView::Nil => Err("table index is nil"),
+            ValueView::Bool(b) => Ok(TableKey::Bool(b)),
+            ValueView::Int(i) => Ok(TableKey::Int(i)),
+            ValueView::Float(f) => {
                 if f.is_nan() {
                     return Err("table index is NaN");
                 }
                 // If float is an exact integer, represent as Int to unify lookup
-                if f.fract() == 0.0 && *f >= (i64::MIN as f64) && *f <= (i64::MAX as f64) {
-                    Ok(TableKey::Int(*f as i64))
+                if f.fract() == 0.0 && f >= (i64::MIN as f64) && f <= (i64::MAX as f64) {
+                    Ok(TableKey::Int(f as i64))
                 } else {
-                    let bits = if *f == 0.0 { 0u64 } else { f.to_bits() };
+                    let bits = if f == 0.0 { 0u64 } else { f.to_bits() };
                     Ok(TableKey::Float(bits))
                 }
             }
-            Value::BigInt(b) => {
-                if let Some(i) = num_traits::ToPrimitive::to_i64(&**b) {
+            ValueView::BigInt(b) => {
+                if let Some(i) = num_traits::ToPrimitive::to_i64(b) {
                     Ok(TableKey::Int(i))
                 } else {
                     Err("table index too large")
                 }
             }
-            Value::String(s) => Ok(TableKey::String(s.clone())),
-            Value::Table(t) => Ok(TableKey::Table(Rc::as_ptr(t))),
-            Value::Closure(c) => Ok(TableKey::Closure(Rc::as_ptr(c))),
-            Value::Native(def) => Ok(TableKey::Native(*def as *const _)),
-            Value::Buffer(b) => Ok(TableKey::Buffer(Rc::as_ptr(b))),
+            ValueView::String(s) => Ok(TableKey::String(s.to_str_ref())),
+            ValueView::Table(t) => Ok(TableKey::Table(t.as_ptr())),
+            ValueView::Closure(c) => Ok(TableKey::Closure(c.as_ptr())),
+            ValueView::Native(def) => Ok(TableKey::Native(def as *const _)),
+            ValueView::Buffer(b) => Ok(TableKey::Buffer(b.as_ptr())),
         }
     }
 }
@@ -90,40 +90,42 @@ impl TableKey {
 /// Where a non-array key sorts: numbers first (ascending), then strings,
 /// booleans, and everything else by identity.
 fn key_rank(key: &Value) -> u8 {
-    match key {
-        Value::Int(_) | Value::BigInt(_) | Value::Float(_) => 0,
-        Value::String(_) => 1,
-        Value::Bool(_) => 2,
+    match key.view() {
+        ValueView::Int(_) | ValueView::BigInt(_) | ValueView::Float(_) => 0,
+        ValueView::String(_) => 1,
+        ValueView::Bool(_) => 2,
         _ => 3,
     }
 }
 
 fn identity(key: &Value) -> usize {
-    match key {
-        Value::Table(t) => Rc::as_ptr(t) as *const u8 as usize,
-        Value::Closure(c) => Rc::as_ptr(c) as *const u8 as usize,
-        Value::Native(d) => *d as *const NativeDef as usize,
-        Value::Buffer(b) => Rc::as_ptr(b) as *const u8 as usize,
+    match key.view() {
+        ValueView::Table(t) => t.as_ptr() as *const u8 as usize,
+        ValueView::Closure(c) => c.as_ptr() as *const u8 as usize,
+        ValueView::Native(d) => d as *const NativeDef as usize,
+        ValueView::Buffer(b) => b.as_ptr() as *const u8 as usize,
         _ => 0,
     }
 }
 
 fn compare_keys(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    key_rank(a).cmp(&key_rank(b)).then_with(|| match (a, b) {
-        (Value::String(x), Value::String(y)) => x.cmp(y),
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        _ if key_rank(a) == 0 => {
-            if crate::vm::ops::eval_lt(a, b).unwrap_or(false) {
-                Ordering::Less
-            } else if crate::vm::ops::eval_lt(b, a).unwrap_or(false) {
-                Ordering::Greater
-            } else {
-                Ordering::Equal
+    key_rank(a)
+        .cmp(&key_rank(b))
+        .then_with(|| match (a.view(), b.view()) {
+            (ValueView::String(x), ValueView::String(y)) => x.as_str().cmp(y.as_str()),
+            (ValueView::Bool(x), ValueView::Bool(y)) => x.cmp(&y),
+            _ if key_rank(a) == 0 => {
+                if crate::vm::ops::eval_lt(a, b).unwrap_or(false) {
+                    Ordering::Less
+                } else if crate::vm::ops::eval_lt(b, a).unwrap_or(false) {
+                    Ordering::Greater
+                } else {
+                    Ordering::Equal
+                }
             }
-        }
-        _ => identity(a).cmp(&identity(b)),
-    })
+            _ => identity(a).cmp(&identity(b)),
+        })
 }
 
 /// The keys outside the array part, in iteration order: numbers ascending,
@@ -133,8 +135,8 @@ pub fn sorted_keys(table: &VmTable) -> Vec<Value> {
     let mut keys: Vec<Value> = table
         .fields
         .iter()
-        .filter(|(_, v)| !matches!(v, Value::Nil))
-        .map(|(k, _)| Value::String(k.clone()))
+        .filter(|(_, v)| !v.is_nil())
+        .map(|(k, _)| Value::str_ref(k.clone()))
         .collect();
     if let Some(general) = &table.general {
         keys.extend(general.values().map(|(k, _)| k.clone()));
@@ -154,23 +156,23 @@ pub fn raw_get(table: &VmTable, key: &Value) -> Value {
 /// current key while iterating is allowed, and the entry after it is still
 /// the one that follows it in iteration order.
 pub fn next_entry(table: &VmTable, key: &Value) -> Result<Option<(Value, Value)>, String> {
-    let array_start = match key {
-        Value::Nil => Some(0),
-        Value::Int(i) if *i >= 1 && (*i as u64) <= table.array.len() as u64 => Some(*i as usize),
+    let array_start = match key.view() {
+        ValueView::Nil => Some(0),
+        ValueView::Int(i) if i >= 1 && (i as u64) <= table.array.len() as u64 => Some(i as usize),
         // A key trimmed off the end of the array: the array is done.
-        Value::Int(i)
-            if *i >= 1
-                && (*i as u64) <= table.array_peak as u64
-                && table.get_general(&TableKey::Int(*i)).is_none() =>
+        ValueView::Int(i)
+            if i >= 1
+                && (i as u64) <= table.array_peak as u64
+                && table.get_general(&TableKey::Int(i)).is_none() =>
         {
             Some(table.array.len())
         }
-        Value::Float(f) if f.is_nan() => return Err("invalid key to 'next'".to_string()),
+        ValueView::Float(f) if f.is_nan() => return Err("invalid key to 'next'".to_string()),
         _ => None,
     };
     if let Some(start) = array_start {
         for (i, v) in table.array.iter().enumerate().skip(start) {
-            if !matches!(v, Value::Nil) {
+            if !v.is_nil() {
                 return Ok(Some((Value::from_usize(i + 1), v.clone())));
             }
         }
@@ -189,8 +191,8 @@ pub fn next_entry(table: &VmTable, key: &Value) -> Result<Option<(Value, Value)>
     for k in table
         .fields
         .iter()
-        .filter(|(_, v)| !matches!(v, Value::Nil))
-        .map(|(k, _)| Value::String(k.clone()))
+        .filter(|(_, v)| !v.is_nil())
+        .map(|(k, _)| Value::str_ref(k.clone()))
         .chain(
             table
                 .general
@@ -239,17 +241,18 @@ struct HashFieldMap {
 
 #[inline(always)]
 pub(crate) fn assign_value(slot: &mut Value, val: &Value) {
-    match (val, slot) {
-        (Value::Int(n), Value::Int(o)) => *o = *n,
-        (Value::Float(n), Value::Float(o)) => *o = *n,
-        (Value::Bool(n), Value::Bool(o)) => *o = *n,
-        (v, dst) => *dst = v.clone(),
-    }
+    slot.assign_ref(val);
 }
 
 #[inline(always)]
 fn entry_matches_strref(entry: &FieldEntry, hash: u64, key: &StrRef) -> bool {
     Rc::ptr_eq(&entry.key.0, &key.0) || (entry.hash == hash && entry.key.0.str == key.0.str)
+}
+
+#[inline(always)]
+fn entry_matches_vmstr(entry: &FieldEntry, key_ptr: *const VmString, key: &VmString) -> bool {
+    std::ptr::eq(Rc::as_ptr(&entry.key.0), key_ptr)
+        || (entry.hash == key.hash && entry.key.0.str == key.str)
 }
 
 impl HashFieldMap {
@@ -316,6 +319,28 @@ impl HashFieldMap {
         let hash = key.0.hash;
         let idx = self
             .find_slot(hash, |e| entry_matches_strref(e, hash, key))
+            .ok()?;
+        self.entries[idx].as_mut().map(|e| &mut e.val)
+    }
+
+    #[inline]
+    fn get_by_vmstr(&self, key_ptr: *const VmString, key: &VmString) -> Option<&Value> {
+        if self.count == 0 {
+            return None;
+        }
+        let idx = self
+            .find_slot(key.hash, |e| entry_matches_vmstr(e, key_ptr, key))
+            .ok()?;
+        self.entries[idx].as_ref().map(|e| &e.val)
+    }
+
+    #[inline]
+    fn get_mut_by_vmstr(&mut self, key_ptr: *const VmString, key: &VmString) -> Option<&mut Value> {
+        if self.count == 0 {
+            return None;
+        }
+        let idx = self
+            .find_slot(key.hash, |e| entry_matches_vmstr(e, key_ptr, key))
             .ok()?;
         self.entries[idx].as_mut().map(|e| &mut e.val)
     }
@@ -405,6 +430,48 @@ impl HashFieldMap {
         self.count += 1;
     }
 
+    #[inline]
+    fn set_by_vmstr(&mut self, key_ptr: *const VmString, key: &VmString, val: &Value) {
+        let clone_key = || {
+            // SAFETY: `key_ptr` came from `Rc::into_raw` on a live `VmString`.
+            unsafe {
+                Rc::increment_strong_count(key_ptr);
+                StrRef(Rc::from_raw(key_ptr))
+            }
+        };
+        let hash = key.hash;
+        if !self.entries.is_empty() {
+            match self.find_slot(hash, |e| entry_matches_vmstr(e, key_ptr, key)) {
+                Ok(idx) => {
+                    if let Some(entry) = &mut self.entries[idx] {
+                        assign_value(&mut entry.val, val);
+                    }
+                    return;
+                }
+                Err(idx) if (self.count + 1) * 4 <= self.entries.len() * 3 => {
+                    self.entries[idx] = Some(FieldEntry {
+                        hash,
+                        key: clone_key(),
+                        val: val.clone(),
+                    });
+                    self.count += 1;
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
+        self.grow();
+        let Err(idx) = self.find_slot(hash, |e| entry_matches_vmstr(e, key_ptr, key)) else {
+            unreachable!("missing key cannot exist after grow");
+        };
+        self.entries[idx] = Some(FieldEntry {
+            hash,
+            key: clone_key(),
+            val: val.clone(),
+        });
+        self.count += 1;
+    }
+
     fn grow(&mut self) {
         let new_cap = (self.entries.len() * 2).max(4);
         let mut new_entries = Vec::with_capacity(new_cap);
@@ -446,6 +513,16 @@ impl HashFieldMap {
         let hash = crate::vm::hash::fx_hash_bytes(key.as_bytes());
         let found = self
             .find_slot(hash, |e| e.hash == hash && e.key.0.str == key)
+            .ok()?;
+        self.remove_at(found)
+    }
+
+    fn remove_by_vmstr(&mut self, key_ptr: *const VmString, key: &VmString) -> Option<Value> {
+        if self.count == 0 {
+            return None;
+        }
+        let found = self
+            .find_slot(key.hash, |e| entry_matches_vmstr(e, key_ptr, key))
             .ok()?;
         self.remove_at(found)
     }
@@ -652,6 +729,72 @@ impl FieldMap {
     }
 
     #[inline(always)]
+    pub fn get_slot_keyed_vmstr(
+        &self,
+        idx: usize,
+        key_ptr: *const VmString,
+        key: &VmString,
+    ) -> Option<&Value> {
+        let entry = match &self.inner {
+            FieldStorage::Small(entries) => entries.get(idx),
+            FieldStorage::Hash(map) => map.entries.get(idx).and_then(|opt| opt.as_ref()),
+        }?;
+        entry_matches_vmstr(entry, key_ptr, key).then_some(&entry.val)
+    }
+
+    #[inline(always)]
+    pub fn get_slot_keyed_vmstr_ptr(&self, idx: usize, key_ptr: *const VmString) -> Option<&Value> {
+        let entry = match &self.inner {
+            FieldStorage::Small(entries) => entries.get(idx),
+            FieldStorage::Hash(map) => map.entries.get(idx).and_then(|opt| opt.as_ref()),
+        }?;
+        std::ptr::eq(Rc::as_ptr(&entry.key.0), key_ptr).then_some(&entry.val)
+    }
+
+    #[inline(always)]
+    pub fn get_slot_keyed_mut_vmstr(
+        &mut self,
+        idx: usize,
+        key_ptr: *const VmString,
+        key: &VmString,
+    ) -> Option<&mut Value> {
+        let entry = match &mut self.inner {
+            FieldStorage::Small(entries) => entries.get_mut(idx),
+            FieldStorage::Hash(map) => map.entries.get_mut(idx).and_then(|opt| opt.as_mut()),
+        }?;
+        entry_matches_vmstr(entry, key_ptr, key).then_some(&mut entry.val)
+    }
+
+    #[inline(always)]
+    pub fn get_slot_keyed_mut_vmstr_ptr(
+        &mut self,
+        idx: usize,
+        key_ptr: *const VmString,
+    ) -> Option<&mut Value> {
+        let entry = match &mut self.inner {
+            FieldStorage::Small(entries) => entries.get_mut(idx),
+            FieldStorage::Hash(map) => map.entries.get_mut(idx).and_then(|opt| opt.as_mut()),
+        }?;
+        std::ptr::eq(Rc::as_ptr(&entry.key.0), key_ptr).then_some(&mut entry.val)
+    }
+
+    #[inline]
+    pub fn find_index_by_vmstr(&self, key_ptr: *const VmString, key: &VmString) -> Option<usize> {
+        match &self.inner {
+            FieldStorage::Small(entries) => entries
+                .iter()
+                .position(|e| entry_matches_vmstr(e, key_ptr, key)),
+            FieldStorage::Hash(map) => {
+                if map.count == 0 {
+                    return None;
+                }
+                map.find_slot(key.hash, |e| entry_matches_vmstr(e, key_ptr, key))
+                    .ok()
+            }
+        }
+    }
+
+    #[inline(always)]
     pub fn get_slot_keyed_mut(&mut self, idx: usize, key: &StrRef) -> Option<&mut Value> {
         let entry = match &mut self.inner {
             FieldStorage::Small(entries) => entries.get_mut(idx),
@@ -714,6 +857,40 @@ impl FieldMap {
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    #[inline]
+    pub fn get_by_vmstr(&self, key_ptr: *const VmString, key: &VmString) -> Option<&Value> {
+        match &self.inner {
+            FieldStorage::Small(entries) => {
+                for entry in entries {
+                    if entry_matches_vmstr(entry, key_ptr, key) {
+                        return Some(&entry.val);
+                    }
+                }
+                None
+            }
+            FieldStorage::Hash(map) => map.get_by_vmstr(key_ptr, key),
+        }
+    }
+
+    #[inline]
+    pub fn get_mut_by_vmstr(
+        &mut self,
+        key_ptr: *const VmString,
+        key: &VmString,
+    ) -> Option<&mut Value> {
+        match &mut self.inner {
+            FieldStorage::Small(entries) => {
+                for entry in entries {
+                    if entry_matches_vmstr(entry, key_ptr, key) {
+                        return Some(&mut entry.val);
+                    }
+                }
+                None
+            }
+            FieldStorage::Hash(map) => map.get_mut_by_vmstr(key_ptr, key),
+        }
     }
 
     #[inline]
@@ -905,6 +1082,66 @@ impl FieldMap {
         }
     }
 
+    #[inline]
+    pub fn set_by_vmstr(&mut self, key_ptr: *const VmString, key: &VmString, val: &Value) {
+        let before = self.len();
+        self.set_by_vmstr_inner(key_ptr, key, val);
+        if self.len() != before {
+            self.bump_shape();
+        }
+    }
+
+    #[inline]
+    fn set_by_vmstr_inner(&mut self, key_ptr: *const VmString, key: &VmString, val: &Value) {
+        let clone_key = || {
+            // SAFETY: `key_ptr` came from `Rc::into_raw` on a live `VmString`.
+            unsafe {
+                Rc::increment_strong_count(key_ptr);
+                StrRef(Rc::from_raw(key_ptr))
+            }
+        };
+        match &mut self.inner {
+            FieldStorage::Small(entries) => {
+                for entry in entries.iter_mut() {
+                    if entry_matches_vmstr(entry, key_ptr, key) {
+                        assign_value(&mut entry.val, val);
+                        return;
+                    }
+                }
+                if entries.len() < SMALL_FIELD_LIMIT {
+                    entries.push(FieldEntry {
+                        hash: key.hash,
+                        key: clone_key(),
+                        val: val.clone(),
+                    });
+                    return;
+                }
+                self.promote_to_hash().set_by_vmstr(key_ptr, key, val);
+            }
+            FieldStorage::Hash(map) => map.set_by_vmstr(key_ptr, key, val),
+        }
+    }
+
+    pub fn remove_by_vmstr(&mut self, key_ptr: *const VmString, key: &VmString) -> Option<Value> {
+        let old = self.remove_by_vmstr_inner(key_ptr, key);
+        if old.is_some() {
+            self.bump_shape();
+        }
+        old
+    }
+
+    fn remove_by_vmstr_inner(&mut self, key_ptr: *const VmString, key: &VmString) -> Option<Value> {
+        match &mut self.inner {
+            FieldStorage::Small(entries) => {
+                let pos = entries
+                    .iter()
+                    .position(|e| entry_matches_vmstr(e, key_ptr, key))?;
+                Some(entries.swap_remove(pos).val)
+            }
+            FieldStorage::Hash(map) => map.remove_by_vmstr(key_ptr, key),
+        }
+    }
+
     pub fn remove(&mut self, key: &str) -> Option<Value> {
         let old = self.remove_inner(key);
         if old.is_some() {
@@ -1012,35 +1249,35 @@ mod tests {
         // must not read or write the other's field.
         let (a, b) = (StrRef::from("a"), StrRef::from("b"));
         let mut first = FieldMap::new();
-        first.insert(a.clone(), Value::Int(1));
-        first.insert(b.clone(), Value::Int(2));
+        first.insert(a.clone(), Value::int(1));
+        first.insert(b.clone(), Value::int(2));
         let mut second = FieldMap::new();
-        second.insert(b.clone(), Value::Int(20));
-        second.insert(a.clone(), Value::Int(10));
+        second.insert(b.clone(), Value::int(20));
+        second.insert(a.clone(), Value::int(10));
         assert_eq!(first.shape_version(), second.shape_version());
         let idx = first.find_index_by_strref(&a).unwrap();
-        assert!(matches!(first.get_slot_keyed(idx, &a), Some(Value::Int(1))));
+        assert_eq!(first.get_slot_keyed(idx, &a), Some(&Value::int(1)));
         assert!(second.get_slot_keyed(idx, &a).is_none());
-        assert!(!second.set_slot_keyed(idx, &a, Value::Int(99)));
-        assert!(matches!(second.get_slot(idx), Some(Value::Int(20))));
+        assert!(!second.set_slot_keyed(idx, &a, Value::int(99)));
+        assert_eq!(second.get_slot(idx), Some(&Value::int(20)));
     }
 
     #[test]
     fn test_table_key_conversions() {
         assert_eq!(
-            TableKey::from_value(&Value::Bool(true)),
+            TableKey::from_value(&Value::bool(true)),
             Ok(TableKey::Bool(true))
         );
         assert_eq!(
-            TableKey::from_value(&Value::Int(-42)),
+            TableKey::from_value(&Value::int(-42)),
             Ok(TableKey::Int(-42))
         );
         assert_eq!(
-            TableKey::from_value(&Value::Float(10.0)),
+            TableKey::from_value(&Value::float(10.0)),
             Ok(TableKey::Int(10))
         );
-        assert!(TableKey::from_value(&Value::Nil).is_err());
-        assert!(TableKey::from_value(&Value::Float(f64::NAN)).is_err());
+        assert!(TableKey::from_value(&Value::NIL).is_err());
+        assert!(TableKey::from_value(&Value::float(f64::NAN)).is_err());
     }
 
     #[test]
@@ -1052,7 +1289,7 @@ mod tests {
         // Insert keys
         for i in 0..50 {
             let key = StrRef::from(format!("field_{i}"));
-            assert!(map.insert(key, Value::Int(i * 10)).is_none());
+            assert!(map.insert(key, Value::int(i * 10)).is_none());
         }
         assert_eq!(map.len(), 50);
 
@@ -1060,14 +1297,14 @@ mod tests {
         for i in 0..50 {
             let key_str = format!("field_{i}");
             let key = StrRef::from(key_str.clone());
-            assert_eq!(map.get_by_strref(&key), Some(&Value::Int(i * 10)));
-            assert_eq!(map.get(&key_str), Some(&Value::Int(i * 10)));
+            assert_eq!(map.get_by_strref(&key), Some(&Value::int(i * 10)));
+            assert_eq!(map.get(&key_str), Some(&Value::int(i * 10)));
         }
 
         // Overwrite
         let k0 = StrRef::from("field_0");
-        assert_eq!(map.insert(k0.clone(), Value::Int(999)), Some(Value::Int(0)));
-        assert_eq!(map.get_by_strref(&k0), Some(&Value::Int(999)));
+        assert_eq!(map.insert(k0.clone(), Value::int(999)), Some(Value::int(0)));
+        assert_eq!(map.get_by_strref(&k0), Some(&Value::int(999)));
 
         // Remove every second key
         for i in (0..50).step_by(2) {
@@ -1081,7 +1318,7 @@ mod tests {
         for i in (1..50).step_by(2) {
             let key_str = format!("field_{i}");
             let key = StrRef::from(key_str.clone());
-            assert_eq!(map.get_by_strref(&key), Some(&Value::Int(i * 10)));
+            assert_eq!(map.get_by_strref(&key), Some(&Value::int(i * 10)));
         }
 
         // Clear
@@ -1100,52 +1337,52 @@ mod tests {
         // Fill up to the small limit (8 entries) via set_by_strref.
         for i in 0..SMALL_FIELD_LIMIT {
             let k = StrRef::from(format!("k{i}"));
-            map.set_by_strref(&k, &Value::Int(i as i64));
+            map.set_by_strref(&k, &Value::int(i as i64));
         }
         assert!(matches!(map.inner, FieldStorage::Small(_)));
         assert_eq!(map.len(), SMALL_FIELD_LIMIT);
 
         // In-place primitive overwrite in Small mode keeps Small representation.
         let k2 = StrRef::from("k2");
-        map.set_by_strref(&k2, &Value::Int(200));
+        map.set_by_strref(&k2, &Value::int(200));
         assert!(matches!(map.inner, FieldStorage::Small(_)));
-        assert_eq!(map.get("k2"), Some(&Value::Int(200)));
+        assert_eq!(map.get("k2"), Some(&Value::int(200)));
 
         // Remove and re-insert in Small mode.
-        assert_eq!(map.remove_by_strref(&k2), Some(Value::Int(200)));
+        assert_eq!(map.remove_by_strref(&k2), Some(Value::int(200)));
         assert_eq!(map.len(), SMALL_FIELD_LIMIT - 1);
-        map.set_by_strref(&k2, &Value::Int(202));
+        map.set_by_strref(&k2, &Value::int(202));
         assert!(matches!(map.inner, FieldStorage::Small(_)));
 
         // `(SMALL_FIELD_LIMIT + 1)`-th distinct key promotes seamlessly to Hash mode.
         let k_promote = StrRef::from(format!("k{SMALL_FIELD_LIMIT}"));
-        map.set_by_strref(&k_promote, &Value::Int(800));
+        map.set_by_strref(&k_promote, &Value::int(800));
         assert!(matches!(map.inner, FieldStorage::Hash(_)));
         assert_eq!(map.len(), SMALL_FIELD_LIMIT + 1);
-        assert_eq!(map.get_by_strref(&k_promote), Some(&Value::Int(800)));
-        assert_eq!(map.get("k2"), Some(&Value::Int(202)));
+        assert_eq!(map.get_by_strref(&k_promote), Some(&Value::int(800)));
+        assert_eq!(map.get("k2"), Some(&Value::int(202)));
         for i in 0..SMALL_FIELD_LIMIT {
             let expected = if i == 2 { 202 } else { i as i64 };
-            assert_eq!(map.get(&format!("k{i}")), Some(&Value::Int(expected)));
+            assert_eq!(map.get(&format!("k{i}")), Some(&Value::int(expected)));
         }
 
         // Overwrite in Hash mode via set_by_strref.
-        map.set_by_strref(&k_promote, &Value::Float(8.5));
-        assert_eq!(map.get(&k_promote), Some(&Value::Float(8.5)));
+        map.set_by_strref(&k_promote, &Value::float(8.5));
+        assert_eq!(map.get(&k_promote), Some(&Value::float(8.5)));
 
         // Retain in both Small and Hash modes.
         map.retain(|k, _| **k == *k_promote || &**k == "k2");
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get("k2"), Some(&Value::Int(202)));
-        assert_eq!(map.get(&k_promote), Some(&Value::Float(8.5)));
+        assert_eq!(map.get("k2"), Some(&Value::int(202)));
+        assert_eq!(map.get(&k_promote), Some(&Value::float(8.5)));
 
         let mut small = FieldMap::with_capacity(4);
-        small.insert(StrRef::from("a"), Value::Int(1));
-        small.insert(StrRef::from("b"), Value::Int(2));
+        small.insert(StrRef::from("a"), Value::int(1));
+        small.insert(StrRef::from("b"), Value::int(2));
         small.retain(|k, _| &**k == "b");
         assert!(matches!(small.inner, FieldStorage::Small(_)));
         assert_eq!(small.len(), 1);
-        assert_eq!(small.get("b"), Some(&Value::Int(2)));
+        assert_eq!(small.get("b"), Some(&Value::int(2)));
         assert_eq!(small.get("a"), None);
     }
 
@@ -1155,7 +1392,7 @@ mod tests {
         // (`(24 + 1) * 4 > 32 * 3`). Updating existing keys must not rehash.
         let mut map = FieldMap::new();
         for i in 0..24 {
-            map.insert(StrRef::from(format!("k{i}")), Value::Int(i));
+            map.insert(StrRef::from(format!("k{i}")), Value::int(i));
         }
         let cap_before = match &map.inner {
             FieldStorage::Hash(h) => h.entries.len(),
@@ -1164,15 +1401,15 @@ mod tests {
         assert_eq!(cap_before, 32);
 
         let k0 = StrRef::from("k0");
-        map.set_by_strref(&k0, &Value::Int(999));
-        map.insert(StrRef::from("k1"), Value::Int(888));
+        map.set_by_strref(&k0, &Value::int(999));
+        map.insert(StrRef::from("k1"), Value::int(888));
 
         let cap_after = match &map.inner {
             FieldStorage::Hash(h) => h.entries.len(),
             FieldStorage::Small(_) => panic!("expected Hash storage"),
         };
         assert_eq!(cap_after, cap_before);
-        assert_eq!(map.get("k0"), Some(&Value::Int(999)));
-        assert_eq!(map.get("k1"), Some(&Value::Int(888)));
+        assert_eq!(map.get("k0"), Some(&Value::int(999)));
+        assert_eq!(map.get("k1"), Some(&Value::int(888)));
     }
 }

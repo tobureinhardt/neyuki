@@ -17,7 +17,9 @@ use crate::bytecode::instruction::MULTRET;
 use crate::vm::frame::CallFrame;
 use crate::vm::machine::{HookEvent, RUNNING_FRAME, VM};
 use crate::vm::ops;
-use crate::vm::value::{Upvalue, Value, VmClosure, VmTable};
+use crate::vm::value::{
+    INLINE_INT_MAX, INLINE_INT_MIN, TAG_RC_START, Upvalue, Value, ValueView, VmClosure, VmTable,
+};
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -34,6 +36,25 @@ type FastHandler = fn(
 
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
+
+type ValueBinOpFn = fn(&Value, &Value) -> Result<Value, String>;
+type ValueBinOpIntoFn = fn(&mut [Value], usize, usize, usize) -> Result<(), String>;
+type ValueCmpFn = fn(&Value, &Value) -> Result<bool, String>;
+type ArithBinOpSpec = (
+    u8,
+    u8,
+    u8,
+    ValueBinOpFn,
+    &'static str,
+    Option<ValueBinOpIntoFn>,
+);
+type ArithConstSpec = (u8, u8, u16, ValueBinOpFn, &'static str);
+type ArithImmSpec = (u8, u8, i16, ValueBinOpFn, &'static str);
+type EvalBinOpSpec = (u8, u8, u8, ValueBinOpFn);
+type EvalConstSpec = (u8, u8, u16, ValueBinOpFn);
+type CmpBinOpSpec = (u8, u8, i16, ValueCmpFn, &'static str, bool);
+type CmpConstSpec = (u8, u16, i16, ValueCmpFn, &'static str, bool);
+type CmpImmSpec = (u8, i16, i16, ValueCmpFn, &'static str, bool);
 
 static DISPATCH_FAST: [FastHandler; NUM_EXEC_OPS] = [
     op_load_nil,           // 0
@@ -186,11 +207,8 @@ unsafe fn base_of(vm: &VM, regs: *mut Value) -> usize {
 }
 
 #[inline(always)]
-fn is_trivial_drop(v: &Value) -> bool {
-    matches!(
-        v,
-        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Native(_)
-    )
+const fn fits_inline_int(i: i64) -> bool {
+    i >= INLINE_INT_MIN && i <= INLINE_INT_MAX
 }
 
 #[cold]
@@ -205,41 +223,24 @@ fn cold_write_int_dispatch(
     val: i64,
 ) -> u8 {
     unsafe {
-        *regs.add(dst as usize) = Value::Int(val);
+        (*regs.add(dst as usize)).set_inplace(Value::int(val));
         dispatch!(vm, regs, pc, consts, dtbl);
     }
 }
 
 #[cold]
 #[inline(never)]
-fn cold_write_float_dispatch(
+fn cold_write_trivial_dispatch(
     vm: &mut VM,
     regs: *mut Value,
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
     dtbl: DispatchTbl,
     dst: u8,
-    val: f64,
+    bits: u64,
 ) -> u8 {
     unsafe {
-        *regs.add(dst as usize) = Value::Float(val);
-        dispatch!(vm, regs, pc, consts, dtbl);
-    }
-}
-
-#[cold]
-#[inline(never)]
-fn cold_write_bool_dispatch(
-    vm: &mut VM,
-    regs: *mut Value,
-    pc: *const Cell<AlignedExec>,
-    consts: *const Value,
-    dtbl: DispatchTbl,
-    dst: u8,
-    val: bool,
-) -> u8 {
-    unsafe {
-        *regs.add(dst as usize) = Value::Bool(val);
+        (*regs.add(dst as usize)).set_inplace(Value::from_trivial_bits(bits));
         dispatch!(vm, regs, pc, consts, dtbl);
     }
 }
@@ -247,139 +248,71 @@ fn cold_write_bool_dispatch(
 macro_rules! write_int_dispatch {
     ($vm:expr, $regs:expr, $pc:expr, $consts:expr, $dtbl:expr, $dst:expr, $val:expr) => {{
         let _slot = $regs.add($dst as usize);
-        let _v = $val;
-        if let Value::Int(old) = &mut *_slot {
-            *old = _v;
-        } else if is_trivial_drop(&*_slot) {
-            std::ptr::write(_slot, Value::Int(_v));
-        } else {
-            return cold_write_int_dispatch($vm, $regs, $pc, $consts, $dtbl, $dst, _v);
+        let _v: i64 = $val;
+        if (*_slot).is_trivial() && fits_inline_int(_v) {
+            std::ptr::write(_slot, Value::int(_v));
+            dispatch!($vm, $regs, $pc, $consts, $dtbl);
         }
-        dispatch!($vm, $regs, $pc, $consts, $dtbl);
+        return cold_write_int_dispatch($vm, $regs, $pc, $consts, $dtbl, $dst, _v);
     }};
 }
 
 macro_rules! write_float_dispatch {
     ($vm:expr, $regs:expr, $pc:expr, $consts:expr, $dtbl:expr, $dst:expr, $val:expr) => {{
         let _slot = $regs.add($dst as usize);
-        let _v = $val;
-        if let Value::Float(old) = &mut *_slot {
-            *old = _v;
-        } else if is_trivial_drop(&*_slot) {
-            std::ptr::write(_slot, Value::Float(_v));
-        } else {
-            return cold_write_float_dispatch($vm, $regs, $pc, $consts, $dtbl, $dst, _v);
+        let _v = Value::float($val);
+        if (*_slot).is_trivial() {
+            std::ptr::write(_slot, _v);
+            dispatch!($vm, $regs, $pc, $consts, $dtbl);
         }
-        dispatch!($vm, $regs, $pc, $consts, $dtbl);
+        return cold_write_trivial_dispatch($vm, $regs, $pc, $consts, $dtbl, $dst, _v.bits());
     }};
 }
 
 macro_rules! write_bool_dispatch {
     ($vm:expr, $regs:expr, $pc:expr, $consts:expr, $dtbl:expr, $dst:expr, $val:expr) => {{
         let _slot = $regs.add($dst as usize);
-        let _v = $val;
-        if let Value::Bool(old) = &mut *_slot {
-            *old = _v;
-        } else if is_trivial_drop(&*_slot) {
-            std::ptr::write(_slot, Value::Bool(_v));
-        } else {
-            return cold_write_bool_dispatch($vm, $regs, $pc, $consts, $dtbl, $dst, _v);
+        let _v = Value::bool($val);
+        if (*_slot).is_trivial() {
+            std::ptr::write(_slot, _v);
+            dispatch!($vm, $regs, $pc, $consts, $dtbl);
         }
-        dispatch!($vm, $regs, $pc, $consts, $dtbl);
+        return cold_write_trivial_dispatch($vm, $regs, $pc, $consts, $dtbl, $dst, _v.bits());
     }};
 }
 
 #[inline(always)]
 unsafe fn write_int(slot: *mut Value, val: i64) {
     unsafe {
-        let s = &mut *slot;
-        match s {
-            Value::Int(old) => *old = val,
-            Value::Nil | Value::Bool(_) | Value::Float(_) | Value::Native(_) => {
-                std::ptr::write(slot, Value::Int(val));
-            }
-            _ => *s = Value::Int(val),
-        }
+        (&mut *slot).set_inplace(Value::int(val));
     }
 }
 
 #[inline(always)]
 unsafe fn write_float(slot: *mut Value, val: f64) {
     unsafe {
-        let s = &mut *slot;
-        match s {
-            Value::Float(old) => *old = val,
-            Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Native(_) => {
-                std::ptr::write(slot, Value::Float(val));
-            }
-            _ => *s = Value::Float(val),
-        }
+        (&mut *slot).set_inplace(Value::float(val));
     }
 }
 
 #[inline(always)]
 unsafe fn write_bool(slot: *mut Value, val: bool) {
     unsafe {
-        let s = &mut *slot;
-        match s {
-            Value::Bool(old) => *old = val,
-            Value::Nil | Value::Int(_) | Value::Float(_) | Value::Native(_) => {
-                std::ptr::write(slot, Value::Bool(val));
-            }
-            _ => *s = Value::Bool(val),
-        }
+        (&mut *slot).set_inplace(Value::bool(val));
     }
 }
 
 #[inline(always)]
 unsafe fn set_slot_val(slot: *mut Value, val: Value) {
     unsafe {
-        let s = &mut *slot;
-        match val {
-            Value::Int(n) => write_int(slot, n),
-            Value::Float(f) => write_float(slot, f),
-            Value::Bool(b) => write_bool(slot, b),
-            other => match s {
-                Value::Nil
-                | Value::Bool(_)
-                | Value::Int(_)
-                | Value::Float(_)
-                | Value::Native(_) => {
-                    std::ptr::write(slot, other);
-                }
-                _ => *s = other,
-            },
-        }
+        (&mut *slot).set_inplace(val);
     }
 }
 
 #[inline(always)]
 unsafe fn copy_slot(dst: *mut Value, src: *const Value) {
     unsafe {
-        match &*src {
-            Value::Int(n) => write_int(dst, *n),
-            Value::Float(f) => write_float(dst, *f),
-            Value::Bool(b) => write_bool(dst, *b),
-            Value::Nil => set_slot_val(dst, Value::Nil),
-            Value::Native(def) => set_slot_val(dst, Value::Native(*def)),
-            Value::Closure(c) => {
-                if let Value::Closure(d) = &*dst
-                    && Rc::ptr_eq(c, d)
-                {
-                    return;
-                }
-                set_slot_val(dst, Value::Closure(Rc::clone(c)));
-            }
-            Value::String(st) => {
-                if let Value::String(d) = &*dst
-                    && Rc::ptr_eq(&st.0, &d.0)
-                {
-                    return;
-                }
-                set_slot_val(dst, Value::String(st.clone()));
-            }
-            other => set_slot_val(dst, other.clone()),
-        }
+        (&mut *dst).assign_ref(&*src);
     }
 }
 
@@ -455,7 +388,7 @@ pub(crate) fn run_fast_threaded(vm: &mut VM, target_depth: usize) -> Result<Opti
     }
     let window_end = base + closure.proto.max_registers as usize;
     if vm.stack.len() < window_end {
-        vm.stack.resize(window_end, Value::Nil);
+        vm.stack.resize(window_end, Value::NIL);
     }
     let saved = SavedDispatchState::save(vm);
 
@@ -509,7 +442,7 @@ fn op_end_sentinel(
         vm.close_upvalues_if_needed(frame_base);
         if vm.frames.len() == vm.run_target_depth {
             vm.returned.clear();
-            vm.run_result = Some(Value::Nil);
+            vm.run_result = Some(Value::NIL);
             return STATUS_OK;
         }
         let (caller_base, caller_ip, caller_exec, caller_consts, caller_closure, caller_upvals) = {
@@ -535,22 +468,6 @@ fn op_end_sentinel(
         let new_pc = (*caller_exec).ops.as_ptr().add(caller_ip);
         let new_regs = vm.stack.as_mut_ptr().add(caller_base);
         dispatch!(vm, new_regs, new_pc, caller_consts, dtbl);
-    }
-}
-
-#[cold]
-#[inline(never)]
-fn cold_write_nil_dispatch(
-    vm: &mut VM,
-    regs: *mut Value,
-    pc: *const Cell<AlignedExec>,
-    consts: *const Value,
-    dtbl: DispatchTbl,
-    dst: u8,
-) -> u8 {
-    unsafe {
-        *regs.add(dst as usize) = Value::Nil;
-        dispatch!(vm, regs, pc, consts, dtbl);
     }
 }
 
@@ -588,8 +505,8 @@ fn cold_get_global_cached_dispatch(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let (dst, name_k, site) = match raw.0 {
-        ExecInst::GetGlobal { dst, name_k, site } => (dst, name_k, site),
+    let (dst, site) = match raw.0 {
+        ExecInst::GetGlobal { dst, site, .. } => (dst, site),
         _ => unsafe { std::hint::unreachable_unchecked() },
     };
     unsafe {
@@ -598,7 +515,7 @@ fn cold_get_global_cached_dispatch(
             dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
-    cold_get_global(vm, regs, pc, consts, dtbl, dst, name_k, Some(site))
+    cold_get_global(vm, regs, pc, consts, dtbl, raw)
 }
 
 fn op_load_nil(
@@ -615,12 +532,12 @@ fn op_load_nil(
     };
     unsafe {
         let slot = regs.add(dst as usize);
-        if is_trivial_drop(&*slot) {
-            std::ptr::write(slot, Value::Nil);
+        if (*slot).is_trivial() {
+            std::ptr::write(slot, Value::NIL);
             dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
-    cold_write_nil_dispatch(vm, regs, pc, consts, dtbl, dst)
+    cold_write_trivial_dispatch(vm, regs, pc, consts, dtbl, dst, Value::NIL.bits())
 }
 
 fn op_load_bool(
@@ -671,26 +588,14 @@ fn op_load_k(
     };
     unsafe {
         let src = &*consts.add(k as usize);
-        match src {
-            Value::Int(n) => write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, *n),
-            Value::Float(f) => write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *f),
-            Value::Bool(b) => write_bool_dispatch!(vm, regs, pc, consts, dtbl, dst, *b),
-            Value::Nil => {
-                let slot = regs.add(dst as usize);
-                if is_trivial_drop(&*slot) {
-                    std::ptr::write(slot, Value::Nil);
-                    dispatch!(vm, regs, pc, consts, dtbl);
-                }
-            }
-            Value::String(st) => {
-                let slot = regs.add(dst as usize);
-                if let Value::String(d) = &*slot
-                    && Rc::ptr_eq(&st.0, &d.0)
-                {
-                    dispatch!(vm, regs, pc, consts, dtbl);
-                }
-            }
-            _ => {}
+        let src_bits = src.bits();
+        let slot = regs.add(dst as usize);
+        if src_bits < TAG_RC_START && (*slot).is_trivial() {
+            std::ptr::write(slot, Value::from_trivial_bits(src_bits));
+            dispatch!(vm, regs, pc, consts, dtbl);
+        }
+        if (*slot).bits() == src_bits {
+            dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
     cold_copy_slot_dispatch(vm, regs, pc, consts, dtbl, raw)
@@ -709,49 +614,27 @@ fn op_move(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        match &*regs.add(src as usize) {
-            Value::Int(n) => write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, *n),
-            Value::Float(f) => write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *f),
-            Value::Bool(b) => write_bool_dispatch!(vm, regs, pc, consts, dtbl, dst, *b),
-            Value::Nil => {
-                let slot = regs.add(dst as usize);
-                if is_trivial_drop(&*slot) {
-                    std::ptr::write(slot, Value::Nil);
-                    dispatch!(vm, regs, pc, consts, dtbl);
-                }
+        let src_ref = &*regs.add(src as usize);
+        let src_bits = src_ref.bits();
+        let slot = regs.add(dst as usize);
+        if (*slot).is_trivial() {
+            if src_bits < TAG_RC_START {
+                std::ptr::write(slot, Value::from_trivial_bits(src_bits));
+                dispatch!(vm, regs, pc, consts, dtbl);
             }
-            Value::Native(def) => {
-                let slot = regs.add(dst as usize);
-                if is_trivial_drop(&*slot) {
-                    std::ptr::write(slot, Value::Native(*def));
+            match src_ref.view() {
+                ValueView::Closure(c) => {
+                    std::ptr::write(slot, Value::closure(c.to_rc()));
                     dispatch!(vm, regs, pc, consts, dtbl);
                 }
+                ValueView::String(st) => {
+                    std::ptr::write(slot, Value::str_ref(st.to_str_ref()));
+                    dispatch!(vm, regs, pc, consts, dtbl);
+                }
+                _ => {}
             }
-            Value::Closure(c) => {
-                let slot = regs.add(dst as usize);
-                if let Value::Closure(d) = &*slot
-                    && Rc::ptr_eq(c, d)
-                {
-                    dispatch!(vm, regs, pc, consts, dtbl);
-                }
-                if is_trivial_drop(&*slot) {
-                    std::ptr::write(slot, Value::Closure(Rc::clone(c)));
-                    dispatch!(vm, regs, pc, consts, dtbl);
-                }
-            }
-            Value::String(st) => {
-                let slot = regs.add(dst as usize);
-                if let Value::String(d) = &*slot
-                    && Rc::ptr_eq(&st.0, &d.0)
-                {
-                    dispatch!(vm, regs, pc, consts, dtbl);
-                }
-                if is_trivial_drop(&*slot) {
-                    std::ptr::write(slot, Value::String(st.clone()));
-                    dispatch!(vm, regs, pc, consts, dtbl);
-                }
-            }
-            _ => {}
+        } else if (*slot).bits() == src_bits {
+            dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
     cold_copy_slot_dispatch(vm, regs, pc, consts, dtbl, raw)
@@ -776,18 +659,11 @@ fn op_get_global(
     };
     unsafe {
         if let Some(val) = (*vm.cur_exec).global_cache_ref(site, vm.globals_epoch) {
-            match val {
-                Value::Native(def) => {
-                    let slot = regs.add(dst as usize);
-                    if is_trivial_drop(&*slot) {
-                        std::ptr::write(slot, Value::Native(*def));
-                        dispatch!(vm, regs, pc, consts, dtbl);
-                    }
-                }
-                Value::Int(n) => write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, *n),
-                Value::Float(f) => write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *f),
-                Value::Bool(b) => write_bool_dispatch!(vm, regs, pc, consts, dtbl, dst, *b),
-                _ => {}
+            let v_bits = val.bits();
+            let slot = regs.add(dst as usize);
+            if v_bits < TAG_RC_START && (*slot).is_trivial() {
+                std::ptr::write(slot, Value::from_trivial_bits(v_bits));
+                dispatch!(vm, regs, pc, consts, dtbl);
             }
         }
     }
@@ -802,11 +678,7 @@ fn op_get_global_dynamic(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let inst = raw.0;
-    let ExecInst::GetGlobalDynamic { dst, name_k } = inst else {
-        unsafe { std::hint::unreachable_unchecked() }
-    };
-    return cold_get_global(vm, regs, pc, consts, dtbl, dst, name_k, None);
+    cold_get_global(vm, regs, pc, consts, dtbl, raw)
 }
 
 #[cold]
@@ -817,18 +689,21 @@ fn cold_get_global(
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
     dtbl: DispatchTbl,
-    dst: u8,
-    name_k: u16,
-    site: Option<u16>,
+    raw: AlignedExec,
 ) -> u8 {
+    let (dst, name_k, site) = match raw.0 {
+        ExecInst::GetGlobal { dst, name_k, site } => (dst, name_k, Some(site)),
+        ExecInst::GetGlobalDynamic { dst, name_k } => (dst, name_k, None),
+        _ => unsafe { std::hint::unreachable_unchecked() },
+    };
     unsafe {
         let name = {
-            let Value::String(name) = &*consts.add(name_k as usize) else {
+            let Some(name) = (&*consts.add(name_k as usize)).as_str_ref() else {
                 return fail_msg(vm, pc, "global name must be string");
             };
-            name.clone()
+            name.to_str_ref()
         };
-        let val = vm.globals.get(&*name).cloned().unwrap_or(Value::Nil);
+        let val = vm.globals.get(&*name).cloned().unwrap_or(Value::NIL);
         if let Some(site) = site {
             (*vm.cur_exec).global_cache_set(site, vm.globals_epoch, val.clone());
         }
@@ -866,14 +741,14 @@ fn set_global_inner(
     name_k: u16,
 ) -> bool {
     unsafe {
-        let Value::String(name) = &*consts.add(name_k as usize) else {
+        let Some(name) = (&*consts.add(name_k as usize)).as_str_ref() else {
             return false;
         };
         let val = (*regs.add(src as usize)).clone();
-        if let Some(slot) = vm.globals.get_mut(&**name) {
+        if let Some(slot) = vm.globals.get_mut(name.as_str()) {
             *slot = val;
         } else {
-            vm.globals.insert(name.clone(), val);
+            vm.globals.insert(name.to_str_ref(), val);
         }
         vm.globals_epoch = vm.globals_epoch.wrapping_add(1);
         true
@@ -961,42 +836,27 @@ fn op_get_upval(
             Some(idx) => vm.stack.as_ptr().add(idx),
             None => uv.closed_ptr() as *const Value,
         };
-        match &*src_ptr {
-            Value::Int(n) => write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, *n),
-            Value::Float(f) => write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *f),
-            Value::Bool(b) => write_bool_dispatch!(vm, regs, pc, consts, dtbl, dst, *b),
-            Value::Nil => {
-                let slot = regs.add(dst as usize);
-                if is_trivial_drop(&*slot) {
-                    std::ptr::write(slot, Value::Nil);
-                    dispatch!(vm, regs, pc, consts, dtbl);
-                }
+        let src_ref = &*src_ptr;
+        let src_bits = src_ref.bits();
+        let slot = regs.add(dst as usize);
+        if (*slot).is_trivial() {
+            if src_bits < TAG_RC_START {
+                std::ptr::write(slot, Value::from_trivial_bits(src_bits));
+                dispatch!(vm, regs, pc, consts, dtbl);
             }
-            Value::Closure(c) => {
-                let slot = regs.add(dst as usize);
-                if let Value::Closure(d) = &*slot
-                    && Rc::ptr_eq(c, d)
-                {
+            match src_ref.view() {
+                ValueView::Closure(c) => {
+                    std::ptr::write(slot, Value::closure(c.to_rc()));
                     dispatch!(vm, regs, pc, consts, dtbl);
                 }
-                if is_trivial_drop(&*slot) {
-                    std::ptr::write(slot, Value::Closure(Rc::clone(c)));
+                ValueView::String(st) => {
+                    std::ptr::write(slot, Value::str_ref(st.to_str_ref()));
                     dispatch!(vm, regs, pc, consts, dtbl);
                 }
+                _ => {}
             }
-            Value::String(st) => {
-                let slot = regs.add(dst as usize);
-                if let Value::String(d) = &*slot
-                    && Rc::ptr_eq(&st.0, &d.0)
-                {
-                    dispatch!(vm, regs, pc, consts, dtbl);
-                }
-                if is_trivial_drop(&*slot) {
-                    std::ptr::write(slot, Value::String(st.clone()));
-                    dispatch!(vm, regs, pc, consts, dtbl);
-                }
-            }
-            _ => {}
+        } else if (*slot).bits() == src_bits {
+            dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
     cold_get_upval_dispatch(vm, regs, pc, consts, dtbl, raw)
@@ -1021,32 +881,10 @@ fn op_set_upval(
             None => uv.closed_ptr(),
             _ => return cold_set_upval_dispatch(vm, regs, pc, consts, dtbl, raw),
         };
-        match (&*regs.add(src as usize), &mut *dst_ptr) {
-            (Value::Int(n), Value::Int(o)) => {
-                *o = *n;
-                dispatch!(vm, regs, pc, consts, dtbl);
-            }
-            (Value::Float(f), Value::Float(o)) => {
-                *o = *f;
-                dispatch!(vm, regs, pc, consts, dtbl);
-            }
-            (Value::Bool(b), Value::Bool(o)) => {
-                *o = *b;
-                dispatch!(vm, regs, pc, consts, dtbl);
-            }
-            (Value::Int(n), d) if is_trivial_drop(d) => {
-                std::ptr::write(dst_ptr, Value::Int(*n));
-                dispatch!(vm, regs, pc, consts, dtbl);
-            }
-            (Value::Float(f), d) if is_trivial_drop(d) => {
-                std::ptr::write(dst_ptr, Value::Float(*f));
-                dispatch!(vm, regs, pc, consts, dtbl);
-            }
-            (Value::Bool(b), d) if is_trivial_drop(d) => {
-                std::ptr::write(dst_ptr, Value::Bool(*b));
-                dispatch!(vm, regs, pc, consts, dtbl);
-            }
-            _ => {}
+        let src_bits = (*regs.add(src as usize)).bits();
+        if src_bits < TAG_RC_START && (*dst_ptr).is_trivial() {
+            std::ptr::write(dst_ptr, Value::from_trivial_bits(src_bits));
+            dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
     cold_set_upval_dispatch(vm, regs, pc, consts, dtbl, raw)
@@ -1073,7 +911,7 @@ fn new_table_inner(
     vm.gc.register_table_sized(&rc, size);
     unsafe {
         let new_regs = vm.stack.as_mut_ptr().add(base);
-        set_slot_val(new_regs.add(dst as usize), Value::Table(rc));
+        set_slot_val(new_regs.add(dst as usize), Value::table(rc));
         Ok(new_regs)
     }
 }
@@ -1119,29 +957,21 @@ fn op_get_table(
     unsafe {
         let tbl_val = &*regs.add(table as usize);
         let k = &*regs.add(key as usize);
-        if let (Value::Table(t), Value::Int(i)) = (tbl_val, k)
-            && *i >= 1
+        if let (Some(t), Some(i)) = (tbl_val.as_table(), k.as_int())
+            && i >= 1
             && let Ok(tbl) = t.try_borrow()
         {
-            let idx = *i as usize - 1;
+            let idx = i as usize - 1;
             if idx < tbl.array.len() {
-                match &tbl.array[idx] {
-                    Value::Int(n) => {
-                        let n = *n;
-                        drop(tbl);
-                        write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, n);
+                let v_bits = tbl.array[idx].bits();
+                if v_bits < TAG_RC_START {
+                    drop(tbl);
+                    let slot = regs.add(dst as usize);
+                    if (*slot).is_trivial() {
+                        std::ptr::write(slot, Value::from_trivial_bits(v_bits));
+                        dispatch!(vm, regs, pc, consts, dtbl);
                     }
-                    Value::Float(f) => {
-                        let f = *f;
-                        drop(tbl);
-                        write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, f);
-                    }
-                    Value::Bool(b) => {
-                        let b = *b;
-                        drop(tbl);
-                        write_bool_dispatch!(vm, regs, pc, consts, dtbl, dst, b);
-                    }
-                    _ => {}
+                    return cold_write_trivial_dispatch(vm, regs, pc, consts, dtbl, dst, v_bits);
                 }
             }
         }
@@ -1214,34 +1044,28 @@ fn op_get_table_k(
     unsafe {
         let tbl_val = &*regs.add(table as usize);
         let k = &*consts.add(key_k as usize);
-        if let (Value::Table(t), Value::String(s)) = (tbl_val, k)
+        if let (Some(t), Some(s)) = (tbl_val.as_table(), k.as_str_ref())
             && let Ok(tbl) = t.try_borrow()
         {
-            let ptr = Rc::as_ptr(t) as usize;
+            let ptr = t.as_ptr() as usize;
             let shape = tbl.fields.shape_version();
             let exec = &*vm.cur_exec;
             if let Some(ic) = exec.table_cache_get(site)
                 && ic.table_ptr == ptr
                 && ic.shape_version == shape
-                && let Some(v) = tbl.fields.get_slot_keyed_ptr(ic.slot_idx as usize, s)
+                && let Some(v) =
+                    tbl.fields
+                        .get_slot_keyed_vmstr(ic.slot_idx as usize, s.as_ptr(), s.vm_str())
             {
-                match v {
-                    Value::Int(n) => {
-                        let n = *n;
-                        drop(tbl);
-                        write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, n);
+                let v_bits = v.bits();
+                if v_bits < TAG_RC_START {
+                    drop(tbl);
+                    let slot = regs.add(dst as usize);
+                    if (*slot).is_trivial() {
+                        std::ptr::write(slot, Value::from_trivial_bits(v_bits));
+                        dispatch!(vm, regs, pc, consts, dtbl);
                     }
-                    Value::Float(f) => {
-                        let f = *f;
-                        drop(tbl);
-                        write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, f);
-                    }
-                    Value::Bool(b) => {
-                        let b = *b;
-                        drop(tbl);
-                        write_bool_dispatch!(vm, regs, pc, consts, dtbl, dst, b);
-                    }
-                    _ => {}
+                    return cold_write_trivial_dispatch(vm, regs, pc, consts, dtbl, dst, v_bits);
                 }
             }
         }
@@ -1284,12 +1108,12 @@ fn cold_get_table_k(
         unsafe {
             let tbl_val = &*regs.add(table as usize);
             let k = &*consts.add(key_k as usize);
-            if let (Value::Table(t), Value::String(s)) = (tbl_val, k) {
-                let ptr = Rc::as_ptr(t) as usize;
+            if let (Some(t), Some(s)) = (tbl_val.as_table(), k.as_str_ref()) {
+                let ptr = t.as_ptr() as usize;
                 let tbl = t.borrow();
                 let shape = tbl.fields.shape_version();
                 let exec = &*vm.cur_exec;
-                if let Some(slot_idx) = tbl.fields.find_index_by_strref(s)
+                if let Some(slot_idx) = tbl.fields.find_index_by_vmstr(s.as_ptr(), s.vm_str())
                     && let Some(v) = tbl.fields.get_slot(slot_idx)
                 {
                     let val = v.clone();
@@ -1306,7 +1130,7 @@ fn cold_get_table_k(
                     dispatch!(vm, regs, pc, consts, dtbl);
                 } else if tbl.metatable.is_none() {
                     drop(tbl);
-                    set_slot_val(regs.add(dst as usize), Value::Nil);
+                    set_slot_val(regs.add(dst as usize), Value::NIL);
                     dispatch!(vm, regs, pc, consts, dtbl);
                 }
             }
@@ -1349,20 +1173,15 @@ unsafe fn try_set_table_fast(regs: *mut Value, table: u8, key: u8, val: u8) -> b
         let tbl_val = &*regs.add(table as usize);
         let k = &*regs.add(key as usize);
         let v = &*regs.add(val as usize);
-        if let (Value::Table(t), Value::Int(i)) = (tbl_val, k)
-            && *i >= 1
-            && !matches!(v, Value::Nil)
+        if let (Some(t), Some(i)) = (tbl_val.as_table(), k.as_int())
+            && i >= 1
+            && !v.is_nil()
         {
             let mut tbl = t.borrow_mut();
             if !tbl.frozen {
-                let idx = *i as usize - 1;
+                let idx = i as usize - 1;
                 if idx < tbl.array.len() {
-                    match (v, &mut tbl.array[idx]) {
-                        (Value::Int(n), Value::Int(o)) => *o = *n,
-                        (Value::Float(n), Value::Float(o)) => *o = *n,
-                        (Value::Bool(n), Value::Bool(o)) => *o = *n,
-                        (v_other, slot) => *slot = v_other.clone(),
-                    }
+                    tbl.array[idx].assign_ref(v);
                     return true;
                 } else if idx == tbl.array.len() && tbl.metatable.is_none() && tbl.general.is_none()
                 {
@@ -1370,16 +1189,16 @@ unsafe fn try_set_table_fast(regs: *mut Value, table: u8, key: u8, val: u8) -> b
                     return true;
                 }
             }
-        } else if let (Value::Table(t), Value::String(s)) = (tbl_val, k)
-            && !matches!(v, Value::Nil)
+        } else if let (Some(t), Some(s)) = (tbl_val.as_table(), k.as_str_ref())
+            && !v.is_nil()
         {
             let mut tbl = t.borrow_mut();
             if !tbl.frozen {
                 if tbl.metatable.is_none() {
-                    tbl.fields.set_by_strref(s, v);
+                    tbl.fields.set_by_vmstr(s.as_ptr(), s.vm_str(), v);
                     return true;
-                } else if let Some(slot) = tbl.fields.get_mut_by_strref(s) {
-                    crate::vm::table::assign_value(slot, v);
+                } else if let Some(slot) = tbl.fields.get_mut_by_vmstr(s.as_ptr(), s.vm_str()) {
+                    slot.assign_ref(v);
                     return true;
                 }
             }
@@ -1404,33 +1223,18 @@ fn op_set_table(
         let tbl_val = &*regs.add(table as usize);
         let k = &*regs.add(key as usize);
         let v = &*regs.add(val as usize);
-        if let (Value::Table(t), Value::Int(i)) = (tbl_val, k)
-            && *i >= 1
-            && !matches!(v, Value::Nil)
+        if let (Some(t), Some(i)) = (tbl_val.as_table(), k.as_int())
+            && i >= 1
+            && !v.is_nil()
+            && v.is_trivial()
             && let Ok(mut tbl) = t.try_borrow_mut()
             && !tbl.frozen
         {
-            let idx = *i as usize - 1;
-            if idx < tbl.array.len() {
-                let slot = &mut tbl.array[idx];
-                match (v, slot) {
-                    (Value::Int(n), Value::Int(o)) => {
-                        *o = *n;
-                        drop(tbl);
-                        dispatch!(vm, regs, pc, consts, dtbl);
-                    }
-                    (Value::Float(n), Value::Float(o)) => {
-                        *o = *n;
-                        drop(tbl);
-                        dispatch!(vm, regs, pc, consts, dtbl);
-                    }
-                    (Value::Bool(n), Value::Bool(o)) => {
-                        *o = *n;
-                        drop(tbl);
-                        dispatch!(vm, regs, pc, consts, dtbl);
-                    }
-                    _ => {}
-                }
+            let idx = i as usize - 1;
+            if idx < tbl.array.len() && tbl.array[idx].is_trivial() {
+                std::ptr::write(&mut tbl.array[idx], Value::from_trivial_bits(v.bits()));
+                drop(tbl);
+                dispatch!(vm, regs, pc, consts, dtbl);
             }
         }
     }
@@ -1496,10 +1300,10 @@ unsafe fn try_set_table_k_fast(
         let tbl_val = &*regs.add(table as usize);
         let k = &*consts.add(key_k as usize);
         let v = &*regs.add(val as usize);
-        if let (Value::Table(t), Value::String(s)) = (tbl_val, k)
-            && !matches!(v, Value::Nil)
+        if let (Some(t), Some(s)) = (tbl_val.as_table(), k.as_str_ref())
+            && !v.is_nil()
         {
-            let ptr = Rc::as_ptr(t) as usize;
+            let ptr = t.as_ptr() as usize;
             let mut tbl = t.borrow_mut();
             if !tbl.frozen {
                 let shape = tbl.fields.shape_version();
@@ -1507,13 +1311,16 @@ unsafe fn try_set_table_k_fast(
                 if let Some(ic) = exec.table_cache_get(site)
                     && ic.table_ptr == ptr
                     && ic.shape_version == shape
-                    && tbl
-                        .fields
-                        .set_slot_keyed(ic.slot_idx as usize, s, v.clone())
+                    && let Some(slot_v) = tbl.fields.get_slot_keyed_mut_vmstr(
+                        ic.slot_idx as usize,
+                        s.as_ptr(),
+                        s.vm_str(),
+                    )
                 {
+                    slot_v.assign_ref(v);
                     return true;
                 }
-                if let Some(slot_idx) = tbl.fields.find_index_by_strref(s) {
+                if let Some(slot_idx) = tbl.fields.find_index_by_vmstr(s.as_ptr(), s.vm_str()) {
                     tbl.fields.set_slot(slot_idx, v.clone());
                     drop(tbl);
                     exec.table_cache_set(
@@ -1526,7 +1333,7 @@ unsafe fn try_set_table_k_fast(
                     );
                     return true;
                 } else if tbl.metatable.is_none() {
-                    let slot_idx = tbl.fields.insert_cached(s.clone(), v.clone());
+                    let slot_idx = tbl.fields.insert_cached(s.to_str_ref(), v.clone());
                     let new_shape = tbl.fields.shape_version();
                     drop(tbl);
                     exec.table_cache_set(
@@ -1567,78 +1374,24 @@ fn op_set_table_k(
         let tbl_val = &*regs.add(table as usize);
         let k = &*consts.add(key_k as usize);
         let v = &*regs.add(val as usize);
-        if let (Value::Table(t), Value::String(s)) = (tbl_val, k)
-            && !matches!(v, Value::Nil)
+        if let (Some(t), Some(s)) = (tbl_val.as_table(), k.as_str_ref())
+            && !v.is_nil()
+            && v.is_trivial()
             && let Ok(mut tbl) = t.try_borrow_mut()
             && !tbl.frozen
         {
-            let ptr = Rc::as_ptr(t) as usize;
+            let ptr = t.as_ptr() as usize;
             let shape = tbl.fields.shape_version();
             let exec = &*vm.cur_exec;
             if let Some(ic) = exec.table_cache_get(site)
                 && ic.table_ptr == ptr
                 && ic.shape_version == shape
-                && match v {
-                    Value::Int(n) => {
-                        if let Some(slot_v) =
-                            tbl.fields.get_slot_keyed_mut_ptr(ic.slot_idx as usize, s)
-                        {
-                            match slot_v {
-                                Value::Int(o) => {
-                                    *o = *n;
-                                    true
-                                }
-                                ref d if is_trivial_drop(d) => {
-                                    std::ptr::write(slot_v, Value::Int(*n));
-                                    true
-                                }
-                                _ => false,
-                            }
-                        } else {
-                            false
-                        }
-                    }
-                    Value::Float(f) => {
-                        if let Some(slot_v) =
-                            tbl.fields.get_slot_keyed_mut_ptr(ic.slot_idx as usize, s)
-                        {
-                            match slot_v {
-                                Value::Float(o) => {
-                                    *o = *f;
-                                    true
-                                }
-                                ref d if is_trivial_drop(d) => {
-                                    std::ptr::write(slot_v, Value::Float(*f));
-                                    true
-                                }
-                                _ => false,
-                            }
-                        } else {
-                            false
-                        }
-                    }
-                    Value::Bool(b) => {
-                        if let Some(slot_v) =
-                            tbl.fields.get_slot_keyed_mut_ptr(ic.slot_idx as usize, s)
-                        {
-                            match slot_v {
-                                Value::Bool(o) => {
-                                    *o = *b;
-                                    true
-                                }
-                                ref d if is_trivial_drop(d) => {
-                                    std::ptr::write(slot_v, Value::Bool(*b));
-                                    true
-                                }
-                                _ => false,
-                            }
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
-                }
+                && let Some(slot_v) = tbl
+                    .fields
+                    .get_slot_keyed_mut_vmstr_ptr(ic.slot_idx as usize, s.as_ptr())
+                && slot_v.is_trivial()
             {
+                std::ptr::write(slot_v, Value::from_trivial_bits(v.bits()));
                 drop(tbl);
                 dispatch!(vm, regs, pc, consts, dtbl);
             }
@@ -1724,7 +1477,7 @@ fn cold_set_table_k(
 unsafe fn append_array_inner(regs: *mut Value, table: u8, src: u8) -> bool {
     unsafe {
         let val = (&*regs.add(src as usize)).clone();
-        if let Value::Table(t) = &*regs.add(table as usize) {
+        if let Some(t) = (&*regs.add(table as usize)).as_table() {
             t.borrow_mut().array.push(val);
             true
         } else {
@@ -1767,31 +1520,20 @@ fn op_append_array(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let Value::Table(t) = &*regs.add(table as usize)
+        if let Some(t) = (&*regs.add(table as usize)).as_table()
             && let Ok(mut tbl) = t.try_borrow_mut()
             && tbl.array.len() < tbl.array.capacity()
         {
-            let len = tbl.array.len();
-            match &*regs.add(src as usize) {
-                Value::Int(n) => {
-                    std::ptr::write(tbl.array.as_mut_ptr().add(len), Value::Int(*n));
-                    tbl.array.set_len(len + 1);
-                    drop(tbl);
-                    dispatch!(vm, regs, pc, consts, dtbl);
-                }
-                Value::Float(f) => {
-                    std::ptr::write(tbl.array.as_mut_ptr().add(len), Value::Float(*f));
-                    tbl.array.set_len(len + 1);
-                    drop(tbl);
-                    dispatch!(vm, regs, pc, consts, dtbl);
-                }
-                Value::Bool(b) => {
-                    std::ptr::write(tbl.array.as_mut_ptr().add(len), Value::Bool(*b));
-                    tbl.array.set_len(len + 1);
-                    drop(tbl);
-                    dispatch!(vm, regs, pc, consts, dtbl);
-                }
-                _ => {}
+            let v_bits = (&*regs.add(src as usize)).bits();
+            if v_bits < TAG_RC_START {
+                let len = tbl.array.len();
+                std::ptr::write(
+                    tbl.array.as_mut_ptr().add(len),
+                    Value::from_trivial_bits(v_bits),
+                );
+                tbl.array.set_len(len + 1);
+                drop(tbl);
+                dispatch!(vm, regs, pc, consts, dtbl);
             }
         }
     }
@@ -1822,7 +1564,7 @@ fn op_get_import(
             dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
-    return cold_get_import(vm, regs, pc, consts, dtbl, raw);
+    cold_get_import(vm, regs, pc, consts, dtbl, raw)
 }
 
 #[cold]
@@ -1846,12 +1588,15 @@ fn cold_get_import(
     };
     let base = unsafe { base_of(vm, regs) };
     let res: Result<Value, String> = unsafe {
-        let (mname, fname) = match (&*consts.add(mod_k as usize), &*consts.add(field_k as usize)) {
-            (Value::String(m), Value::String(f)) => (m.clone(), f.clone()),
+        let (mname, fname) = match (
+            (&*consts.add(mod_k as usize)).as_str_ref(),
+            (&*consts.add(field_k as usize)).as_str_ref(),
+        ) {
+            (Some(m), Some(f)) => (m.to_str_ref(), f.to_str_ref()),
             _ => return fail_msg(vm, pc, "import names must be strings"),
         };
-        let module_val = vm.globals.get(&*mname).cloned().unwrap_or(Value::Nil);
-        let fkey = Value::String(fname);
+        let module_val = vm.globals.get(&*mname).cloned().unwrap_or(Value::NIL);
+        let fkey = Value::str_ref(fname);
         let value = match VM::table_get_fast(&module_val, &fkey) {
             Some(v) => v,
             None => {
@@ -1862,16 +1607,16 @@ fn cold_get_import(
                 }
             }
         };
-        if let Value::Table(t) = &module_val {
+        if let Some(t) = module_val.as_table() {
             let cacheable = {
                 let tbl = t.borrow();
-                tbl.frozen && tbl.metatable.is_none() && !matches!(value, Value::Nil)
+                tbl.frozen && tbl.metatable.is_none() && !value.is_nil()
             };
             if cacheable {
                 (*vm.cur_exec).import_store(
                     site as usize,
                     vm.globals_epoch,
-                    t.clone(),
+                    t.to_rc(),
                     value.clone(),
                 );
             }
@@ -1897,22 +1642,13 @@ fn cold_get_import(
 
 #[cold]
 #[inline(never)]
-fn cold_arith_binop(
+fn cold_arith_binop_ok(
     vm: &mut VM,
-    regs: *mut Value,
+    base: usize,
     pc: *const Cell<AlignedExec>,
-    consts: *const Value,
-    dtbl: DispatchTbl,
     raw: AlignedExec,
-) -> u8 {
-    let (dst, a, b, slow, event, into): (
-        u8,
-        u8,
-        u8,
-        fn(&Value, &Value) -> Result<Value, String>,
-        &'static str,
-        Option<fn(&mut [Value], usize, usize, usize) -> Result<(), String>>,
-    ) = match raw.0 {
+) -> bool {
+    let (dst, a, b, slow, event, into): ArithBinOpSpec = match raw.0 {
         ExecInst::Add { dst, a, b }
         | ExecInst::AddInt { dst, a, b }
         | ExecInst::AddFloat { dst, a, b }
@@ -1933,25 +1669,20 @@ fn cold_arith_binop(
         ExecInst::Pow { dst, a, b } => (dst, a, b, ops::eval_pow, "__pow", None),
         _ => unsafe { std::hint::unreachable_unchecked() },
     };
-    let base = unsafe { base_of(vm, regs) };
     unsafe {
+        let regs = vm.stack.as_mut_ptr().add(base);
         let ra = &*regs.add(a as usize);
         let rb = &*regs.add(b as usize);
-        if (matches!(ra, Value::Table(_)) || matches!(rb, Value::Table(_)))
+        if (ra.is_table() || rb.is_table())
             && let Some(mm) = vm.get_binop_metamethod(ra, rb, event)
         {
             let (va, vb) = (ra.clone(), rb.clone());
             sync_frame_pc(vm, pc);
             if let Err(e) = vm.call_binop_mm(mm, va, vb, base, dst) {
-                return fail_with(vm, pc, e);
+                let _ = fail_with(vm, pc, e);
+                return false;
             }
-            if vm.trap {
-                sync_frame_pc(vm, pc);
-                vm.run_result = None;
-                return STATUS_OK;
-            }
-            let new_regs = vm.stack.as_mut_ptr().add(base);
-            dispatch!(vm, new_regs, pc, consts, dtbl);
+            return true;
         }
         if let Some(into_fn) = into {
             if let Err(e) = into_fn(
@@ -1960,22 +1691,25 @@ fn cold_arith_binop(
                 base + a as usize,
                 base + b as usize,
             ) {
-                return fail_with(vm, pc, e);
+                let _ = fail_with(vm, pc, e);
+                return false;
             }
         } else {
             match slow(ra, rb) {
                 Ok(res) => set_slot_val(regs.add(dst as usize), res),
-                Err(e) => return fail_with(vm, pc, e),
+                Err(e) => {
+                    let _ = fail_with(vm, pc, e);
+                    return false;
+                }
             }
         }
-        let new_regs = vm.stack.as_mut_ptr().add(base);
-        dispatch!(vm, new_regs, pc, consts, dtbl);
+        true
     }
 }
 
 #[cold]
 #[inline(never)]
-fn cold_arith_k(
+fn cold_arith_binop(
     vm: &mut VM,
     regs: *mut Value,
     pc: *const Cell<AlignedExec>,
@@ -1983,13 +1717,31 @@ fn cold_arith_k(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let (dst, a, k, slow, event): (
-        u8,
-        u8,
-        u16,
-        fn(&Value, &Value) -> Result<Value, String>,
-        &'static str,
-    ) = match raw.0 {
+    let base = unsafe { base_of(vm, regs) };
+    if !cold_arith_binop_ok(vm, base, pc, raw) {
+        return STATUS_ERR;
+    }
+    if vm.trap {
+        sync_frame_pc(vm, pc);
+        vm.run_result = None;
+        return STATUS_OK;
+    }
+    unsafe {
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        dispatch!(vm, new_regs, pc, consts, dtbl);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cold_arith_k_ok(
+    vm: &mut VM,
+    base: usize,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    raw: AlignedExec,
+) -> bool {
+    let (dst, a, k, slow, event): ArithConstSpec = match raw.0 {
         ExecInst::AddK { dst, a, k }
         | ExecInst::AddIntK { dst, a, k }
         | ExecInst::AddFloatK { dst, a, k }
@@ -2004,33 +1756,103 @@ fn cold_arith_k(
         | ExecInst::MulKGeneric { dst, a, k } => (dst, a, k, ops::eval_mul, "__mul"),
         _ => unsafe { std::hint::unreachable_unchecked() },
     };
-    let base = unsafe { base_of(vm, regs) };
     unsafe {
+        let regs = vm.stack.as_mut_ptr().add(base);
         let ra = &*regs.add(a as usize);
         let rb = &*consts.add(k as usize);
-        if (matches!(ra, Value::Table(_)) || matches!(rb, Value::Table(_)))
+        if (ra.is_table() || rb.is_table())
             && let Some(mm) = vm.get_binop_metamethod(ra, rb, event)
         {
             let (va, vb) = (ra.clone(), rb.clone());
             sync_frame_pc(vm, pc);
             if let Err(e) = vm.call_binop_mm(mm, va, vb, base, dst) {
-                return fail_with(vm, pc, e);
+                let _ = fail_with(vm, pc, e);
+                return false;
             }
-            if vm.trap {
-                sync_frame_pc(vm, pc);
-                vm.run_result = None;
-                return STATUS_OK;
-            }
-            let new_regs = vm.stack.as_mut_ptr().add(base);
-            dispatch!(vm, new_regs, pc, consts, dtbl);
+            return true;
         }
         match slow(ra, rb) {
             Ok(res) => {
-                let new_regs = vm.stack.as_mut_ptr().add(base);
-                set_slot_val(new_regs.add(dst as usize), res);
-                dispatch!(vm, new_regs, pc, consts, dtbl);
+                set_slot_val(vm.stack.as_mut_ptr().add(base + dst as usize), res);
+                true
             }
-            Err(e) => fail_with(vm, pc, e),
+            Err(e) => {
+                let _ = fail_with(vm, pc, e);
+                false
+            }
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cold_arith_k(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    dtbl: DispatchTbl,
+    raw: AlignedExec,
+) -> u8 {
+    let base = unsafe { base_of(vm, regs) };
+    if !cold_arith_k_ok(vm, base, pc, consts, raw) {
+        return STATUS_ERR;
+    }
+    if vm.trap {
+        sync_frame_pc(vm, pc);
+        vm.run_result = None;
+        return STATUS_OK;
+    }
+    unsafe {
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        dispatch!(vm, new_regs, pc, consts, dtbl);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cold_arith_imm_ok(
+    vm: &mut VM,
+    base: usize,
+    pc: *const Cell<AlignedExec>,
+    raw: AlignedExec,
+) -> bool {
+    let (dst, a, imm, slow, event): ArithImmSpec = match raw.0 {
+        ExecInst::AddI { dst, a, imm }
+        | ExecInst::AddIntI { dst, a, imm }
+        | ExecInst::AddIGeneric { dst, a, imm } => (dst, a, imm, ops::eval_add, "__add"),
+        ExecInst::SubI { dst, a, imm }
+        | ExecInst::SubIntI { dst, a, imm }
+        | ExecInst::SubIGeneric { dst, a, imm } => (dst, a, imm, ops::eval_sub, "__sub"),
+        ExecInst::MulI { dst, a, imm }
+        | ExecInst::MulIntI { dst, a, imm }
+        | ExecInst::MulIGeneric { dst, a, imm } => (dst, a, imm, ops::eval_mul, "__mul"),
+        _ => unsafe { std::hint::unreachable_unchecked() },
+    };
+    unsafe {
+        let regs = vm.stack.as_mut_ptr().add(base);
+        let ra = &*regs.add(a as usize);
+        let rb = Value::int(imm as i64);
+        if ra.is_table()
+            && let Some(mm) = vm.get_binop_metamethod(ra, &rb, event)
+        {
+            let va = ra.clone();
+            sync_frame_pc(vm, pc);
+            if let Err(e) = vm.call_binop_mm(mm, va, rb, base, dst) {
+                let _ = fail_with(vm, pc, e);
+                return false;
+            }
+            return true;
+        }
+        match slow(ra, &rb) {
+            Ok(res) => {
+                set_slot_val(vm.stack.as_mut_ptr().add(base + dst as usize), res);
+                true
+            }
+            Err(e) => {
+                let _ = fail_with(vm, pc, e);
+                false
+            }
         }
     }
 }
@@ -2045,52 +1867,18 @@ fn cold_arith_imm(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let (dst, a, imm, slow, event): (
-        u8,
-        u8,
-        i16,
-        fn(&Value, &Value) -> Result<Value, String>,
-        &'static str,
-    ) = match raw.0 {
-        ExecInst::AddI { dst, a, imm }
-        | ExecInst::AddIntI { dst, a, imm }
-        | ExecInst::AddIGeneric { dst, a, imm } => (dst, a, imm, ops::eval_add, "__add"),
-        ExecInst::SubI { dst, a, imm }
-        | ExecInst::SubIntI { dst, a, imm }
-        | ExecInst::SubIGeneric { dst, a, imm } => (dst, a, imm, ops::eval_sub, "__sub"),
-        ExecInst::MulI { dst, a, imm }
-        | ExecInst::MulIntI { dst, a, imm }
-        | ExecInst::MulIGeneric { dst, a, imm } => (dst, a, imm, ops::eval_mul, "__mul"),
-        _ => unsafe { std::hint::unreachable_unchecked() },
-    };
     let base = unsafe { base_of(vm, regs) };
+    if !cold_arith_imm_ok(vm, base, pc, raw) {
+        return STATUS_ERR;
+    }
+    if vm.trap {
+        sync_frame_pc(vm, pc);
+        vm.run_result = None;
+        return STATUS_OK;
+    }
     unsafe {
-        let ra = &*regs.add(a as usize);
-        let rb = Value::Int(imm as i64);
-        if matches!(ra, Value::Table(_))
-            && let Some(mm) = vm.get_binop_metamethod(ra, &rb, event)
-        {
-            let va = ra.clone();
-            sync_frame_pc(vm, pc);
-            if let Err(e) = vm.call_binop_mm(mm, va, rb, base, dst) {
-                return fail_with(vm, pc, e);
-            }
-            if vm.trap {
-                sync_frame_pc(vm, pc);
-                vm.run_result = None;
-                return STATUS_OK;
-            }
-            let new_regs = vm.stack.as_mut_ptr().add(base);
-            dispatch!(vm, new_regs, pc, consts, dtbl);
-        }
-        match slow(ra, &rb) {
-            Ok(res) => {
-                let new_regs = vm.stack.as_mut_ptr().add(base);
-                set_slot_val(new_regs.add(dst as usize), res);
-                dispatch!(vm, new_regs, pc, consts, dtbl);
-            }
-            Err(e) => fail_with(vm, pc, e),
-        }
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        dispatch!(vm, new_regs, pc, consts, dtbl);
     }
 }
 
@@ -2113,8 +1901,13 @@ macro_rules! def_arith_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*regs.add(b as usize))
-                    && let Some(r) = x.$checked(*y)
+                let ra = &*regs.add(a as usize);
+                let rb = &*regs.add(b as usize);
+                if ra.is_inline_int()
+                    && rb.is_inline_int()
+                    && let Some(r) = ra
+                        .as_inline_int_unchecked()
+                        .$checked(rb.as_inline_int_unchecked())
                 {
                     write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
                 }
@@ -2136,10 +1929,18 @@ macro_rules! def_arith_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                if let (Value::Float(x), Value::Float(y)) =
-                    (&*regs.add(a as usize), &*regs.add(b as usize))
-                {
-                    write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *x $fop *y);
+                let ra = &*regs.add(a as usize);
+                let rb = &*regs.add(b as usize);
+                if ra.is_float() && rb.is_float() {
+                    write_float_dispatch!(
+                        vm,
+                        regs,
+                        pc,
+                        consts,
+                        dtbl,
+                        dst,
+                        ra.as_float_unchecked() $fop rb.as_float_unchecked()
+                    );
                 }
                 (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_deopt { dst, a, b }));
             }
@@ -2159,18 +1960,27 @@ macro_rules! def_arith_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                match (&*regs.add(a as usize), &*regs.add(b as usize)) {
-                    (Value::Int(x), Value::Int(y)) => {
-                        if let Some(r) = x.$checked(*y) {
-                            (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_int { dst, a, b }));
-                            write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
-                        }
+                let ra = &*regs.add(a as usize);
+                let rb = &*regs.add(b as usize);
+                if ra.is_inline_int() && rb.is_inline_int() {
+                    if let Some(r) = ra
+                        .as_inline_int_unchecked()
+                        .$checked(rb.as_inline_int_unchecked())
+                    {
+                        (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_int { dst, a, b }));
+                        write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
                     }
-                    (Value::Float(x), Value::Float(y)) => {
-                        (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_flt { dst, a, b }));
-                        write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *x $fop *y);
-                    }
-                    _ => {}
+                } else if ra.is_float() && rb.is_float() {
+                    (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_flt { dst, a, b }));
+                    write_float_dispatch!(
+                        vm,
+                        regs,
+                        pc,
+                        consts,
+                        dtbl,
+                        dst,
+                        ra.as_float_unchecked() $fop rb.as_float_unchecked()
+                    );
                 }
             }
             return cold_arith_binop(vm, regs, pc, consts, dtbl, raw);
@@ -2189,22 +1999,45 @@ macro_rules! def_arith_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                match (&*regs.add(a as usize), &*regs.add(b as usize)) {
-                    (Value::Int(x), Value::Int(y)) => {
-                        if let Some(r) = x.$checked(*y) {
-                            write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
-                        }
+                let ra = &*regs.add(a as usize);
+                let rb = &*regs.add(b as usize);
+                if ra.is_inline_int() && rb.is_inline_int() {
+                    if let Some(r) = ra
+                        .as_inline_int_unchecked()
+                        .$checked(rb.as_inline_int_unchecked())
+                    {
+                        write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
                     }
-                    (Value::Float(x), Value::Float(y)) => {
-                        write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *x $fop *y);
-                    }
-                    (Value::Int(x), Value::Float(y)) => {
-                        write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *x as f64 $fop *y);
-                    }
-                    (Value::Float(x), Value::Int(y)) => {
-                        write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *x $fop *y as f64);
-                    }
-                    _ => {}
+                } else if ra.is_float() && rb.is_float() {
+                    write_float_dispatch!(
+                        vm,
+                        regs,
+                        pc,
+                        consts,
+                        dtbl,
+                        dst,
+                        ra.as_float_unchecked() $fop rb.as_float_unchecked()
+                    );
+                } else if ra.is_inline_int() && rb.is_float() {
+                    write_float_dispatch!(
+                        vm,
+                        regs,
+                        pc,
+                        consts,
+                        dtbl,
+                        dst,
+                        ra.as_inline_int_unchecked() as f64 $fop rb.as_float_unchecked()
+                    );
+                } else if ra.is_float() && rb.is_inline_int() {
+                    write_float_dispatch!(
+                        vm,
+                        regs,
+                        pc,
+                        consts,
+                        dtbl,
+                        dst,
+                        ra.as_float_unchecked() $fop rb.as_inline_int_unchecked() as f64
+                    );
                 }
             }
             return cold_arith_binop(vm, regs, pc, consts, dtbl, raw);
@@ -2231,9 +2064,13 @@ macro_rules! def_arith_k_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                if let (Value::Int(x), Value::Int(y)) =
-                    (&*regs.add(a as usize), &*consts.add(k as usize))
-                    && let Some(r) = x.$checked(*y)
+                let ra = &*regs.add(a as usize);
+                let rb = &*consts.add(k as usize);
+                if ra.is_inline_int()
+                    && rb.is_inline_int()
+                    && let Some(r) = ra
+                        .as_inline_int_unchecked()
+                        .$checked(rb.as_inline_int_unchecked())
                 {
                     write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
                 }
@@ -2255,10 +2092,18 @@ macro_rules! def_arith_k_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                if let (Value::Float(x), Value::Float(y)) =
-                    (&*regs.add(a as usize), &*consts.add(k as usize))
-                {
-                    write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *x $fop *y);
+                let ra = &*regs.add(a as usize);
+                let rb = &*consts.add(k as usize);
+                if ra.is_float() && rb.is_float() {
+                    write_float_dispatch!(
+                        vm,
+                        regs,
+                        pc,
+                        consts,
+                        dtbl,
+                        dst,
+                        ra.as_float_unchecked() $fop rb.as_float_unchecked()
+                    );
                 }
                 (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_deopt { dst, a, k }));
             }
@@ -2278,18 +2123,27 @@ macro_rules! def_arith_k_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                match (&*regs.add(a as usize), &*consts.add(k as usize)) {
-                    (Value::Int(x), Value::Int(y)) => {
-                        if let Some(r) = x.$checked(*y) {
-                            (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_int { dst, a, k }));
-                            write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
-                        }
+                let ra = &*regs.add(a as usize);
+                let rb = &*consts.add(k as usize);
+                if ra.is_inline_int() && rb.is_inline_int() {
+                    if let Some(r) = ra
+                        .as_inline_int_unchecked()
+                        .$checked(rb.as_inline_int_unchecked())
+                    {
+                        (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_int { dst, a, k }));
+                        write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
                     }
-                    (Value::Float(x), Value::Float(y)) => {
-                        (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_flt { dst, a, k }));
-                        write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *x $fop *y);
-                    }
-                    _ => {}
+                } else if ra.is_float() && rb.is_float() {
+                    (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_flt { dst, a, k }));
+                    write_float_dispatch!(
+                        vm,
+                        regs,
+                        pc,
+                        consts,
+                        dtbl,
+                        dst,
+                        ra.as_float_unchecked() $fop rb.as_float_unchecked()
+                    );
                 }
             }
             return cold_arith_k(vm, regs, pc, consts, dtbl, raw);
@@ -2308,22 +2162,45 @@ macro_rules! def_arith_k_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                match (&*regs.add(a as usize), &*consts.add(k as usize)) {
-                    (Value::Int(x), Value::Int(y)) => {
-                        if let Some(r) = x.$checked(*y) {
-                            write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
-                        }
+                let ra = &*regs.add(a as usize);
+                let rb = &*consts.add(k as usize);
+                if ra.is_inline_int() && rb.is_inline_int() {
+                    if let Some(r) = ra
+                        .as_inline_int_unchecked()
+                        .$checked(rb.as_inline_int_unchecked())
+                    {
+                        write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
                     }
-                    (Value::Float(x), Value::Float(y)) => {
-                        write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *x $fop *y);
-                    }
-                    (Value::Int(x), Value::Float(y)) => {
-                        write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, (*x as f64) $fop *y);
-                    }
-                    (Value::Float(x), Value::Int(y)) => {
-                        write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *x $fop (*y as f64));
-                    }
-                    _ => {}
+                } else if ra.is_float() && rb.is_float() {
+                    write_float_dispatch!(
+                        vm,
+                        regs,
+                        pc,
+                        consts,
+                        dtbl,
+                        dst,
+                        ra.as_float_unchecked() $fop rb.as_float_unchecked()
+                    );
+                } else if ra.is_inline_int() && rb.is_float() {
+                    write_float_dispatch!(
+                        vm,
+                        regs,
+                        pc,
+                        consts,
+                        dtbl,
+                        dst,
+                        (ra.as_inline_int_unchecked() as f64) $fop rb.as_float_unchecked()
+                    );
+                } else if ra.is_float() && rb.is_inline_int() {
+                    write_float_dispatch!(
+                        vm,
+                        regs,
+                        pc,
+                        consts,
+                        dtbl,
+                        dst,
+                        ra.as_float_unchecked() $fop (rb.as_inline_int_unchecked() as f64)
+                    );
                 }
             }
             return cold_arith_k(vm, regs, pc, consts, dtbl, raw);
@@ -2350,8 +2227,9 @@ macro_rules! def_arith_imm_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                if let Value::Int(x) = &*regs.add(a as usize)
-                    && let Some(r) = x.$checked(imm as i64)
+                let ra = &*regs.add(a as usize);
+                if ra.is_inline_int()
+                    && let Some(r) = ra.as_inline_int_unchecked().$checked(imm as i64)
                 {
                     write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
                 }
@@ -2373,17 +2251,22 @@ macro_rules! def_arith_imm_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                match &*regs.add(a as usize) {
-                    Value::Int(x) => {
-                        if let Some(r) = x.$checked(imm as i64) {
-                            (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_int { dst, a, imm }));
-                            write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
-                        }
+                let ra = &*regs.add(a as usize);
+                if ra.is_inline_int() {
+                    if let Some(r) = ra.as_inline_int_unchecked().$checked(imm as i64) {
+                        (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_int { dst, a, imm }));
+                        write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
                     }
-                    Value::Float(x) => {
-                        write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *x $fop (imm as f64));
-                    }
-                    _ => {}
+                } else if ra.is_float() {
+                    write_float_dispatch!(
+                        vm,
+                        regs,
+                        pc,
+                        consts,
+                        dtbl,
+                        dst,
+                        ra.as_float_unchecked() $fop (imm as f64)
+                    );
                 }
             }
             return cold_arith_imm(vm, regs, pc, consts, dtbl, raw);
@@ -2402,16 +2285,21 @@ macro_rules! def_arith_imm_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                match &*regs.add(a as usize) {
-                    Value::Int(x) => {
-                        if let Some(r) = x.$checked(imm as i64) {
-                            write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
-                        }
+                let ra = &*regs.add(a as usize);
+                if ra.is_inline_int() {
+                    if let Some(r) = ra.as_inline_int_unchecked().$checked(imm as i64) {
+                        write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, r);
                     }
-                    Value::Float(x) => {
-                        write_float_dispatch!(vm, regs, pc, consts, dtbl, dst, *x $fop (imm as f64));
-                    }
-                    _ => {}
+                } else if ra.is_float() {
+                    write_float_dispatch!(
+                        vm,
+                        regs,
+                        pc,
+                        consts,
+                        dtbl,
+                        dst,
+                        ra.as_float_unchecked() $fop (imm as f64)
+                    );
                 }
             }
             return cold_arith_imm(vm, regs, pc, consts, dtbl, raw);
@@ -2512,17 +2400,20 @@ fn op_idiv(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*regs.add(b as usize))
-            && *y != 0
-            && !(*x == i64::MIN && *y == -1)
-        {
-            let val = if *x >= 0 && *y > 0 {
-                *x / *y
-            } else {
-                x.div_floor(y)
-            };
-            write_int(regs.add(dst as usize), val);
-            dispatch!(vm, regs, pc, consts, dtbl);
+        let ra = &*regs.add(a as usize);
+        let rb = &*regs.add(b as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            let x = ra.as_inline_int_unchecked();
+            let y = rb.as_inline_int_unchecked();
+            if y != 0 {
+                let val = if x >= 0 && y > 0 {
+                    x / y
+                } else {
+                    num_integer::Integer::div_floor(&x, &y)
+                };
+                write_int(regs.add(dst as usize), val);
+                dispatch!(vm, regs, pc, consts, dtbl);
+            }
         }
     }
     cold_eval_binop_plain(vm, regs, pc, consts, dtbl, raw)
@@ -2541,8 +2432,17 @@ fn op_idiv_int_pow2(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let Value::Int(x) = &*regs.add(a as usize) {
-            write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, *x >> shift);
+        let ra = &*regs.add(a as usize);
+        if ra.is_inline_int() {
+            write_int_dispatch!(
+                vm,
+                regs,
+                pc,
+                consts,
+                dtbl,
+                dst,
+                ra.as_inline_int_unchecked() >> shift
+            );
         }
     }
     cold_eval_idiv_pow2(vm, regs, pc, consts, dtbl, raw)
@@ -2565,7 +2465,7 @@ fn cold_eval_idiv_pow2(
     let base = unsafe { base_of(vm, regs) };
     unsafe {
         let ra = &*regs.add(a as usize);
-        match ops::eval_idiv(ra, &Value::Int(1i64 << shift)) {
+        match ops::eval_idiv(ra, &Value::int(1i64 << shift)) {
             Ok(res) => {
                 let new_regs = vm.stack.as_mut_ptr().add(base);
                 set_slot_val(new_regs.add(dst as usize), res);
@@ -2589,8 +2489,16 @@ fn op_idiv_int_k(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*consts.add(k as usize)) {
-            let val = if *x >= 0 { *x / *y } else { x.div_floor(y) };
+        let ra = &*regs.add(a as usize);
+        let rb = &*consts.add(k as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            let x = ra.as_inline_int_unchecked();
+            let y = rb.as_inline_int_unchecked();
+            let val = if x >= 0 {
+                x / y
+            } else {
+                num_integer::Integer::div_floor(&x, &y)
+            };
             write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, val);
         }
         (&*pc.sub(1)).set(AlignedExec(ExecInst::IDivKGeneric { dst, a, k }));
@@ -2611,17 +2519,25 @@ fn op_idiv_k(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*consts.add(k as usize))
-            && *y > 0
-        {
-            if (*y as u64).is_power_of_two() {
-                let shift = y.trailing_zeros() as u8;
-                (&*pc.sub(1)).set(AlignedExec(ExecInst::IDivIntPow2 { dst, a, shift }));
-                write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, *x >> shift);
-            } else {
-                (&*pc.sub(1)).set(AlignedExec(ExecInst::IDivIntK { dst, a, k }));
-                let val = if *x >= 0 { *x / *y } else { x.div_floor(y) };
-                write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, val);
+        let ra = &*regs.add(a as usize);
+        let rb = &*consts.add(k as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            let x = ra.as_inline_int_unchecked();
+            let y = rb.as_inline_int_unchecked();
+            if y > 0 {
+                if (y as u64).is_power_of_two() {
+                    let shift = y.trailing_zeros() as u8;
+                    (&*pc.sub(1)).set(AlignedExec(ExecInst::IDivIntPow2 { dst, a, shift }));
+                    write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, x >> shift);
+                } else {
+                    (&*pc.sub(1)).set(AlignedExec(ExecInst::IDivIntK { dst, a, k }));
+                    let val = if x >= 0 {
+                        x / y
+                    } else {
+                        num_integer::Integer::div_floor(&x, &y)
+                    };
+                    write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, val);
+                }
             }
         }
     }
@@ -2652,18 +2568,22 @@ fn op_mod(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*regs.add(b as usize))
-            && *y != 0
-        {
-            let val = if *y == -1 {
-                0
-            } else if *x >= 0 && *y > 0 {
-                *x % *y
-            } else {
-                x.mod_floor(y)
-            };
-            write_int(regs.add(dst as usize), val);
-            dispatch!(vm, regs, pc, consts, dtbl);
+        let ra = &*regs.add(a as usize);
+        let rb = &*regs.add(b as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            let x = ra.as_inline_int_unchecked();
+            let y = rb.as_inline_int_unchecked();
+            if y != 0 {
+                let val = if y == -1 {
+                    0
+                } else if x >= 0 && y > 0 {
+                    x % y
+                } else {
+                    x.mod_floor(&y)
+                };
+                write_int(regs.add(dst as usize), val);
+                dispatch!(vm, regs, pc, consts, dtbl);
+            }
         }
     }
     cold_eval_binop_plain(vm, regs, pc, consts, dtbl, raw)
@@ -2682,8 +2602,17 @@ fn op_mod_int_pow2(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let Value::Int(x) = &*regs.add(a as usize) {
-            write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, *x & ((1i64 << shift) - 1));
+        let ra = &*regs.add(a as usize);
+        if ra.is_inline_int() {
+            write_int_dispatch!(
+                vm,
+                regs,
+                pc,
+                consts,
+                dtbl,
+                dst,
+                ra.as_inline_int_unchecked() & ((1i64 << shift) - 1)
+            );
         }
     }
     cold_eval_mod_pow2(vm, regs, pc, consts, dtbl, raw)
@@ -2706,7 +2635,7 @@ fn cold_eval_mod_pow2(
     let base = unsafe { base_of(vm, regs) };
     unsafe {
         let ra = &*regs.add(a as usize);
-        match ops::eval_mod(ra, &Value::Int(1i64 << shift)) {
+        match ops::eval_mod(ra, &Value::int(1i64 << shift)) {
             Ok(res) => {
                 let new_regs = vm.stack.as_mut_ptr().add(base);
                 set_slot_val(new_regs.add(dst as usize), res);
@@ -2730,11 +2659,15 @@ fn op_mod_int_k(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*consts.add(k as usize)) {
-            let val = if *x >= 0 {
-                if *x < *y { *x } else { *x % *y }
+        let ra = &*regs.add(a as usize);
+        let rb = &*consts.add(k as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            let x = ra.as_inline_int_unchecked();
+            let y = rb.as_inline_int_unchecked();
+            let val = if x >= 0 {
+                if x < y { x } else { x % y }
             } else {
-                x.mod_floor(y)
+                x.mod_floor(&y)
             };
             write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, val);
         }
@@ -2756,21 +2689,25 @@ fn op_mod_k(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*consts.add(k as usize))
-            && *y > 0
-        {
-            if (*y as u64).is_power_of_two() {
-                let shift = y.trailing_zeros() as u8;
-                (&*pc.sub(1)).set(AlignedExec(ExecInst::ModIntPow2 { dst, a, shift }));
-                write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, *x & ((1i64 << shift) - 1));
-            } else {
-                (&*pc.sub(1)).set(AlignedExec(ExecInst::ModIntK { dst, a, k }));
-                let val = if *x >= 0 {
-                    if *x < *y { *x } else { *x % *y }
+        let ra = &*regs.add(a as usize);
+        let rb = &*consts.add(k as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            let x = ra.as_inline_int_unchecked();
+            let y = rb.as_inline_int_unchecked();
+            if y > 0 {
+                if (y as u64).is_power_of_two() {
+                    let shift = y.trailing_zeros() as u8;
+                    (&*pc.sub(1)).set(AlignedExec(ExecInst::ModIntPow2 { dst, a, shift }));
+                    write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, x & ((1i64 << shift) - 1));
                 } else {
-                    x.mod_floor(y)
-                };
-                write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, val);
+                    (&*pc.sub(1)).set(AlignedExec(ExecInst::ModIntK { dst, a, k }));
+                    let val = if x >= 0 {
+                        if x < y { x } else { x % y }
+                    } else {
+                        x.mod_floor(&y)
+                    };
+                    write_int_dispatch!(vm, regs, pc, consts, dtbl, dst, val);
+                }
             }
         }
     }
@@ -2790,6 +2727,34 @@ fn op_mod_k_generic(
 
 #[cold]
 #[inline(never)]
+fn cold_eval_binop_plain_ok(
+    vm: &mut VM,
+    base: usize,
+    pc: *const Cell<AlignedExec>,
+    raw: AlignedExec,
+) -> bool {
+    let (dst, a, b, eval): EvalBinOpSpec = match raw.0 {
+        ExecInst::IDiv { dst, a, b } => (dst, a, b, ops::eval_idiv),
+        ExecInst::Mod { dst, a, b } => (dst, a, b, ops::eval_mod),
+        _ => unsafe { std::hint::unreachable_unchecked() },
+    };
+    unsafe {
+        let regs = vm.stack.as_mut_ptr().add(base);
+        match eval(&*regs.add(a as usize), &*regs.add(b as usize)) {
+            Ok(res) => {
+                set_slot_val(vm.stack.as_mut_ptr().add(base + dst as usize), res);
+                true
+            }
+            Err(e) => {
+                let _ = fail_with(vm, pc, e);
+                false
+            }
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
 fn cold_eval_binop_plain(
     vm: &mut VM,
     regs: *mut Value,
@@ -2798,20 +2763,45 @@ fn cold_eval_binop_plain(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let (dst, a, b, eval): (u8, u8, u8, fn(&Value, &Value) -> Result<Value, String>) = match raw.0 {
-        ExecInst::IDiv { dst, a, b } => (dst, a, b, ops::eval_idiv),
-        ExecInst::Mod { dst, a, b } => (dst, a, b, ops::eval_mod),
+    let base = unsafe { base_of(vm, regs) };
+    if !cold_eval_binop_plain_ok(vm, base, pc, raw) {
+        return STATUS_ERR;
+    }
+    unsafe {
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        dispatch!(vm, new_regs, pc, consts, dtbl);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cold_eval_k_plain_ok(
+    vm: &mut VM,
+    base: usize,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    raw: AlignedExec,
+) -> bool {
+    let (dst, a, k, eval): EvalConstSpec = match raw.0 {
+        ExecInst::IDivK { dst, a, k }
+        | ExecInst::IDivIntK { dst, a, k }
+        | ExecInst::IDivKGeneric { dst, a, k } => (dst, a, k, ops::eval_idiv),
+        ExecInst::ModK { dst, a, k }
+        | ExecInst::ModIntK { dst, a, k }
+        | ExecInst::ModKGeneric { dst, a, k } => (dst, a, k, ops::eval_mod),
         _ => unsafe { std::hint::unreachable_unchecked() },
     };
-    let base = unsafe { base_of(vm, regs) };
     unsafe {
-        match eval(&*regs.add(a as usize), &*regs.add(b as usize)) {
+        let regs = vm.stack.as_mut_ptr().add(base);
+        match eval(&*regs.add(a as usize), &*consts.add(k as usize)) {
             Ok(res) => {
-                let new_regs = vm.stack.as_mut_ptr().add(base);
-                set_slot_val(new_regs.add(dst as usize), res);
-                dispatch!(vm, new_regs, pc, consts, dtbl);
+                set_slot_val(vm.stack.as_mut_ptr().add(base + dst as usize), res);
+                true
             }
-            Err(e) => fail_with(vm, pc, e),
+            Err(e) => {
+                let _ = fail_with(vm, pc, e);
+                false
+            }
         }
     }
 }
@@ -2826,26 +2816,13 @@ fn cold_eval_k_plain(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let (dst, a, k, eval): (u8, u8, u16, fn(&Value, &Value) -> Result<Value, String>) = match raw.0
-    {
-        ExecInst::IDivK { dst, a, k }
-        | ExecInst::IDivIntK { dst, a, k }
-        | ExecInst::IDivKGeneric { dst, a, k } => (dst, a, k, ops::eval_idiv),
-        ExecInst::ModK { dst, a, k }
-        | ExecInst::ModIntK { dst, a, k }
-        | ExecInst::ModKGeneric { dst, a, k } => (dst, a, k, ops::eval_mod),
-        _ => unsafe { std::hint::unreachable_unchecked() },
-    };
     let base = unsafe { base_of(vm, regs) };
+    if !cold_eval_k_plain_ok(vm, base, pc, consts, raw) {
+        return STATUS_ERR;
+    }
     unsafe {
-        match eval(&*regs.add(a as usize), &*consts.add(k as usize)) {
-            Ok(res) => {
-                let new_regs = vm.stack.as_mut_ptr().add(base);
-                set_slot_val(new_regs.add(dst as usize), res);
-                dispatch!(vm, new_regs, pc, consts, dtbl);
-            }
-            Err(e) => fail_with(vm, pc, e),
-        }
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        dispatch!(vm, new_regs, pc, consts, dtbl);
     }
 }
 
@@ -2862,8 +2839,13 @@ fn op_bit_and(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*regs.add(b as usize)) {
-            write_int(regs.add(dst as usize), x & y);
+        let ra = &*regs.add(a as usize);
+        let rb = &*regs.add(b as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            write_int(
+                regs.add(dst as usize),
+                ra.as_inline_int_unchecked() & rb.as_inline_int_unchecked(),
+            );
             dispatch!(vm, regs, pc, consts, dtbl);
         }
         let base = base_of(vm, regs);
@@ -2893,8 +2875,13 @@ fn op_bit_or(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*regs.add(b as usize)) {
-            write_int(regs.add(dst as usize), x | y);
+        let ra = &*regs.add(a as usize);
+        let rb = &*regs.add(b as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            write_int(
+                regs.add(dst as usize),
+                ra.as_inline_int_unchecked() | rb.as_inline_int_unchecked(),
+            );
             dispatch!(vm, regs, pc, consts, dtbl);
         }
         let base = base_of(vm, regs);
@@ -2924,8 +2911,13 @@ fn op_bit_xor(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*regs.add(b as usize)) {
-            write_int(regs.add(dst as usize), x ^ y);
+        let ra = &*regs.add(a as usize);
+        let rb = &*regs.add(b as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            write_int(
+                regs.add(dst as usize),
+                ra.as_inline_int_unchecked() ^ rb.as_inline_int_unchecked(),
+            );
             dispatch!(vm, regs, pc, consts, dtbl);
         }
         let base = base_of(vm, regs);
@@ -2955,22 +2947,25 @@ fn op_shl(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*regs.add(b as usize))
-            && *x >= 0
-            && *y >= 0
-        {
-            if *x == 0 {
-                write_int(regs.add(dst as usize), 0);
-                dispatch!(vm, regs, pc, consts, dtbl);
-            }
-            let headroom = x.leading_zeros().saturating_sub(1) as i64;
-            if *y <= headroom {
-                write_int(regs.add(dst as usize), x << *y);
-                dispatch!(vm, regs, pc, consts, dtbl);
+        let ra = &*regs.add(a as usize);
+        let rb = &*regs.add(b as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            let x = ra.as_inline_int_unchecked();
+            let y = rb.as_inline_int_unchecked();
+            if x >= 0 && y >= 0 {
+                if x == 0 {
+                    write_int(regs.add(dst as usize), 0);
+                    dispatch!(vm, regs, pc, consts, dtbl);
+                }
+                let headroom = x.leading_zeros().saturating_sub(1) as i64;
+                if y <= headroom {
+                    write_int(regs.add(dst as usize), x << y);
+                    dispatch!(vm, regs, pc, consts, dtbl);
+                }
             }
         }
     }
-    return cold_shl(vm, regs, pc, consts, dtbl, dst, a, b);
+    cold_shl(vm, regs, pc, consts, dtbl, raw)
 }
 
 #[cold]
@@ -2981,25 +2976,26 @@ fn cold_shl(
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
     dtbl: DispatchTbl,
-    dst: u8,
-    a: u8,
-    b: u8,
+    raw: AlignedExec,
 ) -> u8 {
+    let ExecInst::Shl { dst, a, b } = raw.0 else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
     let base = unsafe { base_of(vm, regs) };
     unsafe {
         let ra = &*regs.add(a as usize);
         let rb = &*regs.add(b as usize);
-        match (ra, rb) {
-            (Value::Int(x), Value::Int(y)) if *x >= 0 && *y >= 0 => {
+        match (ra.view(), rb.view()) {
+            (ValueView::Int(x), ValueView::Int(y)) if x >= 0 && y >= 0 => {
                 let headroom128 = (64 + x.leading_zeros() as i64).saturating_sub(1);
-                let res = if *y <= headroom128 {
-                    Value::from_i128((*x as i128) << *y)
+                let res = if y <= headroom128 {
+                    Value::from_i128((x as i128) << y)
                 } else {
                     let x_bits = 64 - x.leading_zeros() as u64;
-                    if (*y as u64) <= ops::MAX_INT_BITS
-                        && x_bits.saturating_add(*y as u64) <= ops::MAX_INT_BITS
+                    if (y as u64) <= ops::MAX_INT_BITS
+                        && x_bits.saturating_add(y as u64) <= ops::MAX_INT_BITS
                     {
-                        Value::BigInt(Rc::new(num_bigint::BigInt::from(*x) << (*y as usize)))
+                        Value::from_bigint_rc(Rc::new(num_bigint::BigInt::from(x) << (y as usize)))
                     } else {
                         match ops::eval_shl(ra, rb) {
                             Ok(v) => v,
@@ -3009,12 +3005,12 @@ fn cold_shl(
                 };
                 set_slot_val(vm.stack.as_mut_ptr().add(base + dst as usize), res);
             }
-            (Value::BigInt(_), Value::Int(y)) if *y >= 0 => {
+            (ValueView::BigInt(_), ValueView::Int(y)) if y >= 0 => {
                 if let Err(e) = ops::eval_shl_bigint_into(
                     &mut vm.stack,
                     base + dst as usize,
                     base + a as usize,
-                    *y as u64,
+                    y as u64,
                 ) {
                     return fail_with(vm, pc, e);
                 }
@@ -3042,19 +3038,23 @@ fn op_shr(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*regs.add(b as usize))
-            && *y >= 0
-        {
-            let val = if *y >= 64 {
-                if *x < 0 { -1 } else { 0 }
-            } else {
-                x >> *y
-            };
-            write_int(regs.add(dst as usize), val);
-            dispatch!(vm, regs, pc, consts, dtbl);
+        let ra = &*regs.add(a as usize);
+        let rb = &*regs.add(b as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            let x = ra.as_inline_int_unchecked();
+            let y = rb.as_inline_int_unchecked();
+            if y >= 0 {
+                let val = if y >= 64 {
+                    if x < 0 { -1 } else { 0 }
+                } else {
+                    x >> y
+                };
+                write_int(regs.add(dst as usize), val);
+                dispatch!(vm, regs, pc, consts, dtbl);
+            }
         }
     }
-    return cold_shr(vm, regs, pc, consts, dtbl, dst, a, b);
+    cold_shr(vm, regs, pc, consts, dtbl, raw)
 }
 
 #[cold]
@@ -3065,21 +3065,22 @@ fn cold_shr(
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
     dtbl: DispatchTbl,
-    dst: u8,
-    a: u8,
-    b: u8,
+    raw: AlignedExec,
 ) -> u8 {
+    let ExecInst::Shr { dst, a, b } = raw.0 else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
     let base = unsafe { base_of(vm, regs) };
     unsafe {
         let ra = &*regs.add(a as usize);
         let rb = &*regs.add(b as usize);
-        match (ra, rb) {
-            (Value::BigInt(_), Value::Int(y)) if *y >= 0 => {
+        match (ra.view(), rb.view()) {
+            (ValueView::BigInt(_), ValueView::Int(y)) if y >= 0 => {
                 ops::eval_shr_bigint_into(
                     &mut vm.stack,
                     base + dst as usize,
                     base + a as usize,
-                    *y as u64,
+                    y as u64,
                 );
             }
             _ => match ops::eval_shr(ra, rb) {
@@ -3105,22 +3106,85 @@ fn op_shl_i(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let Value::Int(x) = &*regs.add(a as usize)
-            && *x >= 0
-        {
-            if *x == 0 {
-                write_int(regs.add(dst as usize), 0);
-                dispatch!(vm, regs, pc, consts, dtbl);
-            }
-            let shift = imm as u32;
-            let headroom = x.leading_zeros().saturating_sub(1);
-            if shift <= headroom {
-                write_int(regs.add(dst as usize), x << shift);
-                dispatch!(vm, regs, pc, consts, dtbl);
+        let ra = &*regs.add(a as usize);
+        if ra.is_inline_int() {
+            let x = ra.as_inline_int_unchecked();
+            if x >= 0 {
+                if x == 0 {
+                    write_int(regs.add(dst as usize), 0);
+                    dispatch!(vm, regs, pc, consts, dtbl);
+                }
+                let shift = imm as u32;
+                let headroom = x.leading_zeros().saturating_sub(1);
+                if shift <= headroom {
+                    write_int(regs.add(dst as usize), x << shift);
+                    dispatch!(vm, regs, pc, consts, dtbl);
+                }
             }
         }
     }
-    return cold_shl_i(vm, regs, pc, consts, dtbl, dst, a, imm);
+    cold_shl_i(vm, regs, pc, consts, dtbl, raw)
+}
+
+#[cold]
+#[inline(never)]
+fn cold_shl_i_ok(vm: &mut VM, base: usize, pc: *const Cell<AlignedExec>, raw: AlignedExec) -> bool {
+    let ExecInst::ShlI { dst, a, imm } = raw.0 else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
+    unsafe {
+        let ra = &*vm.stack.as_ptr().add(base + a as usize);
+        match ra.view() {
+            ValueView::Int(x) if x >= 0 => {
+                let shift = imm as u32;
+                let headroom128 = (64 + x.leading_zeros()).saturating_sub(1);
+                let res = if shift <= headroom128 {
+                    Value::from_i128((x as i128) << shift)
+                } else {
+                    let x_bits = 64 - x.leading_zeros() as u64;
+                    if (shift as u64) <= ops::MAX_INT_BITS
+                        && x_bits.saturating_add(shift as u64) <= ops::MAX_INT_BITS
+                    {
+                        Value::from_bigint_rc(Rc::new(
+                            num_bigint::BigInt::from(x) << (imm as usize),
+                        ))
+                    } else {
+                        let rb = Value::int(imm as i64);
+                        match ops::eval_shl(ra, &rb) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = fail_with(vm, pc, e);
+                                return false;
+                            }
+                        }
+                    }
+                };
+                set_slot_val(vm.stack.as_mut_ptr().add(base + dst as usize), res);
+            }
+            ValueView::BigInt(_) => {
+                if let Err(e) = ops::eval_shl_bigint_into(
+                    &mut vm.stack,
+                    base + dst as usize,
+                    base + a as usize,
+                    imm as u64,
+                ) {
+                    let _ = fail_with(vm, pc, e);
+                    return false;
+                }
+            }
+            _ => {
+                let rb = Value::int(imm as i64);
+                match ops::eval_shl(ra, &rb) {
+                    Ok(res) => set_slot_val(vm.stack.as_mut_ptr().add(base + dst as usize), res),
+                    Err(e) => {
+                        let _ = fail_with(vm, pc, e);
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
 }
 
 #[cold]
@@ -3131,53 +3195,13 @@ fn cold_shl_i(
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
     dtbl: DispatchTbl,
-    dst: u8,
-    a: u8,
-    imm: u8,
+    raw: AlignedExec,
 ) -> u8 {
     let base = unsafe { base_of(vm, regs) };
+    if !cold_shl_i_ok(vm, base, pc, raw) {
+        return STATUS_ERR;
+    }
     unsafe {
-        let ra = &*regs.add(a as usize);
-        match ra {
-            Value::Int(x) if *x >= 0 => {
-                let shift = imm as u32;
-                let headroom128 = (64 + x.leading_zeros()).saturating_sub(1);
-                let res = if shift <= headroom128 {
-                    Value::from_i128((*x as i128) << shift)
-                } else {
-                    let x_bits = 64 - x.leading_zeros() as u64;
-                    if (shift as u64) <= ops::MAX_INT_BITS
-                        && x_bits.saturating_add(shift as u64) <= ops::MAX_INT_BITS
-                    {
-                        Value::BigInt(Rc::new(num_bigint::BigInt::from(*x) << (imm as usize)))
-                    } else {
-                        let rb = Value::Int(imm as i64);
-                        match ops::eval_shl(ra, &rb) {
-                            Ok(v) => v,
-                            Err(e) => return fail_with(vm, pc, e),
-                        }
-                    }
-                };
-                set_slot_val(vm.stack.as_mut_ptr().add(base + dst as usize), res);
-            }
-            Value::BigInt(_) => {
-                if let Err(e) = ops::eval_shl_bigint_into(
-                    &mut vm.stack,
-                    base + dst as usize,
-                    base + a as usize,
-                    imm as u64,
-                ) {
-                    return fail_with(vm, pc, e);
-                }
-            }
-            _ => {
-                let rb = Value::Int(imm as i64);
-                match ops::eval_shl(ra, &rb) {
-                    Ok(res) => set_slot_val(vm.stack.as_mut_ptr().add(base + dst as usize), res),
-                    Err(e) => return fail_with(vm, pc, e),
-                }
-            }
-        }
         let new_regs = vm.stack.as_mut_ptr().add(base);
         dispatch!(vm, new_regs, pc, consts, dtbl);
     }
@@ -3196,9 +3220,11 @@ fn op_shr_i(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let Value::Int(x) = &*regs.add(a as usize) {
+        let ra = &*regs.add(a as usize);
+        if ra.is_inline_int() {
+            let x = ra.as_inline_int_unchecked();
             let val = if imm >= 64 {
-                if *x < 0 { -1 } else { 0 }
+                if x < 0 { -1 } else { 0 }
             } else {
                 x >> imm
             };
@@ -3206,7 +3232,7 @@ fn op_shr_i(
             dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
-    return cold_shr_i(vm, regs, pc, consts, dtbl, dst, a, imm);
+    cold_shr_i(vm, regs, pc, consts, dtbl, raw)
 }
 
 #[cold]
@@ -3217,28 +3243,26 @@ fn cold_shr_i(
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
     dtbl: DispatchTbl,
-    dst: u8,
-    a: u8,
-    imm: u8,
+    raw: AlignedExec,
 ) -> u8 {
+    let ExecInst::ShrI { dst, a, imm } = raw.0 else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
     let base = unsafe { base_of(vm, regs) };
     unsafe {
         let ra = &*regs.add(a as usize);
-        match ra {
-            Value::BigInt(_) => {
-                ops::eval_shr_bigint_into(
-                    &mut vm.stack,
-                    base + dst as usize,
-                    base + a as usize,
-                    imm as u64,
-                );
-            }
-            _ => {
-                let rb = Value::Int(imm as i64);
-                match ops::eval_shr(ra, &rb) {
-                    Ok(res) => set_slot_val(vm.stack.as_mut_ptr().add(base + dst as usize), res),
-                    Err(e) => return fail_with(vm, pc, e),
-                }
+        if ra.is_bigint() {
+            ops::eval_shr_bigint_into(
+                &mut vm.stack,
+                base + dst as usize,
+                base + a as usize,
+                imm as u64,
+            );
+        } else {
+            let rb = Value::int(imm as i64);
+            match ops::eval_shr(ra, &rb) {
+                Ok(res) => set_slot_val(vm.stack.as_mut_ptr().add(base + dst as usize), res),
+                Err(e) => return fail_with(vm, pc, e),
             }
         }
         let new_regs = vm.stack.as_mut_ptr().add(base);
@@ -3291,26 +3315,21 @@ fn lshift_helper(regs: *mut Value, dst: u8, a: u8, b: u8, left: bool) -> Result<
     unsafe {
         let ra = &*regs.add(a as usize);
         let rb = &*regs.add(b as usize);
-        let res = match (ra, rb) {
-            (Value::Int(x), Value::Int(y)) => {
-                let word = *x as u64;
-                let bits = if *y < 0 { usize::MAX } else { *y as usize };
-                let val = if bits >= 64 {
-                    0
-                } else if left {
-                    word << bits
-                } else {
-                    word >> bits
-                };
-                Value::from_u64(val)
-            }
-            _ => {
-                if left {
-                    ops::eval_lshl(ra, rb)?
-                } else {
-                    ops::eval_lshr(ra, rb)?
-                }
-            }
+        let res = if let (Some(x), Some(y)) = (ra.as_int(), rb.as_int()) {
+            let word = x as u64;
+            let bits = if y < 0 { usize::MAX } else { y as usize };
+            let val = if bits >= 64 {
+                0
+            } else if left {
+                word << bits
+            } else {
+                word >> bits
+            };
+            Value::from_u64(val)
+        } else if left {
+            ops::eval_lshl(ra, rb)?
+        } else {
+            ops::eval_lshr(ra, rb)?
         };
         set_slot_val(regs.add(dst as usize), res);
         Ok(())
@@ -3330,25 +3349,84 @@ unsafe fn concat_inner(
     unsafe {
         let ra = &*regs.add(a as usize);
         let rb = &*regs.add(b as usize);
-        let res = match (ra, rb) {
-            (Value::String(x), Value::String(y)) => {
-                let mut s = String::with_capacity(x.len() + y.len());
-                s.push_str(x);
-                s.push_str(y);
-                Value::string(s)
+        let res = if let (Some(x), Some(y)) = (ra.as_str(), rb.as_str()) {
+            let mut s = String::with_capacity(x.len() + y.len());
+            s.push_str(x);
+            s.push_str(y);
+            Value::string(s)
+        } else if ra.is_table() || rb.is_table() {
+            if let Some(mm) = vm.get_binop_metamethod(ra, rb, "__concat") {
+                let (va, vb) = (ra.clone(), rb.clone());
+                sync_frame_pc(vm, pc);
+                return vm.call_binop_mm(mm, va, vb, base, dst);
             }
-            (Value::Table(_), _) | (_, Value::Table(_)) => {
-                if let Some(mm) = vm.get_binop_metamethod(ra, rb, "__concat") {
-                    let (va, vb) = (ra.clone(), rb.clone());
-                    sync_frame_pc(vm, pc);
-                    return vm.call_binop_mm(mm, va, vb, base, dst);
-                }
-                Value::string(format!("{}{}", ra, rb))
-            }
-            _ => Value::string(format!("{}{}", ra, rb)),
+            Value::string(format!("{}{}", ra, rb))
+        } else {
+            Value::string(format!("{}{}", ra, rb))
         };
         set_slot_val(regs.add(dst as usize), res);
         Ok(())
+    }
+}
+
+#[inline(never)]
+unsafe fn concat_strings_inplace(regs: *mut Value, dst: u8, a: u8, b: u8) {
+    unsafe {
+        if let (Some(x), Some(y)) = (
+            (&*regs.add(a as usize)).as_str(),
+            (&*regs.add(b as usize)).as_str(),
+        ) {
+            let mut s = String::with_capacity(x.len() + y.len());
+            s.push_str(x);
+            s.push_str(y);
+            set_slot_val(regs.add(dst as usize), Value::string(s));
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cold_concat_ok(
+    vm: &mut VM,
+    base: usize,
+    pc: *const Cell<AlignedExec>,
+    raw: AlignedExec,
+) -> bool {
+    let ExecInst::Concat { dst, a, b } = raw.0 else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
+    unsafe {
+        let regs = vm.stack.as_mut_ptr().add(base);
+        if let Err(e) = concat_inner(vm, regs, pc, base, dst, a, b) {
+            let _ = fail_with(vm, pc, e);
+            return false;
+        }
+        true
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cold_concat(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    dtbl: DispatchTbl,
+    raw: AlignedExec,
+) -> u8 {
+    let base = unsafe { base_of(vm, regs) };
+    if !cold_concat_ok(vm, base, pc, raw) {
+        return STATUS_ERR;
+    }
+    if vm.trap {
+        sync_frame_pc(vm, pc);
+        vm.run_result = None;
+        return STATUS_OK;
+    }
+    unsafe {
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        dispatch!(vm, new_regs, pc, consts, dtbl);
     }
 }
 
@@ -3365,29 +3443,12 @@ fn op_concat(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::String(x), Value::String(y)) =
-            (&*regs.add(a as usize), &*regs.add(b as usize))
-        {
-            let mut s = String::with_capacity(x.len() + y.len());
-            s.push_str(x);
-            s.push_str(y);
-            set_slot_val(regs.add(dst as usize), Value::string(s));
+        if (&*regs.add(a as usize)).is_string() && (&*regs.add(b as usize)).is_string() {
+            concat_strings_inplace(regs, dst, a, b);
             dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
-    let base = unsafe { base_of(vm, regs) };
-    unsafe {
-        if let Err(e) = concat_inner(vm, regs, pc, base, dst, a, b) {
-            return fail_with(vm, pc, e);
-        }
-        if vm.trap {
-            sync_frame_pc(vm, pc);
-            vm.run_result = None;
-            return STATUS_OK;
-        }
-        let new_regs = vm.stack.as_mut_ptr().add(base);
-        dispatch!(vm, new_regs, pc, consts, dtbl);
-    }
+    cold_concat(vm, regs, pc, consts, dtbl, raw)
 }
 
 fn op_unm(
@@ -3403,19 +3464,19 @@ fn op_unm(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        match &*regs.add(src as usize) {
-            Value::Int(i) if *i != i64::MIN => {
+        let rv = &*regs.add(src as usize);
+        if rv.is_inline_int() {
+            let i = rv.as_inline_int_unchecked();
+            if i != INLINE_INT_MIN {
                 write_int(regs.add(dst as usize), -i);
                 dispatch!(vm, regs, pc, consts, dtbl);
             }
-            Value::Float(f) => {
-                write_float(regs.add(dst as usize), -f);
-                dispatch!(vm, regs, pc, consts, dtbl);
-            }
-            _ => {}
+        } else if rv.is_float() {
+            write_float(regs.add(dst as usize), -rv.as_float_unchecked());
+            dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
-    return cold_unm(vm, regs, pc, consts, dtbl, dst, src);
+    cold_unm(vm, regs, pc, consts, dtbl, dst, src)
 }
 
 #[cold]
@@ -3432,7 +3493,7 @@ fn cold_unm(
     let base = unsafe { base_of(vm, regs) };
     unsafe {
         let v = &*regs.add(src as usize);
-        if matches!(v, Value::Table(_)) {
+        if v.is_table() {
             if let Some(mm) = vm.get_unop_metamethod(v, "__unm") {
                 let v = v.clone();
                 sync_frame_pc(vm, pc);
@@ -3446,7 +3507,7 @@ fn cold_unm(
                         let new_regs = vm.stack.as_mut_ptr().add(base);
                         set_slot_val(
                             new_regs.add(dst as usize),
-                            res.into_iter().next().unwrap_or(Value::Nil),
+                            res.into_iter().next().unwrap_or(Value::NIL),
                         );
                         dispatch!(vm, new_regs, pc, consts, dtbl);
                     }
@@ -3486,9 +3547,9 @@ fn op_not(
 #[inline(always)]
 unsafe fn len_fast(regs: *mut Value, src: u8) -> Option<usize> {
     unsafe {
-        match &*regs.add(src as usize) {
-            Value::String(s) => Some(s.len()),
-            Value::Table(t) => {
+        match (&*regs.add(src as usize)).view() {
+            ValueView::String(s) => Some(s.len()),
+            ValueView::Table(t) => {
                 let tbl = t.borrow();
                 if tbl.metatable.is_none() {
                     Some(tbl.array.len())
@@ -3496,7 +3557,7 @@ unsafe fn len_fast(regs: *mut Value, src: u8) -> Option<usize> {
                     None
                 }
             }
-            Value::Buffer(b) => Some(b.borrow().len()),
+            ValueView::Buffer(b) => Some(b.borrow().len()),
             _ => None,
         }
     }
@@ -3524,7 +3585,7 @@ fn op_len(
             dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
-    return cold_len(vm, regs, pc, consts, dtbl, dst, src);
+    cold_len(vm, regs, pc, consts, dtbl, dst, src)
 }
 
 #[cold]
@@ -3541,9 +3602,9 @@ fn cold_len(
     let base = unsafe { base_of(vm, regs) };
     unsafe {
         let v = &*regs.add(src as usize);
-        let len = match v {
-            Value::String(s) => s.len(),
-            Value::Table(t) => {
+        let len = match v.view() {
+            ValueView::String(s) => s.len(),
+            ValueView::Table(t) => {
                 if let Some(mm) = vm.get_unop_metamethod(v, "__len") {
                     let v = v.clone();
                     sync_frame_pc(vm, pc);
@@ -3557,7 +3618,7 @@ fn cold_len(
                             let new_regs = vm.stack.as_mut_ptr().add(base);
                             set_slot_val(
                                 new_regs.add(dst as usize),
-                                res.into_iter().next().unwrap_or(Value::Nil),
+                                res.into_iter().next().unwrap_or(Value::NIL),
                             );
                             dispatch!(vm, new_regs, pc, consts, dtbl);
                         }
@@ -3566,7 +3627,7 @@ fn cold_len(
                 }
                 t.borrow().array.len()
             }
-            Value::Buffer(b) => b.borrow().len(),
+            ValueView::Buffer(b) => b.borrow().len(),
             _ => return fail_msg(vm, pc, "len expects string, table or buffer"),
         };
         let new_regs = vm.stack.as_mut_ptr().add(base);
@@ -3588,12 +3649,13 @@ fn op_bit_not(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let Value::Int(x) = &*regs.add(src as usize) {
-            write_int(regs.add(dst as usize), !x);
+        let rv = &*regs.add(src as usize);
+        if rv.is_inline_int() {
+            write_int(regs.add(dst as usize), !rv.as_inline_int_unchecked());
             dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
-    return cold_bit_not(vm, regs, pc, consts, dtbl, dst, src);
+    cold_bit_not(vm, regs, pc, consts, dtbl, dst, src)
 }
 
 #[cold]
@@ -3633,7 +3695,7 @@ fn op_coalesce(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        let src_reg = if matches!(&*regs.add(a as usize), Value::Nil) {
+        let src_reg = if (&*regs.add(a as usize)).is_nil() {
             b
         } else {
             a
@@ -3723,22 +3785,13 @@ fn op_ne(
 
 #[cold]
 #[inline(never)]
-fn cold_cmp_slow(
+fn cold_cmp_slow_eval(
     vm: &mut VM,
-    regs: *mut Value,
+    base: usize,
     pc: *const Cell<AlignedExec>,
-    consts: *const Value,
-    dtbl: DispatchTbl,
     raw: AlignedExec,
-) -> u8 {
-    let (a, b, jump_if_false, slow, event, mm_swap): (
-        u8,
-        u8,
-        i16,
-        fn(&Value, &Value) -> Result<bool, String>,
-        &'static str,
-        bool,
-    ) = match raw.0 {
+) -> i8 {
+    let (a, b, _, slow, event, mm_swap): CmpBinOpSpec = match raw.0 {
         ExecInst::Lt {
             a,
             b,
@@ -3781,11 +3834,11 @@ fn cold_cmp_slow(
         } => (a, b, jump_if_false, ops::eval_ge, "__le", true),
         _ => unsafe { std::hint::unreachable_unchecked() },
     };
-    let base = unsafe { base_of(vm, regs) };
     let holds = unsafe {
+        let regs = vm.stack.as_ptr().add(base);
         let ra = &*regs.add(a as usize);
         let rb = &*regs.add(b as usize);
-        if matches!(ra, Value::Table(_)) || matches!(rb, Value::Table(_)) {
+        if ra.is_table() || rb.is_table() {
             let (l, r) = if mm_swap { (rb, ra) } else { (ra, rb) };
             if let Some(mm) = vm.get_binop_metamethod(l, r, event) {
                 let (vl, vr) = (l.clone(), r.clone());
@@ -3799,29 +3852,18 @@ fn cold_cmp_slow(
         }
     };
     match holds {
-        Ok(h) => {
-            if vm.trap {
-                sync_frame_pc(vm, pc);
-                vm.run_result = None;
-                return STATUS_OK;
-            }
-            unsafe {
-                let next_pc = if !h {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                let new_regs = vm.stack.as_mut_ptr().add(base);
-                dispatch!(vm, new_regs, next_pc, consts, dtbl);
-            }
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(e) => {
+            let _ = fail_with(vm, pc, e);
+            -1
         }
-        Err(e) => fail_with(vm, pc, e),
     }
 }
 
 #[cold]
 #[inline(never)]
-fn cold_cmp_k_slow(
+fn cold_cmp_slow(
     vm: &mut VM,
     regs: *mut Value,
     pc: *const Cell<AlignedExec>,
@@ -3829,14 +3871,48 @@ fn cold_cmp_k_slow(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let (a, k, jump_if_false, slow, event, mm_swap): (
-        u8,
-        u16,
-        i16,
-        fn(&Value, &Value) -> Result<bool, String>,
-        &'static str,
-        bool,
-    ) = match raw.0 {
+    let jump_if_false = match raw.0 {
+        ExecInst::Lt { jump_if_false, .. }
+        | ExecInst::LtInt { jump_if_false, .. }
+        | ExecInst::LtGeneric { jump_if_false, .. }
+        | ExecInst::Le { jump_if_false, .. }
+        | ExecInst::LeInt { jump_if_false, .. }
+        | ExecInst::LeGeneric { jump_if_false, .. }
+        | ExecInst::Gt { jump_if_false, .. }
+        | ExecInst::Ge { jump_if_false, .. } => jump_if_false,
+        _ => unsafe { std::hint::unreachable_unchecked() },
+    };
+    let base = unsafe { base_of(vm, regs) };
+    let res = cold_cmp_slow_eval(vm, base, pc, raw);
+    if res < 0 {
+        return STATUS_ERR;
+    }
+    if vm.trap {
+        sync_frame_pc(vm, pc);
+        vm.run_result = None;
+        return STATUS_OK;
+    }
+    unsafe {
+        let next_pc = if res == 0 {
+            pc.offset(jump_if_false as isize)
+        } else {
+            pc
+        };
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        dispatch!(vm, new_regs, next_pc, consts, dtbl);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cold_cmp_k_slow_eval(
+    vm: &mut VM,
+    base: usize,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    raw: AlignedExec,
+) -> i8 {
+    let (a, k, _, slow, event, mm_swap): CmpConstSpec = match raw.0 {
         ExecInst::LtK {
             a,
             k,
@@ -3879,11 +3955,10 @@ fn cold_cmp_k_slow(
         } => (a, k, jump_if_false, ops::eval_ge, "__le", true),
         _ => unsafe { std::hint::unreachable_unchecked() },
     };
-    let base = unsafe { base_of(vm, regs) };
     let holds = unsafe {
-        let ra = &*regs.add(a as usize);
+        let ra = &*vm.stack.as_ptr().add(base + a as usize);
         let rb = &*consts.add(k as usize);
-        if matches!(ra, Value::Table(_)) || matches!(rb, Value::Table(_)) {
+        if ra.is_table() || rb.is_table() {
             let (l, r) = if mm_swap { (rb, ra) } else { (ra, rb) };
             if let Some(mm) = vm.get_binop_metamethod(l, r, event) {
                 let (vl, vr) = (l.clone(), r.clone());
@@ -3897,29 +3972,18 @@ fn cold_cmp_k_slow(
         }
     };
     match holds {
-        Ok(h) => {
-            if vm.trap {
-                sync_frame_pc(vm, pc);
-                vm.run_result = None;
-                return STATUS_OK;
-            }
-            unsafe {
-                let next_pc = if !h {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                let new_regs = vm.stack.as_mut_ptr().add(base);
-                dispatch!(vm, new_regs, next_pc, consts, dtbl);
-            }
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(e) => {
+            let _ = fail_with(vm, pc, e);
+            -1
         }
-        Err(e) => fail_with(vm, pc, e),
     }
 }
 
 #[cold]
 #[inline(never)]
-fn cold_cmp_imm_slow(
+fn cold_cmp_k_slow(
     vm: &mut VM,
     regs: *mut Value,
     pc: *const Cell<AlignedExec>,
@@ -3927,14 +3991,47 @@ fn cold_cmp_imm_slow(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let (a, imm, jump_if_false, slow, event, mm_swap): (
-        u8,
-        i16,
-        i16,
-        fn(&Value, &Value) -> Result<bool, String>,
-        &'static str,
-        bool,
-    ) = match raw.0 {
+    let jump_if_false = match raw.0 {
+        ExecInst::LtK { jump_if_false, .. }
+        | ExecInst::LtIntK { jump_if_false, .. }
+        | ExecInst::LtKGeneric { jump_if_false, .. }
+        | ExecInst::LeK { jump_if_false, .. }
+        | ExecInst::LeIntK { jump_if_false, .. }
+        | ExecInst::LeKGeneric { jump_if_false, .. }
+        | ExecInst::GtK { jump_if_false, .. }
+        | ExecInst::GeK { jump_if_false, .. } => jump_if_false,
+        _ => unsafe { std::hint::unreachable_unchecked() },
+    };
+    let base = unsafe { base_of(vm, regs) };
+    let res = cold_cmp_k_slow_eval(vm, base, pc, consts, raw);
+    if res < 0 {
+        return STATUS_ERR;
+    }
+    if vm.trap {
+        sync_frame_pc(vm, pc);
+        vm.run_result = None;
+        return STATUS_OK;
+    }
+    unsafe {
+        let next_pc = if res == 0 {
+            pc.offset(jump_if_false as isize)
+        } else {
+            pc
+        };
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        dispatch!(vm, new_regs, next_pc, consts, dtbl);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cold_cmp_imm_slow_eval(
+    vm: &mut VM,
+    base: usize,
+    pc: *const Cell<AlignedExec>,
+    raw: AlignedExec,
+) -> i8 {
+    let (a, imm, _, slow, event, mm_swap): CmpImmSpec = match raw.0 {
         ExecInst::LtI {
             a,
             imm,
@@ -3977,11 +4074,10 @@ fn cold_cmp_imm_slow(
         } => (a, imm, jump_if_false, ops::eval_ge, "__le", true),
         _ => unsafe { std::hint::unreachable_unchecked() },
     };
-    let base = unsafe { base_of(vm, regs) };
     let holds = unsafe {
-        let ra = &*regs.add(a as usize);
-        let rb = Value::Int(imm as i64);
-        if matches!(ra, Value::Table(_)) {
+        let ra = &*vm.stack.as_ptr().add(base + a as usize);
+        let rb = Value::int(imm as i64);
+        if ra.is_table() {
             let (l, r) = if mm_swap { (&rb, ra) } else { (ra, &rb) };
             if let Some(mm) = vm.get_binop_metamethod(l, r, event) {
                 let (vl, vr) = (l.clone(), r.clone());
@@ -3995,23 +4091,54 @@ fn cold_cmp_imm_slow(
         }
     };
     match holds {
-        Ok(h) => {
-            if vm.trap {
-                sync_frame_pc(vm, pc);
-                vm.run_result = None;
-                return STATUS_OK;
-            }
-            unsafe {
-                let next_pc = if !h {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                let new_regs = vm.stack.as_mut_ptr().add(base);
-                dispatch!(vm, new_regs, next_pc, consts, dtbl);
-            }
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(e) => {
+            let _ = fail_with(vm, pc, e);
+            -1
         }
-        Err(e) => fail_with(vm, pc, e),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cold_cmp_imm_slow(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    dtbl: DispatchTbl,
+    raw: AlignedExec,
+) -> u8 {
+    let jump_if_false = match raw.0 {
+        ExecInst::LtI { jump_if_false, .. }
+        | ExecInst::LtIntI { jump_if_false, .. }
+        | ExecInst::LtIGeneric { jump_if_false, .. }
+        | ExecInst::LeI { jump_if_false, .. }
+        | ExecInst::LeIntI { jump_if_false, .. }
+        | ExecInst::LeIGeneric { jump_if_false, .. }
+        | ExecInst::GtI { jump_if_false, .. }
+        | ExecInst::GeI { jump_if_false, .. } => jump_if_false,
+        _ => unsafe { std::hint::unreachable_unchecked() },
+    };
+    let base = unsafe { base_of(vm, regs) };
+    let res = cold_cmp_imm_slow_eval(vm, base, pc, raw);
+    if res < 0 {
+        return STATUS_ERR;
+    }
+    if vm.trap {
+        sync_frame_pc(vm, pc);
+        vm.run_result = None;
+        return STATUS_OK;
+    }
+    unsafe {
+        let next_pc = if res == 0 {
+            pc.offset(jump_if_false as isize)
+        } else {
+            pc
+        };
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        dispatch!(vm, new_regs, next_pc, consts, dtbl);
     }
 }
 
@@ -4039,14 +4166,15 @@ macro_rules! def_cmp_quick_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                if let (Value::Int(x), Value::Int(y)) =
-                    (&*regs.add(a as usize), &*regs.add(b as usize))
-                {
-                    let next_pc = if !(*x $op *y) {
-                        pc.offset(jump_if_false as isize)
-                    } else {
-                    pc
-                    };
+                let ra = &*regs.add(a as usize);
+                let rb = &*regs.add(b as usize);
+                if ra.is_inline_int() && rb.is_inline_int() {
+                    let next_pc =
+                        if !(ra.as_inline_int_unchecked() $op rb.as_inline_int_unchecked()) {
+                            pc.offset(jump_if_false as isize)
+                        } else {
+                            pc
+                        };
                     dispatch!(vm, regs, next_pc, consts, dtbl);
                 }
                 (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_deopt {
@@ -4076,29 +4204,28 @@ macro_rules! def_cmp_quick_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                match (&*regs.add(a as usize), &*regs.add(b as usize)) {
-                    (Value::Int(x), Value::Int(y)) => {
-                        (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_int {
-                            a,
-                            b,
-                            jump_if_false,
-                        }));
-                        let next_pc = if !(*x $op *y) {
+                let ra = &*regs.add(a as usize);
+                let rb = &*regs.add(b as usize);
+                if ra.is_inline_int() && rb.is_inline_int() {
+                    (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_int {
+                        a,
+                        b,
+                        jump_if_false,
+                    }));
+                    let next_pc =
+                        if !(ra.as_inline_int_unchecked() $op rb.as_inline_int_unchecked()) {
                             pc.offset(jump_if_false as isize)
                         } else {
-                        pc
+                            pc
                         };
-                        dispatch!(vm, regs, next_pc, consts, dtbl);
-                    }
-                    (Value::Float(x), Value::Float(y)) => {
-                        let next_pc = if !(*x $op *y) {
-                            pc.offset(jump_if_false as isize)
-                        } else {
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
+                } else if ra.is_float() && rb.is_float() {
+                    let next_pc = if ra.as_float_unchecked() $op rb.as_float_unchecked() {
                         pc
-                        };
-                        dispatch!(vm, regs, next_pc, consts, dtbl);
-                    }
-                    _ => {}
+                    } else {
+                        pc.offset(jump_if_false as isize)
+                    };
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
                 }
             }
             return cold_cmp_slow(vm, regs, pc, consts, dtbl, raw);
@@ -4122,24 +4249,23 @@ macro_rules! def_cmp_quick_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                match (&*regs.add(a as usize), &*regs.add(b as usize)) {
-                    (Value::Int(x), Value::Int(y)) => {
-                        let next_pc = if !(*x $op *y) {
+                let ra = &*regs.add(a as usize);
+                let rb = &*regs.add(b as usize);
+                if ra.is_inline_int() && rb.is_inline_int() {
+                    let next_pc =
+                        if !(ra.as_inline_int_unchecked() $op rb.as_inline_int_unchecked()) {
                             pc.offset(jump_if_false as isize)
                         } else {
-                        pc
+                            pc
                         };
-                        dispatch!(vm, regs, next_pc, consts, dtbl);
-                    }
-                    (Value::Float(x), Value::Float(y)) => {
-                        let next_pc = if !(*x $op *y) {
-                            pc.offset(jump_if_false as isize)
-                        } else {
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
+                } else if ra.is_float() && rb.is_float() {
+                    let next_pc = if ra.as_float_unchecked() $op rb.as_float_unchecked() {
                         pc
-                        };
-                        dispatch!(vm, regs, next_pc, consts, dtbl);
-                    }
-                    _ => {}
+                    } else {
+                        pc.offset(jump_if_false as isize)
+                    };
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
                 }
             }
             return cold_cmp_slow(vm, regs, pc, consts, dtbl, raw);
@@ -4168,24 +4294,22 @@ fn op_gt(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        match (&*regs.add(a as usize), &*regs.add(b as usize)) {
-            (Value::Int(x), Value::Int(y)) => {
-                let next_pc = if !(*x > *y) {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                dispatch!(vm, regs, next_pc, consts, dtbl);
-            }
-            (Value::Float(x), Value::Float(y)) => {
-                let next_pc = if !(*x > *y) {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                dispatch!(vm, regs, next_pc, consts, dtbl);
-            }
-            _ => {}
+        let ra = &*regs.add(a as usize);
+        let rb = &*regs.add(b as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            let next_pc = if !(ra.as_inline_int_unchecked() > rb.as_inline_int_unchecked()) {
+                pc.offset(jump_if_false as isize)
+            } else {
+                pc
+            };
+            dispatch!(vm, regs, next_pc, consts, dtbl);
+        } else if ra.is_float() && rb.is_float() {
+            let next_pc = if ra.as_float_unchecked() > rb.as_float_unchecked() {
+                pc
+            } else {
+                pc.offset(jump_if_false as isize)
+            };
+            dispatch!(vm, regs, next_pc, consts, dtbl);
         }
     }
     let _ = (a, b, jump_if_false);
@@ -4210,24 +4334,22 @@ fn op_ge(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        match (&*regs.add(a as usize), &*regs.add(b as usize)) {
-            (Value::Int(x), Value::Int(y)) => {
-                let next_pc = if !(*x >= *y) {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                dispatch!(vm, regs, next_pc, consts, dtbl);
-            }
-            (Value::Float(x), Value::Float(y)) => {
-                let next_pc = if !(*x >= *y) {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                dispatch!(vm, regs, next_pc, consts, dtbl);
-            }
-            _ => {}
+        let ra = &*regs.add(a as usize);
+        let rb = &*regs.add(b as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            let next_pc = if !(ra.as_inline_int_unchecked() >= rb.as_inline_int_unchecked()) {
+                pc.offset(jump_if_false as isize)
+            } else {
+                pc
+            };
+            dispatch!(vm, regs, next_pc, consts, dtbl);
+        } else if ra.is_float() && rb.is_float() {
+            let next_pc = if ra.as_float_unchecked() >= rb.as_float_unchecked() {
+                pc
+            } else {
+                pc.offset(jump_if_false as isize)
+            };
+            dispatch!(vm, regs, next_pc, consts, dtbl);
         }
     }
     let _ = (a, b, jump_if_false);
@@ -4313,8 +4435,10 @@ fn op_eq_int_k(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*consts.add(k as usize)) {
-            let next_pc = if *x != *y {
+        let ra = &*regs.add(a as usize);
+        let rb = &*consts.add(k as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            let next_pc = if ra.as_inline_int_unchecked() != rb.as_inline_int_unchecked() {
                 pc.offset(jump_if_false as isize)
             } else {
                 pc
@@ -4327,7 +4451,7 @@ fn op_eq_int_k(
             jump_if_false,
         }));
     }
-    return cold_eq_k(vm, regs, pc, consts, dtbl, raw);
+    cold_eq_k(vm, regs, pc, consts, dtbl, raw)
 }
 
 fn op_eq_k(
@@ -4348,13 +4472,15 @@ fn op_eq_k(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(x), Value::Int(y)) = (&*regs.add(a as usize), &*consts.add(k as usize)) {
+        let ra = &*regs.add(a as usize);
+        let rb = &*consts.add(k as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
             (&*pc.sub(1)).set(AlignedExec(ExecInst::EqIntK {
                 a,
                 k,
                 jump_if_false,
             }));
-            let next_pc = if *x != *y {
+            let next_pc = if ra.as_inline_int_unchecked() != rb.as_inline_int_unchecked() {
                 pc.offset(jump_if_false as isize)
             } else {
                 pc
@@ -4362,7 +4488,7 @@ fn op_eq_k(
             dispatch!(vm, regs, next_pc, consts, dtbl);
         }
     }
-    return cold_eq_k(vm, regs, pc, consts, dtbl, raw);
+    cold_eq_k(vm, regs, pc, consts, dtbl, raw)
 }
 
 fn op_eq_k_generic(
@@ -4382,7 +4508,7 @@ fn op_eq_k_generic(
     else {
         unsafe { std::hint::unreachable_unchecked() }
     };
-    return cold_eq_k(vm, regs, pc, consts, dtbl, raw);
+    cold_eq_k(vm, regs, pc, consts, dtbl, raw)
 }
 
 fn op_ne_k(
@@ -4403,7 +4529,7 @@ fn op_ne_k(
         unsafe { std::hint::unreachable_unchecked() }
     };
     let _ = (a, k, jump_if_false);
-    return cold_eq_k(vm, regs, pc, consts, dtbl, raw);
+    cold_eq_k(vm, regs, pc, consts, dtbl, raw)
 }
 
 macro_rules! def_cmp_k_quick_handlers {
@@ -4430,14 +4556,15 @@ macro_rules! def_cmp_k_quick_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                if let (Value::Int(x), Value::Int(y)) =
-                    (&*regs.add(a as usize), &*consts.add(k as usize))
-                {
-                    let next_pc = if !(*x $op *y) {
-                        pc.offset(jump_if_false as isize)
-                    } else {
-                    pc
-                    };
+                let ra = &*regs.add(a as usize);
+                let rb = &*consts.add(k as usize);
+                if ra.is_inline_int() && rb.is_inline_int() {
+                    let next_pc =
+                        if !(ra.as_inline_int_unchecked() $op rb.as_inline_int_unchecked()) {
+                            pc.offset(jump_if_false as isize)
+                        } else {
+                            pc
+                        };
                     dispatch!(vm, regs, next_pc, consts, dtbl);
                 }
                 (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_deopt {
@@ -4467,29 +4594,28 @@ macro_rules! def_cmp_k_quick_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                match (&*regs.add(a as usize), &*consts.add(k as usize)) {
-                    (Value::Int(x), Value::Int(y)) => {
-                        (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_int {
-                            a,
-                            k,
-                            jump_if_false,
-                        }));
-                        let next_pc = if !(*x $op *y) {
+                let ra = &*regs.add(a as usize);
+                let rb = &*consts.add(k as usize);
+                if ra.is_inline_int() && rb.is_inline_int() {
+                    (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_int {
+                        a,
+                        k,
+                        jump_if_false,
+                    }));
+                    let next_pc =
+                        if !(ra.as_inline_int_unchecked() $op rb.as_inline_int_unchecked()) {
                             pc.offset(jump_if_false as isize)
                         } else {
-                        pc
+                            pc
                         };
-                        dispatch!(vm, regs, next_pc, consts, dtbl);
-                    }
-                    (Value::Float(x), Value::Float(y)) => {
-                        let next_pc = if !(*x $op *y) {
-                            pc.offset(jump_if_false as isize)
-                        } else {
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
+                } else if ra.is_float() && rb.is_float() {
+                    let next_pc = if ra.as_float_unchecked() $op rb.as_float_unchecked() {
                         pc
-                        };
-                        dispatch!(vm, regs, next_pc, consts, dtbl);
-                    }
-                    _ => {}
+                    } else {
+                        pc.offset(jump_if_false as isize)
+                    };
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
                 }
             }
             return cold_cmp_k_slow(vm, regs, pc, consts, dtbl, raw);
@@ -4513,24 +4639,23 @@ macro_rules! def_cmp_k_quick_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                match (&*regs.add(a as usize), &*consts.add(k as usize)) {
-                    (Value::Int(x), Value::Int(y)) => {
-                        let next_pc = if !(*x $op *y) {
+                let ra = &*regs.add(a as usize);
+                let rb = &*consts.add(k as usize);
+                if ra.is_inline_int() && rb.is_inline_int() {
+                    let next_pc =
+                        if !(ra.as_inline_int_unchecked() $op rb.as_inline_int_unchecked()) {
                             pc.offset(jump_if_false as isize)
                         } else {
-                        pc
+                            pc
                         };
-                        dispatch!(vm, regs, next_pc, consts, dtbl);
-                    }
-                    (Value::Float(x), Value::Float(y)) => {
-                        let next_pc = if !(*x $op *y) {
-                            pc.offset(jump_if_false as isize)
-                        } else {
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
+                } else if ra.is_float() && rb.is_float() {
+                    let next_pc = if ra.as_float_unchecked() $op rb.as_float_unchecked() {
                         pc
-                        };
-                        dispatch!(vm, regs, next_pc, consts, dtbl);
-                    }
-                    _ => {}
+                    } else {
+                        pc.offset(jump_if_false as isize)
+                    };
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
                 }
             }
             return cold_cmp_k_slow(vm, regs, pc, consts, dtbl, raw);
@@ -4559,24 +4684,22 @@ fn op_gt_k(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        match (&*regs.add(a as usize), &*consts.add(k as usize)) {
-            (Value::Int(x), Value::Int(y)) => {
-                let next_pc = if !(*x > *y) {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                dispatch!(vm, regs, next_pc, consts, dtbl);
-            }
-            (Value::Float(x), Value::Float(y)) => {
-                let next_pc = if !(*x > *y) {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                dispatch!(vm, regs, next_pc, consts, dtbl);
-            }
-            _ => {}
+        let ra = &*regs.add(a as usize);
+        let rb = &*consts.add(k as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            let next_pc = if !(ra.as_inline_int_unchecked() > rb.as_inline_int_unchecked()) {
+                pc.offset(jump_if_false as isize)
+            } else {
+                pc
+            };
+            dispatch!(vm, regs, next_pc, consts, dtbl);
+        } else if ra.is_float() && rb.is_float() {
+            let next_pc = if ra.as_float_unchecked() > rb.as_float_unchecked() {
+                pc
+            } else {
+                pc.offset(jump_if_false as isize)
+            };
+            dispatch!(vm, regs, next_pc, consts, dtbl);
         }
     }
     let _ = (a, k, jump_if_false);
@@ -4601,24 +4724,22 @@ fn op_ge_k(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        match (&*regs.add(a as usize), &*consts.add(k as usize)) {
-            (Value::Int(x), Value::Int(y)) => {
-                let next_pc = if !(*x >= *y) {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                dispatch!(vm, regs, next_pc, consts, dtbl);
-            }
-            (Value::Float(x), Value::Float(y)) => {
-                let next_pc = if !(*x >= *y) {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                dispatch!(vm, regs, next_pc, consts, dtbl);
-            }
-            _ => {}
+        let ra = &*regs.add(a as usize);
+        let rb = &*consts.add(k as usize);
+        if ra.is_inline_int() && rb.is_inline_int() {
+            let next_pc = if !(ra.as_inline_int_unchecked() >= rb.as_inline_int_unchecked()) {
+                pc.offset(jump_if_false as isize)
+            } else {
+                pc
+            };
+            dispatch!(vm, regs, next_pc, consts, dtbl);
+        } else if ra.is_float() && rb.is_float() {
+            let next_pc = if ra.as_float_unchecked() >= rb.as_float_unchecked() {
+                pc
+            } else {
+                pc.offset(jump_if_false as isize)
+            };
+            dispatch!(vm, regs, next_pc, consts, dtbl);
         }
     }
     let _ = (a, k, jump_if_false);
@@ -4643,10 +4764,13 @@ fn op_eq_i(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        let is_eq = match &*regs.add(a as usize) {
-            Value::Int(x) => *x == imm as i64,
-            Value::Float(x) => *x == imm as f64,
-            _ => false,
+        let ra = &*regs.add(a as usize);
+        let is_eq = if ra.is_inline_int() {
+            ra.as_inline_int_unchecked() == imm as i64
+        } else if ra.is_float() {
+            ra.as_float_unchecked() == imm as f64
+        } else {
+            false
         };
         let next_pc = if !is_eq {
             pc.offset(jump_if_false as isize)
@@ -4675,10 +4799,13 @@ fn op_ne_i(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        let is_eq = match &*regs.add(a as usize) {
-            Value::Int(x) => *x == imm as i64,
-            Value::Float(x) => *x == imm as f64,
-            _ => false,
+        let ra = &*regs.add(a as usize);
+        let is_eq = if ra.is_inline_int() {
+            ra.as_inline_int_unchecked() == imm as i64
+        } else if ra.is_float() {
+            ra.as_float_unchecked() == imm as f64
+        } else {
+            false
         };
         let next_pc = if is_eq {
             pc.offset(jump_if_false as isize)
@@ -4713,11 +4840,12 @@ macro_rules! def_cmp_imm_quick_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                if let Value::Int(x) = &*regs.add(a as usize) {
-                    let next_pc = if !(*x $op imm as i64) {
+                let ra = &*regs.add(a as usize);
+                if ra.is_inline_int() {
+                    let next_pc = if !(ra.as_inline_int_unchecked() $op imm as i64) {
                         pc.offset(jump_if_false as isize)
                     } else {
-                    pc
+                        pc
                     };
                     dispatch!(vm, regs, next_pc, consts, dtbl);
                 }
@@ -4748,29 +4876,26 @@ macro_rules! def_cmp_imm_quick_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                match &*regs.add(a as usize) {
-                    Value::Int(x) => {
-                        (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_int {
-                            a,
-                            imm,
-                            jump_if_false,
-                        }));
-                        let next_pc = if !(*x $op imm as i64) {
-                            pc.offset(jump_if_false as isize)
-                        } else {
+                let ra = &*regs.add(a as usize);
+                if ra.is_inline_int() {
+                    (&*pc.sub(1)).set(AlignedExec(ExecInst::$var_int {
+                        a,
+                        imm,
+                        jump_if_false,
+                    }));
+                    let next_pc = if !(ra.as_inline_int_unchecked() $op imm as i64) {
+                        pc.offset(jump_if_false as isize)
+                    } else {
                         pc
-                        };
-                        dispatch!(vm, regs, next_pc, consts, dtbl);
-                    }
-                    Value::Float(x) => {
-                        let next_pc = if !(*x $op imm as f64) {
-                            pc.offset(jump_if_false as isize)
-                        } else {
+                    };
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
+                } else if ra.is_float() {
+                    let next_pc = if ra.as_float_unchecked() $op imm as f64 {
                         pc
-                        };
-                        dispatch!(vm, regs, next_pc, consts, dtbl);
-                    }
-                    _ => {}
+                    } else {
+                        pc.offset(jump_if_false as isize)
+                    };
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
                 }
             }
             return cold_cmp_imm_slow(vm, regs, pc, consts, dtbl, raw);
@@ -4794,24 +4919,21 @@ macro_rules! def_cmp_imm_quick_handlers {
                 unsafe { std::hint::unreachable_unchecked() }
             };
             unsafe {
-                match &*regs.add(a as usize) {
-                    Value::Int(x) => {
-                        let next_pc = if !(*x $op imm as i64) {
-                            pc.offset(jump_if_false as isize)
-                        } else {
+                let ra = &*regs.add(a as usize);
+                if ra.is_inline_int() {
+                    let next_pc = if !(ra.as_inline_int_unchecked() $op imm as i64) {
+                        pc.offset(jump_if_false as isize)
+                    } else {
                         pc
-                        };
-                        dispatch!(vm, regs, next_pc, consts, dtbl);
-                    }
-                    Value::Float(x) => {
-                        let next_pc = if !(*x $op imm as f64) {
-                            pc.offset(jump_if_false as isize)
-                        } else {
+                    };
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
+                } else if ra.is_float() {
+                    let next_pc = if ra.as_float_unchecked() $op imm as f64 {
                         pc
-                        };
-                        dispatch!(vm, regs, next_pc, consts, dtbl);
-                    }
-                    _ => {}
+                    } else {
+                        pc.offset(jump_if_false as isize)
+                    };
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
                 }
             }
             return cold_cmp_imm_slow(vm, regs, pc, consts, dtbl, raw);
@@ -4840,24 +4962,21 @@ fn op_gt_i(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        match &*regs.add(a as usize) {
-            Value::Int(x) => {
-                let next_pc = if !(*x > imm as i64) {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                dispatch!(vm, regs, next_pc, consts, dtbl);
-            }
-            Value::Float(x) => {
-                let next_pc = if !(*x > imm as f64) {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                dispatch!(vm, regs, next_pc, consts, dtbl);
-            }
-            _ => {}
+        let ra = &*regs.add(a as usize);
+        if ra.is_inline_int() {
+            let next_pc = if !(ra.as_inline_int_unchecked() > imm as i64) {
+                pc.offset(jump_if_false as isize)
+            } else {
+                pc
+            };
+            dispatch!(vm, regs, next_pc, consts, dtbl);
+        } else if ra.is_float() {
+            let next_pc = if ra.as_float_unchecked() > imm as f64 {
+                pc
+            } else {
+                pc.offset(jump_if_false as isize)
+            };
+            dispatch!(vm, regs, next_pc, consts, dtbl);
         }
     }
     let _ = (a, imm, jump_if_false);
@@ -4882,24 +5001,21 @@ fn op_ge_i(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        match &*regs.add(a as usize) {
-            Value::Int(x) => {
-                let next_pc = if !(*x >= imm as i64) {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                dispatch!(vm, regs, next_pc, consts, dtbl);
-            }
-            Value::Float(x) => {
-                let next_pc = if !(*x >= imm as f64) {
-                    pc.offset(jump_if_false as isize)
-                } else {
-                    pc
-                };
-                dispatch!(vm, regs, next_pc, consts, dtbl);
-            }
-            _ => {}
+        let ra = &*regs.add(a as usize);
+        if ra.is_inline_int() {
+            let next_pc = if !(ra.as_inline_int_unchecked() >= imm as i64) {
+                pc.offset(jump_if_false as isize)
+            } else {
+                pc
+            };
+            dispatch!(vm, regs, next_pc, consts, dtbl);
+        } else if ra.is_float() {
+            let next_pc = if ra.as_float_unchecked() >= imm as f64 {
+                pc
+            } else {
+                pc.offset(jump_if_false as isize)
+            };
+            dispatch!(vm, regs, next_pc, consts, dtbl);
         }
     }
     let _ = (a, imm, jump_if_false);
@@ -4988,44 +5104,49 @@ fn op_for_prep(
         let init = &*regs.add(b as usize);
         let limit = &*regs.add(b as usize + 1);
         let step = &*regs.add(b as usize + 2);
-        if let (Value::Int(i), Value::Int(lim), Value::Int(s)) = (init, limit, step)
-            && *s != 0
-            && let Some(diff) = i.checked_sub(*s)
-        {
-            let iters: i128 = if (*s > 0 && *i <= *lim) || (*s < 0 && *i >= *lim) {
-                ((*lim as i128 - *i as i128) / (*s as i128)) + 1
-            } else {
-                0
-            };
-            let target_pc = pc.offset(jump as isize);
-            if (0..=i64::MAX as i128).contains(&iters)
-                && let ExecInst::ForLoop { base: fb, jump: fj }
-                | ExecInst::ForLoopInt { base: fb, jump: fj }
-                | ExecInst::ForLoopCount { base: fb, jump: fj }
-                | ExecInst::ForLoopCount1 { base: fb, jump: fj }
-                | ExecInst::ForLoopGeneric { base: fb, jump: fj } = (&*target_pc).get().0
-                && fb == b
+        if init.is_inline_int() && limit.is_inline_int() && step.is_inline_int() {
+            let i = init.as_inline_int_unchecked();
+            let lim = limit.as_inline_int_unchecked();
+            let s = step.as_inline_int_unchecked();
+            if s != 0
+                && let Some(diff) = i.checked_sub(s)
             {
-                let specialized = if *s == 1 {
-                    ExecInst::ForLoopCount1 { base: fb, jump: fj }
+                let iters: i128 = if (s > 0 && i <= lim) || (s < 0 && i >= lim) {
+                    ((lim as i128 - i as i128) / (s as i128)) + 1
                 } else {
-                    ExecInst::ForLoopCount { base: fb, jump: fj }
+                    0
                 };
-                (&*target_pc).set(AlignedExec(specialized));
+                let target_pc = pc.offset(jump as isize);
+                if fits_inline_int(diff)
+                    && (0..=INLINE_INT_MAX as i128).contains(&iters)
+                    && let ExecInst::ForLoop { base: fb, jump: fj }
+                    | ExecInst::ForLoopInt { base: fb, jump: fj }
+                    | ExecInst::ForLoopCount { base: fb, jump: fj }
+                    | ExecInst::ForLoopCount1 { base: fb, jump: fj }
+                    | ExecInst::ForLoopGeneric { base: fb, jump: fj } = (&*target_pc).get().0
+                    && fb == b
+                {
+                    let specialized = if s == 1 {
+                        ExecInst::ForLoopCount1 { base: fb, jump: fj }
+                    } else {
+                        ExecInst::ForLoopCount { base: fb, jump: fj }
+                    };
+                    (&*target_pc).set(AlignedExec(specialized));
+                    write_int(regs.add(b as usize), diff);
+                    write_int(regs.add(b as usize + 1), iters as i64);
+                    dispatch!(vm, regs, target_pc, consts, dtbl);
+                }
+                if let ExecInst::ForLoopCount { base: fb, jump: fj }
+                | ExecInst::ForLoopCount1 { base: fb, jump: fj } = (&*target_pc).get().0
+                {
+                    (&*target_pc).set(AlignedExec(ExecInst::ForLoop { base: fb, jump: fj }));
+                }
                 write_int(regs.add(b as usize), diff);
-                write_int(regs.add(b as usize + 1), iters as i64);
                 dispatch!(vm, regs, target_pc, consts, dtbl);
             }
-            if let ExecInst::ForLoopCount { base: fb, jump: fj }
-            | ExecInst::ForLoopCount1 { base: fb, jump: fj } = (&*target_pc).get().0
-            {
-                (&*target_pc).set(AlignedExec(ExecInst::ForLoop { base: fb, jump: fj }));
-            }
-            write_int(regs.add(b as usize), diff);
-            dispatch!(vm, regs, target_pc, consts, dtbl);
         }
     }
-    return cold_for_prep(vm, regs, pc, consts, dtbl, b, jump);
+    cold_for_prep(vm, regs, pc, consts, dtbl, b, jump)
 }
 
 fn op_for_loop_count(
@@ -5041,23 +5162,28 @@ fn op_for_loop_count(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(rem), Value::Int(i), Value::Int(st)) = (
-            &mut *regs.add(b as usize + 1),
-            &mut *regs.add(b as usize),
-            &*regs.add(b as usize + 2),
-        ) {
-            if *rem > 0 {
-                *rem -= 1;
-                let next = i.wrapping_add(*st);
-                *i = next;
-                let next_pc = pc.offset(jump as isize);
-                write_int_dispatch!(vm, regs, next_pc, consts, dtbl, b + 3, next);
+        let rem_ptr = regs.add(b as usize + 1);
+        let i_ptr = regs.add(b as usize);
+        let st_ref = &*regs.add(b as usize + 2);
+        if (*rem_ptr).is_inline_int() && (*i_ptr).is_inline_int() && st_ref.is_inline_int() {
+            let rem = (*rem_ptr).as_inline_int_unchecked();
+            if rem > 0 {
+                let next = (*i_ptr)
+                    .as_inline_int_unchecked()
+                    .wrapping_add(st_ref.as_inline_int_unchecked());
+                if fits_inline_int(next) {
+                    std::ptr::write(rem_ptr, Value::int(rem - 1));
+                    std::ptr::write(i_ptr, Value::int(next));
+                    let next_pc = pc.offset(jump as isize);
+                    write_int_dispatch!(vm, regs, next_pc, consts, dtbl, b + 3, next);
+                }
+            } else {
+                dispatch!(vm, regs, pc, consts, dtbl);
             }
-            dispatch!(vm, regs, pc, consts, dtbl);
         }
         (&*pc.sub(1)).set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
     }
-    return cold_for_loop(vm, regs, pc, consts, dtbl, b, jump);
+    cold_for_loop(vm, regs, pc, consts, dtbl, b, jump)
 }
 
 fn op_for_loop_count1(
@@ -5073,17 +5199,21 @@ fn op_for_loop_count1(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(rem), Value::Int(i)) =
-            (&mut *regs.add(b as usize + 1), &mut *regs.add(b as usize))
-        {
-            if *rem > 0 {
-                *rem -= 1;
-                let next = i.wrapping_add(1);
-                *i = next;
-                let next_pc = pc.offset(jump as isize);
-                write_int_dispatch!(vm, regs, next_pc, consts, dtbl, b + 3, next);
+        let rem_ptr = regs.add(b as usize + 1);
+        let i_ptr = regs.add(b as usize);
+        if (*rem_ptr).is_inline_int() && (*i_ptr).is_inline_int() {
+            let rem = (*rem_ptr).as_inline_int_unchecked();
+            if rem > 0 {
+                let next = (*i_ptr).as_inline_int_unchecked().wrapping_add(1);
+                if fits_inline_int(next) {
+                    std::ptr::write(rem_ptr, Value::int(rem - 1));
+                    std::ptr::write(i_ptr, Value::int(next));
+                    let next_pc = pc.offset(jump as isize);
+                    write_int_dispatch!(vm, regs, next_pc, consts, dtbl, b + 3, next);
+                }
+            } else {
+                dispatch!(vm, regs, pc, consts, dtbl);
             }
-            dispatch!(vm, regs, pc, consts, dtbl);
         }
         (&*pc.sub(1)).set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
     }
@@ -5110,9 +5240,9 @@ fn cold_for_prep(
         }
         let init = &*regs.add(b as usize);
         let step = &*regs.add(b as usize + 2);
-        match step {
-            Value::Int(0) => return fail_msg(vm, pc, "numeric for step cannot be zero"),
-            Value::Float(f) if *f == 0.0 => {
+        match step.view() {
+            ValueView::Int(0) => return fail_msg(vm, pc, "numeric for step cannot be zero"),
+            ValueView::Float(0.0) => {
                 return fail_msg(vm, pc, "numeric for step cannot be zero");
             }
             _ => {}
@@ -5140,24 +5270,27 @@ fn op_for_loop_int(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(i), Value::Int(lim), Value::Int(st)) = (
-            &*regs.add(b as usize),
-            &*regs.add(b as usize + 1),
-            &*regs.add(b as usize + 2),
-        ) && let Some(next) = i.checked_add(*st)
-        {
-            let again = if *st >= 0 { next <= *lim } else { next >= *lim };
-            write_int(regs.add(b as usize), next);
-            if again {
-                write_int(regs.add(b as usize + 3), next);
-                let next_pc = pc.offset(jump as isize);
-                dispatch!(vm, regs, next_pc, consts, dtbl);
+        let idx = &*regs.add(b as usize);
+        let limit = &*regs.add(b as usize + 1);
+        let step = &*regs.add(b as usize + 2);
+        if idx.is_inline_int() && limit.is_inline_int() && step.is_inline_int() {
+            let i = idx.as_inline_int_unchecked();
+            let lim = limit.as_inline_int_unchecked();
+            let st = step.as_inline_int_unchecked();
+            if let Some(next) = i.checked_add(st) {
+                let again = if st >= 0 { next <= lim } else { next >= lim };
+                write_int(regs.add(b as usize), next);
+                if again {
+                    write_int(regs.add(b as usize + 3), next);
+                    let next_pc = pc.offset(jump as isize);
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
+                }
+                dispatch!(vm, regs, pc, consts, dtbl);
             }
-            dispatch!(vm, regs, pc, consts, dtbl);
         }
         (&*pc.sub(1)).set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
     }
-    return cold_for_loop(vm, regs, pc, consts, dtbl, b, jump);
+    cold_for_loop(vm, regs, pc, consts, dtbl, b, jump)
 }
 
 fn op_for_loop(
@@ -5173,24 +5306,27 @@ fn op_for_loop(
         unsafe { std::hint::unreachable_unchecked() }
     };
     unsafe {
-        if let (Value::Int(i), Value::Int(lim), Value::Int(st)) = (
-            &*regs.add(b as usize),
-            &*regs.add(b as usize + 1),
-            &*regs.add(b as usize + 2),
-        ) && let Some(next) = i.checked_add(*st)
-        {
-            (&*pc.sub(1)).set(AlignedExec(ExecInst::ForLoopInt { base: b, jump }));
-            let again = if *st >= 0 { next <= *lim } else { next >= *lim };
-            write_int(regs.add(b as usize), next);
-            if again {
-                write_int(regs.add(b as usize + 3), next);
-                let next_pc = pc.offset(jump as isize);
-                dispatch!(vm, regs, next_pc, consts, dtbl);
+        let idx = &*regs.add(b as usize);
+        let limit = &*regs.add(b as usize + 1);
+        let step = &*regs.add(b as usize + 2);
+        if idx.is_inline_int() && limit.is_inline_int() && step.is_inline_int() {
+            let i = idx.as_inline_int_unchecked();
+            let lim = limit.as_inline_int_unchecked();
+            let st = step.as_inline_int_unchecked();
+            if let Some(next) = i.checked_add(st) {
+                (&*pc.sub(1)).set(AlignedExec(ExecInst::ForLoopInt { base: b, jump }));
+                let again = if st >= 0 { next <= lim } else { next >= lim };
+                write_int(regs.add(b as usize), next);
+                if again {
+                    write_int(regs.add(b as usize + 3), next);
+                    let next_pc = pc.offset(jump as isize);
+                    dispatch!(vm, regs, next_pc, consts, dtbl);
+                }
+                dispatch!(vm, regs, pc, consts, dtbl);
             }
-            dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
-    return cold_for_loop(vm, regs, pc, consts, dtbl, b, jump);
+    cold_for_loop(vm, regs, pc, consts, dtbl, b, jump)
 }
 
 fn op_for_loop_generic(
@@ -5205,7 +5341,7 @@ fn op_for_loop_generic(
     let ExecInst::ForLoopGeneric { base: b, jump } = inst else {
         unsafe { std::hint::unreachable_unchecked() }
     };
-    return cold_for_loop(vm, regs, pc, consts, dtbl, b, jump);
+    cold_for_loop(vm, regs, pc, consts, dtbl, b, jump)
 }
 
 #[cold]
@@ -5223,10 +5359,10 @@ fn cold_for_loop(
         let idx = &*regs.add(b as usize);
         let limit = &*regs.add(b as usize + 1);
         let step = &*regs.add(b as usize + 2);
-        if let (Value::Int(i), Value::Int(lim), Value::Int(st)) = (idx, limit, step)
-            && let Some(next) = i.checked_add(*st)
+        if let (Some(i), Some(lim), Some(st)) = (idx.as_int(), limit.as_int(), step.as_int())
+            && let Some(next) = i.checked_add(st)
         {
-            let again = if *st >= 0 { next <= *lim } else { next >= *lim };
+            let again = if st >= 0 { next <= lim } else { next >= lim };
             write_int(regs.add(b as usize), next);
             if again {
                 write_int(regs.add(b as usize + 3), next);
@@ -5235,17 +5371,17 @@ fn cold_for_loop(
             }
             dispatch!(vm, regs, pc, consts, dtbl);
         }
-        match step {
-            Value::Int(0) => return fail_msg(vm, pc, "numeric for step cannot be zero"),
-            Value::Float(f) if *f == 0.0 => {
+        match step.view() {
+            ValueView::Int(0) => return fail_msg(vm, pc, "numeric for step cannot be zero"),
+            ValueView::Float(0.0) => {
                 return fail_msg(vm, pc, "numeric for step cannot be zero");
             }
             _ => {}
         }
-        let is_positive = match step {
-            Value::Int(i) => *i >= 0,
-            Value::BigInt(i) => num_traits::Signed::is_positive(&**i),
-            Value::Float(f) => *f >= 0.0,
+        let is_positive = match step.view() {
+            ValueView::Int(i) => i >= 0,
+            ValueView::BigInt(i) => num_traits::Signed::is_positive(i),
+            ValueView::Float(f) => f >= 0.0,
             _ => true,
         };
         let next_idx = match ops::eval_add(idx, step) {
@@ -5293,11 +5429,11 @@ fn closure_inner(vm: &mut VM, base: usize, dst: u8, proto_idx: u16) {
                 .upvalues
                 .get(idx as usize)
                 .cloned()
-                .unwrap_or_else(|| Upvalue::closed(Value::Nil));
+                .unwrap_or_else(|| Upvalue::closed(Value::NIL));
             upvalues.push(up);
         }
     }
-    let val = Value::Closure(Rc::new(VmClosure {
+    let val = Value::closure(Rc::new(VmClosure {
         proto: child_proto,
         upvalues,
     }));
@@ -5332,7 +5468,6 @@ fn call_closure_inner(
     vm: &mut VM,
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
-    _dtbl: DispatchTbl,
     base: usize,
     callee: u8,
     argc: usize,
@@ -5346,18 +5481,19 @@ fn call_closure_inner(
     }
     let args_start = base + callee as usize + 1;
     let same_closure = {
-        let Value::Closure(c) = (unsafe { vm.stack.get_unchecked(base + callee as usize) }) else {
+        let Some(c) = (unsafe { vm.stack.get_unchecked(base + callee as usize) }).as_closure()
+        else {
             unreachable!();
         };
-        let is_same = Rc::as_ptr(c) == vm.cur_closure;
+        let is_same = c.as_ptr() == vm.cur_closure;
         if !is_same && !c.proto.is_verified() {
             crate::bytecode::verify_proto(&c.proto).map_err(|e| e.to_string())?;
             c.proto.mark_verified();
         }
         is_same
     };
-    let Value::Closure(callee_closure) =
-        std::mem::replace(&mut vm.stack[base + callee as usize], Value::Nil)
+    let Ok(callee_closure) =
+        std::mem::replace(&mut vm.stack[base + callee as usize], Value::NIL).into_closure()
     else {
         unreachable!();
     };
@@ -5368,10 +5504,10 @@ fn call_closure_inner(
     let new_base = args_start;
     let needed = new_base + max_registers;
     if needed >= vm.stack.len() {
-        vm.stack.resize(needed + 1, Value::Nil);
+        vm.stack.resize(needed + 1, Value::NIL);
     }
     for i in argc..num_params {
-        vm.stack[new_base + i] = Value::Nil;
+        vm.stack[new_base + i] = Value::NIL;
     }
     let new_frame = if is_vararg && argc > num_params {
         let varargs = vm.stack[new_base + num_params..new_base + argc].to_vec();
@@ -5446,16 +5582,13 @@ fn cold_call_slow(
     };
     let actual_argc = args_end - args_start;
     if args_end > vm.stack.len() {
-        vm.stack.resize(args_end, Value::Nil);
+        vm.stack.resize(args_end, Value::NIL);
     }
     sync_frame_pc(vm, pc);
 
     unsafe {
-        if matches!(
-            &*vm.stack.as_ptr().add(base + callee as usize),
-            Value::Closure(_)
-        ) {
-            match call_closure_inner(vm, pc, consts, dtbl, base, callee, actual_argc, retc) {
+        if (&*vm.stack.as_ptr().add(base + callee as usize)).is_closure() {
+            match call_closure_inner(vm, pc, consts, base, callee, actual_argc, retc) {
                 Ok((new_regs, new_pc, new_consts)) => {
                     dispatch!(vm, new_regs, new_pc, new_consts, dtbl);
                 }
@@ -5490,8 +5623,8 @@ fn op_call(
         {
             let args_start = base + callee as usize + 1;
             let callee_ptr = regs.add(callee as usize);
-            if let Value::Closure(c) = &*callee_ptr {
-                let c_ptr = Rc::as_ptr(c);
+            if let Some(c) = (&*callee_ptr).as_closure() {
+                let c_ptr = c.as_ptr();
                 let same_closure = c_ptr == vm.cur_closure;
                 let proto = &c.proto;
                 let max_regs = proto.max_registers as usize;
@@ -5507,14 +5640,14 @@ fn op_call(
                     let ip = ip_of(vm, pc);
                     let frames_ptr = vm.frames.as_mut_ptr();
                     (*frames_ptr.add(len - 1)).ip = ip;
-                    let callee_closure = match std::ptr::read(callee_ptr) {
-                        Value::Closure(cl) => cl,
-                        other => {
+                    let callee_closure = match std::ptr::read(callee_ptr).into_closure() {
+                        Ok(cl) => cl,
+                        Err(other) => {
                             std::mem::forget(other);
                             std::hint::unreachable_unchecked()
                         }
                     };
-                    std::ptr::write(callee_ptr, Value::Nil);
+                    std::ptr::write(callee_ptr, Value::NIL);
                     std::ptr::write(
                         frames_ptr.add(len),
                         CallFrame::new(callee_closure, args_start).wanting(retc),
@@ -5571,54 +5704,14 @@ fn call_non_closure_inner(
     argc: usize,
     retc: u8,
 ) -> Result<(), String> {
-    match &vm.stack[base + callee as usize] {
-        Value::Native(def) => {
-            let func = def.func;
-            if argc == 1 && is_trivial_drop(&vm.stack[args_start]) {
-                let single = [unsafe { std::ptr::read(&vm.stack[args_start]) }];
-                if vm.debug_active && vm.hook.is_some() {
-                    vm.fire_hook(HookEvent::Call)?;
-                }
-                return match func(vm, &single) {
-                    Ok(results) => {
-                        if vm.debug_active && vm.hook.is_some() {
-                            vm.fire_hook(HookEvent::Return)?;
-                        }
-                        vm.store_call_results(callee, retc, results);
-                        Ok(())
-                    }
-                    Err(err) if vm.is_yielding => {
-                        if let Some(co_id) = vm.current_co
-                            && let Some(co_rc) = vm.co_state(co_id)
-                        {
-                            let mut cs = co_rc.borrow_mut();
-                            cs.yield_callee = callee;
-                            cs.yield_retc = retc;
-                        }
-                        Err(err)
-                    }
-                    Err(err) => Err(err),
-                };
-            }
-            const INLINE_NATIVE_ARGS: usize = 8;
-            let mut inline_args = [const { Value::Nil }; INLINE_NATIVE_ARGS];
-            let heap_args: Vec<Value>;
-            let args: &[Value] = if argc <= INLINE_NATIVE_ARGS {
-                for (dst, src) in inline_args[..argc]
-                    .iter_mut()
-                    .zip(&vm.stack[args_start..args_end])
-                {
-                    *dst = src.clone();
-                }
-                &inline_args[..argc]
-            } else {
-                heap_args = vm.stack[args_start..args_end].to_vec();
-                &heap_args
-            };
+    if let Some(def) = vm.stack[base + callee as usize].as_native() {
+        let func = def.func;
+        if argc == 1 && vm.stack[args_start].is_trivial() {
+            let single = [unsafe { std::ptr::read(&vm.stack[args_start]) }];
             if vm.debug_active && vm.hook.is_some() {
                 vm.fire_hook(HookEvent::Call)?;
             }
-            match func(vm, args) {
+            return match func(vm, &single) {
                 Ok(results) => {
                     if vm.debug_active && vm.hook.is_some() {
                         vm.fire_hook(HookEvent::Return)?;
@@ -5637,23 +5730,66 @@ fn call_non_closure_inner(
                     Err(err)
                 }
                 Err(err) => Err(err),
-            }
+            };
         }
-        Value::Table(t) => {
-            let handler = t.borrow().metamethod("__call");
-            let callee_val = vm.stack[base + callee as usize].clone();
-            if let Some(handler) = handler {
-                let mut call_args = Vec::with_capacity(argc + 1);
-                call_args.push(callee_val);
-                call_args.extend_from_slice(&vm.stack[args_start..args_end]);
-                let results = vm.call_function(handler, &call_args)?;
+        const INLINE_NATIVE_ARGS: usize = 8;
+        let mut inline_args = [const { Value::NIL }; INLINE_NATIVE_ARGS];
+        let heap_args: Vec<Value>;
+        let args: &[Value] = if argc <= INLINE_NATIVE_ARGS {
+            for (dst, src) in inline_args[..argc]
+                .iter_mut()
+                .zip(&vm.stack[args_start..args_end])
+            {
+                *dst = src.clone();
+            }
+            &inline_args[..argc]
+        } else {
+            heap_args = vm.stack[args_start..args_end].to_vec();
+            &heap_args
+        };
+        if vm.debug_active && vm.hook.is_some() {
+            vm.fire_hook(HookEvent::Call)?;
+        }
+        match func(vm, args) {
+            Ok(results) => {
+                if vm.debug_active && vm.hook.is_some() {
+                    vm.fire_hook(HookEvent::Return)?;
+                }
                 vm.store_call_results(callee, retc, results);
                 Ok(())
-            } else {
-                Err(format!("attempted to call non-function ({:?})", callee_val))
             }
+            Err(err) if vm.is_yielding => {
+                if let Some(co_id) = vm.current_co
+                    && let Some(co_rc) = vm.co_state(co_id)
+                {
+                    let mut cs = co_rc.borrow_mut();
+                    cs.yield_callee = callee;
+                    cs.yield_retc = retc;
+                }
+                Err(err)
+            }
+            Err(err) => Err(err),
         }
-        other => Err(format!("attempted to call non-function ({:?})", other)),
+    } else if let Some(handler) = vm.stack[base + callee as usize]
+        .as_table()
+        .map(|t| t.borrow().metamethod("__call"))
+    {
+        let callee_val = vm.stack[base + callee as usize].clone();
+        if let Some(handler) = handler {
+            let mut call_args = Vec::with_capacity(argc + 1);
+            call_args.push(callee_val);
+            call_args.extend_from_slice(&vm.stack[args_start..args_end]);
+            let results = vm.call_function(handler, &call_args)?;
+            vm.store_call_results(callee, retc, results);
+            Ok(())
+        } else {
+            Err(format!("attempted to call non-function ({:?})", callee_val))
+        }
+    } else {
+        Err(format!(
+            "attempted to call non-function ({:?})",
+            vm.stack[base + callee as usize]
+        ))
     }
 }
 
@@ -5695,10 +5831,10 @@ unsafe fn try_self_tail_call(
         return Ok(None);
     }
     unsafe {
-        let Value::Closure(callee_closure) = &*regs.add(callee as usize) else {
+        let Some(callee_closure) = (&*regs.add(callee as usize)).as_closure() else {
             return Ok(None);
         };
-        if Rc::as_ptr(callee_closure) != vm.cur_closure || callee_closure.proto.is_vararg {
+        if callee_closure.as_ptr() != vm.cur_closure || callee_closure.proto.is_vararg {
             return Ok(None);
         }
         let max_registers = callee_closure.proto.max_registers as usize;
@@ -5715,20 +5851,11 @@ unsafe fn try_self_tail_call(
         for k in 0..copy_n {
             let src_ptr = regs.add(args_offset + k);
             let dst_ptr = regs.add(k);
-            match (&*src_ptr, &mut *dst_ptr) {
-                (Value::Int(n), Value::Int(o)) => *o = *n,
-                (Value::Float(f), Value::Float(o)) => *o = *f,
-                (Value::Bool(b), Value::Bool(o)) => *o = *b,
-                (Value::Int(n), d) if is_trivial_drop(d) => {
-                    std::ptr::write(dst_ptr, Value::Int(*n))
-                }
-                (Value::Float(f), d) if is_trivial_drop(d) => {
-                    std::ptr::write(dst_ptr, Value::Float(*f))
-                }
-                (Value::Bool(b), d) if is_trivial_drop(d) => {
-                    std::ptr::write(dst_ptr, Value::Bool(*b))
-                }
-                _ => return Ok(None),
+            let src_bits = (*src_ptr).bits();
+            if src_bits < TAG_RC_START && (*dst_ptr).is_trivial() {
+                std::ptr::write(dst_ptr, Value::from_trivial_bits(src_bits));
+            } else {
+                return Ok(None);
             }
         }
         Ok(Some(regs))
@@ -5758,20 +5885,19 @@ fn op_tail_call(
             Err(e) => return fail_with(vm, pc, e),
         }
     }
-    return cold_tail_call_general(vm, pc, consts, dtbl, base, callee, argc);
+    cold_tail_call_general(vm, pc, consts, dtbl, base, callee, argc)
 }
 
 #[cold]
 #[inline(never)]
-fn cold_tail_call_general(
+fn cold_tail_call_step(
     vm: &mut VM,
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
-    dtbl: DispatchTbl,
     base: usize,
     callee: u8,
     argc: u8,
-) -> u8 {
+) -> Option<(*mut Value, *const Cell<AlignedExec>, *const Value, bool)> {
     let args_start = base + callee as usize + 1;
     let args_end = if argc == MULTRET {
         vm.top.max(args_start)
@@ -5780,23 +5906,20 @@ fn cold_tail_call_general(
     };
     let actual_argc = args_end - args_start;
     if args_end > vm.stack.len() {
-        vm.stack.resize(args_end, Value::Nil);
+        vm.stack.resize(args_end, Value::NIL);
     }
     sync_frame_pc(vm, pc);
-    if base >= 1 && matches!(&vm.stack[base + callee as usize], Value::Closure(_)) {
+    if base >= 1 && vm.stack[base + callee as usize].is_closure() {
         if let Err(e) = vm.limits.check_interrupt() {
-            return fail_with(vm, pc, e);
+            let _ = fail_with(vm, pc, e);
+            return None;
         }
-        let callee_closure = {
-            let Value::Closure(c) = &vm.stack[base + callee as usize] else {
-                unreachable!()
-            };
-            Rc::clone(c)
-        };
+        let callee_closure = vm.stack[base + callee as usize].to_closure().unwrap();
         if !callee_closure.proto.is_verified()
             && let Err(e) = crate::bytecode::verify_proto(&callee_closure.proto)
         {
-            return fail_with(vm, pc, e.to_string());
+            let _ = fail_with(vm, pc, e.to_string());
+            return None;
         }
         callee_closure.proto.mark_verified();
         let max_registers = callee_closure.proto.max_registers as usize;
@@ -5808,7 +5931,7 @@ fn cold_tail_call_general(
         let shift = callee_abs - caller_dest;
         let len = args_end - callee_abs;
         for k in 0..len {
-            let v = std::mem::replace(&mut vm.stack[callee_abs + k], Value::Nil);
+            let v = std::mem::replace(&mut vm.stack[callee_abs + k], Value::NIL);
             vm.stack[caller_dest + k] = v;
         }
         if vm.top > callee_abs {
@@ -5816,10 +5939,10 @@ fn cold_tail_call_general(
         }
         let needed = base + max_registers;
         if needed >= vm.stack.len() {
-            vm.stack.resize(needed + 1, Value::Nil);
+            vm.stack.resize(needed + 1, Value::NIL);
         }
         for i in actual_argc..num_params {
-            vm.stack[base + i] = Value::Nil;
+            vm.stack[base + i] = Value::NIL;
         }
         if is_vararg && actual_argc > num_params {
             let varargs = vm.stack[base + num_params..base + actual_argc].to_vec();
@@ -5836,7 +5959,8 @@ fn cold_tail_call_general(
             if vm.hook.is_some()
                 && let Err(e) = vm.fire_hook(HookEvent::TailCall)
             {
-                return fail_with(vm, pc, e);
+                let _ = fail_with(vm, pc, e);
+                return None;
             }
             if vm.dap.is_some() {
                 let func_name = vm
@@ -5850,7 +5974,8 @@ fn cold_tail_call_general(
                     .unwrap_or("<anonymous>")
                     .to_string();
                 if let Err(e) = crate::dap::check_break(vm, &func_name) {
-                    return fail_with(vm, pc, e);
+                    let _ = fail_with(vm, pc, e);
+                    return None;
                 }
             }
         }
@@ -5864,22 +5989,54 @@ fn cold_tail_call_general(
             vm.cur_upvals = cf.closure.upvalues.as_ptr();
             (exec.ops.as_ptr(), nc)
         };
-        unsafe {
-            let new_regs = vm.stack.as_mut_ptr().add(base);
-            dispatch!(vm, new_regs, new_code, new_consts, dtbl);
-        }
+        let new_regs = unsafe { vm.stack.as_mut_ptr().add(base) };
+        return Some((new_regs, new_code, new_consts, false));
     }
 
-    if matches!(&vm.stack[base + callee as usize], Value::Closure(_)) {
-        match call_closure_inner(vm, pc, consts, dtbl, base, callee, actual_argc, MULTRET) {
-            Ok((new_regs, new_pc, new_consts)) => unsafe {
-                dispatch!(vm, new_regs, new_pc, new_consts, dtbl);
-            },
-            Err(e) => return fail_with(vm, pc, e),
-        }
+    if vm.stack[base + callee as usize].is_closure() {
+        return match call_closure_inner(vm, pc, consts, base, callee, actual_argc, MULTRET) {
+            Ok((new_regs, new_pc, new_consts)) => Some((new_regs, new_pc, new_consts, false)),
+            Err(e) => {
+                let _ = fail_with(vm, pc, e);
+                None
+            }
+        };
     }
-    let ok = call_non_closure_ok(vm, base, callee, args_start, args_end, actual_argc, MULTRET);
-    finish_non_closure_dispatch(vm, pc, consts, dtbl, base, ok)
+    if call_non_closure_ok(vm, base, callee, args_start, args_end, actual_argc, MULTRET) {
+        let new_regs = unsafe { vm.stack.as_mut_ptr().add(base) };
+        Some((new_regs, pc, consts, true))
+    } else {
+        if !vm.is_yielding {
+            sync_frame_pc(vm, pc);
+        }
+        None
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cold_tail_call_general(
+    vm: &mut VM,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    dtbl: DispatchTbl,
+    base: usize,
+    callee: u8,
+    argc: u8,
+) -> u8 {
+    match cold_tail_call_step(vm, pc, consts, base, callee, argc) {
+        Some((new_regs, new_pc, new_consts, check_trap)) => {
+            if check_trap && vm.trap {
+                sync_frame_pc(vm, pc);
+                vm.run_result = None;
+                return STATUS_OK;
+            }
+            unsafe {
+                dispatch!(vm, new_regs, new_pc, new_consts, dtbl);
+            }
+        }
+        None => STATUS_ERR,
+    }
 }
 
 #[inline(always)]
@@ -5918,15 +6075,11 @@ unsafe fn try_fast_return(
         }
         let src_ptr = regs.add(ret as usize);
         let dst_ptr = regs.sub(1);
-        if !is_trivial_drop(&*dst_ptr) {
+        let src_bits = (*src_ptr).bits();
+        if !(*dst_ptr).is_trivial() || src_bits >= TAG_RC_START {
             return None;
         }
-        match &*src_ptr {
-            Value::Int(n) => std::ptr::write(dst_ptr, Value::Int(*n)),
-            Value::Float(f) => std::ptr::write(dst_ptr, Value::Float(*f)),
-            Value::Bool(b) => std::ptr::write(dst_ptr, Value::Bool(*b)),
-            _ => return None,
-        }
+        std::ptr::write(dst_ptr, Value::from_trivial_bits(src_bits));
         if Rc::strong_count(&(*top_ptr).closure) <= 1 {
             return None;
         }
@@ -5976,7 +6129,7 @@ fn op_return(
             dispatch!(vm, new_regs, new_pc, new_consts, dtbl);
         }
     }
-    return cold_return_general(vm, pc, dtbl, ret, count);
+    cold_return_general(vm, pc, dtbl, ret, count)
 }
 
 #[cold]
@@ -6013,7 +6166,7 @@ fn cold_return_general(
         vm.returned.clear();
         vm.returned
             .extend(vm.stack[ret_start..ret_end].iter().cloned());
-        vm.run_result = Some(vm.returned.first().cloned().unwrap_or(Value::Nil));
+        vm.run_result = Some(vm.returned.first().cloned().unwrap_or(Value::NIL));
         return STATUS_OK;
     }
 
@@ -6025,36 +6178,24 @@ fn cold_return_general(
     };
     let needed = caller_dest + wanted;
     if needed > vm.stack.len() {
-        vm.stack.resize(needed, Value::Nil);
+        vm.stack.resize(needed, Value::NIL);
     }
     unsafe {
         let s = vm.stack.as_mut_ptr();
         if wanted == 1 && nret == 1 {
             let src_ptr = s.add(ret_start);
             let dst_ptr = s.add(caller_dest);
-            match &*src_ptr {
-                Value::Int(n) => write_int(dst_ptr, *n),
-                Value::Float(f) => write_float(dst_ptr, *f),
-                _ => {
-                    let v = std::mem::replace(&mut *src_ptr, Value::Nil);
-                    *dst_ptr = v;
-                }
-            }
+            let v = std::mem::replace(&mut *src_ptr, Value::NIL);
+            (*dst_ptr).set_inplace(v);
         } else {
             for i in 0..wanted {
                 if i < nret {
                     let src_ptr = s.add(ret_start + i);
                     let dst_ptr = s.add(caller_dest + i);
-                    match &*src_ptr {
-                        Value::Int(n) => write_int(dst_ptr, *n),
-                        Value::Float(f) => write_float(dst_ptr, *f),
-                        _ => {
-                            let v = std::mem::replace(&mut *src_ptr, Value::Nil);
-                            *dst_ptr = v;
-                        }
-                    }
+                    let v = std::mem::replace(&mut *src_ptr, Value::NIL);
+                    (*dst_ptr).set_inplace(v);
                 } else {
-                    *s.add(caller_dest + i) = Value::Nil;
+                    *s.add(caller_dest + i) = Value::NIL;
                 }
             }
         }
@@ -6099,11 +6240,11 @@ fn vararg_inner(vm: &mut VM, base: usize, dst: u8, count: u8) {
     };
     let dest = base + dst as usize;
     if dest + cnt > vm.stack.len() {
-        vm.stack.resize(dest + cnt, Value::Nil);
+        vm.stack.resize(dest + cnt, Value::NIL);
     }
     let varargs: Vec<Value> = vm.frames.last().expect(RUNNING_FRAME).varargs().to_vec();
     for i in 0..cnt {
-        let val = varargs.get(i).cloned().unwrap_or(Value::Nil);
+        let val = varargs.get(i).cloned().unwrap_or(Value::NIL);
         vm.stack[dest + i] = val;
     }
     if all {
@@ -6140,7 +6281,7 @@ fn set_list_inner(vm: &mut VM, base: usize, table: u8, list: u8, count: u8) -> R
         start + count as usize
     };
     let end = end.min(vm.stack.len());
-    if let Value::Table(t) = &vm.stack[base + table as usize] {
+    if let Some(t) = vm.stack[base + table as usize].as_table() {
         let mut tbl = t.borrow_mut();
         tbl.array.reserve(end.saturating_sub(start));
         tbl.array.extend(vm.stack[start..end].iter().cloned());
@@ -6218,7 +6359,7 @@ fn op_tfor_loop(
     };
     unsafe {
         let src = regs.add(b as usize + 3);
-        if matches!(&*src, Value::Nil) {
+        if (&*src).is_nil() {
             let next_pc = pc.offset(jump as isize);
             dispatch!(vm, regs, next_pc, consts, dtbl);
         }

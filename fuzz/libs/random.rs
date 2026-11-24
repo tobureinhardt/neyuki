@@ -235,8 +235,8 @@ fn run(input: &[u8]) {
 
     let mut vm = sandbox_vm();
     vm.set_global("input", Value::str(&payload));
-    vm.set_global("n1", Value::Int(args[0]));
-    vm.set_global("n2", Value::Int(args[1]));
+    vm.set_global("n1", Value::int(args[0]));
+    vm.set_global("n2", Value::int(args[1]));
     if selector as usize % SCRIPTS.len() == 5 {
         set_keys(&mut vm);
     }

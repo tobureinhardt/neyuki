@@ -19,7 +19,7 @@ impl Default for GlobalCacheSlot {
     fn default() -> Self {
         Self {
             epoch: u64::MAX,
-            value: Value::Nil,
+            value: Value::NIL,
         }
     }
 }
@@ -62,7 +62,7 @@ impl Default for ImportSlot {
         Self {
             epoch: u64::MAX,
             module: None,
-            value: Value::Nil,
+            value: Value::NIL,
         }
     }
 }

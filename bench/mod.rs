@@ -526,7 +526,7 @@ mod tests {
             end
             return fibonacci(18)
         "#;
-        assert_eq!(run(fib_code)?, Value::Int(2584));
+        assert_eq!(run(fib_code)?, Value::int(2584));
 
         // 15. BigInt: dynamic widening and multi-limb arithmetic
         let bigint_code = r#"
@@ -542,10 +542,11 @@ mod tests {
             end
             return sum
         "#;
-        match run(bigint_code)? {
-            Value::Int(v) => assert!(v > 0),
-            Value::BigInt(_) => {}
-            other => return Err(format!("expected int or bigint, got {:?}", other)),
+        let bigint_res = run(bigint_code)?;
+        if let Some(v) = bigint_res.as_int() {
+            assert!(v > 0);
+        } else if !bigint_res.is_bigint() {
+            return Err(format!("expected int or bigint, got {:?}", bigint_res));
         }
 
         // 16. Table lookup throughput: array, named fields, dynamic keys, nested accesses
@@ -569,9 +570,11 @@ mod tests {
             end
             return sum
         "#;
-        match run(table_code)? {
-            Value::Int(v) => assert!(v > 0),
-            other => return Err(format!("expected int, got {:?}", other)),
+        let table_res = run(table_code)?;
+        if let Some(v) = table_res.as_int() {
+            assert!(v > 0);
+        } else {
+            return Err(format!("expected int, got {:?}", table_res));
         }
 
         // 17. GC allocation pressure: live retention and cycle sweep
@@ -594,9 +597,11 @@ mod tests {
             collectgarbage("collect")
             return sum
         "#;
-        match run(gc_code)? {
-            Value::Int(v) => assert!(v > 0),
-            other => return Err(format!("expected int, got {:?}", other)),
+        let gc_res = run(gc_code)?;
+        if let Some(v) = gc_res.as_int() {
+            assert!(v > 0);
+        } else {
+            return Err(format!("expected int, got {:?}", gc_res));
         }
 
         Ok(())

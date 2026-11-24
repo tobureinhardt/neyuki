@@ -146,7 +146,7 @@ fn next_id() -> u64 {
 
 fn string_arg(args: &[Value], index: usize, name: &str) -> Result<String, String> {
     match args.get(index) {
-        Some(Value::String(value)) => Ok(value.to_string()),
+        Some(v) if v.is_string() => Ok(v.as_str().unwrap().to_string()),
         Some(value) => Err(format!(
             "{} must be a string, got {}",
             name,
@@ -158,13 +158,15 @@ fn string_arg(args: &[Value], index: usize, name: &str) -> Result<String, String
 
 fn optional_string_arg(args: &[Value], index: usize, name: &str) -> Result<Option<String>, String> {
     match args.get(index) {
-        None | Some(Value::Nil) => Ok(None),
+        None => Ok(None),
+        Some(v) if v.is_nil() => Ok(None),
         _ => string_arg(args, index, name).map(Some),
     }
 }
 
 fn integer_arg(args: &[Value], index: usize, name: &str) -> Result<u64, String> {
-    let value = args.get(index).unwrap_or(&Value::Nil);
+    let nil = Value::NIL;
+    let value = args.get(index).unwrap_or(&nil);
     let number =
         crate::vm::libs::args::number(value).map_err(|_| format!("{} must be a number", name))?;
     if number < 0.0 || number.fract() != 0.0 {
@@ -181,15 +183,16 @@ const DEFAULT_MAX_BODY: u64 = 64 * 1024 * 1024;
 /// A body size limit in bytes; nil or absent means `DEFAULT_MAX_BODY`.
 fn max_body_arg(args: &[Value], index: usize) -> Result<u64, String> {
     match args.get(index) {
-        None | Some(Value::Nil) => Ok(DEFAULT_MAX_BODY),
+        None => Ok(DEFAULT_MAX_BODY),
+        Some(v) if v.is_nil() => Ok(DEFAULT_MAX_BODY),
         _ => integer_arg(args, index, "maxBody"),
     }
 }
 
 /// A timeout in seconds; nil, absent or zero means "no timeout".
 fn timeout_arg(args: &[Value], index: usize, name: &str) -> Result<Option<Duration>, String> {
-    let value = args.get(index).cloned().unwrap_or(Value::Nil);
-    if matches!(value, Value::Nil) {
+    let value = args.get(index).cloned().unwrap_or(Value::NIL);
+    if value.is_nil() {
         return Ok(None);
     }
     let seconds =
@@ -204,13 +207,13 @@ fn timeout_arg(args: &[Value], index: usize, name: &str) -> Result<Option<Durati
 }
 
 fn bool_arg(args: &[Value], index: usize, name: &str, default: bool) -> Result<bool, String> {
-    match args.get(index) {
-        Some(Value::Bool(value)) => Ok(*value),
-        None | Some(Value::Nil) => Ok(default),
-        Some(value) => Err(format!(
+    match args.get(index).map(crate::vm::value::Value::view) {
+        Some(crate::vm::value::ValueView::Bool(value)) => Ok(value),
+        None | Some(crate::vm::value::ValueView::Nil) => Ok(default),
+        Some(_) => Err(format!(
             "{} must be a boolean, got {}",
             name,
-            value.type_name()
+            args[index].type_name()
         )),
     }
 }
@@ -259,14 +262,16 @@ fn validate_header_value(name: &str, value: &str) -> Result<(), String> {
 }
 
 fn scalar_header_value(key: &str, value: &Value) -> Result<String, String> {
-    let text = match value {
-        Value::String(text) => text.to_string(),
-        Value::Int(_) | Value::BigInt(_) | Value::Float(_) => value.to_string(),
-        other => {
+    let text = match value.view() {
+        crate::vm::value::ValueView::String(text) => text.to_string(),
+        crate::vm::value::ValueView::Int(_)
+        | crate::vm::value::ValueView::BigInt(_)
+        | crate::vm::value::ValueView::Float(_) => value.to_string(),
+        _ => {
             return Err(format!(
                 "header `{}` must be a string or a number, got {}",
                 key,
-                other.type_name()
+                value.type_name()
             ));
         }
     };
@@ -279,8 +284,9 @@ fn scalar_header_value(key: &str, value: &Value) -> Result<String, String> {
 /// non-empty array of strings or numbers.
 fn headers_arg(args: &[Value], index: usize, name: &str) -> Result<Vec<(String, String)>, String> {
     let table = match args.get(index) {
-        None | Some(Value::Nil) => return Ok(Vec::new()),
-        Some(Value::Table(table)) => table.clone(),
+        None => return Ok(Vec::new()),
+        Some(v) if v.is_nil() => return Ok(Vec::new()),
+        Some(v) if v.is_table() => v.as_table().unwrap().to_rc(),
         Some(value) => {
             return Err(format!(
                 "{} must be a table, got {}",
@@ -296,22 +302,19 @@ fn headers_arg(args: &[Value], index: usize, name: &str) -> Result<Vec<(String, 
     let mut headers: Vec<(String, String)> = Vec::new();
     for (key, value) in pairs {
         validate_header_name(key)?;
-        match value {
-            Value::Table(list) => {
-                let list = list.borrow();
-                if list.array.is_empty() || !list.fields.is_empty() || list.general.is_some() {
-                    return Err(format!(
-                        "header `{}` must be a string, a number or a non-empty array of strings",
-                        key
-                    ));
-                }
-                for item in &list.array {
-                    headers.push((key.to_string(), scalar_header_value(key, item)?));
-                }
+        if let Some(list) = value.as_table() {
+            let list = list.borrow();
+            if list.array.is_empty() || !list.fields.is_empty() || list.general.is_some() {
+                return Err(format!(
+                    "header `{}` must be a string, a number or a non-empty array of strings",
+                    key
+                ));
             }
-            other => {
-                headers.push((key.to_string(), scalar_header_value(key, other)?));
+            for item in &list.array {
+                headers.push((key.to_string(), scalar_header_value(key, item)?));
             }
+        } else {
+            headers.push((key.to_string(), scalar_header_value(key, value)?));
         }
     }
     Ok(headers)
@@ -333,20 +336,20 @@ fn multi_headers_table<'a>(headers: impl Iterator<Item = (&'a str, &'a [u8])>) -
         arr.frozen = true;
         table
             .fields
-            .insert(StrRef::from(name), Value::Table(Rc::new(RefCell::new(arr))));
+            .insert(StrRef::from(name), Value::table(Rc::new(RefCell::new(arr))));
     }
-    Value::Table(Rc::new(RefCell::new(table)))
+    Value::table(Rc::new(RefCell::new(table)))
 }
 
 fn optional_body_arg(args: &[Value], index: usize, name: &str) -> Result<Option<Vec<u8>>, String> {
-    match args.get(index) {
-        None | Some(Value::Nil) => Ok(None),
-        Some(Value::String(s)) => Ok(Some(s.as_bytes().to_vec())),
-        Some(Value::Buffer(buf)) => Ok(Some(buf.borrow().data.clone())),
-        Some(other) => Err(format!(
+    match args.get(index).map(crate::vm::value::Value::view) {
+        None | Some(crate::vm::value::ValueView::Nil) => Ok(None),
+        Some(crate::vm::value::ValueView::String(s)) => Ok(Some(s.as_bytes().to_vec())),
+        Some(crate::vm::value::ValueView::Buffer(buf)) => Ok(Some(buf.borrow().data.clone())),
+        Some(_) => Err(format!(
             "{} must be a string or a buffer, got {}",
             name,
-            other.type_name()
+            args[index].type_name()
         )),
     }
 }
@@ -372,7 +375,7 @@ fn headers_table<'a>(headers: impl Iterator<Item = (&'a str, &'a [u8])>) -> Valu
             .fields
             .insert(StrRef::from(name), Value::string(value));
     }
-    Value::Table(Rc::new(RefCell::new(table)))
+    Value::table(Rc::new(RefCell::new(table)))
 }
 
 /// Neyuki strings are UTF-8, so bodies that are not valid UTF-8 have their
@@ -387,7 +390,7 @@ fn record(fields: Vec<(&str, Value)>) -> Value {
     for (name, value) in fields {
         table.fields.insert(StrRef::from(name), value);
     }
-    Value::Table(Rc::new(RefCell::new(table)))
+    Value::table(Rc::new(RefCell::new(table)))
 }
 
 fn integer(value: u64) -> Value {
@@ -577,7 +580,7 @@ fn finish_request(_vm: &mut VM, raw: RawResponse) -> Result<Vec<Value>, String> 
                 fields.push(("body", Value::string(lossy)));
                 fields.push((
                     "bytes",
-                    Value::Buffer(Rc::new(RefCell::new(VmBuffer::from_bytes(raw_bytes)))),
+                    Value::buffer(Rc::new(RefCell::new(VmBuffer::from_bytes(raw_bytes)))),
                 ));
             }
         },
@@ -597,7 +600,8 @@ fn finish_request(_vm: &mut VM, raw: RawResponse) -> Result<Vec<Value>, String> 
 fn builtin_read(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let id = integer_arg(args, 0, "stream")?;
     let size = match args.get(1) {
-        None | Some(Value::Nil) => DEFAULT_READ,
+        None => DEFAULT_READ,
+        Some(v) if v.is_nil() => DEFAULT_READ,
         _ => integer_arg(args, 1, "size")?,
     };
     if size == 0 || size > MAX_READ {
@@ -651,9 +655,9 @@ fn builtin_read(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 }
             });
             if chunk.is_empty() {
-                return Ok(vec![Value::Nil]);
+                return Ok(vec![Value::NIL]);
             }
-            Ok(vec![Value::Buffer(Rc::new(RefCell::new(
+            Ok(vec![Value::buffer(Rc::new(RefCell::new(
                 crate::vm::buffer::VmBuffer::from_bytes(chunk),
             )))])
         },
@@ -664,7 +668,7 @@ fn builtin_read(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn builtin_end(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let id = integer_arg(args, 0, "stream")?;
     STREAMS.with(|streams| streams.borrow_mut().remove(&id));
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 /// `__http_listen(host, port, maxBody?)` binds a server and returns its id
@@ -778,7 +782,7 @@ fn builtin_accept(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         |_vm, accepted| {
             Ok(vec![match accepted {
                 Some((request, bytes)) => park_request(request, bytes),
-                None => Value::Nil,
+                None => Value::NIL,
             }])
         },
     )
@@ -830,7 +834,7 @@ fn park_request(request: tiny_http::Request, bytes: Vec<u8>) -> Value {
     );
     let remote = match request.remote_addr() {
         Some(addr) => Value::string(addr.to_string()),
-        None => Value::Nil,
+        None => Value::NIL,
     };
     let request_id = next_id();
     let table = record(vec![
@@ -874,7 +878,7 @@ fn builtin_respond(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     request
         .respond(response)
         .map_err(|err| format!("cannot send response: {}", err))?;
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 /// `__http_close(server)` stops listening and returns whether the server was
@@ -882,7 +886,7 @@ fn builtin_respond(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn builtin_close(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let id = integer_arg(args, 0, "server")?;
     let Some((server, _)) = SERVERS.with(|servers| servers.borrow_mut().remove(&id)) else {
-        return Ok(vec![Value::Bool(false)]);
+        return Ok(vec![Value::FALSE]);
     };
     let address = server.server_addr().to_ip();
     // Every other reference belongs to an `accept` waiting on a worker
@@ -901,7 +905,7 @@ fn builtin_close(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    Ok(vec![Value::Bool(true)])
+    Ok(vec![Value::TRUE])
 }
 
 /// Headers that describe one hop rather than the message, which a proxy must
@@ -963,7 +967,7 @@ fn builtin_proxy(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             request
                 .respond(response)
                 .map_err(|err| format!("cannot send response: {}", err))?;
-            Ok(vec![Value::Nil])
+            Ok(vec![Value::NIL])
         }
         Err(err) => {
             let message = format!(
@@ -1164,13 +1168,13 @@ fn builtin_forward_wait(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Stri
             return Err("forward is closed".to_string());
         };
         if !running {
-            return Ok(vec![Value::Bool(false)]);
+            return Ok(vec![Value::FALSE]);
         }
         let step = match deadline {
             Some(deadline) => {
                 let now = std::time::Instant::now();
                 if now >= deadline {
-                    return Ok(vec![Value::Bool(true)]);
+                    return Ok(vec![Value::TRUE]);
                 }
                 (deadline - now).min(Duration::from_millis(100))
             }
@@ -1186,7 +1190,7 @@ fn builtin_forward_wait(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Stri
 fn builtin_unforward(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let id = integer_arg(args, 0, "forward")?;
     let Some(mut forward) = FORWARDS.with(|forwards| forwards.borrow_mut().remove(&id)) else {
-        return Ok(vec![Value::Bool(false)]);
+        return Ok(vec![Value::FALSE]);
     };
     forward.stop.store(true, Ordering::SeqCst);
     // The accept loop only notices `stop` when a connection arrives, so make
@@ -1207,7 +1211,7 @@ fn builtin_unforward(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String>
             let _ = thread.join();
         }
     }
-    Ok(vec![Value::Bool(true)])
+    Ok(vec![Value::TRUE])
 }
 
 /// Percent-encodes everything except RFC 3986 unreserved characters.
@@ -1450,7 +1454,7 @@ fn builtin_resolve_static(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Str
         if seg.starts_with('.') {
             match dotfiles.as_str() {
                 "deny" => return Ok(vec![forbidden_static()]),
-                "ignore" => return Ok(vec![Value::Nil]),
+                "ignore" => return Ok(vec![Value::NIL]),
                 _ => {}
             }
         }
@@ -1477,7 +1481,7 @@ fn builtin_resolve_static(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Str
                 bundled_key.push_str(idx);
             }
         } else {
-            return Ok(vec![Value::Nil]);
+            return Ok(vec![Value::NIL]);
         }
     }
     if matches!(crate::app::entry(&bundled_key), Some(Entry::File { .. }))
@@ -1488,7 +1492,7 @@ fn builtin_resolve_static(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Str
         let mime = mime_for_path(Path::new(&bundled_key));
         return Ok(vec![record(vec![
             ("status", Value::str("ok")),
-            ("bundled", Value::Bool(true)),
+            ("bundled", Value::TRUE),
             ("path", Value::string(bundled_key)),
             ("size", integer(size)),
             ("etag", Value::string(etag)),
@@ -1498,10 +1502,10 @@ fn builtin_resolve_static(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Str
 
     vm.permissions.check_read(&root)?;
     let Ok(canon_root) = fs::canonicalize(&root) else {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     };
     if !canon_root.is_dir() {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
 
     let mut candidate = canon_root.clone();
@@ -1514,24 +1518,24 @@ fn builtin_resolve_static(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Str
         {
             candidate.push(idx);
         } else {
-            return Ok(vec![Value::Nil]);
+            return Ok(vec![Value::NIL]);
         }
     }
     if !candidate.exists() {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
     let Ok(canon_target) = fs::canonicalize(&candidate) else {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     };
     // Prevent symlink escapes outside the static root directory.
     if !canon_target.starts_with(&canon_root) {
         return Ok(vec![forbidden_static()]);
     }
     let Ok(meta) = fs::metadata(&canon_target) else {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     };
     if !meta.is_file() {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
     let target_str = canon_target
         .to_str()
@@ -1550,7 +1554,7 @@ fn builtin_resolve_static(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Str
 
     Ok(vec![record(vec![
         ("status", Value::str("ok")),
-        ("bundled", Value::Bool(false)),
+        ("bundled", Value::FALSE),
         ("path", Value::string(target_str)),
         ("size", integer(size)),
         ("etag", Value::string(etag)),
@@ -1607,7 +1611,7 @@ fn builtin_respond_file(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Strin
         request
             .respond(response)
             .map_err(|err| format!("cannot send file response: {}", err))?;
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
 
     vm.permissions.check_read(&path)?;
@@ -1643,7 +1647,7 @@ fn builtin_respond_file(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Strin
             .respond(response)
             .map_err(|err| format!("cannot send file response: {}", err))?;
     }
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 // ---------------------------------------------------------------------------
@@ -1772,20 +1776,19 @@ fn parse_disposition(header: &str) -> Result<(String, Option<String>), String> {
 
 fn insert_multi_field(table: &mut VmTable, key: &str, value: Value) {
     let existing = table.get_str(key);
-    match existing {
-        Value::Nil => table.set_str(key, value),
-        Value::Table(ref arr)
-            if arr.borrow().fields.is_empty() && !arr.borrow().array.is_empty() =>
-        {
-            // Check whether existing is already a promoted list (not a FilePart record).
-            arr.borrow_mut().array.push(value);
-        }
-        prev => {
-            let mut list = VmTable::with_capacity(2, 0);
-            list.array.push(prev);
-            list.array.push(value);
-            table.set_str(key, Value::Table(Rc::new(RefCell::new(list))));
-        }
+    if existing.is_nil() {
+        table.set_str(key, value);
+    } else if existing
+        .as_table()
+        .is_some_and(|arr| arr.borrow().fields.is_empty() && !arr.borrow().array.is_empty())
+    {
+        // Check whether existing is already a promoted list (not a FilePart record).
+        existing.as_table().unwrap().borrow_mut().array.push(value);
+    } else {
+        let mut list = VmTable::with_capacity(2, 0);
+        list.array.push(existing);
+        list.array.push(value);
+        table.set_str(key, Value::table(Rc::new(RefCell::new(list))));
     }
 }
 
@@ -1916,7 +1919,7 @@ fn parse_multipart_bytes_with_limits(
                 ("size", integer(payload.len() as u64)),
                 (
                     "data",
-                    Value::Buffer(Rc::new(RefCell::new(VmBuffer::from_bytes(
+                    Value::buffer(Rc::new(RefCell::new(VmBuffer::from_bytes(
                         payload.to_vec(),
                     )))),
                 ),
@@ -1943,8 +1946,8 @@ fn parse_multipart_bytes_with_limits(
     }
 
     Ok(record(vec![
-        ("fields", Value::Table(Rc::new(RefCell::new(fields)))),
-        ("files", Value::Table(Rc::new(RefCell::new(files)))),
+        ("fields", Value::table(Rc::new(RefCell::new(fields)))),
+        ("files", Value::table(Rc::new(RefCell::new(files)))),
         ("parts", crate::vm::libs::args::array(parts_list)),
     ]))
 }
@@ -1955,22 +1958,22 @@ fn parse_multipart_bytes_with_limits(
 fn builtin_parse_multipart(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let content_type = string_arg(args, 1, "contentType")?;
     let mut limits = MultipartLimits::default();
-    if !matches!(args.get(2), None | Some(Value::Nil)) {
+    if args.get(2).is_some_and(|v| !v.is_nil()) {
         limits.max_parts = integer_arg(args, 2, "maxParts")? as usize;
     }
-    if !matches!(args.get(3), None | Some(Value::Nil)) {
+    if args.get(3).is_some_and(|v| !v.is_nil()) {
         limits.max_field_size = integer_arg(args, 3, "maxFieldSize")? as usize;
     }
-    if !matches!(args.get(4), None | Some(Value::Nil)) {
+    if args.get(4).is_some_and(|v| !v.is_nil()) {
         limits.max_file_size = integer_arg(args, 4, "maxFileSize")? as usize;
     }
-    if !matches!(args.get(5), None | Some(Value::Nil)) {
+    if args.get(5).is_some_and(|v| !v.is_nil()) {
         limits.max_header_bytes = integer_arg(args, 5, "maxHeaderBytes")? as usize;
     }
 
-    let result = match args.first() {
-        Some(Value::Int(id)) if *id > 0 => {
-            let req_id = *id as u64;
+    let result = match args.first().map(crate::vm::value::Value::view) {
+        Some(crate::vm::value::ValueView::Int(id)) if id > 0 => {
+            let req_id = id as u64;
             PENDING.with(|pending| {
                 let map = pending.borrow();
                 let (_, raw_bytes) = map
@@ -1979,18 +1982,20 @@ fn builtin_parse_multipart(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, S
                 parse_multipart_bytes_with_limits(raw_bytes, &content_type, limits)
             })?
         }
-        Some(Value::Buffer(buf)) => {
+        Some(crate::vm::value::ValueView::Buffer(buf)) => {
             let borrowed = buf.borrow();
             parse_multipart_bytes_with_limits(&borrowed.data, &content_type, limits)?
         }
-        Some(Value::String(s)) => {
+        Some(crate::vm::value::ValueView::String(s)) => {
             parse_multipart_bytes_with_limits(s.as_bytes(), &content_type, limits)?
         }
-        None | Some(Value::Nil) => return Err("source must be provided".to_string()),
-        Some(other) => {
+        None | Some(crate::vm::value::ValueView::Nil) => {
+            return Err("source must be provided".to_string());
+        }
+        Some(_) => {
             return Err(format!(
                 "source must be a request, buffer or string, got {}",
-                other.type_name()
+                args[0].type_name()
             ));
         }
     };
@@ -2072,17 +2077,17 @@ mod tests {
 
         // Waiting with a timeout returns once it passes, reporting "running".
         let waited =
-            builtin_forward_wait(&mut VM::new(), &[integer(id), Value::Float(0.05)]).unwrap();
-        assert!(matches!(waited[0], Value::Bool(true)));
+            builtin_forward_wait(&mut VM::new(), &[integer(id), Value::float(0.05)]).unwrap();
+        assert_eq!(waited[0].as_bool(), Some(true));
 
         let closed = builtin_unforward(&mut VM::new(), &[integer(id)]).unwrap();
-        assert!(matches!(closed[0], Value::Bool(true)));
+        assert_eq!(closed[0].as_bool(), Some(true));
         assert!(
             TcpListener::bind(("127.0.0.1", port)).is_ok(),
             "closing should release the port"
         );
         let again = builtin_unforward(&mut VM::new(), &[integer(id)]).unwrap();
-        assert!(matches!(again[0], Value::Bool(false)));
+        assert_eq!(again[0].as_bool(), Some(false));
         assert!(builtin_forward_wait(&mut VM::new(), &[integer(id)]).is_err());
     }
 
@@ -2149,7 +2154,7 @@ mod tests {
         });
 
         let accepted = builtin_accept(&mut VM::new(), &[integer(server)]).unwrap();
-        let Value::Table(table) = &accepted[0] else {
+        let Some(table) = accepted[0].as_table() else {
             panic!("accept should return a table");
         };
         let request_id = table.borrow().fields.get("id").cloned().unwrap();
@@ -2228,7 +2233,7 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "accept must not wait for the socket to close"
         );
-        let Value::Table(table) = &accepted[0] else {
+        let Some(table) = accepted[0].as_table() else {
             panic!("accept should return a table");
         };
         let request_id = table.borrow().fields.get("id").cloned().unwrap();
@@ -2255,7 +2260,7 @@ mod tests {
             read_message(&mut stream)
         });
         let accepted = builtin_accept(&mut VM::new(), &[integer(server)]).unwrap();
-        let Value::Table(table) = &accepted[0] else {
+        let Some(table) = accepted[0].as_table() else {
             panic!("accept should return a table");
         };
         let request_id = table.borrow().fields.get("id").cloned().unwrap();
@@ -2308,12 +2313,13 @@ mod tests {
             (send("far too long a body"), send("fits"))
         });
         let accepted = builtin_accept(&mut VM::new(), &[integer(server), integer(10)]).unwrap();
-        let Value::Table(table) = &accepted[0] else {
+        let Some(table) = accepted[0].as_table() else {
             panic!("accept should return a table");
         };
         let body = table.borrow().fields.get("body").cloned().unwrap();
-        assert!(
-            matches!(&body, Value::String(s) if &**s == "fits"),
+        assert_eq!(
+            body.as_str(),
+            Some("fits"),
             "only the request that fits should be accepted"
         );
         let request_id = table.borrow().fields.get("id").cloned().unwrap();
@@ -2346,10 +2352,10 @@ mod tests {
                 &[
                     Value::string("GET".into()),
                     url.clone(),
-                    Value::Nil,
-                    Value::Nil,
+                    Value::NIL,
+                    Value::NIL,
                     integer(10),
-                    Value::Bool(true),
+                    Value::TRUE,
                     integer(max_body),
                 ],
             )
@@ -2370,8 +2376,8 @@ mod tests {
         let mut cookies = VmTable::new();
         cookies.array.push(Value::str("a=1; HttpOnly"));
         cookies.array.push(Value::str("b=2; Path=/"));
-        h.set_str("set-cookie", Value::Table(Rc::new(RefCell::new(cookies))));
-        let parsed = headers_arg(&[Value::Table(Rc::new(RefCell::new(h)))], 0, "headers").unwrap();
+        h.set_str("set-cookie", Value::table(Rc::new(RefCell::new(cookies))));
+        let parsed = headers_arg(&[Value::table(Rc::new(RefCell::new(h)))], 0, "headers").unwrap();
         assert_eq!(
             parsed,
             vec![
@@ -2383,7 +2389,7 @@ mod tests {
         let mut bad = VmTable::new();
         bad.set_str("x-test", Value::str("ok\r\nSet-Cookie: evil=1"));
         assert!(
-            headers_arg(&[Value::Table(Rc::new(RefCell::new(bad)))], 0, "headers").is_err(),
+            headers_arg(&[Value::table(Rc::new(RefCell::new(bad)))], 0, "headers").is_err(),
             "CRLF header injection must be rejected"
         );
     }
@@ -2426,7 +2432,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let Value::Table(rec) = &ok[0] else {
+        let Some(rec) = ok[0].as_table() else {
             panic!("expected resolved record");
         };
         assert_eq!(rec.borrow().get_str("status"), Value::str("ok"));
@@ -2448,7 +2454,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            let Value::Table(rec) = &res[0] else {
+            let Some(rec) = res[0].as_table() else {
                 panic!("expected forbidden record for {}", bad_path);
             };
             assert_eq!(
@@ -2471,7 +2477,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            let Value::Table(rec) = &res[0] else {
+            let Some(rec) = res[0].as_table() else {
                 panic!("expected forbidden record for symlink escape");
             };
             assert_eq!(rec.borrow().get_str("status"), Value::str("forbidden"));
@@ -2488,16 +2494,17 @@ mod tests {
                     Value::str(path),
                     Value::str("index.html"),
                     Value::str("deny"),
-                    Value::Bool(true),
+                    Value::TRUE,
                 ],
             )
             .unwrap()
         };
-        let Value::Table(rec) = &pre("/100%.txt", &mut vm)[0] else {
+        let pre_res = pre("/100%.txt", &mut vm);
+        let Some(rec) = pre_res[0].as_table() else {
             panic!("expected resolved record for literal percent file");
         };
         assert_eq!(rec.borrow().get_str("status"), Value::str("ok"));
-        assert!(matches!(pre("/%68ello.txt", &mut vm)[0], Value::Nil));
+        assert!(pre("/%68ello.txt", &mut vm)[0].is_nil());
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -2519,18 +2526,21 @@ mod tests {
 
         let parsed =
             parse_multipart_bytes(&body, "multipart/form-data; boundary=bound123").unwrap();
-        let Value::Table(tbl) = parsed else {
+        let Some(tbl) = parsed.as_table() else {
             panic!("expected table");
         };
-        let Value::Table(fields) = tbl.borrow().get_str("fields") else {
+        let fields_val = tbl.borrow().get_str("fields");
+        let Some(fields) = fields_val.as_table() else {
             panic!("expected fields table");
         };
         assert_eq!(fields.borrow().get_str("title"), Value::str("avatar"));
 
-        let Value::Table(files) = tbl.borrow().get_str("files") else {
+        let files_val = tbl.borrow().get_str("files");
+        let Some(files) = files_val.as_table() else {
             panic!("expected files table");
         };
-        let Value::Table(file) = files.borrow().get_str("file") else {
+        let file_val = files.borrow().get_str("file");
+        let Some(file) = file_val.as_table() else {
             panic!("expected file record");
         };
         assert_eq!(file.borrow().get_str("filename"), Value::str("pic.png"));
@@ -2538,7 +2548,8 @@ mod tests {
             file.borrow().get_str("contentType"),
             Value::str("image/png")
         );
-        let Value::Buffer(buf) = file.borrow().get_str("data") else {
+        let data_val = file.borrow().get_str("data");
+        let Some(buf) = data_val.as_buffer() else {
             panic!("expected binary Buffer");
         };
         assert_eq!(buf.borrow().data.as_slice(), png_bytes);

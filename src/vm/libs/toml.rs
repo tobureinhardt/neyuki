@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use crate::vm::libs::args::{array, str_arg};
 use crate::vm::machine::VM;
-use crate::vm::value::{NativeDef, StrRef, Value, VmTable};
+use crate::vm::value::{NativeDef, StrRef, Value, ValueView, VmTable};
 
 /// How deeply arrays and inline tables may nest, and how many parts a
 /// dotted key or a header may have, so a hostile document cannot build a
@@ -44,8 +44,9 @@ fn builtin_decode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// `__toml_encode(value)`: a table as TOML text.
 fn builtin_encode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let root = match args.first() {
-        Some(Value::Table(t)) => t.clone(),
-        None | Some(Value::Nil) => return Err("value must be provided".to_string()),
+        Some(v) if v.is_table() => v.to_table().unwrap(),
+        None => return Err("value must be provided".to_string()),
+        Some(v) if v.is_nil() => return Err("value must be provided".to_string()),
         Some(other) => {
             return Err(format!("value must be a table, got {}", other.type_name()));
         }
@@ -119,9 +120,9 @@ fn decode(text: &str) -> Result<Table, String> {
 fn node_value(node: Node) -> Value {
     match node {
         Node::String(s) | Node::Datetime(s) => Value::string(s),
-        Node::Integer(i) => Value::Int(i),
-        Node::Float(f) => Value::Float(f),
-        Node::Boolean(b) => Value::Bool(b),
+        Node::Integer(i) => Value::int(i),
+        Node::Float(f) => Value::float(f),
+        Node::Boolean(b) => Value::bool(b),
         Node::Array(items) => array(items.into_iter().map(node_value).collect()),
         Node::Table(table) => table_value(table),
         Node::TableArray(tables) => array(tables.into_iter().map(table_value).collect()),
@@ -133,7 +134,7 @@ fn table_value(table: Table) -> Value {
     for (key, node) in table.entries {
         out.fields.insert(StrRef::from(key), node_value(node));
     }
-    Value::Table(Rc::new(RefCell::new(out)))
+    Value::table(Rc::new(RefCell::new(out)))
 }
 
 /// Steps from `table` into `key` for a header, making the table when it is
@@ -927,17 +928,17 @@ fn shape(table: &Rc<RefCell<VmTable>>) -> Result<Shape, String> {
     }
     let mut pairs = Vec::new();
     for (key, value) in crate::vm::libs::table::entries(&tbl) {
-        let key = match key {
-            Value::String(s) => s.to_string(),
-            Value::Int(_) | Value::BigInt(_) => key.to_string(),
-            other => {
+        let key_str = match key.view() {
+            ValueView::String(s) => s.to_string(),
+            ValueView::Int(_) | ValueView::BigInt(_) => key.to_string(),
+            _ => {
                 return Err(format!(
                     "cannot encode a table key of type {} as TOML",
-                    other.type_name()
+                    key.type_name()
                 ));
             }
         };
-        pairs.push((key, value));
+        pairs.push((key_str, value));
     }
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(Shape::Map(pairs))
@@ -958,18 +959,16 @@ fn is_map(table: &Rc<RefCell<VmTable>>) -> bool {
 }
 
 fn classify(value: &Value) -> Result<Class, String> {
-    let Value::Table(table) = value else {
+    let Some(table) = value.as_table() else {
         return Ok(Class::Inline);
     };
-    match shape(table)? {
-        Shape::Map(_) => Ok(Class::Table(table.clone())),
+    let table = table.to_rc();
+    match shape(&table)? {
+        Shape::Map(_) => Ok(Class::Table(table)),
         Shape::Array(items) => {
             let tables: Option<Vec<_>> = items
                 .iter()
-                .map(|item| match item {
-                    Value::Table(t) if is_map(t) => Some(t.clone()),
-                    _ => None,
-                })
+                .map(|item| item.as_table().map(|t| t.to_rc()).filter(is_map))
                 .collect();
             Ok(tables.map_or(Class::Inline, Class::TableArray))
         }
@@ -1146,23 +1145,24 @@ impl Encoder {
     }
 
     fn inline(&mut self, value: &Value, depth: usize) -> Result<(), String> {
-        match value {
-            Value::Bool(b) => self.out.push_str(if *b { "true" } else { "false" }),
-            Value::Int(i) => self.out.push_str(&i.to_string()),
-            Value::BigInt(_) => {
+        match value.view() {
+            ValueView::Bool(b) => self.out.push_str(if b { "true" } else { "false" }),
+            ValueView::Int(i) => self.out.push_str(&i.to_string()),
+            ValueView::BigInt(_) => {
                 return Err("integer is out of TOML's 64-bit range".to_string());
             }
-            Value::Float(f) => self.out.push_str(&format_float(*f)),
-            Value::String(s) => write_string(&mut self.out, s),
-            Value::Table(t) => {
-                self.enter(t, depth)?;
-                let result = self.inline_table(t, depth);
+            ValueView::Float(f) => self.out.push_str(&format_float(f)),
+            ValueView::String(s) => write_string(&mut self.out, &s),
+            ValueView::Table(t) => {
+                let t = t.to_rc();
+                self.enter(&t, depth)?;
+                let result = self.inline_table(&t, depth);
                 self.open.pop();
                 result?;
             }
-            Value::Nil => return Err("cannot encode nil as TOML".to_string()),
-            other => {
-                return Err(format!("cannot encode a {} as TOML", other.type_name()));
+            ValueView::Nil => return Err("cannot encode nil as TOML".to_string()),
+            _ => {
+                return Err(format!("cannot encode a {} as TOML", value.type_name()));
             }
         }
         Ok(())

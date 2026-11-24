@@ -16,10 +16,10 @@ use num_bigint::{BigInt, Sign};
 use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
 
 use crate::vm::machine::VM;
-use crate::vm::value::{Value, VmTable};
+use crate::vm::value::{Value, ValueView, VmTable};
 
 fn arg(args: &[Value], index: usize) -> Value {
-    args.get(index).cloned().unwrap_or(Value::Nil)
+    args.get(index).cloned().unwrap_or(Value::NIL)
 }
 
 fn number(value: Value) -> Result<f64, String> {
@@ -28,9 +28,11 @@ fn number(value: Value) -> Result<f64, String> {
 
 /// Strings, and numbers in their printed form, as Lua coerces them.
 fn require_string(value: &Value) -> Result<Cow<'_, str>, String> {
-    match value {
-        Value::String(s) => Ok(Cow::Borrowed(s)),
-        Value::Int(_) | Value::BigInt(_) | Value::Float(_) => Ok(Cow::Owned(value.to_string())),
+    match value.view() {
+        ValueView::String(s) => Ok(Cow::Borrowed(s.as_str())),
+        ValueView::Int(_) | ValueView::BigInt(_) | ValueView::Float(_) => {
+            Ok(Cow::Owned(value.to_string()))
+        }
         _ => Err("expected a string or number".to_string()),
     }
 }
@@ -41,19 +43,20 @@ pub(crate) fn string_arg<'a>(
     name: &str,
 ) -> Result<Cow<'a, str>, String> {
     match args.get(index) {
-        Some(Value::String(s)) => Ok(Cow::Borrowed(s)),
-        None | Some(Value::Nil) => Err(format!("{} must be provided", name)),
+        Some(v) if v.is_string() => Ok(Cow::Borrowed(v.as_str().unwrap())),
+        None => Err(format!("{} must be provided", name)),
+        Some(v) if v.is_nil() => Err(format!("{} must be provided", name)),
         Some(_) => Err(format!("{} must be a string", name)),
     }
 }
 
 pub(crate) fn int_arg(args: &[Value], index: usize, name: &str) -> Result<i64, String> {
-    match arg(args, index) {
-        Value::Int(value) => Ok(value),
-        Value::BigInt(_) => Err(format!("{} is out of range", name)),
-        Value::Float(value) if value.is_finite() && value.fract() == 0.0 => Ok(value as i64),
-        Value::Float(_) => Err(format!("{} must be an integer", name)),
-        Value::Nil => Err(format!("{} must be provided", name)),
+    match arg(args, index).view() {
+        ValueView::Int(value) => Ok(value),
+        ValueView::BigInt(_) => Err(format!("{} is out of range", name)),
+        ValueView::Float(value) if value.is_finite() && value.fract() == 0.0 => Ok(value as i64),
+        ValueView::Float(_) => Err(format!("{} must be an integer", name)),
+        ValueView::Nil => Err(format!("{} must be provided", name)),
         _ => Err(format!("{} must be a number", name)),
     }
 }
@@ -64,9 +67,10 @@ pub(crate) fn opt_int_arg(
     name: &str,
     default: i64,
 ) -> Result<i64, String> {
-    match arg(args, index) {
-        Value::Nil => Ok(default),
-        _ => int_arg(args, index, name),
+    if arg(args, index).is_nil() {
+        Ok(default)
+    } else {
+        int_arg(args, index, name)
     }
 }
 
@@ -75,7 +79,7 @@ fn bytes_to_string(bytes: &[u8]) -> Value {
 }
 
 fn integer(value: i64) -> Value {
-    Value::Int(value)
+    Value::int(value)
 }
 
 /// Translate a relative (possibly negative) 1-based start index, Lua style.
@@ -170,9 +174,10 @@ pub(crate) fn builtin_reverse(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>
 pub(crate) fn builtin_rep(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = string_arg(args, 0, "s")?;
     let n = int_arg(args, 1, "n")?;
-    let sep = match arg(args, 2) {
-        Value::Nil => Cow::Borrowed(""),
-        _ => string_arg(args, 2, "sep")?,
+    let sep = if arg(args, 2).is_nil() {
+        Cow::Borrowed("")
+    } else {
+        string_arg(args, 2, "sep")?
     };
     if n <= 0 {
         return Ok(vec![Value::str("")]);
@@ -203,9 +208,10 @@ pub(crate) fn builtin_rep(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, St
 
 pub(crate) fn builtin_split(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = string_arg(args, 0, "s")?;
-    let sep = match arg(args, 1) {
-        Value::Nil => Cow::Borrowed(","),
-        _ => string_arg(args, 1, "separator")?,
+    let sep = if arg(args, 1).is_nil() {
+        Cow::Borrowed(",")
+    } else {
+        string_arg(args, 1, "separator")?
     };
     let parts: Vec<Value> = if sep.is_empty() {
         s.chars().map(|c| Value::string(c.to_string())).collect()
@@ -593,11 +599,11 @@ fn find_aux(args: &[Value], find: bool) -> Result<Vec<Value>, String> {
     let pat = pattern.as_bytes();
     let init = pos_relat_start(opt_int_arg(args, 2, "init", 1)?, src.len());
     if init > src.len() + 1 {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
-    let plain = match arg(args, 3) {
-        Value::Bool(value) => value,
-        Value::Nil => false,
+    let plain = match arg(args, 3).view() {
+        ValueView::Bool(value) => value,
+        ValueView::Nil => false,
         _ => return Err("plain must be a boolean".to_string()),
     };
     if find && (plain || !pat.iter().any(|c| SPECIALS.contains(c))) {
@@ -612,7 +618,7 @@ fn find_aux(args: &[Value], find: bool) -> Result<Vec<Value>, String> {
                 integer((init + offset) as i64),
                 integer((init + offset + pat.len() - 1) as i64),
             ],
-            None => vec![Value::Nil],
+            None => vec![Value::NIL],
         });
     }
 
@@ -632,7 +638,7 @@ fn find_aux(args: &[Value], find: bool) -> Result<Vec<Value>, String> {
         }
         s1 += 1;
         if anchor || s1 > src.len() {
-            return Ok(vec![Value::Nil]);
+            return Ok(vec![Value::NIL]);
         }
     }
 }
@@ -665,8 +671,8 @@ fn append_replacement(
     replacement: &Value,
 ) -> Result<(), String> {
     let whole = &ms.src[s..e];
-    let value = match replacement {
-        Value::String(template) => {
+    let value = match replacement.view() {
+        ValueView::String(template) => {
             let t = template.as_bytes();
             let mut i = 0;
             while i < t.len() {
@@ -689,7 +695,7 @@ fn append_replacement(
             }
             return Ok(());
         }
-        Value::Table(_) => {
+        ValueView::Table(_) => {
             let key = ms.get_capture(0, s, e)?;
             vm.table_get(replacement, &key)?
         }
@@ -698,19 +704,19 @@ fn append_replacement(
             vm.call_function(replacement.clone(), &captures)?
                 .into_iter()
                 .next()
-                .unwrap_or(Value::Nil)
+                .unwrap_or(Value::NIL)
         }
     };
-    match value {
-        Value::Nil | Value::Bool(false) => out.extend_from_slice(whole),
-        Value::String(text) => out.extend_from_slice(text.as_bytes()),
-        v @ (Value::Int(_) | Value::BigInt(_) | Value::Float(_)) => {
-            out.extend_from_slice(v.to_string().as_bytes())
+    match value.view() {
+        ValueView::Nil | ValueView::Bool(false) => out.extend_from_slice(whole),
+        ValueView::String(text) => out.extend_from_slice(text.as_bytes()),
+        ValueView::Int(_) | ValueView::BigInt(_) | ValueView::Float(_) => {
+            out.extend_from_slice(value.to_string().as_bytes())
         }
-        other => {
+        _ => {
             return Err(format!(
                 "invalid replacement value (a {})",
-                other.type_name()
+                value.type_name()
             ));
         }
     }
@@ -723,14 +729,14 @@ pub(crate) fn builtin_gsub(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, St
     let s = string_arg(args, 0, "s")?;
     let pattern = string_arg(args, 1, "pattern")?;
     let replacement = match args.get(2) {
-        Some(v @ (Value::String(_) | Value::Table(_) | Value::Closure(_) | Value::Native(_))) => {
-            v.clone()
-        }
-        None | Some(Value::Nil) => return Err("replacement must be provided".to_string()),
+        Some(v) if v.is_string() || v.is_table() || v.is_callable() => v.clone(),
+        None => return Err("replacement must be provided".to_string()),
+        Some(v) if v.is_nil() => return Err("replacement must be provided".to_string()),
         Some(_) => return Err("replacement must be a string, table or function".to_string()),
     };
     let max = match args.get(3) {
-        None | Some(Value::Nil) => i64::MAX,
+        None => i64::MAX,
+        Some(v) if v.is_nil() => i64::MAX,
         _ => int_arg(args, 3, "n")?,
     };
     let src = s.as_bytes();
@@ -762,26 +768,26 @@ pub(crate) fn builtin_gsub(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, St
         }
     }
     out.extend_from_slice(&src[pos.min(src.len())..]);
-    Ok(vec![bytes_value(out), Value::Int(count)])
+    Ok(vec![bytes_value(out), Value::int(count)])
 }
 
 /// One step of a `gmatch` iterator. The iterator is a table whose fields hold
 /// the subject, the pattern and how far matching has got.
 fn gmatch_step(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let Some(Value::Table(state)) = args.first() else {
+    let Some(state) = args.first().and_then(Value::as_table) else {
         return Err("gmatch iterator called without its state".to_string());
     };
     let (subject, pattern, pos, last) = {
         let st = state.borrow();
-        let (Value::String(subject), Value::String(pattern), Value::Int(pos)) =
-            (st.get_str("s"), st.get_str("p"), st.get_str("pos"))
+        let s_val = st.get_str("s");
+        let p_val = st.get_str("p");
+        let pos_val = st.get_str("pos");
+        let (Some(subject), Some(pattern), Some(pos)) =
+            (s_val.to_str_ref(), p_val.to_str_ref(), pos_val.as_int())
         else {
             return Err("gmatch iterator state is corrupt".to_string());
         };
-        let last = match st.get_str("last") {
-            Value::Int(i) => Some(i as usize),
-            _ => None,
-        };
+        let last = st.get_str("last").as_int().map(|i| i as usize);
         (subject, pattern, pos as usize, last)
     };
     let src = subject.as_bytes();
@@ -810,7 +816,7 @@ fn gmatch_step(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     state
         .borrow_mut()
         .set_str("pos", Value::from_usize(src.len() + 1));
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 /// `gmatch(s, pattern)`: an iterator over every match, yielding its captures
@@ -823,9 +829,9 @@ pub(crate) fn builtin_gmatch(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>,
     let mut state = VmTable::new();
     state.set_str("s", Value::string(s.into_owned()));
     state.set_str("p", Value::string(pattern.into_owned()));
-    state.set_str("pos", Value::Int(0));
+    state.set_str("pos", Value::int(0));
     state.metatable = Some(Rc::new(RefCell::new(meta)));
-    Ok(vec![Value::Table(Rc::new(RefCell::new(state)))])
+    Ok(vec![Value::table(Rc::new(RefCell::new(state)))])
 }
 
 // ---------------------------------------------------------------------------
@@ -848,9 +854,10 @@ pub(crate) fn builtin_rtrim(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, 
 
 fn trim_with(args: &[Value], left: bool, right: bool) -> Result<Vec<Value>, String> {
     let s = string_arg(args, 0, "s")?;
-    let chars = match arg(args, 1) {
-        Value::Nil => None,
-        _ => Some(string_arg(args, 1, "chars")?),
+    let chars = if arg(args, 1).is_nil() {
+        None
+    } else {
+        Some(string_arg(args, 1, "chars")?)
     };
     let matches = |c: char| match &chars {
         Some(set) => set.contains(c),
@@ -869,13 +876,13 @@ fn trim_with(args: &[Value], left: bool, right: bool) -> Result<Vec<Value>, Stri
 pub(crate) fn builtin_startswith(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = string_arg(args, 0, "s")?;
     let prefix = string_arg(args, 1, "prefix")?;
-    Ok(vec![Value::Bool(s.starts_with(&*prefix))])
+    Ok(vec![Value::bool(s.starts_with(&*prefix))])
 }
 
 pub(crate) fn builtin_endswith(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = string_arg(args, 0, "s")?;
     let suffix = string_arg(args, 1, "suffix")?;
-    Ok(vec![Value::Bool(s.ends_with(&*suffix))])
+    Ok(vec![Value::bool(s.ends_with(&*suffix))])
 }
 
 pub(crate) fn builtin_len(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -929,13 +936,15 @@ impl FormatSpec {
 }
 
 fn format_integer_arg(value: Value) -> Result<BigInt, String> {
-    match value {
-        Value::Int(value) => Ok(BigInt::from(value)),
-        Value::BigInt(value) => Ok((*value).clone()),
-        Value::Float(value) if value.is_finite() && value.fract() == 0.0 => BigInt::from_f64(value)
-            .ok_or_else(|| "number has no integer representation".to_string()),
-        Value::Float(_) => Err("number has no integer representation".to_string()),
-        other => Err(format!("expected a number, got {}", other.type_name())),
+    match value.view() {
+        ValueView::Int(value) => Ok(BigInt::from(value)),
+        ValueView::BigInt(value) => Ok(value.clone()),
+        ValueView::Float(value) if value.is_finite() && value.fract() == 0.0 => {
+            BigInt::from_f64(value)
+                .ok_or_else(|| "number has no integer representation".to_string())
+        }
+        ValueView::Float(_) => Err("number has no integer representation".to_string()),
+        _ => Err(format!("expected a number, got {}", value.type_name())),
     }
 }
 
@@ -1162,11 +1171,11 @@ fn quote_string(s: &str) -> String {
 }
 
 fn format_quoted(value: Value) -> Result<String, String> {
-    Ok(match value {
-        Value::String(s) => quote_string(&s),
-        Value::Int(value) => value.to_string(),
-        Value::BigInt(value) => value.to_string(),
-        Value::Float(value) => {
+    Ok(match value.view() {
+        ValueView::String(s) => quote_string(&s),
+        ValueView::Int(i) => i.to_string(),
+        ValueView::BigInt(bi) => bi.to_string(),
+        ValueView::Float(value) => {
             if value.is_infinite() {
                 if value > 0.0 {
                     "1e9999".to_string()
@@ -1182,9 +1191,9 @@ fn format_quoted(value: Value) -> Result<String, String> {
                 format!("{}{}", sign, hex_float(value.abs(), None, false))
             }
         }
-        Value::Nil => "nil".to_string(),
-        Value::Bool(value) => value.to_string(),
-        other => return Err(format!("value has no literal form ({})", other.type_name())),
+        ValueView::Nil => "nil".to_string(),
+        ValueView::Bool(b) => b.to_string(),
+        _ => return Err(format!("value has no literal form ({})", value.type_name())),
     })
 }
 
@@ -1681,7 +1690,7 @@ pub(crate) fn builtin_unpack(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>,
                 } else {
                     f32::from_be_bytes(bytes)
                 };
-                values.push(Value::Float(value as f64));
+                values.push(Value::float(value as f64));
             }
             PackKind::Double => {
                 let bytes: [u8; 8] = data[pos..pos + 8].try_into().expect("slice is 8 bytes");
@@ -1690,7 +1699,7 @@ pub(crate) fn builtin_unpack(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>,
                 } else {
                     f64::from_be_bytes(bytes)
                 };
-                values.push(Value::Float(value));
+                values.push(Value::float(value));
             }
             PackKind::Char => values.push(bytes_to_string(&data[pos..pos + size])),
             PackKind::String => {

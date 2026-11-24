@@ -118,7 +118,7 @@ fn run(src: &str) -> (VM, Result<HostValue, String>) {
         .insert(StrRef::from("EXT"), HostValue::from_usize(id as usize));
     vm.globals.insert(
         StrRef::from("F"),
-        HostValue::Table(std::rc::Rc::new(RefCell::new(map))),
+        HostValue::table(std::rc::Rc::new(RefCell::new(map))),
     );
     let prelude = "local ext = setmetatable({}, { __index = function(_, k)\n\
                    return function(...) return __ffi_ext_call(EXT, F[k], ...) end\n\
@@ -208,10 +208,7 @@ fn permissions_follow_the_sandbox() {
     let mut vm = VM::new();
     let (id, map) = init_extension_with_fn(&mut vm, sdk_init, None).unwrap();
     vm.set_permissions(crate::vm::permissions::Permissions::deny_all());
-    let idx = match map.get_str("can_read") {
-        HostValue::Int(i) => i as usize,
-        _ => unreachable!(),
-    };
+    let idx = map.get_str("can_read").as_int().expect("integer index") as usize;
     let err = super::ext::call_ext(&mut vm, id, idx, &[HostValue::str("/etc/hosts")]).unwrap_err();
     assert!(err.contains("permission denied"), "{err}");
 }
@@ -228,9 +225,9 @@ fn tasks_park_on_the_pump_and_services_are_shared() {
         vm.globals
             .get(&StrRef::from(n))
             .cloned()
-            .unwrap_or(HostValue::Nil)
+            .unwrap_or(HostValue::NIL)
     };
-    assert!(matches!(global("before"), HostValue::Nil));
+    assert!(global("before").is_nil());
     assert_eq!(global("first").to_string(), "tick");
     assert_eq!(global("inline").to_string(), "tick");
     assert_eq!(global("greet").to_string(), "42");
