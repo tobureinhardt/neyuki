@@ -61,8 +61,9 @@ To eliminate the prototype's 6.6% semantic corruption on aliased references whil
    - Only ~5% multi-owner `Shared` objects use `rc` inc/dec on `Old`-to-`Old` stores/overwrites.
 4. **Honest Accounting of Cycle Collection (Local `Shared`-Only Collector):**
    - Intentional cycles (parent pointers, caches, observer graphs) should use `look(x)` or weak-value tables (`__mode = "v"` checked with `(slot, gen)`), incurring **zero** cycle-collection work.
-   - Accidental cycles among `Shared` objects are handled by a **bounded Bacon-Rajan trial-deletion pass that visits ONLY the `Shared` purple buffer** (populated exclusively when a `Shared` object's `rc` decrements while remaining `> 0`).
-   - It **never** scans `Beat`, `UniqueOwner` trees, `vm.stack`, or `globals`. If a codebase creates cycles solely through `look`/`__mode = "v"`, the purple buffer stays empty.
+   - Accidental cycles among `Shared` objects are handled by a **bounded Bacon-Rajan trial-deletion pass seeded ONLY from the `Shared` purple buffer** (populated exclusively when a `Shared` object's `rc` decrements while remaining `> 0`).
+   - Crucially, `mark_gray`/`scan_node`/`scan_black`/`collect_white` MUST traverse **both `Shared` and `UniqueOwner` children reachable from `purple`** (each `UniqueOwner` stores `rc = 1` uniformly in its header): a mixed cycle like `Shared A -> UniqueOwner B -> Shared A` would otherwise fail to decrement `A`'s back-edge and leak.
+   - It **never** seeds from or scans uninvolved `Beat`, disjoint `UniqueOwner` trees, `vm.stack`, or `globals`. If a codebase creates cycles solely through `look`/`__mode = "v"`, the purple buffer stays empty.
 
 ### 4.2 Write Barrier on `SetTable` / `SetField` / `SetIndex` / `SetUpval`
 On every container write `container[k] = val`:
@@ -96,9 +97,11 @@ To avoid leaking Rust `Vec`/`Box`/`String` allocations when resetting `beat.curs
 At loop back-edges, temporaries defined inside the loop body still occupy stack registers even though they are dead on the next iteration. Instead of inserting extra `ClearReg` opcodes into tight arithmetic loops:
 
 1. `src/compiler/ir/codegen.rs` already builds `LivenessInfo` (`src/compiler/ir/liveness.rs`) and maps `IrVar` -> `u8` via `RegAlloc` (`[u64; 4]` bitset in `src/compiler/ir/regalloc.rs`).
-2. During bytecode generation, each loop safe-point (`ForLoop`, `TForLoop`, and backward `Jump`) records `live_mask: [u64; 4]` (all registers mapped to variables in `live_in(header_block)`) indexed by bytecode PC on `Proto`.
-3. At runtime on every loop back-edge:
-   - **Zero-allocation fast path:** `if beat.cursor == mark`, nothing was allocated in Beat during this iteration -> skip root scanning and dead-register clearing in **1 predictable branch**.
+2. During bytecode generation, each loop safe-point (`ForLoop`, `TForLoop`, and backward `Jump`) computes `has_alloc`:
+   - **Pure scalar / non-allocating loops (`has_alloc == false` — no `NewTable`, `Closure`, `Concat`, `Call`, `NewBuffer`, etc. inside the loop body):** codegen omits the Beat safe-point check completely, avoiding the ~1 ns/iter check cost measured on tight 50M numeric loops.
+   - **Allocating loops (`has_alloc == true`):** codegen emits the Beat safe-point tagged with `live_mask: [u64; 4]` (all registers mapped to variables in `live_in(header_block)`) indexed by bytecode PC on `Proto`.
+3. At runtime on every allocating loop back-edge:
+   - **No-op iteration path (`beat.cursor == mark`, e.g., loop took an early-continue scalar branch):** skip root scanning and dead-register clearing in 1 comparison.
    - **Reset path (`beat.cursor != mark`):** scan ONLY registers whose bit is `1` in `live_mask` (+ open upvalues + `remembered_set`), reset `beat.cursor = mark`, and clear any dead register (`bit == 0` in `live_mask` within `0..max_registers`) whose tag is `Beat` back to `Value::NIL`. Stale temporaries can never pollute `Old` or become dangling pointers.
 
 ### 4.6 Coroutines & Deterministic Finalizers
