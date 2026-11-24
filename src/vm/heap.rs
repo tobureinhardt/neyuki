@@ -29,6 +29,19 @@ impl VmHeap {
     }
 
     #[inline]
+    pub fn alloc_table_sized(gc: &mut GcTracker, array_cap: u8, fields_cap: u8) -> Value {
+        let table = if array_cap == 0 && fields_cap == 0 {
+            VmTable::new()
+        } else {
+            VmTable::with_capacity(array_cap as usize, fields_cap as usize)
+        };
+        let rc = Rc::new(RefCell::new(table));
+        let size = 64 + (array_cap as usize) * std::mem::size_of::<Value>();
+        gc.register_table_sized(&rc, size);
+        Value::table(rc)
+    }
+
+    #[inline]
     pub fn alloc_table(gc: &mut GcTracker, table: VmTable) -> Value {
         let rc = Rc::new(RefCell::new(table));
         gc.register_table(&rc);
@@ -65,6 +78,12 @@ impl VmHeap {
 }
 
 impl VM {
+    /// Allocates a mutable GC-tracked table with precomputed `NewTable` capacities.
+    #[inline]
+    pub fn alloc_table_sized(&mut self, array_cap: u8, fields_cap: u8) -> Value {
+        VmHeap::alloc_table_sized(&mut self.gc, array_cap, fields_cap)
+    }
+
     /// Allocates a mutable GC-tracked table.
     #[inline]
     pub fn alloc_table(&mut self, table: VmTable) -> Value {

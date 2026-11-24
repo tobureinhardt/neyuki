@@ -7,7 +7,7 @@
 //! Slow paths, error construction, and `Drop`-bearing values stay in cold helpers
 //! or inner blocks so no destructors remain live across a tail call.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 use num_integer::Integer as _;
@@ -18,7 +18,7 @@ use crate::vm::frame::CallFrame;
 use crate::vm::machine::{HookEvent, RUNNING_FRAME, VM};
 use crate::vm::ops;
 use crate::vm::value::{
-    INLINE_INT_MAX, INLINE_INT_MIN, TAG_RC_START, Upvalue, Value, ValueView, VmClosure, VmTable,
+    INLINE_INT_MAX, INLINE_INT_MIN, TAG_RC_START, Upvalue, Value, ValueView, VmClosure,
 };
 
 #[repr(transparent)]
@@ -901,17 +901,10 @@ fn new_table_inner(
     if vm.gc.should_collect() || vm.gc.sweeping {
         vm.gc_auto_step()?;
     }
-    let table = if array_cap == 0 && fields_cap == 0 {
-        VmTable::new()
-    } else {
-        VmTable::with_capacity(array_cap as usize, fields_cap as usize)
-    };
-    let rc = Rc::new(RefCell::new(table));
-    let size = 64 + (array_cap as usize) * std::mem::size_of::<Value>();
-    vm.gc.register_table_sized(&rc, size);
+    let table_val = vm.alloc_table_sized(array_cap, fields_cap);
     unsafe {
         let new_regs = vm.stack.as_mut_ptr().add(base);
-        set_slot_val(new_regs.add(dst as usize), Value::table(rc));
+        set_slot_val(new_regs.add(dst as usize), table_val);
         Ok(new_regs)
     }
 }
@@ -5433,10 +5426,7 @@ fn closure_inner(vm: &mut VM, base: usize, dst: u8, proto_idx: u16) {
             upvalues.push(up);
         }
     }
-    let val = Value::closure(Rc::new(VmClosure {
-        proto: child_proto,
-        upvalues,
-    }));
+    let val = vm.alloc_closure(child_proto, upvalues);
     unsafe {
         set_slot_val(vm.stack.as_mut_ptr().add(base + dst as usize), val);
     }

@@ -10,7 +10,7 @@ use crate::bytecode::instruction::MULTRET;
 use crate::vm::frame::CallFrame;
 use crate::vm::machine::{HookEvent, RUNNING_FRAME, VM};
 use crate::vm::ops;
-use crate::vm::value::{TAG_RC_START, Upvalue, Value, ValueView, VmClosure, VmTable};
+use crate::vm::value::{TAG_RC_START, Upvalue, Value, ValueView, VmTable};
 
 /// A register of the running frame. The interpreter loop only calls this
 /// with indices below `base + max_registers` of a verified prototype, and
@@ -520,15 +520,8 @@ impl VM {
                             sync_ip!();
                         })?;
                     }
-                    let table = if array_cap == 0 && fields_cap == 0 {
-                        VmTable::new()
-                    } else {
-                        VmTable::with_capacity(array_cap as usize, fields_cap as usize)
-                    };
-                    let rc = Rc::new(RefCell::new(table));
-                    let size = 64 + (array_cap as usize) * std::mem::size_of::<Value>();
-                    self.gc.register_table_sized(&rc, size);
-                    set!(dst, Value::table(rc));
+                    let table_val = self.alloc_table_sized(array_cap, fields_cap);
+                    set!(dst, table_val);
                 }
                 ExecInst::GetTable { dst, table, key } => {
                     let tbl_val = &reg!(table);
@@ -2310,10 +2303,7 @@ impl VM {
                             upvalues.push(up);
                         }
                     }
-                    let new_closure = Value::closure(Rc::new(VmClosure {
-                        proto: child_proto,
-                        upvalues,
-                    }));
+                    let new_closure = self.alloc_closure(child_proto, upvalues);
                     set!(dst, new_closure);
                 }
                 ExecInst::TailCall { callee, argc } => {
@@ -3041,9 +3031,8 @@ impl VM {
             keys.reverse();
             let mut snapshot = VmTable::new();
             snapshot.array = keys;
-            let rc = Rc::new(RefCell::new(snapshot));
-            *state_slot = Value::table(rc.clone());
-            rc
+            *state_slot = crate::vm::heap::VmHeap::alloc_table_untracked(snapshot);
+            state_slot.as_table().unwrap().to_rc()
         };
         let mut snapshot = snapshot.borrow_mut();
         while let Some(key) = snapshot.array.pop() {

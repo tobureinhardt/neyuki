@@ -395,15 +395,15 @@ impl VM {
             });
             globals.insert(
                 tpl.g_key.clone(),
-                Value::table(Rc::new(RefCell::new(g_table))),
+                crate::vm::heap::VmHeap::alloc_table_untracked(g_table),
             );
 
             for (name, key, tbl, needs_deep) in &tpl.libs {
-                let lib = Value::table(if *needs_deep {
-                    deep_clone_table(tbl)
+                let lib = if *needs_deep {
+                    Value::table(deep_clone_table(tbl))
                 } else {
-                    Rc::new(RefCell::new(tbl.clone()))
-                });
+                    crate::vm::heap::VmHeap::alloc_table_untracked(tbl.clone())
+                };
                 if *name == "string" {
                     vm.string_lib = lib.clone();
                 } else if *name == "bit" {
@@ -1817,7 +1817,7 @@ return path .. \" \" .. params.name .. \" \" .. http.encode(\"a b\")";
         let mut root = VmTable::new();
         root.fields.insert(
             StrRef::from("path"),
-            Value::table(Rc::new(RefCell::new(inner))),
+            crate::vm::heap::VmHeap::alloc_table_untracked(inner),
         );
         root.metatable = Some(Rc::new(RefCell::new(mt)));
 
