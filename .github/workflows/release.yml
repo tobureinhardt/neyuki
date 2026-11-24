@@ -46,7 +46,7 @@ jobs:
         run: |
           name=neyuki-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir "$name"
-          cp LICENSE README.md "$name/"
+          cp LICENSE-MIT LICENSE-APACHE README.md "$name/"
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             cp target/${{ matrix.target }}/release/neyuki.exe "$name/"
             7z a "$name.zip" "$name"

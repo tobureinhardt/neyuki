@@ -37,7 +37,7 @@ ignore = [
 ]
 
 [licenses]
-# Licenses compatible with distributing Neyuki under MIT. Crates offered
+# Licenses compatible with distributing Neyuki under MIT OR Apache-2.0. Crates offered
 # under several licenses (e.g. `MIT OR LGPL-2.1-or-later`) pass as long as
 # one of them is listed here.
 allow = [
