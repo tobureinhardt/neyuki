@@ -4,6 +4,7 @@ pub mod call;
 pub mod frame;
 pub mod gc;
 pub mod hash;
+pub mod heap;
 pub mod interp;
 pub mod libs;
 pub mod limits;

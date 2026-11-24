@@ -88,6 +88,7 @@ pub struct VM {
     /// older epoch re-resolve instead of trusting a stale value.
     pub globals_epoch: u64,
     pub gc: GcTracker,
+    pub heap: crate::vm::heap::VmHeap,
     /// Coroutine states by id, held weakly: each handle table's `co_state`
     /// field owns its state, so dropping the last handle frees a suspended
     /// coroutine by refcounting.
@@ -331,6 +332,7 @@ impl VM {
             globals: new_map(),
             globals_epoch: 0,
             gc: GcTracker::new(),
+            heap: crate::vm::heap::VmHeap::new(),
             co_states: HashMap::new(),
             co_states_pruned_at: 0,
             next_co_id: 1,
