@@ -168,6 +168,8 @@ impl From<String> for StrRef {
 // ---- NaN-boxing bit constants ----
 
 const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+pub(crate) const BIT_BEAT: u64 = 1u64 << 47;
+const BEAT_PAYLOAD_MASK: u64 = 0x0000_7FFF_FFFF_FFFF;
 const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
 
@@ -204,10 +206,20 @@ pub const INLINE_INT_MAX: i64 = (1i64 << 47) - 1;
 fn pack_ptr<T>(ptr: *const T, tag: u64) -> u64 {
     let addr = ptr.expose_provenance() as u64;
     assert!(
-        addr <= PAYLOAD_MASK,
-        "pointer address {addr:#x} exceeds 48-bit NaN-box payload"
+        addr <= PAYLOAD_MASK && (tag < TAG_RC_START || (addr & BIT_BEAT) == 0),
+        "pointer address {addr:#x} exceeds 48-bit NaN-box payload or collides with BIT_BEAT"
     );
     tag | addr
+}
+
+#[inline(always)]
+fn pack_beat_ptr<T>(ptr: *const T, tag: u64) -> u64 {
+    let addr = ptr.expose_provenance() as u64;
+    assert!(
+        addr <= BEAT_PAYLOAD_MASK,
+        "beat pointer address {addr:#x} exceeds 47-bit payload"
+    );
+    tag | BIT_BEAT | addr
 }
 
 #[inline(always)]
@@ -216,12 +228,17 @@ fn unpack_ptr<T>(bits: u64) -> *const T {
 }
 
 #[inline(always)]
+fn unpack_beat_ptr<T>(bits: u64) -> *mut T {
+    std::ptr::with_exposed_provenance_mut((bits & BEAT_PAYLOAD_MASK) as usize)
+}
+
+#[inline(always)]
 fn pack_bigint(rc: Rc<BigInt>) -> u64 {
     let ptr = Rc::into_raw(rc);
     let addr = ptr.expose_provenance() as u64;
     assert!(
-        addr <= PAYLOAD_MASK && (addr & 1) == 0,
-        "BigInt pointer {addr:#x} invalid for 48-bit tagged NaN-box"
+        addr <= BEAT_PAYLOAD_MASK && (addr & 1) == 0,
+        "BigInt pointer {addr:#x} invalid for tagged NaN-box"
     );
     TAG_BIG | addr
 }
@@ -231,8 +248,8 @@ fn pack_heap_int(i: i64) -> u64 {
     let ptr = Rc::into_raw(Rc::new(i));
     let addr = ptr.expose_provenance() as u64;
     assert!(
-        addr <= PAYLOAD_MASK && (addr & 1) == 0,
-        "HeapInt pointer {addr:#x} invalid for 48-bit tagged NaN-box"
+        addr <= BEAT_PAYLOAD_MASK && (addr & 1) == 0,
+        "HeapInt pointer {addr:#x} invalid for tagged NaN-box"
     );
     TAG_BIG | addr | 1
 }
@@ -296,10 +313,11 @@ impl<T> Deref for BorrowedRc<'_, T> {
     }
 }
 
-/// Non-owning shared borrow of a [`VmString`] packed inside a [`Value`].
+/// Non-owning shared borrow of a [`VmString`] or Beat-allocated
+/// [`crate::vm::beat::BeatString`] packed inside a [`Value`].
 #[derive(Copy, Clone)]
 pub struct BorrowedStr<'a> {
-    ptr: *const VmString,
+    raw: usize,
     _marker: PhantomData<&'a VmString>,
 }
 
@@ -307,39 +325,82 @@ impl<'a> BorrowedStr<'a> {
     #[inline(always)]
     unsafe fn from_raw(ptr: *const VmString) -> Self {
         Self {
-            ptr,
+            raw: ptr.expose_provenance(),
             _marker: PhantomData,
         }
     }
 
     #[inline(always)]
+    unsafe fn from_beat_raw(ptr: *const crate::vm::beat::BeatString) -> Self {
+        Self {
+            raw: ptr.expose_provenance() | 1,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_beat(self) -> bool {
+        (self.raw & 1) != 0
+    }
+
+    #[inline(always)]
+    pub fn as_old_vmstr(self) -> Option<(*const VmString, &'a VmString)> {
+        if self.is_beat() {
+            None
+        } else {
+            let ptr: *const VmString = std::ptr::with_exposed_provenance(self.raw);
+            Some((ptr, unsafe { &*ptr }))
+        }
+    }
+
+    #[inline(always)]
     pub fn as_ptr(self) -> *const VmString {
-        self.ptr
+        assert!(!self.is_beat(), "BorrowedStr::as_ptr called on BeatString");
+        std::ptr::with_exposed_provenance(self.raw)
     }
 
     #[inline(always)]
     pub fn vm_str(self) -> &'a VmString {
-        // SAFETY: `self.ptr` stays alive for at least `'a`.
-        unsafe { &*self.ptr }
+        assert!(!self.is_beat(), "BorrowedStr::vm_str called on BeatString");
+        unsafe { &*std::ptr::with_exposed_provenance::<VmString>(self.raw) }
+    }
+
+    #[inline(always)]
+    pub fn beat_str(self) -> &'a crate::vm::beat::BeatString {
+        unsafe { &*std::ptr::with_exposed_provenance::<crate::vm::beat::BeatString>(self.raw & !1) }
     }
 
     #[inline(always)]
     pub fn as_str(self) -> &'a str {
-        &self.vm_str().str
+        if self.is_beat() {
+            self.beat_str().as_str()
+        } else {
+            &self.vm_str().str
+        }
     }
 
     #[inline(always)]
     pub fn hash_u64(self) -> u64 {
-        self.vm_str().hash
+        if self.is_beat() {
+            self.beat_str().hash
+        } else {
+            self.vm_str().hash
+        }
     }
 
-    /// Promotes this borrow into an owned [`StrRef`], incrementing the refcount.
+    /// Promotes this borrow into an owned [`StrRef`], incrementing the refcount
+    /// for `Old` strings or materializing an `Rc<VmString>` for Beat strings.
     #[inline]
     pub fn to_str_ref(self) -> StrRef {
-        // SAFETY: `self.ptr` came from `Rc::into_raw` and remains live for `'a`.
-        unsafe {
-            Rc::increment_strong_count(self.ptr);
-            StrRef(Rc::from_raw(self.ptr))
+        if self.is_beat() {
+            StrRef::from(self.beat_str().as_str())
+        } else {
+            let ptr: *const VmString = std::ptr::with_exposed_provenance(self.raw);
+            // SAFETY: `ptr` came from `Rc::into_raw` and remains live for `'a`.
+            unsafe {
+                Rc::increment_strong_count(ptr);
+                StrRef(Rc::from_raw(ptr))
+            }
         }
     }
 }
@@ -363,8 +424,78 @@ impl AsRef<str> for BorrowedStr<'_> {
 impl PartialEq for BorrowedStr<'_> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self.ptr, other.ptr)
+        self.raw == other.raw
             || (self.hash_u64() == other.hash_u64() && self.as_str() == other.as_str())
+    }
+}
+
+/// Uniform read borrow over either an Old `Rc<RefCell<VmTable>>` or a Beat
+/// [`crate::vm::beat::BeatTable`].
+pub enum TableBorrow<'a> {
+    Old(std::cell::Ref<'a, VmTable>),
+    Beat(&'a crate::vm::beat::BeatTable),
+}
+
+impl<'a> TableBorrow<'a> {
+    #[inline(always)]
+    pub fn array_slice(&self) -> &[Value] {
+        match self {
+            TableBorrow::Old(t) => &t.array,
+            TableBorrow::Beat(t) => t.array_slice(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn array_len(&self) -> usize {
+        self.array_slice().len()
+    }
+
+    #[inline(always)]
+    pub fn get_str(&self, key: &str) -> Value {
+        match self {
+            TableBorrow::Old(t) => t.get_str(key),
+            TableBorrow::Beat(t) => t.get_str(key),
+        }
+    }
+
+    #[inline(always)]
+    pub fn raw_get(&self, key: &Value) -> Value {
+        match self {
+            TableBorrow::Old(t) => t.raw_get(key),
+            TableBorrow::Beat(t) => t.raw_get(key),
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_frozen(&self) -> bool {
+        match self {
+            TableBorrow::Old(t) => t.frozen,
+            TableBorrow::Beat(t) => t.is_frozen(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn has_co_state(&self) -> bool {
+        match self {
+            TableBorrow::Old(t) => t.co_state.is_some(),
+            TableBorrow::Beat(t) => t.has_co_state(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn co_state(&self) -> Option<Rc<RefCell<crate::vm::machine::CoroutineState>>> {
+        match self {
+            TableBorrow::Old(t) => t.co_state.clone(),
+            TableBorrow::Beat(t) => t.co_state(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn metatable(&self) -> Option<Rc<RefCell<VmTable>>> {
+        match self {
+            TableBorrow::Old(t) => t.metatable.clone(),
+            TableBorrow::Beat(t) => t.extra_ref().and_then(|e| e.metatable.clone()),
+        }
     }
 }
 
@@ -466,8 +597,9 @@ unsafe fn drop_rc_slow(bits: u64) {
 impl Clone for Value {
     #[inline(always)]
     fn clone(&self) -> Self {
-        if self.0 >= TAG_RC_START {
-            // SAFETY: `self.0 >= TAG_RC_START` guarantees a valid `Rc::into_raw` payload.
+        if self.0 >= TAG_RC_START && (self.0 & BIT_BEAT) == 0 {
+            // SAFETY: `self.0 >= TAG_RC_START && (self.0 & BIT_BEAT) == 0`
+            // guarantees a valid Old `Rc::into_raw` payload.
             unsafe { clone_rc_slow(self.0) };
         }
         Value(self.0)
@@ -477,8 +609,9 @@ impl Clone for Value {
 impl Drop for Value {
     #[inline(always)]
     fn drop(&mut self) {
-        if self.0 >= TAG_RC_START {
-            // SAFETY: `self.0 >= TAG_RC_START` guarantees this Value owns one strong ref.
+        if self.0 >= TAG_RC_START && (self.0 & BIT_BEAT) == 0 {
+            // SAFETY: `self.0 >= TAG_RC_START && (self.0 & BIT_BEAT) == 0`
+            // guarantees this Value owns one strong Old `Rc` ref.
             unsafe { drop_rc_slow(self.0) };
         }
     }
@@ -536,8 +669,38 @@ impl Value {
     }
 
     #[inline(always)]
+    pub fn beat_string(ptr: *const crate::vm::beat::BeatString) -> Value {
+        Value(pack_beat_ptr(ptr, TAG_STRING))
+    }
+
+    #[inline(always)]
     pub fn table(t: Rc<RefCell<VmTable>>) -> Value {
         Value(pack_ptr(Rc::into_raw(t), TAG_TABLE))
+    }
+
+    #[inline(always)]
+    pub fn beat_table(ptr: *const crate::vm::beat::BeatTable) -> Value {
+        Value(pack_beat_ptr(ptr, TAG_TABLE))
+    }
+
+    #[inline(always)]
+    pub const fn is_beat(&self) -> bool {
+        self.0 >= TAG_RC_START && (self.0 & BIT_BEAT) != 0
+    }
+
+    #[inline(always)]
+    pub const fn is_beat_string(&self) -> bool {
+        (self.0 & (TAG_MASK | BIT_BEAT)) == (TAG_STRING | BIT_BEAT)
+    }
+
+    #[inline(always)]
+    pub const fn is_beat_table(&self) -> bool {
+        (self.0 & (TAG_MASK | BIT_BEAT)) == (TAG_TABLE | BIT_BEAT)
+    }
+
+    #[inline(always)]
+    pub const fn is_old_table(&self) -> bool {
+        (self.0 & (TAG_MASK | BIT_BEAT)) == TAG_TABLE
     }
 
     #[inline(always)]
@@ -774,7 +937,15 @@ impl Value {
     #[inline(always)]
     pub fn as_str_ref(&self) -> Option<BorrowedStr<'_>> {
         if self.is_string() {
-            Some(unsafe { BorrowedStr::from_raw(unpack_ptr::<VmString>(self.0)) })
+            if (self.0 & BIT_BEAT) != 0 {
+                Some(unsafe {
+                    BorrowedStr::from_beat_raw(unpack_beat_ptr::<crate::vm::beat::BeatString>(
+                        self.0,
+                    ))
+                })
+            } else {
+                Some(unsafe { BorrowedStr::from_raw(unpack_ptr::<VmString>(self.0)) })
+            }
         } else {
             None
         }
@@ -791,13 +962,22 @@ impl Value {
     }
 
     #[inline(always)]
+    pub fn beat_str_ptr(&self) -> Option<*mut crate::vm::beat::BeatString> {
+        if self.is_beat_string() {
+            Some(unpack_beat_ptr::<crate::vm::beat::BeatString>(self.0))
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
     pub const fn is_table(&self) -> bool {
         (self.0 & TAG_MASK) == TAG_TABLE
     }
 
     #[inline(always)]
     pub fn as_table(&self) -> Option<BorrowedRc<'_, RefCell<VmTable>>> {
-        if self.is_table() {
+        if self.is_old_table() {
             Some(unsafe { BorrowedRc::from_raw(unpack_ptr::<RefCell<VmTable>>(self.0)) })
         } else {
             None
@@ -806,8 +986,43 @@ impl Value {
 
     #[inline(always)]
     pub fn table_ptr(&self) -> Option<*const RefCell<VmTable>> {
-        if self.is_table() {
+        if self.is_old_table() {
             Some(unpack_ptr::<RefCell<VmTable>>(self.0))
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn beat_table_ptr(&self) -> Option<*mut crate::vm::beat::BeatTable> {
+        if self.is_beat_table() {
+            Some(unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0))
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn table_borrow(&self) -> Option<TableBorrow<'_>> {
+        if self.is_old_table() {
+            let tbl = unsafe { &*unpack_ptr::<RefCell<VmTable>>(self.0) };
+            Some(TableBorrow::Old(tbl.borrow()))
+        } else if self.is_beat_table() {
+            let tbl = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0) };
+            Some(TableBorrow::Beat(tbl))
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn try_table_borrow(&self) -> Option<Result<TableBorrow<'_>, std::cell::BorrowError>> {
+        if self.is_old_table() {
+            let tbl = unsafe { &*unpack_ptr::<RefCell<VmTable>>(self.0) };
+            Some(tbl.try_borrow().map(TableBorrow::Old))
+        } else if self.is_beat_table() {
+            let tbl = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0) };
+            Some(Ok(TableBorrow::Beat(tbl)))
         } else {
             None
         }
@@ -896,11 +1111,27 @@ impl Value {
             },
             TAG_NATIVE_HI => ValueView::Native(unsafe { &*unpack_ptr::<NativeDef>(bits) }),
             TAG_STRING_HI => {
-                ValueView::String(unsafe { BorrowedStr::from_raw(unpack_ptr::<VmString>(bits)) })
+                if (bits & BIT_BEAT) != 0 {
+                    ValueView::String(unsafe {
+                        BorrowedStr::from_beat_raw(unpack_beat_ptr::<crate::vm::beat::BeatString>(
+                            bits,
+                        ))
+                    })
+                } else {
+                    ValueView::String(unsafe {
+                        BorrowedStr::from_raw(unpack_ptr::<VmString>(bits))
+                    })
+                }
             }
-            TAG_TABLE_HI => ValueView::Table(unsafe {
-                BorrowedRc::from_raw(unpack_ptr::<RefCell<VmTable>>(bits))
-            }),
+            TAG_TABLE_HI => {
+                assert!(
+                    (bits & BIT_BEAT) == 0,
+                    "Value::view called on BeatTable; use table_borrow()"
+                );
+                ValueView::Table(unsafe {
+                    BorrowedRc::from_raw(unpack_ptr::<RefCell<VmTable>>(bits))
+                })
+            }
             TAG_CLOSURE_HI => {
                 ValueView::Closure(unsafe { BorrowedRc::from_raw(unpack_ptr::<VmClosure>(bits)) })
             }
@@ -934,8 +1165,22 @@ impl Value {
                     _ => OwnedValue::Bool(true),
                 },
                 TAG_NATIVE_HI => OwnedValue::Native(&*unpack_ptr::<NativeDef>(bits)),
-                TAG_STRING_HI => OwnedValue::String(StrRef(Rc::from_raw(unpack_ptr(bits)))),
-                TAG_TABLE_HI => OwnedValue::Table(Rc::from_raw(unpack_ptr(bits))),
+                TAG_STRING_HI => {
+                    if (bits & BIT_BEAT) != 0 {
+                        let bs = &*unpack_beat_ptr::<crate::vm::beat::BeatString>(bits);
+                        OwnedValue::String(StrRef::from(bs.as_str()))
+                    } else {
+                        OwnedValue::String(StrRef(Rc::from_raw(unpack_ptr(bits))))
+                    }
+                }
+                TAG_TABLE_HI => {
+                    if (bits & BIT_BEAT) != 0 {
+                        let bt = &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(bits);
+                        OwnedValue::Table(Rc::new(RefCell::new(bt.to_vm_table_cloned())))
+                    } else {
+                        OwnedValue::Table(Rc::from_raw(unpack_ptr(bits)))
+                    }
+                }
                 TAG_CLOSURE_HI => OwnedValue::Closure(Rc::from_raw(unpack_ptr(bits))),
                 TAG_BUFFER_HI => OwnedValue::Buffer(Rc::from_raw(unpack_ptr(bits))),
                 _ => {
@@ -952,10 +1197,15 @@ impl Value {
 
     #[inline]
     pub fn into_table(self) -> Result<Rc<RefCell<VmTable>>, Value> {
-        if self.is_table() {
+        if self.is_old_table() {
             let bits = self.0;
             std::mem::forget(self);
             Ok(unsafe { Rc::from_raw(unpack_ptr(bits)) })
+        } else if self.is_beat_table() {
+            let bt = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0) };
+            let vm_tbl = bt.to_vm_table_cloned();
+            std::mem::forget(self);
+            Ok(Rc::new(RefCell::new(vm_tbl)))
         } else {
             Err(self)
         }
@@ -964,9 +1214,16 @@ impl Value {
     #[inline]
     pub fn into_str_ref(self) -> Result<StrRef, Value> {
         if self.is_string() {
-            let bits = self.0;
-            std::mem::forget(self);
-            Ok(StrRef(unsafe { Rc::from_raw(unpack_ptr(bits)) }))
+            if (self.0 & BIT_BEAT) != 0 {
+                let s = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatString>(self.0) };
+                let owned = StrRef::from(s.as_str());
+                std::mem::forget(self);
+                Ok(owned)
+            } else {
+                let bits = self.0;
+                std::mem::forget(self);
+                Ok(StrRef(unsafe { Rc::from_raw(unpack_ptr(bits)) }))
+            }
         } else {
             Err(self)
         }
@@ -1052,6 +1309,13 @@ impl Value {
     }
 
     pub fn type_name(&self) -> &'static str {
+        if let Some(bt) = self.beat_table_ptr() {
+            return if unsafe { &*bt }.has_co_state() {
+                "thread"
+            } else {
+                "table"
+            };
+        }
         match self.view() {
             ValueView::Nil => "nil",
             ValueView::Bool(_) => "boolean",
@@ -1065,6 +1329,13 @@ impl Value {
     }
 
     pub fn typeof_name(&self) -> &'static str {
+        if let Some(bt) = self.beat_table_ptr() {
+            return if unsafe { &*bt }.has_co_state() {
+                "thread"
+            } else {
+                "table"
+            };
+        }
         match self.view() {
             ValueView::Nil => "nil",
             ValueView::Bool(_) => "boolean",
@@ -1099,13 +1370,11 @@ impl Value {
                 "array" | "list" => self.is_table(),
                 "buf" | "buffer" => self.is_buffer(),
                 "thread" | "coroutine" => self
-                    .as_table()
-                    .is_some_and(|t| t.try_borrow().is_ok_and(|t| t.co_state.is_some())),
+                    .try_table_borrow()
+                    .is_some_and(|t| t.is_ok_and(|t| t.has_co_state())),
                 "function" => self.is_callable(),
                 other_name => {
-                    if let Some(t) = self.as_table()
-                        && let Ok(tbl) = t.try_borrow()
-                    {
+                    if let Some(Ok(tbl)) = self.try_table_borrow() {
                         if let Some(e) = tbl.get_str("__enum").as_str()
                             && e.eq_ignore_ascii_case(other_name)
                         {
@@ -1116,7 +1385,7 @@ impl Value {
                         {
                             return true;
                         }
-                        if let Some(meta) = &tbl.metatable
+                        if let Some(meta) = tbl.metatable()
                             && let Ok(mt) = meta.try_borrow()
                             && let Some(n) = mt.get_str("__name").as_str()
                             && n.eq_ignore_ascii_case(other_name)
@@ -1130,9 +1399,11 @@ impl Value {
             TypeExpr::Optional(inner) => self.is_nil() || self.matches_type_expr(inner),
             TypeExpr::Union(variants) => variants.iter().any(|v| self.matches_type_expr(v)),
             TypeExpr::Array(elem_ty) => {
-                if let Some(t) = self.as_table() {
-                    if let Ok(tbl) = t.try_borrow() {
-                        tbl.array.iter().all(|elem| elem.matches_type_expr(elem_ty))
+                if let Some(t) = self.try_table_borrow() {
+                    if let Ok(tbl) = t {
+                        tbl.array_slice()
+                            .iter()
+                            .all(|elem| elem.matches_type_expr(elem_ty))
                     } else {
                         true
                     }
@@ -1141,8 +1412,8 @@ impl Value {
                 }
             }
             TypeExpr::Record(fields) => {
-                if let Some(t) = self.as_table() {
-                    if let Ok(tbl) = t.try_borrow() {
+                if let Some(t) = self.try_table_borrow() {
+                    if let Ok(tbl) = t {
                         for (fname, fty) in fields {
                             let fval = tbl.get_str(fname);
                             if !fval.matches_type_expr(fty) {
@@ -1166,6 +1437,9 @@ impl Value {
     #[cold]
     #[inline(never)]
     fn eq_slow(&self, other: &Self) -> bool {
+        if self.is_table() || other.is_table() {
+            return false;
+        }
         match (self.view(), other.view()) {
             (ValueView::Float(a), ValueView::Float(b)) => a == b,
             (ValueView::Int(a), ValueView::Int(b)) => a == b,
@@ -1265,11 +1539,16 @@ impl VmTable {
             return self.raw_get(&Value::int(f as i64));
         }
         match key.view() {
-            ValueView::String(k) => self
-                .fields
-                .get_by_vmstr(k.as_ptr(), k.vm_str())
-                .cloned()
-                .unwrap_or(Value::NIL),
+            ValueView::String(k) => {
+                if let Some((k_ptr, k_vms)) = k.as_old_vmstr() {
+                    self.fields
+                        .get_by_vmstr(k_ptr, k_vms)
+                        .cloned()
+                        .unwrap_or(Value::NIL)
+                } else {
+                    self.fields.get(k.as_str()).cloned().unwrap_or(Value::NIL)
+                }
+            }
             ValueView::Int(i) if i >= 1 && (i as u64) <= self.array.len() as u64 => {
                 self.array[i as usize - 1].clone()
             }
@@ -1287,7 +1566,11 @@ impl VmTable {
     pub fn raw_set(&mut self, key: Value, val: Value) -> Result<(), String> {
         if let Some(s) = key.as_str_ref() {
             if val.is_nil() {
-                self.fields.remove_by_vmstr(s.as_ptr(), s.vm_str());
+                if let Some((s_ptr, s_vms)) = s.as_old_vmstr() {
+                    self.fields.remove_by_vmstr(s_ptr, s_vms);
+                } else {
+                    self.fields.remove(s.as_str());
+                }
             } else {
                 let owned = key.into_str_ref().unwrap_or_else(|_| unreachable!());
                 self.fields.insert(owned, val);
@@ -1493,6 +1776,9 @@ impl From<&str> for Value {
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_beat_table() {
+            return write!(f, "table");
+        }
         match self.view() {
             ValueView::Nil => write!(f, "nil"),
             ValueView::Bool(b) => write!(f, "{}", b),
@@ -1611,5 +1897,62 @@ mod tests {
         drop(vs2);
         assert_eq!(Rc::strong_count(&tbl), 1);
         assert_eq!(Rc::strong_count(&s.0), 1);
+    }
+
+    #[test]
+    fn beat_value_tags_skip_rc_and_borrow_uniformly() {
+        let mut beat = crate::vm::beat::BeatArena::new();
+        let bs = beat.alloc_string("beat_key");
+        let bt = beat.alloc_table(2, 2);
+        let vs_beat = Value::beat_string(bs);
+        let vt_beat = Value::beat_table(bt);
+
+        assert!(vs_beat.is_beat());
+        assert!(vs_beat.is_beat_string());
+        assert!(vs_beat.is_string());
+        assert!(!vs_beat.is_table());
+        assert_eq!(vs_beat.as_str(), Some("beat_key"));
+
+        assert!(vt_beat.is_beat());
+        assert!(vt_beat.is_beat_table());
+        assert!(vt_beat.is_table());
+        assert!(!vt_beat.is_old_table());
+        assert!(vt_beat.as_table().is_none());
+        assert!(vt_beat.table_ptr().is_none());
+        assert_eq!(vt_beat.beat_table_ptr(), Some(bt));
+        assert_eq!(vt_beat.type_name(), "table");
+        assert_eq!(vt_beat.typeof_name(), "table");
+        assert_eq!(format!("{vt_beat}"), "table");
+
+        // Compare BeatString equality against an Old VmString with identical content.
+        let vs_old = Value::str("beat_key");
+        assert_eq!(vs_beat, vs_old);
+        assert_eq!(vs_old, vs_beat);
+
+        // Clone and drop of Beat values must not touch any Rc or mutate arena state.
+        let vt_clone = vt_beat.clone();
+        let vs_clone = vs_beat.clone();
+        assert_eq!(vt_clone, vt_beat);
+        assert_eq!(vs_clone, vs_beat);
+        assert_ne!(vt_beat, Value::NIL);
+
+        unsafe {
+            beat.table_raw_set(bt, vs_beat.clone(), Value::int(77))
+                .unwrap();
+            beat.table_raw_set(bt, Value::int(1), Value::int(11))
+                .unwrap();
+        }
+        {
+            let tb = vt_beat.table_borrow().unwrap();
+            assert_eq!(tb.array_len(), 1);
+            assert_eq!(tb.get_str("beat_key"), Value::int(77));
+            assert_eq!(tb.raw_get(&vs_old), Value::int(77));
+            assert_eq!(tb.raw_get(&Value::int(1)), Value::int(11));
+        }
+
+        // Convert BeatTable into Old via into_table without mutating the Beat slot.
+        let owned_rc = vt_clone.into_table().unwrap();
+        assert_eq!(owned_rc.borrow().get_str("beat_key"), Value::int(77));
+        assert_eq!(owned_rc.borrow().array, vec![Value::int(11)]);
     }
 }

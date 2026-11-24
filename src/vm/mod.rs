@@ -1,3 +1,4 @@
+pub mod beat;
 pub mod buffer;
 pub mod builtins;
 pub mod call;
