@@ -136,7 +136,7 @@ impl<'a> SemanticAnalyzer<'a> {
             };
             if attr.name == "allow" && attr.args.is_empty() {
                 let diag = Diagnostic::warning("attribute '@allow' expects at least one rule name")
-                    .with_code(ErrorCode::W0005)
+                    .with_code(ErrorCode::W0007)
                     .with_label(span, "missing rule argument, e.g. '@allow(unused)'");
                 self.diagnostics.push(diag);
             } else if attr.name == "deprecated"
@@ -149,7 +149,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 let diag = Diagnostic::warning(
                     "attribute '@deprecated' expects an optional string message",
                 )
-                .with_code(ErrorCode::W0005)
+                .with_code(ErrorCode::W0007)
                 .with_label(span, "expected string literal reason");
                 self.diagnostics.push(diag);
             }
@@ -540,7 +540,7 @@ impl<'a> SemanticAnalyzer<'a> {
                     format!("use of deprecated '{}': {}", name, reason)
                 };
                 let diag = Diagnostic::warning(msg)
-                    .with_code(ErrorCode::W0005)
+                    .with_code(ErrorCode::W0008)
                     .with_label(span, "deprecated symbol referenced here")
                     .with_secondary_label(decl_span, "marked '@deprecated' here");
                 self.diagnostics.push(diag);

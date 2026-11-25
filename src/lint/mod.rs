@@ -445,9 +445,35 @@ print(old_fn())
         );
         let dep = diags
             .iter()
-            .find(|d| d.code == Some(ErrorCode::W0005))
+            .find(|d| d.code == Some(ErrorCode::W0008))
             .expect("expected deprecation warning");
         assert!(dep.message.contains("old_fn"));
         assert!(dep.message.contains("use new_fn"));
+        assert!(
+            !diags.iter().any(|d| d.code == Some(ErrorCode::W0005)),
+            "deprecation must not be tagged as a redundant operation: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn invalid_attributes_have_their_own_code() {
+        let source = "@allow
+local a = 1
+@deprecated(42)
+local function f() end
+print(a, f)
+";
+        let diags = lint_source(source);
+        let invalid: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(ErrorCode::W0007))
+            .collect();
+        assert_eq!(invalid.len(), 2, "{:?}", diags);
+        assert!(
+            !diags.iter().any(|d| d.code == Some(ErrorCode::W0005)),
+            "{:?}",
+            diags
+        );
     }
 }
