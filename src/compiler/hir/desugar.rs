@@ -25,15 +25,28 @@ fn block_has_loop_ctrl(stmts: &[HirStmt]) -> bool {
     })
 }
 
+/// Only a string literal is statically a string: a concatenation can return
+/// any value through `__concat`, so `"" .. (t .. u)` must keep its outer
+/// concat.
 fn is_static_string(expr: &HirExpr) -> bool {
-    matches!(
-        expr.kind,
-        HirExprKind::Literal(Literal::String(_))
-            | HirExprKind::Binary {
-                op: BinOp::Concat,
-                ..
-            }
-    )
+    matches!(expr.kind, HirExprKind::Literal(Literal::String(_)))
+}
+
+/// Takes an operand out of `and`/`or`/`??` for the folded expression. A
+/// binary operand is cut to one value, so a call or `...` is wrapped in
+/// `Paren` to keep that truncation once the operator is gone.
+fn take_single_value(expr: &mut HirExpr) -> HirExprKind {
+    let kind = std::mem::replace(&mut expr.kind, HirExprKind::Literal(Literal::Nil));
+    match kind {
+        HirExprKind::Call { .. } | HirExprKind::MethodCall { .. } | HirExprKind::Vararg => {
+            HirExprKind::Paren(Box::new(HirExpr {
+                hir_id: expr.hir_id,
+                source_id: expr.source_id,
+                kind,
+            }))
+        }
+        other => other,
+    }
 }
 
 fn is_known_boolean(expr: &HirExpr) -> bool {
@@ -160,11 +173,7 @@ fn optimize_expr(expr: &mut HirExpr, opt_level: OptLevel) {
                         if !lit.is_truthy() {
                             expr.kind = HirExprKind::Literal(lit.clone());
                         } else {
-                            let rhs = std::mem::replace(
-                                &mut right.kind,
-                                HirExprKind::Literal(Literal::Nil),
-                            );
-                            expr.kind = rhs;
+                            expr.kind = take_single_value(right);
                         }
                     }
                 }
@@ -173,22 +182,14 @@ fn optimize_expr(expr: &mut HirExpr, opt_level: OptLevel) {
                         if lit.is_truthy() {
                             expr.kind = HirExprKind::Literal(lit.clone());
                         } else {
-                            let rhs = std::mem::replace(
-                                &mut right.kind,
-                                HirExprKind::Literal(Literal::Nil),
-                            );
-                            expr.kind = rhs;
+                            expr.kind = take_single_value(right);
                         }
                     }
                 }
                 BinOp::Coalesce => {
                     if let HirExprKind::Literal(lit) = &left.kind {
                         if matches!(lit, Literal::Nil) {
-                            let rhs = std::mem::replace(
-                                &mut right.kind,
-                                HirExprKind::Literal(Literal::Nil),
-                            );
-                            expr.kind = rhs;
+                            expr.kind = take_single_value(right);
                         } else {
                             expr.kind = HirExprKind::Literal(lit.clone());
                         }

@@ -5,6 +5,7 @@ use num_integer::Integer as _;
 use num_traits::{FromPrimitive, ToPrimitive, Zero};
 use std::collections::HashSet;
 
+use crate::ast::NodeId;
 use crate::ast::literal::Literal;
 use crate::ast::op::{BinOp, UnOp};
 use crate::ast::pattern::AssignTarget;
@@ -456,6 +457,23 @@ fn fold_assign_target_scoped(target: AssignTarget, shadowed: &HashSet<String>) -
     }
 }
 
+// The operand of a folded `and`/`or`/`??` stands in for the whole binary
+// expression, which yields one value: a call or `...` keeps that truncation
+// in a `Paren` that takes over the binary node's id.
+fn single_value(expr: Expr, id: NodeId) -> Expr {
+    if matches!(
+        expr,
+        Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Vararg { .. }
+    ) {
+        Expr::Paren {
+            expr: Box::new(expr),
+            id,
+        }
+    } else {
+        expr
+    }
+}
+
 // Recursively optimize an AST expression by folding constants with shadow tracking
 fn fold_expr_scoped(expr: Expr, shadowed: &HashSet<String>) -> Expr {
     match expr {
@@ -532,14 +550,14 @@ fn fold_expr_scoped(expr: Expr, shadowed: &HashSet<String>) -> Expr {
                     if !c.is_truthy() {
                         return folded_left;
                     }
-                    return fold_expr_scoped(*right, shadowed);
+                    return single_value(fold_expr_scoped(*right, shadowed), id);
                 }
             } else if op == BinOp::Or {
                 if let Some(c) = FoldVal::from_expr(&folded_left) {
                     if c.is_truthy() {
                         return folded_left;
                     }
-                    return fold_expr_scoped(*right, shadowed);
+                    return single_value(fold_expr_scoped(*right, shadowed), id);
                 }
             } else if op == BinOp::Coalesce
                 && let Some(c) = FoldVal::from_expr(&folded_left)
@@ -547,7 +565,7 @@ fn fold_expr_scoped(expr: Expr, shadowed: &HashSet<String>) -> Expr {
                 if c != FoldVal::Nil {
                     return folded_left;
                 }
-                return fold_expr_scoped(*right, shadowed);
+                return single_value(fold_expr_scoped(*right, shadowed), id);
             }
 
             let folded_right = fold_expr_scoped(*right, shadowed);

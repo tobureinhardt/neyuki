@@ -209,6 +209,21 @@ fn fold_constants_and_branches(body: &mut MirBody) -> bool {
     let num_locals = body.locals.len();
     let mut consts: Vec<Option<MirConst>> = vec![None; num_locals];
 
+    // Locals captured by a closure can be rewritten by any call or metamethod
+    // that runs that closure, so their values are never tracked.
+    let mut captured = vec![false; num_locals];
+    for bb in &body.blocks {
+        for stmt in &bb.statements {
+            if let StatementKind::Assign(_, Rvalue::Closure { captures, .. }) = &stmt.kind {
+                for cap in captures.iter().flatten() {
+                    if let Some(slot) = captured.get_mut(cap.0 as usize) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+    }
+
     for bb in &mut body.blocks {
         consts.fill(None);
         for stmt in &mut bb.statements {
@@ -258,7 +273,7 @@ fn fold_constants_and_branches(body: &mut MirBody) -> bool {
                     *rvalue = Rvalue::Use(Operand::Constant(c.clone()));
                     changed = true;
                 }
-                if dst_idx < consts.len() {
+                if dst_idx < consts.len() && !captured[dst_idx] {
                     consts[dst_idx] = Some(c);
                 }
             } else if dst_idx < consts.len() {
