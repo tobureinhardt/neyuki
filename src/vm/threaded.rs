@@ -772,9 +772,12 @@ fn cold_get_upval_dispatch(
     unsafe {
         let uv = &*vm.cur_upvals.add(upval_idx as usize);
         match uv.location.get() {
-            Some(idx) => {
+            Some(idx) if idx < vm.stack.len() => {
                 copy_slot(regs.add(dst as usize), vm.stack.as_ptr().add(idx));
             }
+            // An upvalue still open past the end of the stack reads as nil,
+            // matching the loop interpreter's `upvalue_get`.
+            Some(_) => set_slot_val(regs.add(dst as usize), Value::NIL),
             None => {
                 uv.with_closed(|v| copy_slot(regs.add(dst as usize), v));
             }
@@ -833,8 +836,9 @@ fn op_get_upval(
     unsafe {
         let uv = &*vm.cur_upvals.add(upval_idx as usize);
         let src_ptr: *const Value = match uv.location.get() {
-            Some(idx) => vm.stack.as_ptr().add(idx),
+            Some(idx) if idx < vm.stack.len() => vm.stack.as_ptr().add(idx),
             None => uv.closed_ptr() as *const Value,
+            _ => return cold_get_upval_dispatch(vm, regs, pc, consts, dtbl, raw),
         };
         let src_ref = &*src_ptr;
         let src_bits = src_ref.bits();
@@ -964,7 +968,9 @@ fn op_get_table(
             let idx = i as usize - 1;
             if idx < tbl.array.len() {
                 let v_bits = tbl.array[idx].bits();
-                if v_bits < TAG_RC_START {
+                // A nil hole goes to the cold path so `__index` runs.
+                if v_bits < TAG_RC_START && (v_bits != Value::NIL.bits() || tbl.metatable.is_none())
+                {
                     drop(tbl);
                     let slot = regs.add(dst as usize);
                     if (*slot).is_trivial() {
@@ -1058,7 +1064,8 @@ fn op_get_table_k(
                         .get_slot_keyed_vmstr(ic.slot_idx as usize, s.as_ptr(), s.vm_str())
             {
                 let v_bits = v.bits();
-                if v_bits < TAG_RC_START {
+                if v_bits < TAG_RC_START && (v_bits != Value::NIL.bits() || tbl.metatable.is_none())
+                {
                     drop(tbl);
                     let slot = regs.add(dst as usize);
                     if (*slot).is_trivial() {
@@ -1115,6 +1122,7 @@ fn cold_get_table_k(
                 let exec = &*vm.cur_exec;
                 if let Some(slot_idx) = tbl.fields.find_index_by_vmstr(s.as_ptr(), s.vm_str())
                     && let Some(v) = tbl.fields.get_slot(slot_idx)
+                    && (!v.is_nil() || tbl.metatable.is_none())
                 {
                     let val = v.clone();
                     drop(tbl);
