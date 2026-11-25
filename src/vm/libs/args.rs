@@ -1,11 +1,9 @@
 //! Argument checks and result builders shared by the native libraries.
 
-use std::cell::RefCell;
-
 use num_traits::ToPrimitive;
 
 use crate::vm::heap::VmHeap;
-use crate::vm::value::{BorrowedRc, Value, ValueView, VmTable};
+use crate::vm::value::{BorrowedTable, Value, ValueView, VmTable};
 
 /// A number as a float. Integers too large for an `f64` are an error rather
 /// than silently becoming infinity.
@@ -98,20 +96,19 @@ pub(crate) fn opt_int_arg(
     }
 }
 
-/// A table argument.
+/// A table argument (Old or Beat).
 pub(crate) fn table_arg<'a>(
     args: &'a [Value],
     index: usize,
     name: &str,
-) -> Result<BorrowedRc<'a, RefCell<VmTable>>, String> {
-    match args.get(index) {
-        Some(v) if v.is_table() => Ok(v.as_table().unwrap()),
-        None => Err(format!("{} must be provided", name)),
-        Some(v) if v.is_nil() => Err(format!("{} must be provided", name)),
-        Some(other) => Err(format!(
+) -> Result<BorrowedTable<'a>, String> {
+    match args.get(index).map(Value::view) {
+        Some(ValueView::Table(t)) => Ok(t),
+        None | Some(ValueView::Nil) => Err(format!("{} must be provided", name)),
+        Some(_) => Err(format!(
             "{} must be a table, got {}",
             name,
-            other.type_name()
+            args[index].type_name()
         )),
     }
 }

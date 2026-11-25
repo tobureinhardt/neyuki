@@ -323,34 +323,16 @@ fn debug_getmetatable(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
 
 /// `debug.setmetatable(t, mt)`, ignoring a `__metatable` field.
 fn debug_setmetatable(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let Some(t) = args.first().and_then(Value::as_table) else {
+    let Some(tbl_val) = args.first() else {
         return Err("setmetatable expects a table".to_string());
     };
     let mt = match args.get(1) {
         None => None,
         Some(v) if v.is_nil() => None,
-        Some(v) if v.is_table() => Some(v.as_table().unwrap().to_rc()),
-        Some(other) => {
-            return Err(format!(
-                "metatable must be a table or nil, got {}",
-                other.type_name()
-            ));
-        }
+        Some(v) => Some(v.clone()),
     };
-    let gc_handler = mt
-        .as_ref()
-        .is_some_and(|mt| mt.borrow().get_str("__gc").is_callable());
-    t.borrow_mut().metatable = mt;
-    let t_rc = t.to_rc();
-    if gc_handler {
-        vm.gc.pin_table(&t_rc);
-    } else {
-        vm.gc.unpin_table(&t_rc);
-    }
-    if crate::vm::gc::table_weak_values(&t_rc) {
-        vm.gc.has_weak_tables = true;
-    }
-    Ok(vec![args[0].clone()])
+    vm.table_set_metatable(tbl_val, mt)?;
+    Ok(vec![tbl_val.clone()])
 }
 
 /// `debug.sethook(hook, mask?, count?)`, or `debug.sethook()` to remove it.

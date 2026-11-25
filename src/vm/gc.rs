@@ -25,7 +25,11 @@ fn push_tables(
     seen_closures: &mut FxHashSet<*const VmClosure>,
 ) {
     match val.view() {
-        ValueView::Table(t) => out.push(t.to_rc()),
+        ValueView::Table(t) => {
+            if let Some(old) = t.as_old() {
+                out.push(old.to_rc());
+            }
+        }
         ValueView::Closure(c) => {
             let mut pending = vec![c.to_rc()];
             while let Some(closure) = pending.pop() {
@@ -38,7 +42,11 @@ fn push_tables(
                     }
                     upval.with_closed(|val| match val.view() {
                         ValueView::Closure(inner) => pending.push(inner.to_rc()),
-                        ValueView::Table(t) => out.push(t.to_rc()),
+                        ValueView::Table(t) => {
+                            if let Some(old) = t.as_old() {
+                                out.push(old.to_rc());
+                            }
+                        }
                         _ => {}
                     });
                 }
@@ -310,12 +318,14 @@ impl GcTracker {
     pub fn mark_value(&mut self, val: &Value) {
         match val.view() {
             ValueView::Table(t_rc) => {
-                let t_ptr = t_rc.as_ptr();
-                if let Some((_, header)) = self.tables.get_mut(&t_ptr)
-                    && (header.color == GcColor::White0 || header.color == GcColor::White1)
-                {
-                    header.color = GcColor::Gray;
-                    self.gray_stack.push(t_ptr);
+                if let Some(old) = t_rc.as_old() {
+                    let t_ptr = old.as_ptr();
+                    if let Some((_, header)) = self.tables.get_mut(&t_ptr)
+                        && (header.color == GcColor::White0 || header.color == GcColor::White1)
+                    {
+                        header.color = GcColor::Gray;
+                        self.gray_stack.push(t_ptr);
+                    }
                 }
             }
             ValueView::Buffer(b_rc) => {
@@ -697,7 +707,9 @@ impl GcTracker {
         doomed_buffers: &FxHashSet<*const RefCell<VmBuffer>>,
     ) {
         let dead = |v: &Value| match v.view() {
-            ValueView::Table(t) => doomed_tables.contains(&t.as_ptr()),
+            ValueView::Table(t) => t
+                .as_old()
+                .is_some_and(|old| doomed_tables.contains(&old.as_ptr())),
             ValueView::Buffer(b) => doomed_buffers.contains(&b.as_ptr()),
             _ => false,
         };

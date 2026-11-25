@@ -282,7 +282,7 @@ fn builtin_write_console(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Str
 struct LogJsonEncoder<'a> {
     vm: &'a mut VM,
     out: String,
-    open: Vec<*const RefCell<VmTable>>,
+    open: Vec<usize>,
 }
 
 impl LogJsonEncoder<'_> {
@@ -324,28 +324,27 @@ impl LogJsonEncoder<'_> {
                 self.out.push_str("null")
             }
             crate::vm::value::ValueView::Table(t) => {
+                let ptr = t.as_ptr_id();
                 let custom = t.borrow().metamethod("__tojson");
                 if let Some(handler) = custom {
                     let result = self
                         .vm
                         .call_function(handler, std::slice::from_ref(value))?;
                     let result = result.into_iter().next().unwrap_or(Value::NIL);
-                    if result
-                        .table_ptr()
-                        .is_some_and(|p| std::ptr::eq(p, t.as_ptr()))
+                    if let crate::vm::value::ValueView::Table(rt) = result.view()
+                        && rt.as_ptr_id() == ptr
                     {
                         json::write_string(&mut self.out, "<cycle>");
                         return Ok(());
                     }
                     return self.value(&result, depth + 1);
                 }
-                let ptr = t.as_ptr();
                 if self.open.contains(&ptr) {
                     json::write_string(&mut self.out, "<cycle>");
                     return Ok(());
                 }
                 self.open.push(ptr);
-                let result = self.table(&t, depth);
+                let result = self.table(t, depth);
                 self.open.pop();
                 result?;
             }
@@ -356,18 +355,22 @@ impl LogJsonEncoder<'_> {
         self.check_limit()
     }
 
-    fn table(&mut self, t: &RefCell<VmTable>, depth: usize) -> Result<(), String> {
+    fn table(
+        &mut self,
+        t: crate::vm::value::BorrowedTable<'_>,
+        depth: usize,
+    ) -> Result<(), String> {
         let (is_array, items, entries) = {
             let tbl = t.borrow();
             let marked = tbl
-                .metatable
+                .metatable()
                 .as_ref()
                 .is_some_and(|m| m.borrow().get_str(json::ARRAY_MARK).is_truthy());
-            let has_keys = !tbl.fields.is_empty() || tbl.general.is_some();
-            if (marked || !tbl.array.is_empty()) && !has_keys {
-                (true, tbl.array.clone(), Vec::new())
+            let has_keys = !tbl.fields_is_empty() || tbl.has_general();
+            if (marked || !tbl.array_slice().is_empty()) && !has_keys {
+                (true, tbl.array_slice().to_vec(), Vec::new())
             } else {
-                let entries = crate::vm::libs::table::entries(&tbl);
+                let entries = crate::vm::libs::table::entries_borrow(&tbl);
                 (false, Vec::new(), entries)
             }
         };
@@ -439,7 +442,11 @@ fn builtin_json_line(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> 
     let fields = match args.get(4) {
         None => None,
         Some(v) if v.is_nil() => None,
-        Some(v) if v.is_table() => Some(v.as_table().unwrap().to_rc()),
+        Some(v) if v.is_table() => {
+            let mut promoted = v.clone();
+            vm.beat_escape_if_needed(&mut promoted);
+            Some(promoted.as_table().unwrap().to_rc())
+        }
         Some(other) => {
             return Err(format!("fields must be a table, got {}", other.type_name()));
         }
@@ -567,7 +574,11 @@ fn builtin_format_pretty(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Stri
     let fields = match args.get(4) {
         None => None,
         Some(v) if v.is_nil() => None,
-        Some(v) if v.is_table() => Some(v.as_table().unwrap().to_rc()),
+        Some(v) if v.is_table() => {
+            let mut promoted = v.clone();
+            vm.beat_escape_if_needed(&mut promoted);
+            Some(promoted.as_table().unwrap().to_rc())
+        }
         Some(other) => {
             return Err(format!("fields must be a table, got {}", other.type_name()));
         }

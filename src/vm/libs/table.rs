@@ -1,16 +1,14 @@
 //! The `table` library.
 
-use std::cell::RefCell;
-
 use crate::vm::libs::args::{frozen, int_arg, opt_int_arg, table_arg};
 use crate::vm::machine::VM;
-use crate::vm::value::{BorrowedRc, Value, ValueView, VmTable};
+use crate::vm::value::{BorrowedTable, TableBorrow, Value, ValueView, VmTable};
 
 const MAX_CREATE: i64 = 100_000_000;
 
-fn writable<'a>(args: &'a [Value], name: &str) -> Result<BorrowedRc<'a, RefCell<VmTable>>, String> {
+fn writable<'a>(args: &'a [Value], name: &str) -> Result<BorrowedTable<'a>, String> {
     let t = table_arg(args, 0, name)?;
-    if t.borrow().frozen {
+    if t.borrow().is_frozen() {
         return Err("attempted to mutate a frozen table".to_string());
     }
     Ok(t)
@@ -38,27 +36,81 @@ pub(crate) fn entries(table: &VmTable) -> Vec<(Value, Value)> {
     out
 }
 
+/// Beat/Old-unified version of [`entries`].
+pub(crate) fn entries_borrow(table: &TableBorrow<'_>) -> Vec<(Value, Value)> {
+    let arr = table.array_slice();
+    let mut out = Vec::with_capacity(arr.len() + table.fields_len());
+    for (i, v) in arr.iter().enumerate() {
+        if !v.is_nil() {
+            out.push((Value::from_usize(i + 1), v.clone()));
+        }
+    }
+    for key in table.sorted_keys() {
+        let value = table.raw_get(&key);
+        if !value.is_nil() {
+            out.push((key, value));
+        }
+    }
+    out
+}
+
 /// Number of non-nil entries, including named keys (`#t` only counts the
 /// array part).
 fn table_length(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let t_handle = table_arg(args, 0, "t")?;
     let t = t_handle.borrow();
-    let mut n = t.array.iter().filter(|v| !v.is_nil()).count();
-    n += t.fields.values().filter(|v| !v.is_nil()).count();
-    if let Some(general) = &t.general {
-        n += general.len();
-    }
+    let mut n = t.array_slice().iter().filter(|v| !v.is_nil()).count();
+    t.for_each_field(|_, v| {
+        if !v.is_nil() {
+            n += 1;
+        }
+    });
+    n += t.general_len();
     Ok(vec![Value::from_usize(n)])
 }
 
 /// `insert(t, v)` appends; `insert(t, pos, v)` shifts later elements up.
-fn table_insert(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let t = writable(args, "t")?;
+fn table_insert(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+    let _ = writable(args, "t")?;
+    let tbl_val = &args[0];
+    if let Some(bt_ptr) = tbl_val.beat_table_ptr() {
+        match args.len() {
+            0 | 1 => return Err("insert expects a value".to_string()),
+            2 => {
+                let len = unsafe { &*bt_ptr }.array_slice().len();
+                vm.table_raw_set(tbl_val, Value::from_usize(len + 1), args[1].clone())?;
+                return Ok(Vec::new());
+            }
+            _ => {
+                let pos = int_arg(args, 1, "pos")?;
+                let len = unsafe { &*bt_ptr }.array_slice().len() as i64;
+                if pos < 1 || pos > len + 1 {
+                    return Err(format!(
+                        "position {} is out of bounds (1 to {})",
+                        pos,
+                        len + 1
+                    ));
+                }
+                let ext = vm.heap.beat.ensure_extra(unsafe { &mut *bt_ptr });
+                ext.array.insert((pos - 1) as usize, args[2].clone());
+                return Ok(Vec::new());
+            }
+        }
+    }
+    let Some(t) = tbl_val.as_table() else {
+        return Err("t must be a table".to_string());
+    };
+    let mut val = match args.len() {
+        0 | 1 => return Err("insert expects a value".to_string()),
+        2 => args[1].clone(),
+        _ => args[2].clone(),
+    };
+    vm.beat_escape_if_needed(&mut val);
+    vm.gc.write_barrier(tbl_val, &val);
     let mut tbl = t.borrow_mut();
     match args.len() {
-        0 | 1 => Err("insert expects a value".to_string()),
         2 => {
-            tbl.array.push(args[1].clone());
+            tbl.array.push(val);
             Ok(Vec::new())
         }
         _ => {
@@ -71,7 +123,7 @@ fn table_insert(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                     len + 1
                 ));
             }
-            tbl.array.insert((pos - 1) as usize, args[2].clone());
+            tbl.array.insert((pos - 1) as usize, val);
             Ok(Vec::new())
         }
     }
@@ -79,8 +131,32 @@ fn table_insert(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
 /// Removes and returns the element at `pos` (the last one by default),
 /// shifting later elements down.
-fn table_remove(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let t = writable(args, "t")?;
+fn table_remove(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+    let _ = writable(args, "t")?;
+    let tbl_val = &args[0];
+    if let Some(bt_ptr) = tbl_val.beat_table_ptr() {
+        let len = unsafe { &*bt_ptr }.array_slice().len() as i64;
+        let pos = opt_int_arg(args, 1, "pos", len)?;
+        if len == 0 && (pos == 0 || pos == len) {
+            return Ok(vec![Value::NIL]);
+        }
+        if pos < 1 || pos > len {
+            return Err(format!("position {} is out of bounds (1 to {})", pos, len));
+        }
+        let bt = unsafe { &mut *bt_ptr };
+        if bt.extra.is_null() && pos == len {
+            let idx = (len - 1) as usize;
+            let removed = unsafe {
+                let slot = bt.arr_ptr.add(idx);
+                std::mem::replace(&mut *slot, Value::NIL)
+            };
+            bt.arr_len -= 1;
+            return Ok(vec![removed]);
+        }
+        let ext = vm.heap.beat.ensure_extra(bt);
+        return Ok(vec![ext.array.remove((pos - 1) as usize)]);
+    }
+    let t = tbl_val.as_table().unwrap();
     let mut tbl = t.borrow_mut();
     let len = tbl.array.len() as i64;
     let pos = opt_int_arg(args, 1, "pos", len)?;
@@ -117,13 +193,14 @@ fn table_concat(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             return Err(format!("sep must be a string, got {}", args[1].type_name()));
         }
     };
-    let (i, j) = range(args, 2, t.array.len())?;
+    let arr = t.array_slice();
+    let (i, j) = range(args, 2, arr.len())?;
     let mut out = String::new();
     for idx in i..=j {
         if idx > i {
             out.push_str(&sep);
         }
-        let item = &t.array[idx - 1];
+        let item = &arr[idx - 1];
         match item.view() {
             ValueView::String(s) => out.push_str(&s),
             ValueView::Int(_) | ValueView::BigInt(_) | ValueView::Float(_) => {
@@ -150,7 +227,8 @@ fn table_create(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     if n > MAX_CREATE {
         return Err(format!("n exceeds the maximum ({})", MAX_CREATE));
     }
-    let value = args.get(1).cloned().unwrap_or(Value::NIL);
+    let mut value = args.get(1).cloned().unwrap_or(Value::NIL);
+    vm.beat_escape_if_needed(&mut value);
     let mut table = VmTable::new();
     if !value.is_nil() {
         table.array = vec![value; n as usize];
@@ -168,14 +246,14 @@ fn table_find(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         return Err("value must be provided".to_string());
     }
     let init = opt_int_arg(args, 2, "init", 1)?.max(1) as usize;
-    for (i, v) in t.array.iter().enumerate().skip(init - 1) {
+    for (i, v) in t.array_slice().iter().enumerate().skip(init - 1) {
         if *v == needle {
             return Ok(vec![Value::from_usize(i + 1)]);
         }
     }
     if init == 1 {
-        for key in crate::vm::table::sorted_keys(&t) {
-            if crate::vm::table::raw_get(&t, &key) == needle {
+        for key in t.sorted_keys() {
+            if t.raw_get(&key) == needle {
                 return Ok(vec![key]);
             }
         }
@@ -184,22 +262,34 @@ fn table_find(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn table_keys(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let keys = {
+    let mut keys = {
         let t_handle = table_arg(args, 0, "t")?;
         let t = t_handle.borrow();
-        entries(&t).into_iter().map(|(k, _)| k).collect::<Vec<_>>()
+        entries_borrow(&t)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect::<Vec<_>>()
     };
+    for k in &mut keys {
+        vm.beat_escape_if_needed(k);
+    }
     let mut table = VmTable::new();
     table.array = keys;
     Ok(vec![new_table(vm, table)])
 }
 
 fn table_values(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let values = {
+    let mut values = {
         let t_handle = table_arg(args, 0, "t")?;
         let t = t_handle.borrow();
-        entries(&t).into_iter().map(|(_, v)| v).collect::<Vec<_>>()
+        entries_borrow(&t)
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect::<Vec<_>>()
     };
+    for v in &mut values {
+        vm.beat_escape_if_needed(v);
+    }
     let mut table = VmTable::new();
     table.array = values;
     Ok(vec![new_table(vm, table)])
@@ -207,7 +297,11 @@ fn table_values(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
 fn table_pack(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let mut tbl = VmTable::new();
-    tbl.array = args.to_vec();
+    let mut arr = args.to_vec();
+    for v in &mut arr {
+        vm.beat_escape_if_needed(v);
+    }
+    tbl.array = arr;
     tbl.set_str("n", Value::from_usize(args.len()));
     Ok(vec![new_table(vm, tbl)])
 }
@@ -217,7 +311,8 @@ const MAX_UNPACK: usize = 8000;
 fn table_unpack(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let t_handle = table_arg(args, 0, "t")?;
     let t = t_handle.borrow();
-    let (i, j) = range(args, 1, t.array.len())?;
+    let arr = t.array_slice();
+    let (i, j) = range(args, 1, arr.len())?;
     if j < i {
         return Ok(Vec::new());
     }
@@ -227,42 +322,74 @@ fn table_unpack(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             MAX_UNPACK
         ));
     }
-    Ok(t.array[i - 1..j].to_vec())
+    Ok(arr[i - 1..j].to_vec())
 }
 
 fn table_freeze(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let t = table_arg(args, 0, "t")?;
-    t.borrow_mut().frozen = true;
+    if let Some(old) = t.as_old() {
+        old.borrow_mut().frozen = true;
+    } else if let Some(bt) = args[0].beat_table_ptr() {
+        unsafe { (*bt).set_frozen(true) };
+    }
     Ok(vec![args[0].clone()])
 }
 
 fn table_isfrozen(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    Ok(vec![Value::bool(table_arg(args, 0, "t")?.borrow().frozen)])
+    Ok(vec![Value::bool(
+        table_arg(args, 0, "t")?.borrow().is_frozen(),
+    )])
 }
 
 fn table_clear(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let t = writable(args, "t")?;
-    let mut tbl = t.borrow_mut();
-    tbl.array.clear();
-    tbl.fields.clear();
-    tbl.general = None;
+    if let Some(old) = t.as_old() {
+        let mut tbl = old.borrow_mut();
+        tbl.array.clear();
+        tbl.fields.clear();
+        tbl.general = None;
+    } else if let Some(bt_ptr) = args[0].beat_table_ptr() {
+        unsafe {
+            let bt = &mut *bt_ptr;
+            if let Some(ext) = bt.extra_mut() {
+                ext.array.clear();
+                ext.fields.clear();
+                ext.general = None;
+            } else {
+                bt.drop_inline_old_refs();
+            }
+        }
+    }
     Ok(Vec::new())
 }
 
 /// A shallow copy. The metatable is shared; the copy is never frozen.
 fn table_clone(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let copy = {
+    let mut copy = {
         let tbl_handle = table_arg(args, 0, "t")?;
-        let tbl = tbl_handle.borrow();
-        let mut copy = VmTable::new();
-        copy.array = tbl.array.clone();
-        copy.fields = tbl.fields.clone();
-        copy.general = tbl.general.clone();
-        copy.metatable = tbl.metatable.clone();
-        // Cloned coroutine handles share the one coroutine state.
-        copy.co_state = tbl.co_state.clone();
-        copy
+        match tbl_handle.borrow() {
+            TableBorrow::Old(tbl) => {
+                let mut copy = VmTable::new();
+                copy.array = tbl.array.clone();
+                copy.fields = tbl.fields.clone();
+                copy.general = tbl.general.clone();
+                copy.metatable = tbl.metatable.clone();
+                copy.co_state = tbl.co_state.clone();
+                copy
+            }
+            TableBorrow::Beat(bt) => {
+                let mut copy = bt.to_vm_table_cloned();
+                copy.frozen = false;
+                copy
+            }
+        }
     };
+    for v in &mut copy.array {
+        vm.beat_escape_if_needed(v);
+    }
+    for v in copy.fields.values_mut() {
+        vm.beat_escape_if_needed(v);
+    }
     Ok(vec![new_table(vm, copy)])
 }
 
@@ -307,11 +434,43 @@ fn merge_sort(
 /// Sorts the array part in place, by `<` or by `cmp(a, b)` returning true
 /// when `a` must come first. The sort is stable.
 fn table_sort(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let t = writable(args, "t")?.to_rc();
-    let mut items = std::mem::take(&mut t.borrow_mut().array);
+    let tbl_handle = writable(args, "t")?;
+    if let Some(old) = tbl_handle.as_old() {
+        let t = old.to_rc();
+        let mut items = std::mem::take(&mut t.borrow_mut().array);
+        let result = match args.get(1) {
+            None => sort_default(&mut items),
+            Some(v) if v.is_nil() => sort_default(&mut items),
+            Some(cmp) => {
+                let cmp = cmp.clone();
+                merge_sort(&mut items, |a, b| {
+                    Ok(vm
+                        .call_function(cmp.clone(), &[a.clone(), b.clone()])?
+                        .first()
+                        .is_some_and(Value::is_truthy))
+                })
+            }
+        };
+        t.borrow_mut().array = items;
+        return result.map(|_| Vec::new());
+    }
+    let bt_ptr = args[0].beat_table_ptr().unwrap();
+    let mut items = unsafe {
+        let bt = &mut *bt_ptr;
+        if !bt.extra.is_null() {
+            std::mem::take(&mut (*bt.extra).table.array)
+        } else {
+            let len = bt.arr_len as usize;
+            let slice = std::slice::from_raw_parts_mut(bt.arr_ptr, len);
+            let mut out = Vec::with_capacity(len);
+            for slot in slice {
+                out.push(std::mem::replace(slot, Value::NIL));
+            }
+            bt.arr_len = 0;
+            out
+        }
+    };
     let result = match args.get(1) {
-        // Equal integers or strings cannot be told apart, so lists of only
-        // one of them need no stability and take the standard library's sort.
         None => sort_default(&mut items),
         Some(v) if v.is_nil() => sort_default(&mut items),
         Some(cmp) => {
@@ -324,7 +483,18 @@ fn table_sort(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             })
         }
     };
-    t.borrow_mut().array = items;
+    unsafe {
+        let bt = &mut *bt_ptr;
+        if !bt.extra.is_null() {
+            (*bt.extra).table.array = items;
+        } else {
+            debug_assert!(items.len() <= bt.arr_cap as usize);
+            bt.arr_len = items.len() as u32;
+            for (idx, val) in items.into_iter().enumerate() {
+                std::ptr::write(bt.arr_ptr.add(idx), val);
+            }
+        }
+    }
     result.map(|_| Vec::new())
 }
 
@@ -348,7 +518,7 @@ fn sort_default(items: &mut Vec<Value>) -> Result<(), String> {
 /// `move(a1, f, e, t, a2?)`: copies `a1[f..e]` to `a2[t..]` (or within
 /// `a1`), handling overlap, and returns the destination.
 fn table_move(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let src_ptr = table_arg(args, 0, "a1")?.as_ptr();
+    let src_ptr = table_arg(args, 0, "a1")?.as_ptr_id();
     let f = int_arg(args, 1, "f")?;
     let e = int_arg(args, 2, "e")?;
     let t = int_arg(args, 3, "t")?;
@@ -356,7 +526,7 @@ fn table_move(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         None => (args[0].clone(), src_ptr),
         Some(v) if v.is_nil() => (args[0].clone(), src_ptr),
         _ => {
-            let p = table_arg(args, 4, "a2")?.as_ptr();
+            let p = table_arg(args, 4, "a2")?.as_ptr_id();
             (args[4].clone(), p)
         }
     };
@@ -368,7 +538,7 @@ fn table_move(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         if t > i64::MAX - count + 1 {
             return Err("destination wrap around".to_string());
         }
-        let overlapping = std::ptr::eq(src_ptr, dest_ptr) && t > f && t <= e;
+        let overlapping = src_ptr == dest_ptr && t > f && t <= e;
         let source = args[0].clone();
         let order: Box<dyn Iterator<Item = i64>> = if overlapping {
             Box::new((0..count).rev())

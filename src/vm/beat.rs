@@ -11,8 +11,8 @@ use std::rc::Rc;
 
 use crate::vm::hash::fx_hash_bytes;
 use crate::vm::machine::CoroutineState;
-use crate::vm::table::TableKey;
-use crate::vm::value::{StrRef, Value, ValueView, VmTable};
+use crate::vm::table::compare_keys;
+use crate::vm::value::{Value, ValueView, VmTable};
 
 const INITIAL_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_BYTES: usize = 1024 * 1024;
@@ -27,6 +27,7 @@ const INLINE_FLD_LIMIT: usize = 8;
 pub struct BeatString {
     pub len: u32,
     pub hash: u64,
+    pub alloc_mark: BeatMark,
     pub forwarded: u64,
 }
 
@@ -68,7 +69,7 @@ pub struct BeatTable {
     pub depth: u16,
     pub frozen: bool,
     pub has_old_refs: bool,
-    pub has_gc: bool,
+    pub in_rem_set: bool,
     pub shape_version: u32,
     pub alloc_mark: BeatMark,
     pub arr_len: u32,
@@ -190,6 +191,71 @@ impl BeatTable {
         }
     }
 
+    /// Looks up metamethod `name` if this BeatTable has spilled to `BeatExtra` with a metatable.
+    #[inline]
+    pub fn metamethod(&self, name: &str) -> Option<Value> {
+        self.extra_ref().and_then(|ext| ext.metamethod(name))
+    }
+
+    /// Returns sorted non-array keys in standard Neyuki `pairs`/`next` order.
+    pub fn sorted_keys(&self) -> Vec<Value> {
+        if let Some(ext) = self.extra_ref() {
+            return crate::vm::table::sorted_keys(ext);
+        }
+        let mut keys: Vec<Value> = self
+            .fields_slice()
+            .iter()
+            .filter(|f| !f.val.is_nil())
+            .map(|f| f.key.clone())
+            .collect();
+        keys.sort_by(compare_keys);
+        keys
+    }
+
+    /// Iteration helper matching [`crate::vm::table::next_entry`] for Beat tables.
+    pub fn next_entry(&self, key: &Value) -> Result<Option<(Value, Value)>, String> {
+        if let Some(ext) = self.extra_ref() {
+            return crate::vm::table::next_entry(ext, key);
+        }
+        let arr = self.array_slice();
+        let array_start = match key.view() {
+            ValueView::Nil => Some(0),
+            ValueView::Int(i) if i >= 1 && (i as u64) <= arr.len() as u64 => Some(i as usize),
+            ValueView::Float(f) if f.is_nan() => {
+                return Err("invalid key to 'next'".to_string());
+            }
+            _ => None,
+        };
+        if let Some(start) = array_start {
+            for (i, v) in arr.iter().enumerate().skip(start) {
+                if !v.is_nil() {
+                    return Ok(Some((Value::from_usize(i + 1), v.clone())));
+                }
+            }
+            if self.fld_len == 0 {
+                return Ok(None);
+            }
+        }
+        let after = if array_start.is_some() {
+            None
+        } else {
+            Some(key)
+        };
+        let mut best: Option<&BeatField> = None;
+        for f in self.fields_slice() {
+            if f.val.is_nil() {
+                continue;
+            }
+            if after.is_some_and(|a| compare_keys(&f.key, a) != std::cmp::Ordering::Greater) {
+                continue;
+            }
+            if best.is_none_or(|b| compare_keys(&f.key, &b.key) == std::cmp::Ordering::Less) {
+                best = Some(f);
+            }
+        }
+        Ok(best.map(|f| (f.key.clone(), f.val.clone())))
+    }
+
     /// Clones this `BeatTable` into a freshly owned `VmTable` without
     /// modifying or consuming the Beat slot.
     pub fn to_vm_table_cloned(&self) -> VmTable {
@@ -268,6 +334,7 @@ impl BeatTable {
 #[derive(Clone, Copy, Debug)]
 pub struct BeatFrame {
     pub floor: BeatMark,
+    pub rewind_mark: BeatMark,
     pub depth: u16,
 }
 
@@ -295,23 +362,11 @@ impl BeatMark {
     }
 }
 
-/// Escape target recorded by write barriers when storing a Beat value into an
-/// `Old` container or an outer-depth Beat table.
-#[derive(Clone)]
+/// Escape target recorded by write barriers when storing a young Beat value
+/// into an older-depth Beat table.
+#[derive(Clone, Copy)]
 pub enum BeatRemTarget {
-    OldTable {
-        table_ptr: *const RefCell<VmTable>,
-        key: TableKey,
-        raw_key: Value,
-    },
-    OldTableArray {
-        table_ptr: *const RefCell<VmTable>,
-        index: usize,
-    },
-    OldGlobal(StrRef),
-    OuterBeatTable {
-        table: *mut BeatTable,
-    },
+    OuterBeatTable { table: *mut BeatTable },
 }
 
 struct BeatChunk {
@@ -343,6 +398,7 @@ pub struct BeatArena {
     cur_off: usize,
     pub depth: u16,
     pub floor: BeatMark,
+    pub rewind_mark: BeatMark,
     frames: Vec<BeatFrame>,
     pub rem_set: Vec<BeatRemTarget>,
     pub extras: Vec<(BeatMark, NonNull<BeatExtra>)>,
@@ -365,6 +421,7 @@ impl BeatArena {
             cur_off: 0,
             depth: 1,
             floor: BeatMark::ZERO,
+            rewind_mark: BeatMark::ZERO,
             frames: Vec::with_capacity(16),
             rem_set: Vec::new(),
             extras: Vec::new(),
@@ -390,17 +447,21 @@ impl BeatArena {
         let prev_floor = self.floor;
         self.frames.push(BeatFrame {
             floor: prev_floor,
+            rewind_mark: self.rewind_mark,
             depth: self.depth,
         });
-        self.floor = self.cursor();
+        let cur = self.cursor();
+        self.floor = cur;
+        self.rewind_mark = cur;
         self.depth = self.depth.saturating_add(1);
-        prev_floor
+        cur
     }
 
     #[inline(always)]
     pub fn exit_nested(&mut self) {
         if let Some(prev) = self.frames.pop() {
             self.floor = prev.floor;
+            self.rewind_mark = prev.rewind_mark;
             self.depth = prev.depth;
         }
     }
@@ -449,6 +510,7 @@ impl BeatArena {
 
     /// Allocates a UTF-8 [`BeatString`] directly inside the Beat bump arena.
     pub fn alloc_string(&mut self, s: &str) -> *mut BeatString {
+        let alloc_mark = self.cursor();
         let total = std::mem::size_of::<BeatString>() + s.len();
         let raw = self.alloc_raw(total, std::mem::align_of::<BeatString>());
         let hdr = raw as *mut BeatString;
@@ -459,6 +521,7 @@ impl BeatArena {
                 BeatString {
                     len: s.len() as u32,
                     hash,
+                    alloc_mark,
                     forwarded: 0,
                 },
             );
@@ -487,7 +550,7 @@ impl BeatArena {
                     depth: self.depth,
                     frozen: false,
                     has_old_refs: false,
-                    has_gc: false,
+                    in_rem_set: false,
                     shape_version: 0,
                     alloc_mark,
                     arr_len: 0,
@@ -558,6 +621,15 @@ impl BeatArena {
         let val_old = val.bits() >= crate::vm::value::TAG_RC_START && !val.is_beat();
         if key_old || val_old {
             unsafe { self.mark_old_ref_holder(tbl_ptr) };
+        }
+        if tbl.alloc_mark < self.rewind_mark && !tbl.in_rem_set {
+            let young_key = key.beat_alloc_mark().is_some_and(|m| m >= self.rewind_mark);
+            let young_val = val.beat_alloc_mark().is_some_and(|m| m >= self.rewind_mark);
+            if young_key || young_val {
+                tbl.in_rem_set = true;
+                self.rem_set
+                    .push(BeatRemTarget::OuterBeatTable { table: tbl_ptr });
+            }
         }
 
         if !tbl.extra.is_null() {
@@ -713,7 +785,7 @@ mod tests {
         let t_outer = beat.alloc_table(4, 4);
         unsafe { beat.table_raw_set(t_outer, Value::str("k"), Value::int(7)) }.unwrap();
         let floor = beat.enter_nested();
-        assert_eq!(floor, BeatMark::ZERO);
+        assert_eq!(floor, beat.cursor());
 
         for i in 0..1000 {
             let mark = beat.cursor();

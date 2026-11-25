@@ -66,7 +66,9 @@ impl VM {
 
     pub fn call_function(&mut self, func: Value, args: &[Value]) -> Result<Vec<Value>, String> {
         self.native_calls += 1;
+        let _beat_floor = self.beat_enter_nested();
         let res = self.call_function_inner(func, args);
+        self.beat_exit_nested();
         self.native_calls -= 1;
         res
     }
@@ -169,9 +171,9 @@ impl VM {
                 let mut callee = func;
                 let mut call_args = args.to_vec();
                 for _ in 0..MAX_CALL_CHAIN {
-                    let handler = match callee.as_table() {
-                        Some(t) => t.borrow().metamethod("__call"),
-                        None => return self.call_function_inner(callee, &call_args),
+                    let Some(handler) = callee.table_borrow().map(|t| t.metamethod("__call"))
+                    else {
+                        return self.call_function_inner(callee, &call_args);
                     };
                     let Some(handler) = handler else {
                         return Err(

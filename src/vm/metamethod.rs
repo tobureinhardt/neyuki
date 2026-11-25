@@ -5,13 +5,13 @@ use crate::vm::value::{Value, ValueView};
 
 impl VM {
     pub(crate) fn get_binop_metamethod(&self, a: &Value, b: &Value, event: &str) -> Option<Value> {
-        if let Some(t) = a.as_table()
-            && let Some(h) = t.borrow().metamethod(event)
+        if let Some(t) = a.table_borrow()
+            && let Some(h) = t.metamethod(event)
         {
             return Some(h);
         }
-        if let Some(t) = b.as_table()
-            && let Some(h) = t.borrow().metamethod(event)
+        if let Some(t) = b.table_borrow()
+            && let Some(h) = t.metamethod(event)
         {
             return Some(h);
         }
@@ -19,8 +19,8 @@ impl VM {
     }
 
     pub(crate) fn get_unop_metamethod(&self, val: &Value, event: &str) -> Option<Value> {
-        if let Some(t) = val.as_table() {
-            return t.borrow().metamethod(event);
+        if let Some(t) = val.table_borrow() {
+            return t.metamethod(event);
         }
         None
     }
@@ -52,6 +52,14 @@ impl VM {
     /// (metamethods, buffers, strings, errors) has to decide.
     #[inline]
     pub(crate) fn table_get_fast(table: &Value, key: &Value) -> Option<Value> {
+        if let Some(bt_ptr) = table.beat_table_ptr() {
+            let bt = unsafe { &*bt_ptr };
+            let found = bt.raw_get(key);
+            if found.is_nil() && bt.extra_ref().is_some_and(|e| e.metatable.is_some()) {
+                return None;
+            }
+            return Some(found);
+        }
         let t = table.as_table()?;
         let tbl = t.borrow();
         let found = if key.is_inline_int() {
@@ -62,10 +70,14 @@ impl VM {
                 tbl.raw_get(key)
             }
         } else if let Some(k) = key.as_str_ref() {
-            tbl.fields
-                .get_by_vmstr(k.as_ptr(), k.vm_str())
-                .cloned()
-                .unwrap_or(Value::NIL)
+            if let Some((k_ptr, k_vms)) = k.as_old_vmstr() {
+                tbl.fields
+                    .get_by_vmstr(k_ptr, k_vms)
+                    .cloned()
+                    .unwrap_or(Value::NIL)
+            } else {
+                tbl.fields.get(k.as_str()).cloned().unwrap_or(Value::NIL)
+            }
         } else if key.is_bigint() {
             return None;
         } else {
@@ -79,13 +91,13 @@ impl VM {
 
     /// Raw store into an existing array slot or field, or an append, on a
     /// table that nothing can intercept. Returns false to defer to the slow
-    /// path, which also handles nil (removal) and reports errors.
+    /// path, which also handles nil (removal), Beat escapes, and reports errors.
     #[inline]
     pub(crate) fn table_set_fast(table: &Value, key: &Value, val: &Value) -> bool {
         let Some(t) = table.as_table() else {
             return false;
         };
-        if val.is_nil() {
+        if val.is_nil() || key.is_beat() || val.is_beat() {
             return false;
         }
         let mut tbl = t.borrow_mut();
@@ -107,11 +119,13 @@ impl VM {
             }
             return false;
         }
-        if let Some(k) = key.as_str_ref() {
+        if let Some(k) = key.as_str_ref()
+            && let Some((k_ptr, k_vms)) = k.as_old_vmstr()
+        {
             if tbl.metatable.is_none() {
-                tbl.fields.set_by_vmstr(k.as_ptr(), k.vm_str(), val);
+                tbl.fields.set_by_vmstr(k_ptr, k_vms, val);
                 return true;
-            } else if let Some(slot) = tbl.fields.get_mut_by_vmstr(k.as_ptr(), k.vm_str()) {
+            } else if let Some(slot) = tbl.fields.get_mut_by_vmstr(k_ptr, k_vms) {
                 slot.assign_ref(val);
                 return true;
             }
@@ -172,12 +186,18 @@ impl VM {
             }
             // Strings index the string library, so `s:upper()` works.
             ValueView::String(_) => match (self.string_lib.as_table(), key.as_str_ref()) {
-                (Some(lib), Some(name)) => Ok(lib
-                    .borrow()
-                    .fields
-                    .get_by_vmstr(name.as_ptr(), name.vm_str())
-                    .cloned()
-                    .unwrap_or(Value::NIL)),
+                (Some(lib), Some(name)) => {
+                    if let Some((ptr, vms)) = name.as_old_vmstr() {
+                        Ok(lib
+                            .borrow()
+                            .fields
+                            .get_by_vmstr(ptr, vms)
+                            .cloned()
+                            .unwrap_or(Value::NIL))
+                    } else {
+                        Ok(lib.borrow().get_str(name.as_str()))
+                    }
+                }
                 _ => Ok(Value::NIL),
             },
             _ => Err(format!("attempted to index a {} value", table.type_name())),
@@ -198,10 +218,17 @@ impl VM {
         if depth > 100 {
             return Err("loop in settable / __newindex chain".to_string());
         }
-        self.gc.write_barrier(table, &val);
         match table.view() {
             ValueView::Table(t) => {
-                if t.borrow().frozen {
+                let (frozen, key_exists, newindex_handler) = {
+                    let tbl = t.borrow();
+                    (
+                        tbl.is_frozen(),
+                        !tbl.raw_get(&key).is_nil(),
+                        tbl.metamethod("__newindex"),
+                    )
+                };
+                if frozen {
                     return Err("attempted to mutate a frozen table".to_string());
                 }
 
@@ -210,20 +237,16 @@ impl VM {
                 {
                     return Err("table index too large".to_string());
                 }
-                let key_exists = !t.borrow().raw_get(&key).is_nil();
-                if !key_exists {
-                    let newindex_handler = t.borrow().metamethod("__newindex");
-                    if let Some(handler) = newindex_handler {
-                        if handler.is_table() {
-                            return self.table_set_depth(&handler, key, val, depth + 1);
-                        }
-                        if handler.is_callable() {
-                            self.call_function(handler, &[table.clone(), key, val])?;
-                            return Ok(());
-                        }
+                if !key_exists && let Some(handler) = newindex_handler {
+                    if handler.is_table() {
+                        return self.table_set_depth(&handler, key, val, depth + 1);
+                    }
+                    if handler.is_callable() {
+                        self.call_function(handler, &[table.clone(), key, val])?;
+                        return Ok(());
                     }
                 }
-                t.borrow_mut().raw_set(key, val)
+                self.table_raw_set(table, key, val)
             }
             ValueView::Buffer(b) => {
                 let mut buf = b.borrow_mut();

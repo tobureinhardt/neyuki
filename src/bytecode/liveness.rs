@@ -15,6 +15,16 @@ pub struct LoopSafepoint {
     pub live_mask: [u64; 4],
 }
 
+impl LoopSafepoint {
+    /// Returns `true` when register `reg` may be read after this loop back-edge.
+    #[inline(always)]
+    pub const fn is_live(&self, reg: u8) -> bool {
+        let word = (reg as usize) >> 6;
+        let bit = (reg as usize) & 63;
+        ((self.live_mask[word] >> bit) & 1) != 0
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct RegBits([u64; 4]);
 

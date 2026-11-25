@@ -202,7 +202,10 @@ fn os_args(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
     )])
 }
 
-fn string_field(table: &VmTable, name: &str) -> Result<Option<String>, String> {
+fn string_field(
+    table: &crate::vm::value::TableBorrow<'_>,
+    name: &str,
+) -> Result<Option<String>, String> {
     let v = table.get_str(name);
     match v.view() {
         ValueView::Nil => Ok(None),
@@ -236,8 +239,9 @@ fn os_run(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         }
         Some(ValueView::Table(list)) => {
             let list = list.borrow();
-            let mut parts = Vec::with_capacity(list.array.len());
-            for (index, part) in list.array.iter().enumerate() {
+            let arr = list.array_slice();
+            let mut parts = Vec::with_capacity(arr.len());
+            for (index, part) in arr.iter().enumerate() {
                 if let Some(s) = part.as_str() {
                     parts.push(s.to_string());
                 } else {
@@ -288,16 +292,23 @@ fn os_run(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             match env_val.view() {
                 ValueView::Nil => {}
                 ValueView::Table(env) => {
-                    for (key, value) in env.borrow().fields.iter() {
+                    let mut err = None;
+                    env.borrow().for_each_field(|key, value| {
+                        if err.is_some() {
+                            return;
+                        }
                         if let Some(v) = value.as_str() {
-                            command.env(&**key, v);
+                            command.env(key, v);
                         } else {
-                            return Err(format!(
+                            err = Some(format!(
                                 "env.{} must be a string, got {}",
-                                &**key,
+                                key,
                                 value.type_name()
                             ));
                         }
+                    });
+                    if let Some(e) = err {
+                        return Err(e);
                     }
                 }
                 _ => {

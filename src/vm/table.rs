@@ -14,6 +14,7 @@ pub enum TableKey {
     Float(u64), // normalized f64 bits
     String(StrRef),
     Table(*const RefCell<VmTable>),
+    BeatTable(*const crate::vm::beat::BeatTable),
     Closure(*const VmClosure),
     Native(*const NativeDef),
     Buffer(*const RefCell<VmBuffer>),
@@ -27,6 +28,7 @@ impl PartialEq for TableKey {
             (TableKey::Float(a), TableKey::Float(b)) => a == b,
             (TableKey::String(a), TableKey::String(b)) => a == b,
             (TableKey::Table(a), TableKey::Table(b)) => std::ptr::eq(*a, *b),
+            (TableKey::BeatTable(a), TableKey::BeatTable(b)) => std::ptr::eq(*a, *b),
             (TableKey::Closure(a), TableKey::Closure(b)) => std::ptr::eq(*a, *b),
             (TableKey::Native(a), TableKey::Native(b)) => std::ptr::eq(*a, *b),
             (TableKey::Buffer(a), TableKey::Buffer(b)) => std::ptr::eq(*a, *b),
@@ -46,6 +48,7 @@ impl Hash for TableKey {
             TableKey::Float(bits) => bits.hash(state),
             TableKey::String(s) => s.hash(state),
             TableKey::Table(p) => p.hash(state),
+            TableKey::BeatTable(p) => p.hash(state),
             TableKey::Closure(p) => p.hash(state),
             TableKey::Native(p) => p.hash(state),
             TableKey::Buffer(p) => p.hash(state),
@@ -79,7 +82,15 @@ impl TableKey {
                 }
             }
             ValueView::String(s) => Ok(TableKey::String(s.to_str_ref())),
-            ValueView::Table(t) => Ok(TableKey::Table(t.as_ptr())),
+            ValueView::Table(t) => {
+                if let Some(o) = t.as_old() {
+                    Ok(TableKey::Table(o.as_ptr()))
+                } else {
+                    Ok(TableKey::BeatTable(
+                        t.as_beat().expect("Beat table must have Beat pointer") as *const _,
+                    ))
+                }
+            }
             ValueView::Closure(c) => Ok(TableKey::Closure(c.as_ptr())),
             ValueView::Native(def) => Ok(TableKey::Native(def as *const _)),
             ValueView::Buffer(b) => Ok(TableKey::Buffer(b.as_ptr())),
@@ -100,7 +111,7 @@ fn key_rank(key: &Value) -> u8 {
 
 fn identity(key: &Value) -> usize {
     match key.view() {
-        ValueView::Table(t) => t.as_ptr() as *const u8 as usize,
+        ValueView::Table(t) => t.as_ptr_id(),
         ValueView::Closure(c) => c.as_ptr() as *const u8 as usize,
         ValueView::Native(d) => d as *const NativeDef as usize,
         ValueView::Buffer(b) => b.as_ptr() as *const u8 as usize,
@@ -108,7 +119,7 @@ fn identity(key: &Value) -> usize {
     }
 }
 
-fn compare_keys(a: &Value, b: &Value) -> std::cmp::Ordering {
+pub(crate) fn compare_keys(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     key_rank(a)
         .cmp(&key_rank(b))

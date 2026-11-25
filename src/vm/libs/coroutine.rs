@@ -184,6 +184,7 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
     // The caller's open upvalues are parked while its stack is put aside, so
     // closures that captured its locals keep working from inside the coroutine.
+    let beat_floor = vm.beat_enter_nested();
     let caller_open_upvalues = vm.park_upvalues();
     let caller_stack = std::mem::take(&mut vm.stack);
     let caller_frames = std::mem::take(&mut vm.frames);
@@ -244,6 +245,8 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             }
             ValueView::Native(def) => {
                 let res = (def.func)(vm, resume_args);
+                vm.beat_flush_to_floor(beat_floor, false);
+                vm.beat_exit_nested();
                 co_rc.borrow_mut().status = "dead".to_string();
                 vm.co_states.remove(&co_id);
                 vm.close_upvalues(0);
@@ -263,6 +266,8 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 };
             }
             _ => {
+                vm.beat_flush_to_floor(beat_floor, false);
+                vm.beat_exit_nested();
                 vm.close_upvalues(0);
                 vm.stack = caller_stack;
                 vm.frames = caller_frames;
@@ -306,13 +311,21 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     match run_res {
         Err(ref _err) if vm.is_yielding => {
             vm.is_yielding = false;
+            let mut yielded = {
+                let mut cs = co_rc.borrow_mut();
+                std::mem::take(&mut cs.yield_values)
+            };
+            for y in &mut yielded {
+                vm.beat_escape_if_needed(y);
+            }
+            vm.beat_flush_to_floor(beat_floor, true);
+            vm.beat_exit_nested();
             let parked = vm.park_upvalues();
             let mut cs = co_rc.borrow_mut();
             cs.stack = std::mem::take(&mut vm.stack);
             cs.frames = std::mem::take(&mut vm.frames);
             cs.open_upvalues = parked;
             cs.status = "suspended".to_string();
-            let yielded = std::mem::take(&mut cs.yield_values);
             drop(cs);
 
             vm.stack = caller_stack;
@@ -325,9 +338,12 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             out.extend(yielded);
             Ok(out)
         }
-        Ok(first) => {
+        Ok(mut first) => {
+            vm.beat_flush_to_floor(beat_floor, false);
+            vm.beat_exit_nested();
             let mut returned = vm.take_returned();
             if returned.is_empty() {
+                vm.beat_promote_if_after(&mut first, beat_floor);
                 returned.push(first);
             }
             vm.close_upvalues(0);
@@ -347,6 +363,8 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             Ok(out)
         }
         Err(err) => {
+            vm.beat_flush_to_floor(beat_floor, false);
+            vm.beat_exit_nested();
             vm.close_upvalues(0);
             let mut cs = co_rc.borrow_mut();
             cs.status = "dead".to_string();

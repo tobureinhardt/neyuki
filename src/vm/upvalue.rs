@@ -32,7 +32,8 @@ impl VM {
                 .open_upvalues
                 .pop()
                 .expect("the loop condition saw an open upvalue");
-            let val = self.stack.get(idx).cloned().unwrap_or(Value::NIL);
+            let mut val = self.stack.get(idx).cloned().unwrap_or(Value::NIL);
+            self.beat_escape_if_needed(&mut val);
             uv.close(val);
         }
     }
@@ -43,7 +44,8 @@ impl VM {
         let pos = self.open_upvalues.partition_point(|(i, _)| *i < idx);
         if self.open_upvalues.get(pos).is_some_and(|(i, _)| *i == idx) {
             let (_, uv) = self.open_upvalues.remove(pos);
-            let val = self.stack.get(idx).cloned().unwrap_or(Value::NIL);
+            let mut val = self.stack.get(idx).cloned().unwrap_or(Value::NIL);
+            self.beat_escape_if_needed(&mut val);
             uv.close(val);
         }
     }
@@ -70,7 +72,8 @@ impl VM {
     pub fn park_upvalues(&mut self) -> Vec<ParkedUpvalue> {
         let parked = std::mem::take(&mut self.open_upvalues);
         for (idx, uv) in &parked {
-            let val = self.stack.get(*idx).cloned().unwrap_or(Value::NIL);
+            let mut val = self.stack.get(*idx).cloned().unwrap_or(Value::NIL);
+            self.beat_escape_if_needed(&mut val);
             uv.close(val);
         }
         parked
@@ -97,10 +100,19 @@ impl VM {
     }
 
     #[inline]
-    pub fn upvalue_set(&mut self, uv: &Upvalue, val: Value) {
+    pub fn upvalue_set(&mut self, uv: &Upvalue, mut val: Value) {
         match uv.location.get() {
-            Some(idx) => self.set_reg_grow(idx, val),
-            None => uv.set_closed(val),
+            Some(idx) => {
+                let cur_base = self.frames.last().map(|f| f.base).unwrap_or(0);
+                if idx < cur_base {
+                    self.beat_escape_if_needed(&mut val);
+                }
+                self.set_reg_grow(idx, val);
+            }
+            None => {
+                self.beat_escape_if_needed(&mut val);
+                uv.set_closed(val);
+            }
         }
     }
 }

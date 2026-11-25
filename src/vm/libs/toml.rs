@@ -42,13 +42,19 @@ fn builtin_decode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 /// `__toml_encode(value)`: a table as TOML text.
-fn builtin_encode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let root = crate::vm::libs::args::table_arg(args, 0, "value")?;
+fn builtin_encode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+    let _ = crate::vm::libs::args::table_arg(args, 0, "value")?;
+    let mut root_val = args[0].clone();
+    vm.beat_escape_if_needed(&mut root_val);
+    let root = root_val
+        .as_table()
+        .expect("promoted TOML root must be Old")
+        .to_rc();
     let mut encoder = Encoder {
         out: String::new(),
         open: Vec::new(),
     };
-    encoder.section(&root.to_rc(), &mut Vec::new(), 0, Header::None)?;
+    encoder.section(&root, &mut Vec::new(), 0, Header::None)?;
     Ok(vec![Value::string(encoder.out)])
 }
 
@@ -1153,7 +1159,10 @@ impl Encoder {
             ValueView::Float(f) => self.out.push_str(&format_float(f)),
             ValueView::String(s) => write_string(&mut self.out, &s),
             ValueView::Table(t) => {
-                let t = t.to_rc();
+                let t = t
+                    .as_old()
+                    .expect("toml encoder promotes root Beat tables upfront")
+                    .to_rc();
                 self.enter(&t, depth)?;
                 let result = self.inline_table(&t, depth);
                 self.open.pop();

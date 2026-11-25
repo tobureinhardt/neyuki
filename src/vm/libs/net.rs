@@ -1188,16 +1188,23 @@ fn builtin_websocket(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> 
             match headers_val.view() {
                 crate::vm::value::ValueView::Nil => {}
                 crate::vm::value::ValueView::Table(list) => {
-                    for (name, value) in list.borrow().fields.iter() {
+                    let mut err = None;
+                    list.borrow().for_each_field(|name, value| {
+                        if err.is_some() {
+                            return;
+                        }
                         if let Some(v) = value.as_str() {
-                            headers.push(((**name).to_string(), v.to_string()));
+                            headers.push((name.to_string(), v.to_string()));
                         } else {
-                            return Err(format!(
+                            err = Some(format!(
                                 "headers.{} must be a string, got {}",
-                                &**name,
+                                name,
                                 value.type_name()
                             ));
                         }
+                    });
+                    if let Some(e) = err {
+                        return Err(e);
                     }
                 }
                 _ => {
@@ -1893,7 +1900,7 @@ fn process_arg(args: &[Value]) -> Result<Arc<Process>, String> {
     })
 }
 
-fn stdio_mode(options: &VmTable, name: &str) -> Result<Stdio, String> {
+fn stdio_mode(options: &crate::vm::value::TableBorrow<'_>, name: &str) -> Result<Stdio, String> {
     let val = options.get_str(name);
     match val.view() {
         crate::vm::value::ValueView::Nil => Ok(Stdio::inherit()),
@@ -1931,8 +1938,9 @@ pub(crate) fn os_spawn(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
         }
         Some(crate::vm::value::ValueView::Table(list)) => {
             let list = list.borrow();
-            let mut parts = Vec::with_capacity(list.array.len());
-            for (index, part) in list.array.iter().enumerate() {
+            let arr = list.array_slice();
+            let mut parts = Vec::with_capacity(arr.len());
+            for (index, part) in arr.iter().enumerate() {
                 if let Some(s) = part.as_str() {
                     parts.push(s.to_string());
                 } else {
@@ -1980,16 +1988,23 @@ pub(crate) fn os_spawn(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
             match env_val.view() {
                 crate::vm::value::ValueView::Nil => {}
                 crate::vm::value::ValueView::Table(env) => {
-                    for (key, value) in env.borrow().fields.iter() {
+                    let mut err = None;
+                    env.borrow().for_each_field(|key, value| {
+                        if err.is_some() {
+                            return;
+                        }
                         if let Some(v) = value.as_str() {
-                            command.env(&**key, v);
+                            command.env(key, v);
                         } else {
-                            return Err(format!(
+                            err = Some(format!(
                                 "env.{} must be a string, got {}",
-                                &**key,
+                                key,
                                 value.type_name()
                             ));
                         }
+                    });
+                    if let Some(e) = err {
+                        return Err(e);
                     }
                 }
                 _ => {

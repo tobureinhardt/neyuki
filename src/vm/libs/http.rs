@@ -282,35 +282,31 @@ fn scalar_header_value(key: &str, value: &Value) -> Result<String, String> {
 /// may be strings, numbers, or (for repeated headers such as `Set-Cookie`) a
 /// non-empty array of strings or numbers.
 fn headers_arg(args: &[Value], index: usize, name: &str) -> Result<Vec<(String, String)>, String> {
-    let table = match args.get(index) {
+    let mut pairs: Vec<(String, Value)> = Vec::new();
+    match args.get(index) {
         None => return Ok(Vec::new()),
         Some(v) if v.is_nil() => return Ok(Vec::new()),
-        Some(v) if v.is_table() => v.as_table().unwrap().to_rc(),
-        Some(value) => {
-            return Err(format!(
-                "{} must be a table, got {}",
-                name,
-                value.type_name()
-            ));
+        Some(v) => {
+            let Some(table) = v.table_borrow() else {
+                return Err(format!("{} must be a table, got {}", name, v.type_name()));
+            };
+            table.for_each_field(|k, val| pairs.push((k.to_string(), val.clone())));
         }
-    };
-    let table = table.borrow();
-    let mut pairs: Vec<(&StrRef, &Value)> = table.fields.iter().collect();
+    }
     // Deterministic key order makes requests and responses reproducible.
-    pairs.sort_by_key(|(a, _)| *a);
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut headers: Vec<(String, String)> = Vec::new();
-    for (key, value) in pairs {
+    for (key, value) in &pairs {
         validate_header_name(key)?;
-        if let Some(list) = value.as_table() {
-            let list = list.borrow();
-            if list.array.is_empty() || !list.fields.is_empty() || list.general.is_some() {
+        if let Some(list) = value.table_borrow() {
+            if list.array_slice().is_empty() || !list.fields_is_empty() || list.has_general() {
                 return Err(format!(
                     "header `{}` must be a string, a number or a non-empty array of strings",
                     key
                 ));
             }
-            for item in &list.array {
-                headers.push((key.to_string(), scalar_header_value(key, item)?));
+            for item in list.array_slice() {
+                headers.push((key.clone(), scalar_header_value(key, item)?));
             }
         } else {
             headers.push((key.to_string(), scalar_header_value(key, value)?));

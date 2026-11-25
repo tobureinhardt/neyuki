@@ -7,7 +7,6 @@
 //! with `keepNull`). Anchors, aliases and merge keys (`<<`) are bounded by
 //! strict depth, node-count and expansion caps to prevent Billion Laughs DoS.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use num_bigint::BigInt;
@@ -758,7 +757,7 @@ struct Encoder {
     out: String,
     indent: usize,
     sort_keys: bool,
-    open: Vec<*const RefCell<VmTable>>,
+    open: Vec<usize>,
 }
 
 /// Whether `s` can be written as an unquoted plain YAML scalar without being
@@ -879,17 +878,19 @@ fn write_double_quoted(out: &mut String, s: &str) {
     out.push('"');
 }
 
-fn classify_table(t: &RefCell<VmTable>) -> (bool, Vec<Value>, Vec<(Value, Value)>) {
+fn classify_table(
+    t: crate::vm::value::BorrowedTable<'_>,
+) -> (bool, Vec<Value>, Vec<(Value, Value)>) {
     let tbl = t.borrow();
     let marked = tbl
-        .metatable
+        .metatable()
         .as_ref()
         .is_some_and(|m| m.borrow().get_str(json::ARRAY_MARK).is_truthy());
-    let has_keys = !tbl.fields.is_empty() || tbl.general.is_some();
-    if (marked || !tbl.array.is_empty()) && !has_keys {
-        (true, tbl.array.clone(), Vec::new())
+    let has_keys = !tbl.fields_is_empty() || tbl.has_general();
+    if (marked || !tbl.array_slice().is_empty()) && !has_keys {
+        (true, tbl.array_slice().to_vec(), Vec::new())
     } else {
-        let entries = crate::vm::libs::table::entries(&tbl);
+        let entries = crate::vm::libs::table::entries_borrow(&tbl);
         (false, Vec::new(), entries)
     }
 }
@@ -1005,7 +1006,7 @@ impl Encoder {
     fn root(&mut self, value: &Value) -> Result<(), String> {
         match value.view() {
             crate::vm::value::ValueView::Table(t) if !json::is_null(value) => {
-                let (is_array, items, mut entries) = classify_table(&t);
+                let (is_array, items, mut entries) = classify_table(t);
                 if is_array && items.is_empty() {
                     self.out.push_str("[]");
                     return Ok(());
@@ -1014,7 +1015,7 @@ impl Encoder {
                     self.out.push_str("{}");
                     return Ok(());
                 }
-                let ptr = t.as_ptr();
+                let ptr = t.as_ptr_id();
                 self.open.push(ptr);
                 let result = if is_array {
                     self.write_seq(&items, 0, false)
@@ -1054,11 +1055,11 @@ impl Encoder {
                 self.write_block_literal(&s, child_level)
             }
             crate::vm::value::ValueView::Table(t) if !json::is_null(value) => {
-                let ptr = t.as_ptr();
+                let ptr = t.as_ptr_id();
                 if self.open.contains(&ptr) {
                     return Err("cannot encode a table that contains itself".to_string());
                 }
-                let (is_array, items, mut entries) = classify_table(&t);
+                let (is_array, items, mut entries) = classify_table(t);
                 if is_array && items.is_empty() {
                     self.out.push_str(" []");
                     return Ok(());
@@ -1128,11 +1129,11 @@ impl Encoder {
                     self.write_block_literal(&s, level + 1)?;
                 }
                 crate::vm::value::ValueView::Table(t) if !json::is_null(item) => {
-                    let ptr = t.as_ptr();
+                    let ptr = t.as_ptr_id();
                     if self.open.contains(&ptr) {
                         return Err("cannot encode a table that contains itself".to_string());
                     }
-                    let (is_array, sub_items, mut sub_entries) = classify_table(&t);
+                    let (is_array, sub_items, mut sub_entries) = classify_table(t);
                     if is_array && sub_items.is_empty() {
                         self.out.push_str(" []");
                     } else if !is_array && sub_entries.is_empty() {

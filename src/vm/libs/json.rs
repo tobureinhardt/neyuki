@@ -72,14 +72,14 @@ fn json_array(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         }
     };
     let has_meta = tbl_val
-        .as_table()
-        .is_some_and(|t| t.borrow().metatable.is_some());
+        .table_borrow()
+        .is_some_and(|t| t.metatable().is_some());
     if !has_meta {
         let meta = vm.alloc_table(VmTable::new());
         vm.table_set_metatable(&tbl_val, Some(meta))?;
     }
-    if let Some(t) = tbl_val.as_table()
-        && let Some(ref mt) = t.borrow().metatable
+    if let Some(t) = tbl_val.table_borrow()
+        && let Some(mt) = t.metatable()
     {
         mt.borrow_mut().set_str(ARRAY_MARK, Value::TRUE);
     }
@@ -96,7 +96,7 @@ struct Encoder<'a> {
     indent: String,
     sort_keys: bool,
     /// Tables being encoded, to reject cycles.
-    open: Vec<*const RefCell<VmTable>>,
+    open: Vec<usize>,
 }
 
 /// `json.encode(value, options?)` with `indent` (a number of spaces or a
@@ -176,26 +176,25 @@ impl Encoder<'_> {
             ValueView::String(s) => write_string(&mut self.out, &s),
             ValueView::Table(_) if is_null(value) => self.out.push_str("null"),
             ValueView::Table(t) => {
+                let ptr = t.as_ptr_id();
                 let custom = t.borrow().metamethod("__tojson");
                 if let Some(handler) = custom {
                     let result = self
                         .vm
                         .call_function(handler, std::slice::from_ref(value))?;
                     let result = result.into_iter().next().unwrap_or(Value::NIL);
-                    if result
-                        .table_ptr()
-                        .is_some_and(|p| std::ptr::eq(p, t.as_ptr()))
+                    if let ValueView::Table(rt) = result.view()
+                        && rt.as_ptr_id() == ptr
                     {
                         return Err("__tojson returned its own table".to_string());
                     }
                     return self.value(&result, depth + 1);
                 }
-                let ptr = t.as_ptr();
                 if self.open.contains(&ptr) {
                     return Err("cannot encode a table that contains itself".to_string());
                 }
                 self.open.push(ptr);
-                let result = self.table(&t, depth);
+                let result = self.table(t, depth);
                 self.open.pop();
                 result?;
             }
@@ -206,18 +205,22 @@ impl Encoder<'_> {
         Ok(())
     }
 
-    fn table(&mut self, t: &RefCell<VmTable>, depth: usize) -> Result<(), String> {
+    fn table(
+        &mut self,
+        t: crate::vm::value::BorrowedTable<'_>,
+        depth: usize,
+    ) -> Result<(), String> {
         let (is_array, items, entries) = {
             let tbl = t.borrow();
             let marked = tbl
-                .metatable
+                .metatable()
                 .as_ref()
                 .is_some_and(|m| m.borrow().get_str(ARRAY_MARK).is_truthy());
-            let has_keys = !tbl.fields.is_empty() || tbl.general.is_some();
-            if (marked || !tbl.array.is_empty()) && !has_keys {
-                (true, tbl.array.clone(), Vec::new())
+            let has_keys = !tbl.fields_is_empty() || tbl.has_general();
+            if (marked || !tbl.array_slice().is_empty()) && !has_keys {
+                (true, tbl.array_slice().to_vec(), Vec::new())
             } else {
-                let entries = crate::vm::libs::table::entries(&tbl);
+                let entries = crate::vm::libs::table::entries_borrow(&tbl);
                 (false, Vec::new(), entries)
             }
         };

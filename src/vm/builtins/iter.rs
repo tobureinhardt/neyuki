@@ -13,11 +13,11 @@ pub static NEXT: &NativeDef = &NativeDef {
 /// `next(t, key?)`: the entry after `key` (the first one when `key` is nil),
 /// or nil at the end. The order is the one `for k, v in t` uses.
 pub fn builtin_next(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let Some(t) = args.first().and_then(|v| v.as_table()) else {
+    let Some(t) = args.first().and_then(|v| v.table_borrow()) else {
         return Err("next expects a table".to_string());
     };
     let key = args.get(1).cloned().unwrap_or(Value::NIL);
-    match crate::vm::table::next_entry(&t.borrow(), &key)? {
+    match t.next_entry(&key)? {
         Some((k, v)) => Ok(vec![k, v]),
         None => Ok(vec![Value::NIL]),
     }
@@ -28,10 +28,10 @@ pub fn builtin_pairs(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> 
     let Some(table) = args.first() else {
         return Err("pairs expects a table".to_string());
     };
-    let Some(t) = table.as_table() else {
+    let Some(t) = table.table_borrow() else {
         return Err("pairs expects a table".to_string());
     };
-    let handler = t.borrow().metamethod("__pairs");
+    let handler = t.metamethod("__pairs");
     if let Some(handler) = handler {
         let mut results = vm.call_function(handler, std::slice::from_ref(table))?;
         results.resize(3, Value::NIL);

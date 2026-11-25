@@ -1,6 +1,6 @@
 //! Bytecode interpreter dispatch loop and loop-control helpers.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 use num_integer::Integer as _;
@@ -1599,7 +1599,7 @@ impl VM {
                                 set!(dst, res.into_iter().next().unwrap_or(Value::NIL));
                                 continue;
                             }
-                            t.borrow().array.len()
+                            t.borrow().array_len()
                         }
                         ValueView::Buffer(b) => b.borrow().len(),
                         _ => throw!("len expects string, table or buffer"),
@@ -2983,7 +2983,7 @@ impl VM {
         };
         if direct_table {
             let (head, tail) = self.stack.split_at_mut(iter_idx + 1);
-            if let Some(t) = head[iter_idx].as_table() {
+            if let Some(t) = head[iter_idx].table_borrow() {
                 let (state_slice, rest) = tail.split_at_mut(2);
                 Self::table_for_step_into(&t, &mut state_slice[0], &mut rest[..retc_usize]);
                 return Ok(());
@@ -3009,7 +3009,11 @@ impl VM {
     /// snapshot of the remaining keys (stored reversed, popped from the end).
     /// Entries removed during the loop are skipped; keys added after the
     /// snapshot are not visited.
-    fn table_for_step_into(t: &RefCell<VmTable>, state_slot: &mut Value, vars: &mut [Value]) {
+    fn table_for_step_into(
+        tbl: &crate::vm::value::TableBorrow<'_>,
+        state_slot: &mut Value,
+        vars: &mut [Value],
+    ) {
         #[inline]
         fn write_entry(vars: &mut [Value], key: Value, value: Value) {
             if vars.len() > 1 {
@@ -3023,18 +3027,17 @@ impl VM {
             }
         }
 
-        let tbl = t.borrow();
         let mut next_index = match state_slot.view() {
             ValueView::Int(i) => i as usize,
             ValueView::Table(_) => usize::MAX,
             _ => 0,
         };
-        while next_index < tbl.array.len() {
-            let v = &tbl.array[next_index];
+        let arr = tbl.array_slice();
+        while next_index < arr.len() {
+            let v = &arr[next_index];
             next_index += 1;
             if !v.is_nil() {
                 let v = v.clone();
-                drop(tbl);
                 let idx_val = Value::from_usize(next_index);
                 state_slot.set_inplace(idx_val.clone());
                 write_entry(vars, idx_val, v);
@@ -3044,14 +3047,20 @@ impl VM {
         let snapshot = if let Some(snapshot) = state_slot.as_table() {
             snapshot.to_rc()
         } else {
-            if tbl.fields.is_empty() && tbl.general.is_none() {
-                drop(tbl);
+            if tbl.fields_is_empty() && !tbl.has_general() {
                 for slot in vars {
                     *slot = Value::NIL;
                 }
                 return;
             }
-            let mut keys = crate::vm::table::sorted_keys(&tbl);
+            let mut keys = tbl.sorted_keys();
+            for k in &mut keys {
+                if let Some(s) = k.as_str_ref()
+                    && s.is_beat()
+                {
+                    *k = Value::str_ref(s.to_str_ref());
+                }
+            }
             keys.reverse();
             let mut snapshot = VmTable::new();
             snapshot.array = keys;
@@ -3063,13 +3072,11 @@ impl VM {
             let value = tbl.raw_get(&key);
             if !value.is_nil() {
                 drop(snapshot);
-                drop(tbl);
                 write_entry(vars, key, value);
                 return;
             }
         }
         drop(snapshot);
-        drop(tbl);
         for slot in vars {
             *slot = Value::NIL;
         }

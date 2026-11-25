@@ -283,10 +283,10 @@ fn collect_numbers(args: &[Value], name: &str) -> Result<Vec<Value>, String> {
             out.push(value.clone());
             return Ok(());
         }
-        if let Some(t) = value.as_table()
+        if let Some(t) = value.table_borrow()
             && depth < 16
         {
-            for item in &t.borrow().array {
+            for item in t.array_slice() {
                 push(item, out, depth + 1)?;
             }
             return Ok(());

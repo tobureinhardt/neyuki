@@ -2185,8 +2185,8 @@ end
     fn exists_in(root: &Value, path: &str) -> bool {
         let mut current = root.clone();
         for part in path.split('.') {
-            let next = match current.as_table() {
-                Some(table) => table.borrow().get_str(part),
+            let next = match current.table_borrow() {
+                Some(table) => table.get_str(part),
                 None => return false,
             };
             current = next;

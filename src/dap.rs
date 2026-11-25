@@ -195,8 +195,8 @@ fn preview(v: &Value) -> String {
         ValueView::String(s) => format!("{:?}", s.as_str()),
         ValueView::Table(t) => {
             let t = t.borrow();
-            let named = t.fields.len() + t.general.as_ref().map_or(0, |g| g.len());
-            match (t.array.len(), named) {
+            let named = t.fields_len() + t.general_len();
+            match (t.array_len(), named) {
                 (0, 0) => "{}".to_string(),
                 (n, 0) => format!("{{...}} ({} items)", n),
                 (0, m) => format!("{{...}} ({} keys)", m),
@@ -493,8 +493,8 @@ fn variables(vm: &mut VM, reference: usize) -> Json {
                 .collect()
         }
         Some(VarRef::Value(ref val)) if val.is_table() => {
-            let t = val.as_table().unwrap();
-            crate::vm::libs::table::entries(&t.borrow())
+            let t = val.table_borrow().unwrap();
+            crate::vm::libs::table::entries_borrow(&t)
                 .into_iter()
                 .map(|(k, v)| {
                     let name = match k.as_str() {

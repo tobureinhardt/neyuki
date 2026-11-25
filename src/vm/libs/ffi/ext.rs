@@ -387,7 +387,16 @@ impl ExtState {
         self.frames.last().map_or(0, |f| f.serial)
     }
 
-    fn new_handle(&mut self, value: Value) -> NeyukiExtValue {
+    fn promote_if_beat(&self, val: &mut Value) {
+        if val.is_beat()
+            && let Ok(vm) = self.vm()
+        {
+            unsafe { (*vm.as_ptr()).beat_promote_value(val) };
+        }
+    }
+
+    fn new_handle(&mut self, mut value: Value) -> NeyukiExtValue {
+        self.promote_if_beat(&mut value);
         let serial = self.serial();
         let index = self.handles.len() as i64;
         self.handles.push((serial, value));
@@ -424,7 +433,8 @@ impl ExtState {
     }
 
     /// Converts a host value for the extension.
-    fn export(&mut self, value: Value) -> NeyukiExtValue {
+    fn export(&mut self, mut value: Value) -> NeyukiExtValue {
+        self.promote_if_beat(&mut value);
         if let Some(s) = value.as_str() {
             let out = NeyukiExtValue::from_bytes(s.as_bytes());
             // The string's heap bytes do not move while a clone of the

@@ -104,8 +104,9 @@ pub fn builtin_asserttype(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, St
 
 /// A value as `tostring` prints it, honoring `__tostring`.
 pub fn tostring(vm: &mut VM, val: &Value) -> Result<String, String> {
-    if let Some(t) = val.as_table() {
-        let handler = t.borrow().metamethod("__tostring");
+    if let Some(t) = val.table_borrow() {
+        let handler = t.metamethod("__tostring");
+        drop(t);
         if let Some(h) = handler {
             let res = vm.call_function(h, std::slice::from_ref(val))?;
             return Ok(res.into_iter().next().unwrap_or(Value::NIL).to_string());
@@ -435,8 +436,8 @@ fn load_native_package(
         .map_err(|e| format!("cannot load {}'s native library: {}", package, e))?;
     let ffi = load_bundled_module(vm, "@neyuki/ffi")?
         .ok_or_else(|| "@neyuki/ffi is not available".to_string())?;
-    let bind = match ffi.as_table() {
-        Some(t) => t.borrow().get_str("_bindExtension"),
+    let bind = match ffi.table_borrow() {
+        Some(t) => t.get_str("_bindExtension"),
         None => Value::NIL,
     };
     let fn_map = vm.alloc_table(fn_map);

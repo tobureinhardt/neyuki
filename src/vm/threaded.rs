@@ -3548,8 +3548,8 @@ unsafe fn len_fast(regs: *mut Value, src: u8) -> Option<usize> {
             ValueView::String(s) => Some(s.len()),
             ValueView::Table(t) => {
                 let tbl = t.borrow();
-                if tbl.metatable.is_none() {
-                    Some(tbl.array.len())
+                if tbl.metatable().is_none() {
+                    Some(tbl.array_len())
                 } else {
                     None
                 }
@@ -3622,7 +3622,7 @@ fn cold_len(
                         Err(e) => return fail_with(vm, pc, e),
                     }
                 }
-                t.borrow().array.len()
+                t.borrow().array_len()
             }
             ValueView::Buffer(b) => b.borrow().len(),
             _ => return fail_msg(vm, pc, "len expects string, table or buffer"),

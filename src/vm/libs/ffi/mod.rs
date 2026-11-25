@@ -223,7 +223,7 @@ fn parse_signature(tbl: &VmTable) -> Result<(Vec<FfiType>, FfiType), String> {
         crate::vm::value::ValueView::Nil => {}
         crate::vm::value::ValueView::Table(arg_tbl) => {
             let arg_tbl = arg_tbl.borrow();
-            for (idx, val) in arg_tbl.array.iter().enumerate() {
+            for (idx, val) in arg_tbl.array_slice().iter().enumerate() {
                 let Some(s) = val.as_str() else {
                     return Err(format!(
                         "signature args[{}] must be a type string, got {}",
@@ -264,7 +264,12 @@ fn builtin_open(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let perm_target = if path.is_empty() { "<self>" } else { path };
     let resolved = vm.permissions.resolve_ffi_library(path)?;
 
-    let sigs_tbl = table_arg(args, 1, "signatures")?;
+    let _ = table_arg(args, 1, "signatures")?;
+    let mut sigs_val = args[1].clone();
+    vm.beat_escape_if_needed(&mut sigs_val);
+    let sigs_tbl = sigs_val
+        .as_table()
+        .expect("promoted FFI signatures must be Old");
     let lib = open_library(&resolved)?;
 
     let mut symbols = Vec::new();

@@ -197,11 +197,6 @@ fn builtin_decode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![vm.alloc_array(rows)])
 }
 
-/// Whether a row is keyed by column names rather than an array.
-fn is_keyed(row: &VmTable) -> bool {
-    !row.fields.is_empty() || row.general.is_some()
-}
-
 fn write_record(out: &mut String, cells: &[String], delimiter: u8, newline: &str) {
     let delimiter = delimiter as char;
     for (i, cell) in cells.iter().enumerate() {
@@ -244,15 +239,15 @@ fn cell_text(vm: &mut VM, value: &Value, row: usize) -> Result<String, String> {
 /// sorted. A header line naming the columns is written unless `header` is
 /// false.
 fn builtin_encode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let rows = table_arg(args, 0, "rows")?.borrow().array.clone();
+    let rows = table_arg(args, 0, "rows")?.borrow().array_slice().to_vec();
     let delimiter = delimiter_arg(args, 1)?;
     let columns = match args.get(2) {
         None => None,
         Some(v) if v.is_nil() => None,
         Some(v) if v.is_table() => {
-            let t = v.as_table().unwrap();
+            let t = v.table_borrow().unwrap();
             let mut names = Vec::new();
-            for value in t.borrow().array.iter() {
+            for value in t.array_slice().iter() {
                 match value.as_str() {
                     Some(s) => names.push(s.to_string()),
                     None => return Err("columns must be an array of strings".to_string()),
@@ -277,8 +272,8 @@ fn builtin_encode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
     let mut keyed = false;
     for (i, row) in rows.iter().enumerate() {
-        match row.as_table() {
-            Some(t) => keyed |= is_keyed(&t.borrow()),
+        match row.table_borrow() {
+            Some(t) => keyed |= !t.fields_is_empty() || t.has_general(),
             None => {
                 return Err(format!(
                     "row {} must be a table, got {}",
@@ -293,10 +288,10 @@ fn builtin_encode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         None if keyed => {
             let mut names = BTreeSet::new();
             for row in &rows {
-                if let Some(t) = row.as_table() {
-                    for (key, _) in t.borrow().fields.iter() {
+                if let Some(t) = row.table_borrow() {
+                    t.for_each_field(|key, _| {
                         names.insert(key.to_string());
-                    }
+                    });
                 }
             }
             Some(names.into_iter().collect())
@@ -309,16 +304,14 @@ fn builtin_encode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         write_record(&mut out, columns, delimiter, &newline);
     }
     for (i, row) in rows.iter().enumerate() {
-        let Some(t) = row.as_table() else {
+        let Some(t) = row.table_borrow() else {
             continue;
         };
         let values: Vec<Value> = {
-            let t = t.borrow();
+            let is_k = !t.fields_is_empty() || t.has_general();
             match &columns {
-                Some(columns) if is_keyed(&t) => {
-                    columns.iter().map(|name| t.get_str(name)).collect()
-                }
-                _ => t.array.clone(),
+                Some(columns) if is_k => columns.iter().map(|name| t.get_str(name)).collect(),
+                _ => t.array_slice().to_vec(),
             }
         };
         let mut cells = Vec::with_capacity(values.len());

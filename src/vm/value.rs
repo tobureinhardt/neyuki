@@ -497,6 +497,197 @@ impl<'a> TableBorrow<'a> {
             TableBorrow::Beat(t) => t.extra_ref().and_then(|e| e.metatable.clone()),
         }
     }
+
+    #[inline]
+    pub fn metamethod(&self, name: &str) -> Option<Value> {
+        match self {
+            TableBorrow::Old(t) => t.metamethod(name),
+            TableBorrow::Beat(t) => t.metamethod(name),
+        }
+    }
+
+    #[inline]
+    pub fn fields_len(&self) -> usize {
+        match self {
+            TableBorrow::Old(t) => t.fields.len(),
+            TableBorrow::Beat(t) => match t.extra_ref() {
+                Some(ext) => ext.fields.len(),
+                None => t.fld_len as usize,
+            },
+        }
+    }
+
+    #[inline]
+    pub fn general_len(&self) -> usize {
+        match self {
+            TableBorrow::Old(t) => t.general.as_ref().map_or(0, |g| g.len()),
+            TableBorrow::Beat(t) => t
+                .extra_ref()
+                .and_then(|e| e.general.as_ref())
+                .map_or(0, |g| g.len()),
+        }
+    }
+
+    #[inline]
+    pub fn fields_is_empty(&self) -> bool {
+        match self {
+            TableBorrow::Old(t) => t.fields.is_empty(),
+            TableBorrow::Beat(t) => match t.extra_ref() {
+                Some(ext) => ext.fields.is_empty(),
+                None => t.fld_len == 0,
+            },
+        }
+    }
+
+    #[inline]
+    pub fn has_general(&self) -> bool {
+        match self {
+            TableBorrow::Old(t) => t.general.is_some(),
+            TableBorrow::Beat(t) => t.extra_ref().is_some_and(|e| e.general.is_some()),
+        }
+    }
+
+    #[inline]
+    pub fn sorted_keys(&self) -> Vec<Value> {
+        match self {
+            TableBorrow::Old(t) => crate::vm::table::sorted_keys(t),
+            TableBorrow::Beat(t) => t.sorted_keys(),
+        }
+    }
+
+    #[inline]
+    pub fn next_entry(&self, key: &Value) -> Result<Option<(Value, Value)>, String> {
+        match self {
+            TableBorrow::Old(t) => crate::vm::table::next_entry(t, key),
+            TableBorrow::Beat(t) => t.next_entry(key),
+        }
+    }
+
+    pub fn for_each_field(&self, mut f: impl FnMut(&str, &Value)) {
+        match self {
+            TableBorrow::Old(t) => {
+                for (k, v) in t.fields.iter() {
+                    f(&k.0.str, v);
+                }
+            }
+            TableBorrow::Beat(t) => {
+                if let Some(ext) = t.extra_ref() {
+                    for (k, v) in ext.fields.iter() {
+                        f(&k.0.str, v);
+                    }
+                } else {
+                    for entry in t.fields_slice() {
+                        if let Some(ks) = entry.key.as_str() {
+                            f(ks, &entry.val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn for_each_general(&self, mut f: impl FnMut(&Value, &Value)) {
+        match self {
+            TableBorrow::Old(t) => {
+                if let Some(gen_map) = &t.general {
+                    for (k, v) in gen_map.values() {
+                        f(k, v);
+                    }
+                }
+            }
+            TableBorrow::Beat(t) => {
+                if let Some(ext) = t.extra_ref()
+                    && let Some(gen_map) = &ext.general
+                {
+                    for (k, v) in gen_map.values() {
+                        f(k, v);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Non-owning shared handle to either an Old `RefCell<VmTable>` or a Beat
+/// [`crate::vm::beat::BeatTable`], without acquiring a `RefCell` borrow on view.
+#[derive(Copy, Clone)]
+pub struct BorrowedTable<'a> {
+    raw: usize,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl<'a> BorrowedTable<'a> {
+    #[inline(always)]
+    unsafe fn from_old_raw(ptr: *const RefCell<VmTable>) -> Self {
+        Self {
+            raw: ptr.expose_provenance(),
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn from_beat_raw(ptr: *const crate::vm::beat::BeatTable) -> Self {
+        Self {
+            raw: ptr.expose_provenance() | 1,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_beat(self) -> bool {
+        (self.raw & 1) != 0
+    }
+
+    #[inline(always)]
+    pub fn as_ptr_id(self) -> usize {
+        self.raw & !1
+    }
+
+    #[inline(always)]
+    pub fn ptr_eq(a: Self, b: Self) -> bool {
+        a.raw == b.raw
+    }
+
+    #[inline(always)]
+    pub fn as_old(self) -> Option<BorrowedRc<'a, RefCell<VmTable>>> {
+        if self.is_beat() {
+            None
+        } else {
+            let ptr: *const RefCell<VmTable> = std::ptr::with_exposed_provenance(self.raw);
+            Some(unsafe { BorrowedRc::from_raw(ptr) })
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_beat(self) -> Option<&'a crate::vm::beat::BeatTable> {
+        if self.is_beat() {
+            let ptr: *const crate::vm::beat::BeatTable =
+                std::ptr::with_exposed_provenance(self.raw & !1);
+            Some(unsafe { &*ptr })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn borrow(self) -> TableBorrow<'a> {
+        if let Some(bt) = self.as_beat() {
+            TableBorrow::Beat(bt)
+        } else {
+            let ptr: *const RefCell<VmTable> = std::ptr::with_exposed_provenance(self.raw);
+            TableBorrow::Old(unsafe { &*ptr }.borrow())
+        }
+    }
+
+    #[inline(always)]
+    pub fn try_borrow(self) -> Result<TableBorrow<'a>, std::cell::BorrowError> {
+        if let Some(bt) = self.as_beat() {
+            Ok(TableBorrow::Beat(bt))
+        } else {
+            let ptr: *const RefCell<VmTable> = std::ptr::with_exposed_provenance(self.raw);
+            unsafe { &*ptr }.try_borrow().map(TableBorrow::Old)
+        }
+    }
 }
 
 impl Eq for BorrowedStr<'_> {}
@@ -522,7 +713,7 @@ pub enum ValueView<'a> {
     Native(&'static NativeDef),
     BigInt(&'a BigInt),
     String(BorrowedStr<'a>),
-    Table(BorrowedRc<'a, RefCell<VmTable>>),
+    Table(BorrowedTable<'a>),
     Closure(BorrowedRc<'a, VmClosure>),
     Buffer(BorrowedRc<'a, RefCell<VmBuffer>>),
 }
@@ -727,6 +918,30 @@ impl Value {
     pub(crate) const unsafe fn from_trivial_bits(bits: u64) -> Value {
         debug_assert!(bits < TAG_RC_START);
         Value(bits)
+    }
+
+    /// Reconstructs a cloned owned `Value` from a stored raw NaN-boxed bit word
+    /// (incrementing strong count if it represents an Old `Rc`-backed object).
+    ///
+    /// # Safety
+    /// Caller must ensure `bits` represents a live valid `Value` encoding.
+    #[inline(always)]
+    pub(crate) unsafe fn clone_from_bits(bits: u64) -> Value {
+        if bits >= TAG_RC_START && (bits & BIT_BEAT) == 0 {
+            unsafe { clone_rc_slow(bits) };
+        }
+        Value(bits)
+    }
+
+    /// Returns the Beat allocation cursor for a Beat-resident value (`BeatTable`
+    /// or `BeatString`), or `None` for scalars and Old values.
+    #[inline(always)]
+    pub fn beat_alloc_mark(&self) -> Option<crate::vm::beat::BeatMark> {
+        if let Some(bt) = self.beat_table_ptr() {
+            Some(unsafe { (*bt).alloc_mark })
+        } else {
+            self.beat_str_ptr().map(|bs| unsafe { (*bs).alloc_mark })
+        }
     }
 
     /// Overwrites `*self` with `val`, bypassing `Drop` when both old and new are trivial scalars.
@@ -1124,13 +1339,17 @@ impl Value {
                 }
             }
             TAG_TABLE_HI => {
-                assert!(
-                    (bits & BIT_BEAT) == 0,
-                    "Value::view called on BeatTable; use table_borrow()"
-                );
-                ValueView::Table(unsafe {
-                    BorrowedRc::from_raw(unpack_ptr::<RefCell<VmTable>>(bits))
-                })
+                if (bits & BIT_BEAT) != 0 {
+                    ValueView::Table(unsafe {
+                        BorrowedTable::from_beat_raw(unpack_beat_ptr::<crate::vm::beat::BeatTable>(
+                            bits,
+                        ))
+                    })
+                } else {
+                    ValueView::Table(unsafe {
+                        BorrowedTable::from_old_raw(unpack_ptr::<RefCell<VmTable>>(bits))
+                    })
+                }
             }
             TAG_CLOSURE_HI => {
                 ValueView::Closure(unsafe { BorrowedRc::from_raw(unpack_ptr::<VmClosure>(bits)) })
@@ -1309,19 +1528,12 @@ impl Value {
     }
 
     pub fn type_name(&self) -> &'static str {
-        if let Some(bt) = self.beat_table_ptr() {
-            return if unsafe { &*bt }.has_co_state() {
-                "thread"
-            } else {
-                "table"
-            };
-        }
         match self.view() {
             ValueView::Nil => "nil",
             ValueView::Bool(_) => "boolean",
             ValueView::Int(_) | ValueView::BigInt(_) | ValueView::Float(_) => "number",
             ValueView::String(_) => "string",
-            ValueView::Table(t) if t.try_borrow().is_ok_and(|t| t.co_state.is_some()) => "thread",
+            ValueView::Table(t) if t.try_borrow().is_ok_and(|t| t.has_co_state()) => "thread",
             ValueView::Table(_) => "table",
             ValueView::Closure(_) | ValueView::Native(..) => "function",
             ValueView::Buffer(_) => "buffer",
@@ -1329,20 +1541,13 @@ impl Value {
     }
 
     pub fn typeof_name(&self) -> &'static str {
-        if let Some(bt) = self.beat_table_ptr() {
-            return if unsafe { &*bt }.has_co_state() {
-                "thread"
-            } else {
-                "table"
-            };
-        }
         match self.view() {
             ValueView::Nil => "nil",
             ValueView::Bool(_) => "boolean",
             ValueView::Int(_) | ValueView::BigInt(_) => "bigint",
             ValueView::Float(_) => "float",
             ValueView::String(_) => "string",
-            ValueView::Table(t) if t.try_borrow().is_ok_and(|t| t.co_state.is_some()) => "thread",
+            ValueView::Table(t) if t.try_borrow().is_ok_and(|t| t.has_co_state()) => "thread",
             ValueView::Table(_) => "table",
             ValueView::Closure(_) | ValueView::Native(..) => "function",
             ValueView::Buffer(_) => "buffer",
@@ -1776,9 +1981,6 @@ impl From<&str> for Value {
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_beat_table() {
-            return write!(f, "table");
-        }
         match self.view() {
             ValueView::Nil => write!(f, "nil"),
             ValueView::Bool(b) => write!(f, "{}", b),
