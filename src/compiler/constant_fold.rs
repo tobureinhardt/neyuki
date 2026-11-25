@@ -27,8 +27,11 @@ impl PartialEq for FoldVal {
             (FoldVal::Bool(a), FoldVal::Bool(b)) => a == b,
             (FoldVal::Int(a), FoldVal::Int(b)) => a == b,
             (FoldVal::Float(a), FoldVal::Float(b)) => a == b,
-            (FoldVal::Int(a), FoldVal::Float(b)) => a.to_f64().is_some_and(|v| v == *b),
-            (FoldVal::Float(a), FoldVal::Int(b)) => b.to_f64().is_some_and(|v| *a == v),
+            // Exact, like the VM: converting the integer to `f64` rounds
+            // above 2^53, so the float is converted to an integer instead.
+            (FoldVal::Int(a), FoldVal::Float(b)) | (FoldVal::Float(b), FoldVal::Int(a)) => {
+                b.fract() == 0.0 && BigInt::from_f64(*b).is_some_and(|v| v == *a)
+            }
             (FoldVal::Str(a), FoldVal::Str(b)) => a == b,
             _ => false,
         }
@@ -938,6 +941,17 @@ pub fn fold_program(mut stmts: Vec<Stmt>) -> Vec<Stmt> {
 mod tests {
     use super::*;
     use crate::parser::Parser;
+
+    #[test]
+    fn int_float_equality_folds_exactly() {
+        let big = |s: &str| FoldVal::Int(s.parse::<BigInt>().unwrap());
+        assert_ne!(big("9007199254740993"), FoldVal::Float(9007199254740992.0));
+        assert_ne!(big("9223372036854775807"), FoldVal::Float(2f64.powi(63)));
+        assert_eq!(big("9007199254740992"), FoldVal::Float(9007199254740992.0));
+        assert_eq!(FoldVal::Float(2f64.powi(63)), big("9223372036854775808"));
+        assert_ne!(big("1"), FoldVal::Float(1.5));
+        assert_ne!(big("0"), FoldVal::Float(f64::NAN));
+    }
 
     #[test]
     fn test_fold_arithmetic() {
