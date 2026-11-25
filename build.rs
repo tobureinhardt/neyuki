@@ -71,8 +71,11 @@ fn main() {
 /// handler-to-handler tail calls are known to become jumps. Rust does not
 /// guarantee tail calls, so it stays behind the opt-in `threaded` feature and
 /// is further limited to optimized builds without debug assertions on 64-bit
-/// x86 and ARM, where LLVM performs sibling-call optimisation. Everywhere else
-/// the loop interpreter in `interp.rs` runs.
+/// x86 and ARM, where LLVM performs sibling-call optimisation. Windows is
+/// left out: the Win64 convention passes only four arguments in registers,
+/// and a handler hands the next one a new sixth argument on the stack, so
+/// no dispatch can be a jump there. Everywhere else the loop interpreter in
+/// `interp.rs` runs.
 fn threaded_interpreter_cfg() {
     println!("cargo::rustc-check-cfg=cfg(neyuki_threaded)");
     let feature = env::var_os("CARGO_FEATURE_THREADED").is_some();
@@ -83,7 +86,8 @@ fn threaded_interpreter_cfg() {
         Ok("x86_64" | "aarch64")
     );
     let width_ok = env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64");
-    if feature && optimized && !debug_assertions && arch_ok && width_ok {
+    let windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    if feature && optimized && !debug_assertions && arch_ok && width_ok && !windows {
         println!("cargo::rustc-cfg=neyuki_threaded");
     }
 }

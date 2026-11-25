@@ -1,8 +1,8 @@
 //! Threaded tail-call bytecode interpreter (`TRAP == false`).
 //!
 //! Compiled only under `cfg(neyuki_threaded)`, which build.rs sets for the
-//! opt-in `threaded` feature in optimized 64-bit x86/ARM builds without debug
-//! assertions. Rust does not guarantee tail calls; those are the builds where
+//! opt-in `threaded` feature in optimized 64-bit x86/ARM Linux and macOS
+//! builds without debug assertions. Rust does not guarantee tail calls; those are the builds where
 //! the handler-to-handler calls are known to become jumps.
 //!
 //! Each opcode handler takes six scalar/pointer arguments in registers:

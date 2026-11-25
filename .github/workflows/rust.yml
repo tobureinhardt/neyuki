@@ -61,7 +61,8 @@ jobs:
   # test job never runs it. Its handlers chain through tail calls that Rust
   # does not guarantee; if any dispatch path stops being a jump, the native
   # stack grows per instruction. The disassembly check finds such a path
-  # directly; the long loops catch it on the other platforms.
+  # directly; the long loops catch it on macOS. build.rs leaves the threaded
+  # interpreter off on Windows, so that leg runs the release loop interpreter.
   release-threaded:
     name: Release threaded interpreter
     runs-on: ${{ matrix.os }}
