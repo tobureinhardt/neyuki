@@ -22,8 +22,8 @@ Language features and APIs are organized into three distinct stability tiers:
 
 ### Tier 2: Standard Library (`@neyuki/*`)
 - **Scope**: Every library documented under `docs/reference/`, which today means `bit`, `buffer`, `coroutine`, `crypto`, `debug`, `fs`, `http`, `io`, `json`, `math`, `net`, `os`, `profile`, `string`, `table`, `task` and `utf8`, together with the global functions in `docs/reference/globals.md`.
-- **Guarantee**: APIs are strictly additive within minor versions. Any deprecated function will be marked with diagnostics warning `W0005` for at least one minor release cycle before potential removal in a major release.
-- **Fields and methods**: A documented field and a documented method are equally covered, so a field cannot quietly become a method or the reverse. Note that only a method call can carry the `W0005` warning of the deprecation lifecycle below; a field read cannot, so a field named in `docs/reference/` can only be retired at a major boundary.
+- **Guarantee**: APIs are strictly additive within minor versions. Any deprecated function will be marked with diagnostics warning `W0008` for at least one minor release cycle before potential removal in a major release.
+- **Fields and methods**: A documented field and a documented method are equally covered, so a field cannot quietly become a method or the reverse. Note that only a method call can carry the `W0008` warning of the deprecation lifecycle below; a field read cannot, so a field named in `docs/reference/` can only be retired at a major boundary.
 
 ### Tier 3: Experimental and Preview Tooling
 - **Scope**: Features designated with `--experimental` flags, unstable LSP extensions, and internal development tools.
@@ -49,6 +49,6 @@ Bytecode artifacts (`.nykb`) carry an explicit version byte in the 12-byte heade
 ## 4. Deprecation Lifecycle
 
 When an API or language pattern is targeted for deprecation:
-1. **Phase 1 (Warning)**: The compiler and linter emit a diagnostic warning (`W0005`) with a clear explanation and recommendation for the replacement API (`= help: use new_api instead`). Code continues to execute identically.
+1. **Phase 1 (Warning)**: The compiler and linter emit a diagnostic warning (`W0008`) with a clear explanation and recommendation for the replacement API (`= help: use new_api instead`). Code continues to execute identically.
 2. **Phase 2 (Deprecation Window)**: The feature remains operational for at least one full minor release cycle (minimum 6 months).
 3. **Phase 3 (Removal)**: The feature is retired upon the subsequent major version boundary (`v2.0`).

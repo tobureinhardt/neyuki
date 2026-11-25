@@ -1,10 +1,31 @@
 //! Runtime values and tables.
+//!
+//! [`Value`] uses 64-bit Negative-QNaN NaN-boxing (`size_of::<Value>() == 8`,
+//! half the size of Lua 5.4's 16-byte `TValue`):
+//!
+//! - Non-NaN IEEE-754 `f64` values occupy `[0x0000_0000_0000_0000, TAG_BASE)`,
+//!   with NaNs canonicalized to `0x7FF8_0000_0000_0000`. Checking `is_float`
+//!   is a single unsigned comparison and decoding is zero-cost.
+//! - `[TAG_INT, ...]` (`0xFFF8..0xFFFF`) uses the upper 16 bits as a type tag
+//!   and the lower 48 bits as inline signed integer / misc tag / 48-bit pointer:
+//!   - `0xFFF8`: inline 48-bit signed integer (`[-2^47, 2^47 - 1]`)
+//!   - `0xFFF9`: `Nil` (`0`), `Bool(false)` (`1`), `Bool(true)` (`2`) —
+//!     making `!is_truthy()` a 2-instruction `(bits | 1) == FALSE_BITS` check.
+//!   - `0xFFFA`: static [`NativeDef`] reference (never refcounted).
+//!   - `0xFFFB..=0xFFFF` (`bits >= TAG_RC_START`): refcounted heap pointers
+//!     (`String`, `Table`, `Closure`, `Buffer`, and `BigInt` / out-of-range
+//!     64-bit `HeapInt` distinguished by bit 0 of the 8-byte aligned pointer).
+//!
+//! Heap ownership (`Clone`/`Drop` for `bits >= TAG_RC_START`) is isolated inside
+//! this module so a tracing/arena GC can replace `Rc` without touching VM
+//! callers.
 
 use num_bigint::BigInt;
-use num_traits::ToPrimitive;
-use std::cell::{Cell, RefCell};
+use num_traits::{FromPrimitive, ToPrimitive};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::rc::Rc;
 
@@ -14,10 +35,33 @@ use crate::vm::buffer::VmBuffer;
 use crate::vm::hash::FxHashMap;
 use crate::vm::table::TableKey;
 
+// A `Value` is a NaN-boxed `u64` whose heap pointers live in the low 48 bits,
+// so only 64-bit targets are supported; 32-bit targets (wasm32, i686, armv7)
+// are rejected here instead of failing in the layout assertions below.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!(
+    "Neyuki needs a 64-bit target: its NaN-boxed `Value` stores pointers in a 48-bit payload. \
+     32-bit targets (wasm32, i686, armv7) are not supported."
+);
+// Android on aarch64 hands out heap pointers with a tag in the top byte
+// (Scudo's 0xb4 TBI tag, or per-allocation MTE tags), which neither fits the
+// 48-bit payload nor can be restored after stripping. Other 64-bit targets
+// keep user-space addresses below 2^47 (on Linux with 5-level paging or
+// 52-bit VA too, since the kernel only maps higher when `mmap` is given a
+// hint above that line), so `pack_ptr` and friends only assert it.
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+compile_error!(
+    "Neyuki does not support Android on aarch64: tagged heap pointers do not fit the \
+     48-bit NaN-box payload of `Value`."
+);
+const _: () = assert!(std::mem::size_of::<usize>() == 8);
+const _: () = assert!(std::mem::align_of::<i64>() >= 2);
+const _: () = assert!(std::mem::align_of::<BigInt>() >= 2);
+
 pub type NativeFn = fn(&mut crate::vm::machine::VM, &[Value]) -> Result<Vec<Value>, String>;
 
 /// A native function together with its name. Values hold these by static
-/// reference, which keeps `Value` at three words.
+/// reference, avoiding any heap allocation or refcount traffic.
 pub struct NativeDef {
     pub name: &'static str,
     pub func: NativeFn,
@@ -35,18 +79,17 @@ macro_rules! native_def {
     }};
 }
 
-/// A `Value::Native` for a name and function known at compile time.
+/// A `Value::native` for a name and function known at compile time.
 #[macro_export]
 macro_rules! native {
     ($name:expr, $func:expr) => {
-        $crate::vm::value::Value::Native($crate::native_def!($name, $func))
+        $crate::vm::value::Value::native($crate::native_def!($name, $func))
     };
 }
 
 /// Shared string handle. It wraps `Rc<VmString>` instead of `Rc<str>` so the
-/// pointer stays thin (8 bytes); a fat `Rc<str>` would push every `Value`
-/// past two words. Hash, equality and borrowing all follow the string
-/// contents, so `&str` lookups on maps keyed by this keep working.
+/// pointer stays thin (8 bytes). Hash, equality and borrowing all follow the
+/// string contents, so `&str` lookups on maps keyed by this keep working.
 #[derive(Clone, Debug)]
 pub struct VmString {
     pub str: String,
@@ -59,6 +102,7 @@ pub struct VmString {
     pub hash: u64,
 }
 
+#[repr(transparent)]
 #[derive(Clone, Debug)]
 pub struct StrRef(pub Rc<VmString>);
 
@@ -140,26 +184,1040 @@ impl From<String> for StrRef {
     }
 }
 
-/// A runtime value. Kept small and cheap to clone: every heap-backed variant
-/// is behind an `Rc`, so copying a register never copies a string or a table.
+// ---- NaN-boxing bit constants ----
+
+const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
+const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
+
+const TAG_BASE: u64 = 0xFFF8_0000_0000_0000;
+const TAG_INT: u64 = 0xFFF8_0000_0000_0000;
+const TAG_MISC: u64 = 0xFFF9_0000_0000_0000;
+const TAG_NATIVE: u64 = 0xFFFA_0000_0000_0000;
+pub(crate) const TAG_RC_START: u64 = 0xFFFB_0000_0000_0000;
+const TAG_STRING: u64 = 0xFFFB_0000_0000_0000;
+const TAG_TABLE: u64 = 0xFFFC_0000_0000_0000;
+const TAG_CLOSURE: u64 = 0xFFFD_0000_0000_0000;
+const TAG_BUFFER: u64 = 0xFFFE_0000_0000_0000;
+const TAG_BIG: u64 = 0xFFFF_0000_0000_0000;
+
+const TAG_INT_HI: u16 = 0xFFF8;
+const TAG_MISC_HI: u16 = 0xFFF9;
+const TAG_NATIVE_HI: u16 = 0xFFFA;
+const TAG_STRING_HI: u16 = 0xFFFB;
+const TAG_TABLE_HI: u16 = 0xFFFC;
+const TAG_CLOSURE_HI: u16 = 0xFFFD;
+const TAG_BUFFER_HI: u16 = 0xFFFE;
+const TAG_BIG_HI: u16 = 0xFFFF;
+
+const NIL_BITS: u64 = TAG_MISC;
+const FALSE_BITS: u64 = TAG_MISC | 1;
+const TRUE_BITS: u64 = TAG_MISC | 2;
+
+/// Inclusive minimum of 48-bit inline signed integers (`-2^47`).
+pub const INLINE_INT_MIN: i64 = -(1i64 << 47);
+/// Inclusive maximum of 48-bit inline signed integers (`2^47 - 1`).
+pub const INLINE_INT_MAX: i64 = (1i64 << 47) - 1;
+
+#[inline(always)]
+fn pack_ptr<T>(ptr: *const T, tag: u64) -> u64 {
+    let addr = ptr.expose_provenance() as u64;
+    assert!(
+        addr <= PAYLOAD_MASK,
+        "pointer address {addr:#x} exceeds 48-bit NaN-box payload"
+    );
+    tag | addr
+}
+
+#[inline(always)]
+fn unpack_ptr<T>(bits: u64) -> *const T {
+    std::ptr::with_exposed_provenance((bits & PAYLOAD_MASK) as usize)
+}
+
+#[inline(always)]
+fn pack_bigint(rc: Rc<BigInt>) -> u64 {
+    let ptr = Rc::into_raw(rc);
+    let addr = ptr.expose_provenance() as u64;
+    assert!(
+        addr <= PAYLOAD_MASK && (addr & 1) == 0,
+        "BigInt pointer {addr:#x} invalid for 48-bit tagged NaN-box"
+    );
+    TAG_BIG | addr
+}
+
+#[inline(always)]
+fn pack_heap_int(i: i64) -> u64 {
+    let ptr = Rc::into_raw(Rc::new(i));
+    let addr = ptr.expose_provenance() as u64;
+    assert!(
+        addr <= PAYLOAD_MASK && (addr & 1) == 0,
+        "HeapInt pointer {addr:#x} invalid for 48-bit tagged NaN-box"
+    );
+    TAG_BIG | addr | 1
+}
+
+/// Non-owning shared borrow of an `Rc<T>` payload packed inside a [`Value`].
 ///
-/// Integers are arbitrary precision as far as programs can tell, but almost
-/// all of them fit an `i64`. `Int` is the fast path; arithmetic that
-/// overflows promotes to `BigInt`, and every constructor normalises so that a
-/// `BigInt` is never inside the `i64` range. That invariant is what lets
-/// `Int == BigInt` be answered without looking at the digits.
-#[derive(Clone)]
-pub enum Value {
+/// Dereferences to `&T` with zero refcount operations, and can promote to an
+/// owned `Rc<T>` via [`BorrowedRc::to_rc`] only when shared ownership is needed.
+pub struct BorrowedRc<'a, T> {
+    ptr: *const T,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<T> Copy for BorrowedRc<'_, T> {}
+impl<T> Clone for BorrowedRc<'_, T> {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, T> BorrowedRc<'a, T> {
+    #[inline(always)]
+    unsafe fn from_raw(ptr: *const T) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Raw pointer identical to `Rc::as_ptr`.
+    #[inline(always)]
+    pub fn as_ptr(self) -> *const T {
+        self.ptr
+    }
+
+    /// Pointer equality identical to `Rc::ptr_eq`.
+    #[inline(always)]
+    pub fn ptr_eq(a: Self, b: Self) -> bool {
+        std::ptr::eq(a.ptr, b.ptr)
+    }
+
+    /// Clones into an owned `Rc<T>`, incrementing the strong count.
+    #[inline]
+    pub fn to_rc(self) -> Rc<T> {
+        // SAFETY: `self.ptr` came from `Rc::into_raw` and remains live for `'a`.
+        unsafe {
+            Rc::increment_strong_count(self.ptr);
+            Rc::from_raw(self.ptr)
+        }
+    }
+}
+
+impl<T> Deref for BorrowedRc<'_, T> {
+    type Target = T;
+
+    #[inline(always)]
+    fn deref(&self) -> &T {
+        // SAFETY: `self.ptr` stays alive for at least `'a`.
+        unsafe { &*self.ptr }
+    }
+}
+
+/// Non-owning shared borrow of a [`VmString`] packed inside a [`Value`].
+#[derive(Copy, Clone)]
+pub struct BorrowedStr<'a> {
+    ptr: *const VmString,
+    _marker: PhantomData<&'a VmString>,
+}
+
+impl<'a> BorrowedStr<'a> {
+    #[inline(always)]
+    unsafe fn from_raw(ptr: *const VmString) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_ptr(self) -> *const VmString {
+        self.ptr
+    }
+
+    #[inline(always)]
+    pub fn vm_str(self) -> &'a VmString {
+        // SAFETY: `self.ptr` stays alive for at least `'a`.
+        unsafe { &*self.ptr }
+    }
+
+    #[inline(always)]
+    pub fn as_str(self) -> &'a str {
+        &self.vm_str().str
+    }
+
+    #[inline(always)]
+    pub fn hash_u64(self) -> u64 {
+        self.vm_str().hash
+    }
+
+    /// Promotes this borrow into an owned [`StrRef`], incrementing the refcount.
+    #[inline]
+    pub fn to_str_ref(self) -> StrRef {
+        // SAFETY: `self.ptr` came from `Rc::into_raw` and remains live for `'a`.
+        unsafe {
+            Rc::increment_strong_count(self.ptr);
+            StrRef(Rc::from_raw(self.ptr))
+        }
+    }
+}
+
+impl Deref for BorrowedStr<'_> {
+    type Target = str;
+
+    #[inline(always)]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for BorrowedStr<'_> {
+    #[inline(always)]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq for BorrowedStr<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.ptr, other.ptr)
+            || (self.hash_u64() == other.hash_u64() && self.as_str() == other.as_str())
+    }
+}
+
+impl Eq for BorrowedStr<'_> {}
+
+impl fmt::Display for BorrowedStr<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Debug for BorrowedStr<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
+}
+
+/// Borrowed discriminated view of a [`Value`] for clean pattern matching.
+pub enum ValueView<'a> {
     Nil,
     Bool(bool),
     Int(i64),
-    BigInt(Rc<BigInt>),
     Float(f64),
+    Native(&'static NativeDef),
+    BigInt(&'a BigInt),
+    String(BorrowedStr<'a>),
+    Table(BorrowedRc<'a, RefCell<VmTable>>),
+    Closure(BorrowedRc<'a, VmClosure>),
+    Buffer(BorrowedRc<'a, RefCell<VmBuffer>>),
+}
+
+/// Owned discriminated representation extracted without extra refcount bumps.
+pub enum OwnedValue {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Native(&'static NativeDef),
+    BigInt(Rc<BigInt>),
     String(StrRef),
     Table(Rc<RefCell<VmTable>>),
     Closure(Rc<VmClosure>),
-    Native(&'static NativeDef),
     Buffer(Rc<RefCell<VmBuffer>>),
+}
+
+/// A compact 8-byte runtime value encoded via 64-bit NaN-boxing.
+///
+/// Integers are arbitrary precision as far as programs can tell: values within
+/// `[-2^47, 2^47 - 1]` live completely inline inside the 8-byte word, values
+/// inside `i64` outside 48-bit box as `Rc<i64>`, and larger integers normalize to
+/// `Rc<BigInt>` (which never holds values in `i64` range).
+#[repr(transparent)]
+pub struct Value(u64);
+
+#[cold]
+#[inline(never)]
+unsafe fn clone_rc_slow(bits: u64) {
+    let tag_hi = (bits >> 48) as u16;
+    unsafe {
+        match tag_hi {
+            TAG_STRING_HI => Rc::increment_strong_count(unpack_ptr::<VmString>(bits)),
+            TAG_TABLE_HI => Rc::increment_strong_count(unpack_ptr::<RefCell<VmTable>>(bits)),
+            TAG_CLOSURE_HI => Rc::increment_strong_count(unpack_ptr::<VmClosure>(bits)),
+            TAG_BUFFER_HI => Rc::increment_strong_count(unpack_ptr::<RefCell<VmBuffer>>(bits)),
+            TAG_BIG_HI => {
+                if (bits & 1) == 0 {
+                    Rc::increment_strong_count(unpack_ptr::<BigInt>(bits));
+                } else {
+                    Rc::increment_strong_count(unpack_ptr::<i64>(bits & !1));
+                }
+            }
+            _ => std::hint::unreachable_unchecked(),
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn drop_rc_slow(bits: u64) {
+    let tag_hi = (bits >> 48) as u16;
+    unsafe {
+        match tag_hi {
+            TAG_STRING_HI => drop(Rc::from_raw(unpack_ptr::<VmString>(bits))),
+            TAG_TABLE_HI => drop(Rc::from_raw(unpack_ptr::<RefCell<VmTable>>(bits))),
+            TAG_CLOSURE_HI => drop(Rc::from_raw(unpack_ptr::<VmClosure>(bits))),
+            TAG_BUFFER_HI => drop(Rc::from_raw(unpack_ptr::<RefCell<VmBuffer>>(bits))),
+            TAG_BIG_HI => {
+                if (bits & 1) == 0 {
+                    drop(Rc::from_raw(unpack_ptr::<BigInt>(bits)));
+                } else {
+                    drop(Rc::from_raw(unpack_ptr::<i64>(bits & !1)));
+                }
+            }
+            _ => std::hint::unreachable_unchecked(),
+        }
+    }
+}
+
+impl Clone for Value {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        if self.0 >= TAG_RC_START {
+            // SAFETY: `self.0 >= TAG_RC_START` guarantees a valid `Rc::into_raw` payload.
+            unsafe { clone_rc_slow(self.0) };
+        }
+        Value(self.0)
+    }
+}
+
+impl Drop for Value {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.0 >= TAG_RC_START {
+            // SAFETY: `self.0 >= TAG_RC_START` guarantees this Value owns one strong ref.
+            unsafe { drop_rc_slow(self.0) };
+        }
+    }
+}
+
+impl Value {
+    pub const NIL: Value = Value(NIL_BITS);
+    pub const FALSE: Value = Value(FALSE_BITS);
+    pub const TRUE: Value = Value(TRUE_BITS);
+
+    #[inline(always)]
+    pub const fn nil() -> Value {
+        Value(NIL_BITS)
+    }
+
+    #[inline(always)]
+    pub const fn bool(b: bool) -> Value {
+        Value(if b { TRUE_BITS } else { FALSE_BITS })
+    }
+
+    /// Encodes a 32-bit integer directly inline without heap fallback.
+    #[inline(always)]
+    pub const fn small_int(i: i32) -> Value {
+        Value(TAG_INT | ((i as i64 as u64) & PAYLOAD_MASK))
+    }
+
+    /// Encodes an `i64`, storing 48-bit signed values inline and boxing larger
+    /// 64-bit values only when outside `[-2^47, 2^47 - 1]`.
+    #[inline(always)]
+    pub fn int(i: i64) -> Value {
+        if (INLINE_INT_MIN..=INLINE_INT_MAX).contains(&i) {
+            Value(TAG_INT | ((i as u64) & PAYLOAD_MASK))
+        } else {
+            Value(pack_heap_int(i))
+        }
+    }
+
+    #[inline(always)]
+    pub const fn float(f: f64) -> Value {
+        if f.is_nan() {
+            Value(CANONICAL_NAN)
+        } else {
+            Value(f.to_bits())
+        }
+    }
+
+    #[inline(always)]
+    pub fn native(def: &'static NativeDef) -> Value {
+        Value(pack_ptr(def as *const NativeDef, TAG_NATIVE))
+    }
+
+    #[inline(always)]
+    pub fn str_ref(s: StrRef) -> Value {
+        Value(pack_ptr(Rc::into_raw(s.0), TAG_STRING))
+    }
+
+    #[inline(always)]
+    pub fn table(t: Rc<RefCell<VmTable>>) -> Value {
+        Value(pack_ptr(Rc::into_raw(t), TAG_TABLE))
+    }
+
+    #[inline(always)]
+    pub fn closure(c: Rc<VmClosure>) -> Value {
+        Value(pack_ptr(Rc::into_raw(c), TAG_CLOSURE))
+    }
+
+    #[inline(always)]
+    pub fn buffer(b: Rc<RefCell<VmBuffer>>) -> Value {
+        Value(pack_ptr(Rc::into_raw(b), TAG_BUFFER))
+    }
+
+    /// Raw NaN-boxed 64-bit representation.
+    #[inline(always)]
+    pub const fn bits(&self) -> u64 {
+        self.0
+    }
+
+    /// Constructs a `Value` from a trivial (non-RC) raw bit pattern.
+    ///
+    /// # Safety
+    /// Caller must ensure `bits < TAG_RC_START` and represents a valid encoded scalar.
+    #[inline(always)]
+    pub(crate) const unsafe fn from_trivial_bits(bits: u64) -> Value {
+        debug_assert!(bits < TAG_RC_START);
+        Value(bits)
+    }
+
+    /// Overwrites `*self` with `val`, bypassing `Drop` when both old and new are trivial scalars.
+    #[inline(always)]
+    pub fn set_inplace(&mut self, val: Value) {
+        if self.0 < TAG_RC_START && val.0 < TAG_RC_START {
+            self.0 = val.0;
+            std::mem::forget(val);
+        } else {
+            *self = val;
+        }
+    }
+
+    /// Overwrites `*self` from `&Value`, bypassing both `Drop` and `Clone` for scalars
+    /// and identical `Rc` handles.
+    #[inline(always)]
+    pub fn assign_ref(&mut self, val: &Value) {
+        if self.0 < TAG_RC_START && val.0 < TAG_RC_START {
+            self.0 = val.0;
+        } else if self.0 != val.0 {
+            *self = val.clone();
+        }
+    }
+
+    #[inline(always)]
+    pub const fn is_trivial(&self) -> bool {
+        self.0 < TAG_RC_START
+    }
+
+    #[inline(always)]
+    pub const fn is_nil(&self) -> bool {
+        self.0 == NIL_BITS
+    }
+
+    #[inline(always)]
+    pub const fn is_truthy(&self) -> bool {
+        (self.0 | 1) != FALSE_BITS
+    }
+
+    #[inline(always)]
+    pub const fn is_bool(&self) -> bool {
+        self.0 == FALSE_BITS || self.0 == TRUE_BITS
+    }
+
+    #[inline(always)]
+    pub const fn as_bool(&self) -> Option<bool> {
+        if self.0 == TRUE_BITS {
+            Some(true)
+        } else if self.0 == FALSE_BITS {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub const fn is_float(&self) -> bool {
+        self.0 < TAG_BASE
+    }
+
+    #[inline(always)]
+    pub const fn as_float(&self) -> Option<f64> {
+        if self.is_float() {
+            Some(f64::from_bits(self.0))
+        } else {
+            None
+        }
+    }
+
+    /// Unchecked float extraction when `self.is_float()` is already known.
+    #[inline(always)]
+    pub const fn as_float_unchecked(&self) -> f64 {
+        debug_assert!(self.is_float());
+        f64::from_bits(self.0)
+    }
+
+    #[inline(always)]
+    pub const fn is_inline_int(&self) -> bool {
+        (self.0 & TAG_MASK) == TAG_INT
+    }
+
+    /// Unchecked inline 48-bit integer extraction when `self.is_inline_int()` is already known.
+    #[inline(always)]
+    pub const fn as_inline_int_unchecked(&self) -> i64 {
+        debug_assert!(self.is_inline_int());
+        ((self.0 as i64) << 16) >> 16
+    }
+
+    #[inline(always)]
+    pub fn is_int(&self) -> bool {
+        self.is_inline_int() || (self.0 & (TAG_MASK | 1)) == (TAG_BIG | 1)
+    }
+
+    #[inline(always)]
+    pub fn as_int(&self) -> Option<i64> {
+        if self.is_inline_int() {
+            Some(self.as_inline_int_unchecked())
+        } else if (self.0 & (TAG_MASK | 1)) == (TAG_BIG | 1) {
+            // SAFETY: `TAG_BIG | 1` stores an exposed `Rc::into_raw` for `i64`.
+            Some(unsafe { *unpack_ptr::<i64>(self.0 & !1) })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub const fn is_bigint(&self) -> bool {
+        (self.0 & (TAG_MASK | 1)) == TAG_BIG
+    }
+
+    #[inline(always)]
+    pub fn as_bigint(&self) -> Option<&BigInt> {
+        if self.is_bigint() {
+            // SAFETY: `TAG_BIG` with bit 0 == 0 stores an exposed `Rc::into_raw` for `BigInt`.
+            Some(unsafe { &*unpack_ptr::<BigInt>(self.0) })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn to_bigint_rc(&self) -> Option<Rc<BigInt>> {
+        if self.is_bigint() {
+            let ptr = unpack_ptr::<BigInt>(self.0);
+            unsafe {
+                Rc::increment_strong_count(ptr);
+                Some(Rc::from_raw(ptr))
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Mutates a uniquely-owned `BigInt` (`strong_count == 1`) in place and demotes
+    /// it back to an inline/boxed `i64` if the result shrunk into `i64` range.
+    #[inline]
+    pub fn with_unique_bigint_mut(&mut self, f: impl FnOnce(&mut BigInt)) -> bool {
+        if !self.is_bigint() {
+            return false;
+        }
+        let ptr = unpack_ptr::<BigInt>(self.0);
+        // Quick read check before temporarily taking ownership out of `self.0`.
+        let prev_bits = std::mem::replace(&mut self.0, NIL_BITS);
+        let mut rc = unsafe { Rc::from_raw(ptr) };
+        if let Some(big) = Rc::get_mut(&mut rc) {
+            f(big);
+            *self = Value::from_bigint_rc(rc);
+            true
+        } else {
+            std::mem::forget(rc);
+            self.0 = prev_bits;
+            false
+        }
+    }
+
+    /// Mutates a uniquely-owned boxed `i64` (`strong_count == 1`) in place when
+    /// `next` stays outside inline range, or demotes back to inline `Int`.
+    #[inline(always)]
+    pub(crate) fn try_set_unique_heap_int(&mut self, next: i64) -> bool {
+        if (self.0 & (TAG_MASK | 1)) != (TAG_BIG | 1) {
+            return false;
+        }
+        let ptr = std::ptr::with_exposed_provenance::<i64>((self.0 & (PAYLOAD_MASK & !1)) as usize);
+        let prev_bits = std::mem::replace(&mut self.0, NIL_BITS);
+        let mut rc = unsafe { Rc::from_raw(ptr) };
+        if let Some(slot) = Rc::get_mut(&mut rc) {
+            if (INLINE_INT_MIN..=INLINE_INT_MAX).contains(&next) {
+                drop(rc);
+                self.0 = TAG_INT | ((next as u64) & PAYLOAD_MASK);
+            } else {
+                *slot = next;
+                let _ = Rc::into_raw(rc);
+                self.0 = prev_bits;
+            }
+            true
+        } else {
+            std::mem::forget(rc);
+            self.0 = prev_bits;
+            false
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_number(&self) -> bool {
+        self.is_float() || self.is_inline_int() || (self.0 & TAG_MASK) == TAG_BIG
+    }
+
+    #[inline(always)]
+    pub const fn is_native(&self) -> bool {
+        (self.0 & TAG_MASK) == TAG_NATIVE
+    }
+
+    #[inline(always)]
+    pub fn as_native(&self) -> Option<&'static NativeDef> {
+        if self.is_native() {
+            // SAFETY: `TAG_NATIVE` stores `&'static NativeDef`.
+            Some(unsafe { &*unpack_ptr::<NativeDef>(self.0) })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub const fn is_string(&self) -> bool {
+        (self.0 & TAG_MASK) == TAG_STRING
+    }
+
+    #[inline(always)]
+    pub fn as_str_ref(&self) -> Option<BorrowedStr<'_>> {
+        if self.is_string() {
+            Some(unsafe { BorrowedStr::from_raw(unpack_ptr::<VmString>(self.0)) })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_str(&self) -> Option<&str> {
+        self.as_str_ref().map(|s| s.as_str())
+    }
+
+    #[inline]
+    pub fn to_str_ref(&self) -> Option<StrRef> {
+        self.as_str_ref().map(|s| s.to_str_ref())
+    }
+
+    #[inline(always)]
+    pub const fn is_table(&self) -> bool {
+        (self.0 & TAG_MASK) == TAG_TABLE
+    }
+
+    #[inline(always)]
+    pub fn as_table(&self) -> Option<BorrowedRc<'_, RefCell<VmTable>>> {
+        if self.is_table() {
+            Some(unsafe { BorrowedRc::from_raw(unpack_ptr::<RefCell<VmTable>>(self.0)) })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn table_ptr(&self) -> Option<*const RefCell<VmTable>> {
+        if self.is_table() {
+            Some(unpack_ptr::<RefCell<VmTable>>(self.0))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn to_table(&self) -> Option<Rc<RefCell<VmTable>>> {
+        self.as_table().map(|t| t.to_rc())
+    }
+
+    #[inline(always)]
+    pub const fn is_closure(&self) -> bool {
+        (self.0 & TAG_MASK) == TAG_CLOSURE
+    }
+
+    #[inline(always)]
+    pub fn as_closure(&self) -> Option<BorrowedRc<'_, VmClosure>> {
+        if self.is_closure() {
+            Some(unsafe { BorrowedRc::from_raw(unpack_ptr::<VmClosure>(self.0)) })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn closure_ptr(&self) -> Option<*const VmClosure> {
+        if self.is_closure() {
+            Some(unpack_ptr::<VmClosure>(self.0))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn to_closure(&self) -> Option<Rc<VmClosure>> {
+        self.as_closure().map(|c| c.to_rc())
+    }
+
+    #[inline(always)]
+    pub const fn is_buffer(&self) -> bool {
+        (self.0 & TAG_MASK) == TAG_BUFFER
+    }
+
+    #[inline(always)]
+    pub fn as_buffer(&self) -> Option<BorrowedRc<'_, RefCell<VmBuffer>>> {
+        if self.is_buffer() {
+            Some(unsafe { BorrowedRc::from_raw(unpack_ptr::<RefCell<VmBuffer>>(self.0)) })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn buffer_ptr(&self) -> Option<*const RefCell<VmBuffer>> {
+        if self.is_buffer() {
+            Some(unpack_ptr::<RefCell<VmBuffer>>(self.0))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn to_buffer(&self) -> Option<Rc<RefCell<VmBuffer>>> {
+        self.as_buffer().map(|b| b.to_rc())
+    }
+
+    #[inline(always)]
+    pub const fn is_callable(&self) -> bool {
+        let hi = (self.0 >> 48) as u16;
+        hi == TAG_NATIVE_HI || hi == TAG_CLOSURE_HI
+    }
+
+    /// Borrows this value as a pattern-matchable [`ValueView`] with zero refcount overhead.
+    #[inline(always)]
+    pub fn view(&self) -> ValueView<'_> {
+        let bits = self.0;
+        if bits < TAG_BASE {
+            return ValueView::Float(f64::from_bits(bits));
+        }
+        match (bits >> 48) as u16 {
+            TAG_INT_HI => ValueView::Int(((bits as i64) << 16) >> 16),
+            TAG_MISC_HI => match bits {
+                NIL_BITS => ValueView::Nil,
+                FALSE_BITS => ValueView::Bool(false),
+                _ => ValueView::Bool(true),
+            },
+            TAG_NATIVE_HI => ValueView::Native(unsafe { &*unpack_ptr::<NativeDef>(bits) }),
+            TAG_STRING_HI => {
+                ValueView::String(unsafe { BorrowedStr::from_raw(unpack_ptr::<VmString>(bits)) })
+            }
+            TAG_TABLE_HI => ValueView::Table(unsafe {
+                BorrowedRc::from_raw(unpack_ptr::<RefCell<VmTable>>(bits))
+            }),
+            TAG_CLOSURE_HI => {
+                ValueView::Closure(unsafe { BorrowedRc::from_raw(unpack_ptr::<VmClosure>(bits)) })
+            }
+            TAG_BUFFER_HI => ValueView::Buffer(unsafe {
+                BorrowedRc::from_raw(unpack_ptr::<RefCell<VmBuffer>>(bits))
+            }),
+            _ => {
+                if (bits & 1) == 0 {
+                    ValueView::BigInt(unsafe { &*unpack_ptr::<BigInt>(bits) })
+                } else {
+                    ValueView::Int(unsafe { *unpack_ptr::<i64>(bits & !1) })
+                }
+            }
+        }
+    }
+
+    /// Consumes `self`, moving out any `Rc` handle without changing refcounts.
+    #[inline]
+    pub fn into_view(self) -> OwnedValue {
+        let bits = self.0;
+        if bits < TAG_BASE {
+            return OwnedValue::Float(f64::from_bits(bits));
+        }
+        std::mem::forget(self);
+        unsafe {
+            match (bits >> 48) as u16 {
+                TAG_INT_HI => OwnedValue::Int(((bits as i64) << 16) >> 16),
+                TAG_MISC_HI => match bits {
+                    NIL_BITS => OwnedValue::Nil,
+                    FALSE_BITS => OwnedValue::Bool(false),
+                    _ => OwnedValue::Bool(true),
+                },
+                TAG_NATIVE_HI => OwnedValue::Native(&*unpack_ptr::<NativeDef>(bits)),
+                TAG_STRING_HI => OwnedValue::String(StrRef(Rc::from_raw(unpack_ptr(bits)))),
+                TAG_TABLE_HI => OwnedValue::Table(Rc::from_raw(unpack_ptr(bits))),
+                TAG_CLOSURE_HI => OwnedValue::Closure(Rc::from_raw(unpack_ptr(bits))),
+                TAG_BUFFER_HI => OwnedValue::Buffer(Rc::from_raw(unpack_ptr(bits))),
+                _ => {
+                    if (bits & 1) == 0 {
+                        OwnedValue::BigInt(Rc::from_raw(unpack_ptr(bits)))
+                    } else {
+                        let rc = Rc::from_raw(unpack_ptr::<i64>(bits & !1));
+                        OwnedValue::Int(*rc)
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn into_table(self) -> Result<Rc<RefCell<VmTable>>, Value> {
+        if self.is_table() {
+            let bits = self.0;
+            std::mem::forget(self);
+            Ok(unsafe { Rc::from_raw(unpack_ptr(bits)) })
+        } else {
+            Err(self)
+        }
+    }
+
+    #[inline]
+    pub fn into_str_ref(self) -> Result<StrRef, Value> {
+        if self.is_string() {
+            let bits = self.0;
+            std::mem::forget(self);
+            Ok(StrRef(unsafe { Rc::from_raw(unpack_ptr(bits)) }))
+        } else {
+            Err(self)
+        }
+    }
+
+    #[inline]
+    pub fn into_closure(self) -> Result<Rc<VmClosure>, Value> {
+        if self.is_closure() {
+            let bits = self.0;
+            std::mem::forget(self);
+            Ok(unsafe { Rc::from_raw(unpack_ptr(bits)) })
+        } else {
+            Err(self)
+        }
+    }
+
+    /// Builds an integer value, storing it inline/i64 when it fits `i64`.
+    #[inline]
+    pub fn from_bigint(i: BigInt) -> Value {
+        match i.to_i64() {
+            Some(small) => Value::int(small),
+            None => Value(pack_bigint(Rc::new(i))),
+        }
+    }
+
+    #[inline]
+    pub fn from_bigint_rc(i: Rc<BigInt>) -> Value {
+        match i.to_i64() {
+            Some(small) => Value::int(small),
+            None => Value(pack_bigint(i)),
+        }
+    }
+
+    /// Builds an integer value from `i128`, storing it inline when it fits.
+    #[inline]
+    pub fn from_i128(i: i128) -> Value {
+        if let Ok(small) = i64::try_from(i) {
+            Value::int(small)
+        } else {
+            Value(pack_bigint(Rc::new(BigInt::from(i))))
+        }
+    }
+
+    #[inline]
+    pub fn from_u128(i: u128) -> Value {
+        if let Ok(small) = i64::try_from(i) {
+            Value::int(small)
+        } else {
+            Value(pack_bigint(Rc::new(BigInt::from(i))))
+        }
+    }
+
+    #[inline]
+    pub fn from_usize(i: usize) -> Value {
+        match i64::try_from(i) {
+            Ok(small) => Value::int(small),
+            Err(_) => Value(pack_bigint(Rc::new(BigInt::from(i)))),
+        }
+    }
+
+    #[inline]
+    pub fn from_u64(i: u64) -> Value {
+        match i64::try_from(i) {
+            Ok(small) => Value::int(small),
+            Err(_) => Value(pack_bigint(Rc::new(BigInt::from(i)))),
+        }
+    }
+
+    #[inline]
+    pub fn str(s: &str) -> Value {
+        Value::str_ref(StrRef::from(s))
+    }
+
+    #[inline]
+    pub fn string(s: String) -> Value {
+        Value::str_ref(StrRef::from(s))
+    }
+
+    /// The integer as a `usize`, if it is a non-negative integer that fits.
+    #[inline]
+    pub fn as_usize(&self) -> Option<usize> {
+        self.as_int().and_then(|i| usize::try_from(i).ok())
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        match self.view() {
+            ValueView::Nil => "nil",
+            ValueView::Bool(_) => "boolean",
+            ValueView::Int(_) | ValueView::BigInt(_) | ValueView::Float(_) => "number",
+            ValueView::String(_) => "string",
+            ValueView::Table(t) if t.try_borrow().is_ok_and(|t| t.co_state.is_some()) => "thread",
+            ValueView::Table(_) => "table",
+            ValueView::Closure(_) | ValueView::Native(..) => "function",
+            ValueView::Buffer(_) => "buffer",
+        }
+    }
+
+    pub fn typeof_name(&self) -> &'static str {
+        match self.view() {
+            ValueView::Nil => "nil",
+            ValueView::Bool(_) => "boolean",
+            ValueView::Int(_) | ValueView::BigInt(_) => "bigint",
+            ValueView::Float(_) => "float",
+            ValueView::String(_) => "string",
+            ValueView::Table(t) if t.try_borrow().is_ok_and(|t| t.co_state.is_some()) => "thread",
+            ValueView::Table(_) => "table",
+            ValueView::Closure(_) | ValueView::Native(..) => "function",
+            ValueView::Buffer(_) => "buffer",
+        }
+    }
+
+    /// Checks if this runtime value satisfies a given type expression.
+    pub fn matches_type_expr(&self, ty: &TypeExpr) -> bool {
+        match ty {
+            TypeExpr::Any => true,
+            TypeExpr::Never => false,
+            TypeExpr::Nil => self.is_nil(),
+            TypeExpr::Named(name) => match name.to_lowercase().as_str() {
+                "any" => true,
+                "nil" => self.is_nil(),
+                "never" | "void" => false,
+                "bool" | "boolean" => self.is_bool(),
+                "int" | "integer" | "i32" | "i64" | "u32" | "u64" => {
+                    self.is_int() || self.is_bigint()
+                }
+                "float" | "f32" | "f64" => self.is_float(),
+                "num" | "number" => self.is_number(),
+                "str" | "string" => self.is_string(),
+                "table" | "dict" => self.is_table(),
+                "array" | "list" => self.is_table(),
+                "buf" | "buffer" => self.is_buffer(),
+                "thread" | "coroutine" => self
+                    .as_table()
+                    .is_some_and(|t| t.try_borrow().is_ok_and(|t| t.co_state.is_some())),
+                "function" => self.is_callable(),
+                other_name => {
+                    if let Some(t) = self.as_table()
+                        && let Ok(tbl) = t.try_borrow()
+                    {
+                        if let Some(e) = tbl.get_str("__enum").as_str()
+                            && e.eq_ignore_ascii_case(other_name)
+                        {
+                            return true;
+                        }
+                        if let Some(tp) = tbl.get_str("__type").as_str()
+                            && tp.eq_ignore_ascii_case(other_name)
+                        {
+                            return true;
+                        }
+                        if let Some(meta) = &tbl.metatable
+                            && let Ok(mt) = meta.try_borrow()
+                            && let Some(n) = mt.get_str("__name").as_str()
+                            && n.eq_ignore_ascii_case(other_name)
+                        {
+                            return true;
+                        }
+                    }
+                    false
+                }
+            },
+            TypeExpr::Optional(inner) => self.is_nil() || self.matches_type_expr(inner),
+            TypeExpr::Union(variants) => variants.iter().any(|v| self.matches_type_expr(v)),
+            TypeExpr::Array(elem_ty) => {
+                if let Some(t) = self.as_table() {
+                    if let Ok(tbl) = t.try_borrow() {
+                        tbl.array.iter().all(|elem| elem.matches_type_expr(elem_ty))
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                }
+            }
+            TypeExpr::Record(fields) => {
+                if let Some(t) = self.as_table() {
+                    if let Ok(tbl) = t.try_borrow() {
+                        for (fname, fty) in fields {
+                            let fval = tbl.get_str(fname);
+                            if !fval.matches_type_expr(fty) {
+                                return false;
+                            }
+                        }
+                        true
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                }
+            }
+            TypeExpr::Tuple(_) => self.is_table(),
+            TypeExpr::Table { .. } => self.is_table(),
+            TypeExpr::Function { .. } => self.is_callable(),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn eq_slow(&self, other: &Self) -> bool {
+        match (self.view(), other.view()) {
+            (ValueView::Float(a), ValueView::Float(b)) => a == b,
+            (ValueView::Int(a), ValueView::Int(b)) => a == b,
+            (ValueView::BigInt(a), ValueView::BigInt(b)) => a == b,
+            (ValueView::Int(_), ValueView::BigInt(_))
+            | (ValueView::BigInt(_), ValueView::Int(_)) => false,
+            (ValueView::Int(a), ValueView::Float(b)) | (ValueView::Float(b), ValueView::Int(a)) => {
+                int_eq_float(a, b)
+            }
+            (ValueView::BigInt(a), ValueView::Float(b))
+            | (ValueView::Float(b), ValueView::BigInt(a)) => bigint_eq_float(a, b),
+            (ValueView::String(a), ValueView::String(b)) => a == b,
+            (ValueView::Native(a), ValueView::Native(b)) => std::ptr::eq(a, b) || a.name == b.name,
+            _ => false,
+        }
+    }
+}
+
+/// Exact integer/float equality. Converting the integer to `f64` rounds
+/// above 2^53, which would make `9007199254740993 == 9007199254740992.0`.
+#[inline]
+fn int_eq_float(i: i64, f: f64) -> bool {
+    // 2^63 itself is out of range: `as i64` would saturate it to `i64::MAX`.
+    f.fract() == 0.0
+        && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f)
+        && f as i64 == i
+}
+
+/// Exact big integer/float equality; a finite integral float converts to a
+/// `BigInt` without loss.
+#[inline]
+fn bigint_eq_float(b: &BigInt, f: f64) -> bool {
+    f.fract() == 0.0 && BigInt::from_f64(f).is_some_and(|v| &v == b)
 }
 
 #[derive(Clone)]
@@ -219,7 +1277,7 @@ impl VmTable {
     }
 
     pub fn get_str(&self, key: &str) -> Value {
-        self.fields.get(key).cloned().unwrap_or(Value::Nil)
+        self.fields.get(key).cloned().unwrap_or(Value::NIL)
     }
 
     pub fn set_str(&mut self, key: &str, val: Value) {
@@ -237,22 +1295,26 @@ impl VmTable {
 
     /// Reads a key without metamethods. Nil and NaN keys read as nil.
     pub fn raw_get(&self, key: &Value) -> Value {
-        if let Value::Float(f) = key
+        if let Some(f) = key.as_float()
             && f.fract() == 0.0
             && f.abs() < i64::MAX as f64
         {
-            return self.raw_get(&Value::Int(*f as i64));
+            return self.raw_get(&Value::int(f as i64));
         }
-        match key {
-            Value::String(k) => self.fields.get_by_strref(k).cloned().unwrap_or(Value::Nil),
-            Value::Int(i) if *i >= 1 && (*i as u64) <= self.array.len() as u64 => {
-                self.array[*i as usize - 1].clone()
+        match key.view() {
+            ValueView::String(k) => self
+                .fields
+                .get_by_vmstr(k.as_ptr(), k.vm_str())
+                .cloned()
+                .unwrap_or(Value::NIL),
+            ValueView::Int(i) if i >= 1 && (i as u64) <= self.array.len() as u64 => {
+                self.array[i as usize - 1].clone()
             }
-            _ if self.general.is_none() => Value::Nil,
-            other => TableKey::from_value(other)
+            _ if self.general.is_none() => Value::NIL,
+            _ => TableKey::from_value(key)
                 .ok()
                 .and_then(|k| self.get_general(&k).cloned())
-                .unwrap_or(Value::Nil),
+                .unwrap_or(Value::NIL),
         }
     }
 
@@ -260,42 +1322,46 @@ impl VmTable {
     /// removes the entry; trailing nils are trimmed off the array part so
     /// `#t` shrinks with `t[#t] = nil`.
     pub fn raw_set(&mut self, key: Value, val: Value) -> Result<(), String> {
-        match key {
-            Value::String(k) => {
-                if matches!(val, Value::Nil) {
-                    self.fields.remove_by_strref(&k);
-                } else {
-                    self.fields.insert(k, val);
+        if let Some(s) = key.as_str_ref() {
+            if val.is_nil() {
+                self.fields.remove_by_vmstr(s.as_ptr(), s.vm_str());
+            } else {
+                let owned = key.into_str_ref().unwrap_or_else(|_| unreachable!());
+                self.fields.insert(owned, val);
+            }
+            return Ok(());
+        }
+        if let Some(i) = key.as_int()
+            && i >= 1
+        {
+            let len = self.array.len() as u64;
+            let idx = i as u64;
+            if idx <= len {
+                self.array[i as usize - 1] = val;
+                if idx == len {
+                    self.trim_array();
                 }
                 return Ok(());
             }
-            Value::Int(i) if i >= 1 => {
-                let len = self.array.len() as u64;
-                let idx = i as u64;
-                if idx <= len {
-                    self.array[i as usize - 1] = val;
-                    if idx == len {
-                        self.trim_array();
-                    }
-                    return Ok(());
+            if idx == len + 1 {
+                if val.is_nil() {
+                    self.remove_general(&TableKey::Int(i));
+                } else {
+                    self.array.push(val);
+                    self.absorb_general();
                 }
-                if idx == len + 1 {
-                    if matches!(val, Value::Nil) {
-                        self.remove_general(&TableKey::Int(i));
-                    } else {
-                        self.array.push(val);
-                        self.absorb_general();
-                    }
-                    return Ok(());
-                }
+                return Ok(());
             }
-            Value::Float(f) if f.fract() == 0.0 && f >= 1.0 && f < i64::MAX as f64 => {
-                return self.raw_set(Value::Int(f as i64), val);
-            }
-            _ => {}
+        }
+        if let Some(f) = key.as_float()
+            && f.fract() == 0.0
+            && f >= 1.0
+            && f < i64::MAX as f64
+        {
+            return self.raw_set(Value::int(f as i64), val);
         }
         let tk = TableKey::from_value(&key).map_err(|e| e.to_string())?;
-        if matches!(val, Value::Nil) {
+        if val.is_nil() {
             self.remove_general(&tk);
         } else {
             // A new key inside the trimmed range would read as an array slot.
@@ -320,7 +1386,7 @@ impl VmTable {
 
     fn trim_array(&mut self) {
         self.array_peak = self.array_peak.max(self.array.len());
-        while matches!(self.array.last(), Some(Value::Nil)) {
+        while self.array.last().is_some_and(|v| v.is_nil()) {
             self.array.pop();
         }
     }
@@ -346,8 +1412,8 @@ impl VmTable {
     pub fn metamethod(&self, event: &str) -> Option<Value> {
         let mt = self.metatable.as_ref()?;
         match mt.borrow().fields.get(event) {
-            Some(Value::Nil) | None => None,
-            Some(h) => Some(h.clone()),
+            Some(v) if !v.is_nil() => Some(v.clone()),
+            _ => None,
         }
     }
 }
@@ -360,21 +1426,21 @@ impl VmTable {
 pub struct Upvalue {
     /// The stack index while open, `None` once closed.
     pub location: Cell<Option<usize>>,
-    pub closed: RefCell<Value>,
+    closed: UnsafeCell<Value>,
 }
 
 impl Upvalue {
     pub fn open(index: usize) -> Rc<Upvalue> {
         Rc::new(Upvalue {
             location: Cell::new(Some(index)),
-            closed: RefCell::new(Value::Nil),
+            closed: UnsafeCell::new(Value::NIL),
         })
     }
 
     pub fn closed(value: Value) -> Rc<Upvalue> {
         Rc::new(Upvalue {
             location: Cell::new(None),
-            closed: RefCell::new(value),
+            closed: UnsafeCell::new(value),
         })
     }
 
@@ -383,8 +1449,51 @@ impl Upvalue {
         self.location.get().is_some()
     }
 
+    /// Reads the closed value without re-entering user code.
+    #[inline(always)]
+    pub fn get_closed(&self) -> Value {
+        // SAFETY: VM execution is single-threaded (`!Sync`) and cloning a
+        // `Value` never mutates or re-borrows `self.closed`.
+        unsafe { &*self.closed.get() }.clone()
+    }
+
+    /// Borrows the closed value briefly for non-reentrant inspection.
+    #[inline(always)]
+    pub fn with_closed<R>(&self, f: impl FnOnce(&Value) -> R) -> R {
+        // SAFETY: `f` must not mutate this `Upvalue`; callers only inspect GC edges.
+        f(unsafe { &*self.closed.get() })
+    }
+
+    #[cfg(neyuki_threaded)]
+    #[inline(always)]
+    pub(crate) fn closed_ptr(&self) -> *mut Value {
+        self.closed.get()
+    }
+
+    /// Overwrites the closed value, updating primitives in place to skip drops.
+    #[inline(always)]
+    pub fn set_closed(&self, value: Value) {
+        // SAFETY: VM execution is single-threaded and old value drop happens
+        // only after `&mut` is released via `set_inplace`.
+        unsafe { &mut *self.closed.get() }.set_inplace(value);
+    }
+
+    /// Overwrites the closed value from a reference, skipping `Value::clone` on primitives.
+    #[inline(always)]
+    pub fn set_closed_ref(&self, value: &Value) {
+        // SAFETY: VM execution is single-threaded.
+        unsafe { &mut *self.closed.get() }.assign_ref(value);
+    }
+
+    /// Moves the closed value out, leaving `Value::NIL` behind.
+    #[inline]
+    pub fn take_closed(&self) -> Value {
+        // SAFETY: VM execution is single-threaded and `mem::replace` does not alias.
+        std::mem::replace(unsafe { &mut *self.closed.get() }, Value::NIL)
+    }
+
     pub fn close(&self, value: Value) {
-        *self.closed.borrow_mut() = value;
+        self.set_closed(value);
         self.location.set(None);
     }
 }
@@ -394,198 +1503,10 @@ pub struct VmClosure {
     pub upvalues: Vec<Rc<Upvalue>>,
 }
 
-impl Value {
-    #[inline]
-    pub fn is_truthy(&self) -> bool {
-        !matches!(self, Value::Nil | Value::Bool(false))
-    }
-
-    /// Builds an integer value, storing it inline when it fits an `i64`.
-    #[inline]
-    pub fn from_bigint(i: BigInt) -> Value {
-        match i.to_i64() {
-            Some(small) => Value::Int(small),
-            None => Value::BigInt(Rc::new(i)),
-        }
-    }
-
-    /// Builds an integer value from `i128`, storing it inline when it fits an `i64`.
-    #[inline]
-    pub fn from_i128(i: i128) -> Value {
-        if let Ok(small) = i64::try_from(i) {
-            Value::Int(small)
-        } else {
-            Value::BigInt(Rc::new(BigInt::from(i)))
-        }
-    }
-
-    #[inline]
-    pub fn from_u128(i: u128) -> Value {
-        if let Ok(small) = i64::try_from(i) {
-            Value::Int(small)
-        } else {
-            Value::BigInt(Rc::new(BigInt::from(i)))
-        }
-    }
-
-    #[inline]
-    pub fn from_usize(i: usize) -> Value {
-        match i64::try_from(i) {
-            Ok(small) => Value::Int(small),
-            Err(_) => Value::BigInt(Rc::new(BigInt::from(i))),
-        }
-    }
-
-    #[inline]
-    pub fn from_u64(i: u64) -> Value {
-        match i64::try_from(i) {
-            Ok(small) => Value::Int(small),
-            Err(_) => Value::BigInt(Rc::new(BigInt::from(i))),
-        }
-    }
-
-    #[inline]
-    pub fn str(s: &str) -> Value {
-        Value::String(StrRef::from(s))
-    }
-
-    #[inline]
-    pub fn string(s: String) -> Value {
-        Value::String(StrRef::from(s))
-    }
-
-    #[inline]
-    pub fn is_number(&self) -> bool {
-        matches!(self, Value::Int(_) | Value::BigInt(_) | Value::Float(_))
-    }
-
-    /// The integer as a `usize`, if it is a non-negative integer that fits.
-    #[inline]
-    pub fn as_usize(&self) -> Option<usize> {
-        match self {
-            Value::Int(i) => usize::try_from(*i).ok(),
-            _ => None,
-        }
-    }
-
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            Value::Nil => "nil",
-            Value::Bool(_) => "boolean",
-            Value::Int(_) | Value::BigInt(_) | Value::Float(_) => "number",
-            Value::String(_) => "string",
-            Value::Table(t) if t.try_borrow().is_ok_and(|t| t.co_state.is_some()) => "thread",
-            Value::Table(_) => "table",
-            Value::Closure(_) | Value::Native(..) => "function",
-            Value::Buffer(_) => "buffer",
-        }
-    }
-
-    pub fn typeof_name(&self) -> &'static str {
-        match self {
-            Value::Nil => "nil",
-            Value::Bool(_) => "boolean",
-            Value::Int(_) | Value::BigInt(_) => "bigint",
-            Value::Float(_) => "float",
-            Value::String(_) => "string",
-            Value::Table(t) if t.try_borrow().is_ok_and(|t| t.co_state.is_some()) => "thread",
-            Value::Table(_) => "table",
-            Value::Closure(_) | Value::Native(..) => "function",
-            Value::Buffer(_) => "buffer",
-        }
-    }
-
-    /// Checks if this runtime value satisfies a given type expression.
-    pub fn matches_type_expr(&self, ty: &TypeExpr) -> bool {
-        match ty {
-            TypeExpr::Any => true,
-            TypeExpr::Never => false,
-            TypeExpr::Nil => matches!(self, Value::Nil),
-            TypeExpr::Named(name) => match name.to_lowercase().as_str() {
-                "any" => true,
-                "nil" => matches!(self, Value::Nil),
-                "never" | "void" => false,
-                "bool" | "boolean" => matches!(self, Value::Bool(_)),
-                "int" | "integer" | "i32" | "i64" | "u32" | "u64" => {
-                    matches!(self, Value::Int(_) | Value::BigInt(_))
-                }
-                "float" | "f32" | "f64" => matches!(self, Value::Float(_)),
-                "num" | "number" => self.is_number(),
-                "str" | "string" => matches!(self, Value::String(_)),
-                "table" | "dict" => matches!(self, Value::Table(_)),
-                "array" | "list" => matches!(self, Value::Table(_)),
-                "buf" | "buffer" => matches!(self, Value::Buffer(_)),
-                "thread" | "coroutine" => {
-                    matches!(self, Value::Table(t) if t.try_borrow().is_ok_and(|t| t.co_state.is_some()))
-                }
-                "function" => matches!(self, Value::Closure(_) | Value::Native(..)),
-                other_name => {
-                    if let Value::Table(t) = self
-                        && let Ok(tbl) = t.try_borrow()
-                    {
-                        if let Value::String(e) = tbl.get_str("__enum")
-                            && e.eq_ignore_ascii_case(other_name)
-                        {
-                            return true;
-                        }
-                        if let Value::String(tp) = tbl.get_str("__type")
-                            && tp.eq_ignore_ascii_case(other_name)
-                        {
-                            return true;
-                        }
-                        if let Some(meta) = &tbl.metatable
-                            && let Ok(mt) = meta.try_borrow()
-                            && let Value::String(n) = mt.get_str("__name")
-                            && n.eq_ignore_ascii_case(other_name)
-                        {
-                            return true;
-                        }
-                    }
-                    false
-                }
-            },
-            TypeExpr::Optional(inner) => {
-                matches!(self, Value::Nil) || self.matches_type_expr(inner)
-            }
-            TypeExpr::Union(variants) => variants.iter().any(|v| self.matches_type_expr(v)),
-            TypeExpr::Array(elem_ty) => {
-                if let Value::Table(t) = self {
-                    if let Ok(tbl) = t.try_borrow() {
-                        tbl.array.iter().all(|elem| elem.matches_type_expr(elem_ty))
-                    } else {
-                        true
-                    }
-                } else {
-                    false
-                }
-            }
-            TypeExpr::Record(fields) => {
-                if let Value::Table(t) = self {
-                    if let Ok(tbl) = t.try_borrow() {
-                        for (fname, fty) in fields {
-                            let fval = tbl.get_str(fname);
-                            if !fval.matches_type_expr(fty) {
-                                return false;
-                            }
-                        }
-                        true
-                    } else {
-                        true
-                    }
-                } else {
-                    false
-                }
-            }
-            TypeExpr::Tuple(_) => matches!(self, Value::Table(_)),
-            TypeExpr::Table { .. } => matches!(self, Value::Table(_)),
-            TypeExpr::Function { .. } => matches!(self, Value::Closure(_) | Value::Native(..)),
-        }
-    }
-}
-
 impl From<i64> for Value {
+    #[inline]
     fn from(i: i64) -> Value {
-        Value::Int(i)
+        Value::int(i)
     }
 }
 
@@ -597,33 +1518,33 @@ impl From<BigInt> for Value {
 
 impl From<String> for Value {
     fn from(s: String) -> Value {
-        Value::String(StrRef::from(s))
+        Value::str_ref(StrRef::from(s))
     }
 }
 
 impl From<&str> for Value {
     fn from(s: &str) -> Value {
-        Value::String(StrRef::from(s))
+        Value::str_ref(StrRef::from(s))
     }
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::Nil => write!(f, "nil"),
-            Value::Bool(b) => write!(f, "{}", b),
-            Value::Int(i) => write!(f, "{}", i),
-            Value::BigInt(i) => write!(f, "{}", i),
-            Value::Float(n) => write!(f, "{}", n),
-            Value::String(s) => write!(f, "{}", s),
-            Value::Table(_) => write!(f, "table"),
-            Value::Closure(c) => write!(
+        match self.view() {
+            ValueView::Nil => write!(f, "nil"),
+            ValueView::Bool(b) => write!(f, "{}", b),
+            ValueView::Int(i) => write!(f, "{}", i),
+            ValueView::BigInt(i) => write!(f, "{}", i),
+            ValueView::Float(n) => write!(f, "{}", n),
+            ValueView::String(s) => write!(f, "{}", s),
+            ValueView::Table(_) => write!(f, "table"),
+            ValueView::Closure(c) => write!(
                 f,
                 "function({})",
                 c.proto.name.as_deref().unwrap_or("anonymous")
             ),
-            Value::Native(def) => write!(f, "native function({})", def.name),
-            Value::Buffer(b) => write!(f, "buffer({})", b.borrow().len()),
+            ValueView::Native(def) => write!(f, "native function({})", def.name),
+            ValueView::Buffer(b) => write!(f, "buffer({})", b.borrow().len()),
         }
     }
 }
@@ -635,27 +1556,12 @@ impl fmt::Debug for Value {
 }
 
 impl PartialEq for Value {
+    #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Nil, Value::Nil) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::BigInt(a), Value::BigInt(b)) => Rc::ptr_eq(a, b) || a == b,
-            // A normalised BigInt is outside the i64 range, so it can never
-            // equal an Int.
-            (Value::Int(_), Value::BigInt(_)) | (Value::BigInt(_), Value::Int(_)) => false,
-            (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
-            (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
-            (Value::BigInt(a), Value::Float(b)) => a.to_f64().is_some_and(|v| v == *b),
-            (Value::Float(a), Value::BigInt(b)) => b.to_f64().is_some_and(|v| *a == v),
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::Table(a), Value::Table(b)) => Rc::ptr_eq(a, b),
-            (Value::Closure(a), Value::Closure(b)) => Rc::ptr_eq(a, b),
-            (Value::Native(a), Value::Native(b)) => std::ptr::eq(*a, *b) || a.name == b.name,
-            (Value::Buffer(a), Value::Buffer(b)) => Rc::ptr_eq(a, b),
-            _ => false,
+        if self.0 == other.0 {
+            return self.0 != CANONICAL_NAN;
         }
+        self.eq_slow(other)
     }
 }
 
@@ -664,10 +1570,83 @@ mod tests {
     use super::*;
     use std::mem::size_of;
 
-    /// Hot-loop values are copied on every move: the enum must stay at two
-    /// words so register traffic stays cheap.
+    /// Hot-loop values are packed into a single 64-bit word (half of Lua 5.4's
+    /// 16-byte `TValue`) so register traffic and table arrays stay dense.
     #[test]
-    fn value_stays_two_words() {
-        assert_eq!(size_of::<Value>(), 16);
+    fn value_is_one_word() {
+        assert_eq!(size_of::<Value>(), 8);
+    }
+
+    #[test]
+    fn nan_box_primitives_and_boundaries() {
+        assert!(Value::NIL.is_nil());
+        assert!(!Value::NIL.is_truthy());
+        assert!(!Value::bool(false).is_truthy());
+        assert!(Value::bool(true).is_truthy());
+        assert_eq!(Value::bool(false).as_bool(), Some(false));
+        assert_eq!(Value::bool(true).as_bool(), Some(true));
+        assert!(Value::int(0).is_truthy());
+        assert!(Value::float(0.0).is_truthy());
+
+        for &n in &[
+            0i64,
+            1,
+            -1,
+            INLINE_INT_MIN,
+            INLINE_INT_MAX,
+            INLINE_INT_MIN - 1,
+            INLINE_INT_MAX + 1,
+            i64::MIN,
+            i64::MAX,
+        ] {
+            let v = Value::int(n);
+            assert_eq!(v.as_int(), Some(n));
+            assert!(v.is_int());
+            assert!(v.is_number());
+            assert_eq!(v, Value::int(n));
+        }
+
+        let pos_zero = Value::float(0.0);
+        let neg_zero = Value::float(-0.0);
+        assert_eq!(pos_zero, neg_zero);
+        assert_eq!(pos_zero, Value::int(0));
+
+        let nan = Value::float(f64::NAN);
+        assert!(nan.is_float());
+        assert!(nan.as_float().unwrap().is_nan());
+        assert_ne!(nan, nan);
+
+        for &f in &[f64::INFINITY, f64::NEG_INFINITY, -1.5, 42.25] {
+            let v = Value::float(f);
+            assert_eq!(v.as_float(), Some(f));
+        }
+    }
+
+    #[test]
+    fn nan_box_rc_refcounts_cleanly() {
+        let tbl = Rc::new(RefCell::new(VmTable::new()));
+        let s = StrRef::from("hello");
+        assert_eq!(Rc::strong_count(&tbl), 1);
+        assert_eq!(Rc::strong_count(&s.0), 1);
+
+        let vt = Value::table(Rc::clone(&tbl));
+        let vs = Value::str_ref(s.clone());
+        assert_eq!(Rc::strong_count(&tbl), 2);
+        assert_eq!(Rc::strong_count(&s.0), 2);
+
+        let vt2 = vt.clone();
+        let vs2 = vs.clone();
+        assert_eq!(Rc::strong_count(&tbl), 3);
+        assert_eq!(Rc::strong_count(&s.0), 3);
+        assert_eq!(vt, vt2);
+        assert_eq!(vs, vs2);
+        assert_eq!(vs.as_str(), Some("hello"));
+
+        drop(vt);
+        drop(vt2);
+        drop(vs);
+        drop(vs2);
+        assert_eq!(Rc::strong_count(&tbl), 1);
+        assert_eq!(Rc::strong_count(&s.0), 1);
     }
 }

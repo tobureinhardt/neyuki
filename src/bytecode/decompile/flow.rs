@@ -125,6 +125,8 @@ pub(super) fn access(inst: &Instruction, proto: &Proto, open: Option<Reg>) -> Ac
         I::AddK { dst, a, .. }
         | I::SubK { dst, a, .. }
         | I::MulK { dst, a, .. }
+        | I::IDivK { dst, a, .. }
+        | I::ModK { dst, a, .. }
         | I::AddI { dst, a, .. }
         | I::SubI { dst, a, .. }
         | I::MulI { dst, a, .. }
@@ -485,9 +487,9 @@ impl Flow {
         }
         let mut innermost: Vec<Option<usize>> = vec![None; blocks.len()];
         for (l, lp) in loops.iter().enumerate() {
-            for b in 0..blocks.len() {
-                if lp.body[b] && innermost[b].is_none_or(|cur| loops[cur].size > lp.size) {
-                    innermost[b] = Some(l);
+            for (slot, &in_body) in innermost.iter_mut().zip(&lp.body) {
+                if in_body && slot.is_none_or(|cur| loops[cur].size > lp.size) {
+                    *slot = Some(l);
                 }
             }
         }

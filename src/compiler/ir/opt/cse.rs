@@ -9,6 +9,7 @@ use crate::vm::hash::{FxHashMap, new_map};
 enum ExpressionKey {
     BinOp(IrBinaryOp, IrVar, IrVar),
     UnOp(IrUnaryOp, IrVar),
+    Upval(u8),
 }
 
 fn canonical_binop_key(op: IrBinaryOp, lhs: IrVar, rhs: IrVar) -> ExpressionKey {
@@ -63,7 +64,6 @@ fn has_side_effects(inst: &IrInst) -> bool {
             | IrInst::GetTable { .. }
             | IrInst::AppendArray { .. }
             | IrInst::SetGlobal { .. }
-            | IrInst::SetUpval { .. }
     )
 }
 
@@ -76,6 +76,26 @@ fn cse_slice(instructions: &mut [IrInst]) -> bool {
             expr_map.clear();
         }
         match inst {
+            IrInst::SetUpval { index, src } => {
+                expr_map.insert(ExpressionKey::Upval(*index), *src);
+            }
+            IrInst::GetUpval { dst, index } => {
+                let key = ExpressionKey::Upval(*index);
+                if let Some(&existing_var) = expr_map.get(&key) {
+                    if existing_var != *dst {
+                        *inst = IrInst::Move {
+                            dst: *dst,
+                            src: existing_var,
+                        };
+                        modified = true;
+                    }
+                } else {
+                    let d = *dst;
+                    invalidate_expressions(&mut expr_map, d);
+                    expr_map.insert(key, d);
+                    continue;
+                }
+            }
             IrInst::BinOp { dst, op, lhs, rhs } if is_cse_candidate(*op) => {
                 let key = canonical_binop_key(*op, *lhs, *rhs);
                 if let Some(&existing_var) = expr_map.get(&key) {
@@ -133,6 +153,7 @@ fn invalidate_expressions(map: &mut FxHashMap<ExpressionKey, IrVar>, modified_va
         match key {
             ExpressionKey::BinOp(_, lhs, rhs) => *lhs != modified_var && *rhs != modified_var,
             ExpressionKey::UnOp(_, src) => *src != modified_var,
+            ExpressionKey::Upval(_) => true,
         }
     });
 }

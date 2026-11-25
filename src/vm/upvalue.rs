@@ -10,6 +10,17 @@ use crate::vm::value::{Upvalue, Value};
 pub type ParkedUpvalue = (usize, Rc<Upvalue>);
 
 impl VM {
+    /// Closes open upvalues at or above `from` only when any live open upvalue
+    /// actually lies in that range, avoiding a call on ordinary returns/tailcalls.
+    #[inline(always)]
+    pub fn close_upvalues_if_needed(&mut self, from: usize) {
+        if let Some(&(idx, _)) = self.open_upvalues.last()
+            && idx >= from
+        {
+            self.close_upvalues(from);
+        }
+    }
+
     /// Moves every open upvalue at or above `from` off the stack and into
     /// its own cell. Called when the frame owning those registers ends.
     pub fn close_upvalues(&mut self, from: usize) {
@@ -21,7 +32,7 @@ impl VM {
                 .open_upvalues
                 .pop()
                 .expect("the loop condition saw an open upvalue");
-            let val = self.stack.get(idx).cloned().unwrap_or(Value::Nil);
+            let val = self.stack.get(idx).cloned().unwrap_or(Value::NIL);
             uv.close(val);
         }
     }
@@ -32,7 +43,7 @@ impl VM {
         let pos = self.open_upvalues.partition_point(|(i, _)| *i < idx);
         if self.open_upvalues.get(pos).is_some_and(|(i, _)| *i == idx) {
             let (_, uv) = self.open_upvalues.remove(pos);
-            let val = self.stack.get(idx).cloned().unwrap_or(Value::Nil);
+            let val = self.stack.get(idx).cloned().unwrap_or(Value::NIL);
             uv.close(val);
         }
     }
@@ -40,7 +51,7 @@ impl VM {
     /// Finds or creates the open upvalue for stack slot `idx`.
     pub(crate) fn capture_upvalue(&mut self, idx: usize) -> Rc<Upvalue> {
         if idx >= self.stack.len() {
-            self.stack.resize(idx + 1, Value::Nil);
+            self.stack.resize(idx + 1, Value::NIL);
         }
         let pos = self.open_upvalues.partition_point(|(i, _)| *i < idx);
         if let Some((i, uv)) = self.open_upvalues.get(pos)
@@ -59,7 +70,7 @@ impl VM {
     pub fn park_upvalues(&mut self) -> Vec<ParkedUpvalue> {
         let parked = std::mem::take(&mut self.open_upvalues);
         for (idx, uv) in &parked {
-            let val = self.stack.get(*idx).cloned().unwrap_or(Value::Nil);
+            let val = self.stack.get(*idx).cloned().unwrap_or(Value::NIL);
             uv.close(val);
         }
         parked
@@ -70,7 +81,7 @@ impl VM {
     /// their registers.
     pub fn unpark_upvalues(&mut self, parked: Vec<ParkedUpvalue>) {
         for (idx, uv) in &parked {
-            let val = std::mem::replace(&mut *uv.closed.borrow_mut(), Value::Nil);
+            let val = uv.take_closed();
             self.set_reg_grow(*idx, val);
             uv.location.set(Some(*idx));
         }
@@ -80,8 +91,8 @@ impl VM {
     #[inline]
     pub fn upvalue_get(&self, uv: &Upvalue) -> Value {
         match uv.location.get() {
-            Some(idx) => self.stack.get(idx).cloned().unwrap_or(Value::Nil),
-            None => uv.closed.borrow().clone(),
+            Some(idx) => self.stack.get(idx).cloned().unwrap_or(Value::NIL),
+            None => uv.get_closed(),
         }
     }
 
@@ -89,7 +100,7 @@ impl VM {
     pub fn upvalue_set(&mut self, uv: &Upvalue, val: Value) {
         match uv.location.get() {
             Some(idx) => self.set_reg_grow(idx, val),
-            None => *uv.closed.borrow_mut() = val,
+            None => uv.set_closed(val),
         }
     }
 }

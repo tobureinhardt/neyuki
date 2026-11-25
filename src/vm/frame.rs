@@ -59,6 +59,16 @@ impl CallFrame {
     }
 
     #[inline]
+    pub fn clear_varargs(&mut self) {
+        self.varargs = None;
+    }
+
+    #[inline(always)]
+    pub fn has_varargs(&self) -> bool {
+        self.varargs.is_some()
+    }
+
+    #[inline]
     pub fn wanting(mut self, want_ret: u8) -> Self {
         self.want_ret = want_ret;
         self

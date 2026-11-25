@@ -26,6 +26,10 @@ path = "src/main.rs"
 [features]
 default = []
 mimalloc = ["dep:mimalloc"]
+# Threaded tail-call interpreter. Only takes effect in optimized builds
+# without debug assertions on x86_64/aarch64 Linux and macOS (see build.rs);
+# elsewhere the loop interpreter runs.
+threaded = []
 
 [dependencies]
 num-bigint = "0.4"

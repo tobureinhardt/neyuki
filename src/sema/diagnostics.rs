@@ -115,7 +115,7 @@ impl<'a> SemanticAnalyzer<'a> {
             // `self` is part of the method calling convention, even in a
             // method that doesn't read it.
             let is_self = sym.kind == SymbolKind::Parameter && sym.name == "self";
-            if !sym.used && !sym.name.starts_with('_') && !is_self {
+            if !sym.used && !sym.allow_unused && !sym.name.starts_with('_') && !is_self {
                 let (code, msg, label_msg) = if sym.kind == SymbolKind::Parameter {
                     (
                         ErrorCode::W0002,
@@ -144,7 +144,11 @@ impl<'a> SemanticAnalyzer<'a> {
     pub(super) fn flush_remaining_unused(&mut self) {
         let remaining = self.scope_mgr.flush_all();
         for sym in remaining {
-            if !sym.used && !sym.name.starts_with('_') && sym.kind == SymbolKind::Variable {
+            if !sym.used
+                && !sym.allow_unused
+                && !sym.name.starts_with('_')
+                && sym.kind == SymbolKind::Variable
+            {
                 let diag = Diagnostic::warning(format!("unused variable '{}'", sym.name))
                     .with_code(ErrorCode::W0001)
                     .with_label(sym.span, "variable declared here but never used")

@@ -1,10 +1,8 @@
 //! Metatables and raw access: setmetatable, getmetatable, rawget, rawset,
 //! rawequal, rawlen.
 
-use std::rc::Rc;
-
 use crate::vm::machine::VM;
-use crate::vm::value::Value;
+use crate::vm::value::{BorrowedRc, Value, ValueView};
 
 pub fn builtin_setmetatable(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let tbl_val = args
@@ -13,47 +11,44 @@ pub fn builtin_setmetatable(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, S
     let mt_val = args
         .get(1)
         .ok_or_else(|| "setmetatable expects 2 arguments".to_string())?;
-    match tbl_val {
-        Value::Table(t) => {
-            if let Some(existing_mt) = &t.borrow().metatable
-                && let Some(metaname) = existing_mt.borrow().fields.get("__metatable")
-                && !matches!(metaname, Value::Nil)
-            {
-                return Err("cannot change a protected metatable".to_string());
-            }
-            // Pin tables carrying a finalizer so refcounting alone can
-            // never destroy them before a sweep runs their `__gc`; unpin
-            // as soon as the metatable stops providing one.
-            let pinned_now = matches!(
-                mt_val,
-                Value::Table(mt)
-                    if matches!(
-                        mt.borrow().fields.get("__gc"),
-                        Some(Value::Closure(_) | Value::Native(_))
-                    )
-            );
-            match mt_val {
-                Value::Nil => {
-                    t.borrow_mut().metatable = None;
-                    vm.gc.unpin_table(t);
-                    Ok(vec![tbl_val.clone()])
-                }
-                Value::Table(mt) => {
-                    t.borrow_mut().metatable = Some(mt.clone());
-                    if pinned_now {
-                        vm.gc.pin_table(t);
-                    } else {
-                        vm.gc.unpin_table(t);
-                    }
-                    if crate::vm::gc::table_weak_values(t) {
-                        vm.gc.has_weak_tables = true;
-                    }
-                    Ok(vec![tbl_val.clone()])
-                }
-                _ => Err("metatable must be a table or nil".to_string()),
-            }
+    let Some(t) = tbl_val.as_table() else {
+        return Err("setmetatable expects a table as first argument".to_string());
+    };
+    if let Some(existing_mt) = &t.borrow().metatable
+        && let Some(metaname) = existing_mt.borrow().fields.get("__metatable")
+        && !metaname.is_nil()
+    {
+        return Err("cannot change a protected metatable".to_string());
+    }
+    let t_rc = t.to_rc();
+    // Pin tables carrying a finalizer so refcounting alone can
+    // never destroy them before a sweep runs their `__gc`; unpin
+    // as soon as the metatable stops providing one.
+    let pinned_now = mt_val.as_table().is_some_and(|mt| {
+        mt.borrow()
+            .fields
+            .get("__gc")
+            .is_some_and(|h| h.is_callable())
+    });
+    match mt_val.view() {
+        ValueView::Nil => {
+            t_rc.borrow_mut().metatable = None;
+            vm.gc.unpin_table(&t_rc);
+            Ok(vec![tbl_val.clone()])
         }
-        _ => Err("setmetatable expects a table as first argument".to_string()),
+        ValueView::Table(mt) => {
+            t_rc.borrow_mut().metatable = Some(mt.to_rc());
+            if pinned_now {
+                vm.gc.pin_table(&t_rc);
+            } else {
+                vm.gc.unpin_table(&t_rc);
+            }
+            if crate::vm::gc::table_weak_values(&t_rc) {
+                vm.gc.has_weak_tables = true;
+            }
+            Ok(vec![tbl_val.clone()])
+        }
+        _ => Err("metatable must be a table or nil".to_string()),
     }
 }
 
@@ -61,42 +56,44 @@ pub fn builtin_getmetatable(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, 
     let tbl_val = args
         .first()
         .ok_or_else(|| "getmetatable expects 1 argument".to_string())?;
-    match tbl_val {
-        Value::Table(t) => {
+    match tbl_val.as_table() {
+        Some(t) => {
             if let Some(mt) = &t.borrow().metatable {
                 if let Some(metaname) = mt.borrow().fields.get("__metatable")
-                    && !matches!(metaname, Value::Nil)
+                    && !metaname.is_nil()
                 {
                     return Ok(vec![metaname.clone()]);
                 }
-                Ok(vec![Value::Table(mt.clone())])
+                Ok(vec![Value::table(mt.clone())])
             } else {
-                Ok(vec![Value::Nil])
+                Ok(vec![Value::NIL])
             }
         }
-        _ => Ok(vec![Value::Nil]),
+        None => Ok(vec![Value::NIL]),
     }
 }
 
 pub fn builtin_rawget(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let Some(Value::Table(t)) = args.first() else {
+    let Some(t) = args.first().and_then(|v| v.as_table()) else {
         return Err("rawget expects a table".to_string());
     };
-    let key = args.get(1).unwrap_or(&Value::Nil);
+    let nil = Value::NIL;
+    let key = args.get(1).unwrap_or(&nil);
     Ok(vec![t.borrow().raw_get(key)])
 }
 
 pub fn builtin_rawset(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let table = args.first().unwrap_or(&Value::Nil);
-    let Value::Table(t) = table else {
+    let nil = Value::NIL;
+    let table = args.first().unwrap_or(&nil);
+    let Some(t) = table.as_table() else {
         return Err("rawset expects a table".to_string());
     };
-    let key = args.get(1).cloned().unwrap_or(Value::Nil);
-    let val = args.get(2).cloned().unwrap_or(Value::Nil);
+    let key = args.get(1).cloned().unwrap_or(Value::NIL);
+    let val = args.get(2).cloned().unwrap_or(Value::NIL);
     if t.borrow().frozen {
         return Err("attempted to mutate a frozen table".to_string());
     }
-    if let Value::BigInt(_) = key {
+    if key.is_bigint() {
         return Err("table index too large".to_string());
     }
     vm.gc.write_barrier(table, &val);
@@ -105,30 +102,33 @@ pub fn builtin_rawset(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String>
 }
 
 pub fn builtin_rawequal(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let a = args.first().unwrap_or(&Value::Nil);
-    let b = args.get(1).unwrap_or(&Value::Nil);
-    match (a, b) {
-        (Value::Nil, Value::Nil) => Ok(vec![Value::Bool(true)]),
-        (Value::Bool(x), Value::Bool(y)) => Ok(vec![Value::Bool(x == y)]),
-        (Value::Int(x), Value::Int(y)) => Ok(vec![Value::Bool(x == y)]),
-        (Value::Float(x), Value::Float(y)) => Ok(vec![Value::Bool(x == y)]),
-        (Value::String(x), Value::String(y)) => Ok(vec![Value::Bool(x == y)]),
-        (Value::Table(x), Value::Table(y)) => Ok(vec![Value::Bool(Rc::ptr_eq(x, y))]),
-        (Value::Buffer(x), Value::Buffer(y)) => Ok(vec![Value::Bool(Rc::ptr_eq(x, y))]),
-        (Value::Closure(x), Value::Closure(y)) => Ok(vec![Value::Bool(Rc::ptr_eq(x, y))]),
-        (Value::Native(na), Value::Native(nb)) => Ok(vec![Value::Bool(na.name == nb.name)]),
-        _ => Ok(vec![Value::Bool(false)]),
-    }
+    let nil = Value::NIL;
+    let a = args.first().unwrap_or(&nil);
+    let b = args.get(1).unwrap_or(&nil);
+    let eq = match (a.view(), b.view()) {
+        (ValueView::Nil, ValueView::Nil) => true,
+        (ValueView::Bool(x), ValueView::Bool(y)) => x == y,
+        (ValueView::Int(x), ValueView::Int(y)) => x == y,
+        (ValueView::BigInt(x), ValueView::BigInt(y)) => x == y,
+        (ValueView::Float(x), ValueView::Float(y)) => x == y,
+        (ValueView::String(x), ValueView::String(y)) => x == y,
+        (ValueView::Table(x), ValueView::Table(y)) => BorrowedRc::ptr_eq(x, y),
+        (ValueView::Buffer(x), ValueView::Buffer(y)) => BorrowedRc::ptr_eq(x, y),
+        (ValueView::Closure(x), ValueView::Closure(y)) => BorrowedRc::ptr_eq(x, y),
+        (ValueView::Native(na), ValueView::Native(nb)) => na.name == nb.name,
+        _ => false,
+    };
+    Ok(vec![Value::bool(eq)])
 }
 
 pub fn builtin_rawlen(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let val = args
         .first()
         .ok_or_else(|| "rawlen expects 1 argument".to_string())?;
-    match val {
-        Value::Table(t) => Ok(vec![Value::from_usize(t.borrow().array.len())]),
-        Value::String(s) => Ok(vec![Value::from_usize(s.len())]),
-        Value::Buffer(b) => Ok(vec![Value::from_usize(b.borrow().len())]),
+    match val.view() {
+        ValueView::Table(t) => Ok(vec![Value::from_usize(t.borrow().array.len())]),
+        ValueView::String(s) => Ok(vec![Value::from_usize(s.len())]),
+        ValueView::Buffer(b) => Ok(vec![Value::from_usize(b.borrow().len())]),
         _ => Err("rawlen expects table, string, or buffer".to_string()),
     }
 }

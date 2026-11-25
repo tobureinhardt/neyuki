@@ -107,9 +107,12 @@ pub fn position_at(text: &str, offset: usize) -> (usize, usize) {
     (line, head[line_start..].encode_utf16().count())
 }
 
-/// Resolves the names of `text`, or `None` when it does not parse.
+/// Resolves the names of `text`, or `None` when no valid statements recover.
 pub fn analyze(text: &str) -> Option<Analysis> {
-    let parsed = crate::compiler::parse(text).ok()?;
+    let parsed = crate::compiler::parse_with_recovery(text);
+    if parsed.stmts.is_empty() && !parsed.errors.is_empty() {
+        return None;
+    }
     let mut resolver = Resolver {
         text,
         masked: mask_text(text),
@@ -795,7 +798,8 @@ impl AstVisitor for FoldCollector<'_> {
 /// it parses) and runs of comment lines.
 pub fn folding_ranges(text: &str) -> Vec<Fold> {
     let mut folds = Vec::new();
-    if let Ok(parsed) = crate::compiler::parse(text) {
+    let parsed = crate::compiler::parse_with_recovery(text);
+    if !parsed.stmts.is_empty() {
         let mut collector = FoldCollector {
             text,
             masked: mask_text(text),

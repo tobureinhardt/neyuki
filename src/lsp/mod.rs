@@ -1577,7 +1577,8 @@ fn collect_symbols_from_expr(
 
 fn extract_document_symbols(content: &str) -> Vec<FoundSymbol> {
     let mut symbols = Vec::new();
-    if let Ok(parsed) = crate::compiler::parse(content) {
+    let parsed = crate::compiler::parse_with_recovery(content);
+    if !parsed.stmts.is_empty() {
         collect_symbols_from_stmts(&parsed.stmts, &parsed.spans, &mut symbols);
     }
     symbols
@@ -1904,6 +1905,41 @@ mod tests {
         assert!(resp_str.contains("\"name\":\"solve\""));
     }
 
+    #[test]
+    fn test_lsp_publishes_multiple_syntax_diagnostics_and_recovers_symbols() {
+        let mut server = LspServer::new();
+        let broken_text = "\
+local = 1
+function healthy_one(a)
+    return a + 1
+end
+local broken =
+function healthy_two(b)
+    return b * 2
+end
+";
+        let open_req = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///broken.nyk","text":{}}}}}}}"#,
+            dap_json::render_json(&Json::Str(broken_text.to_string()))
+        );
+        let pub_resp = server.handle_message(open_req.as_bytes()).unwrap();
+        let pub_str = String::from_utf8(pub_resp).unwrap();
+        assert!(pub_str.contains("textDocument/publishDiagnostics"));
+        let err_count = pub_str.matches("\"code\":\"E005").count();
+        assert!(
+            err_count >= 2,
+            "expected >= 2 syntax diagnostics in LSP output, got {}: {}",
+            err_count,
+            pub_str
+        );
+
+        let sym_req = r#"{"jsonrpc":"2.0","id":55,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///broken.nyk"}}}"#;
+        let sym_resp = server.handle_message(sym_req.as_bytes()).unwrap();
+        let sym_str = String::from_utf8(sym_resp).unwrap();
+        assert!(sym_str.contains("\"name\":\"healthy_one\""), "{}", sym_str);
+        assert!(sym_str.contains("\"name\":\"healthy_two\""), "{}", sym_str);
+    }
+
     /// Opens `text` as `file:///test.nyk`.
     fn open_document(server: &mut LspServer, text: &str) {
         let open_req = format!(
@@ -2149,13 +2185,13 @@ mod tests {
     fn exists_in(root: &Value, path: &str) -> bool {
         let mut current = root.clone();
         for part in path.split('.') {
-            let next = match &current {
-                Value::Table(table) => table.borrow().get_str(part),
-                _ => return false,
+            let next = match current.as_table() {
+                Some(table) => table.borrow().get_str(part),
+                None => return false,
             };
             current = next;
         }
-        !matches!(current, Value::Nil)
+        !current.is_nil()
     }
 
     /// What `require(module)` returns in a fresh VM.
@@ -2206,10 +2242,10 @@ mod tests {
                     .globals
                     .get(&crate::vm::value::StrRef::from(first))
                     .cloned()
-                    .unwrap_or(Value::Nil);
+                    .unwrap_or(Value::NIL);
                 match rest {
                     Some(rest) => exists_in(&root, rest),
-                    None => !matches!(root, Value::Nil),
+                    None => !root.is_nil(),
                 }
             } else if let Some(module) = modules.get(page) {
                 // `fs.read` is the field `read` of what `require` returns.

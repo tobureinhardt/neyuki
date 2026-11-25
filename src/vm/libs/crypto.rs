@@ -134,7 +134,7 @@ pub(crate) const NATIVES: &[NativeDef] = &[
 
 fn str_arg<'a>(args: &'a [Value], index: usize, name: &str) -> Result<&'a str, String> {
     match args.get(index) {
-        Some(Value::String(value)) => Ok(value),
+        Some(v) if v.is_string() => Ok(v.as_str().unwrap()),
         Some(value) => Err(format!(
             "{} must be a string, got {}",
             name,
@@ -147,23 +147,26 @@ fn str_arg<'a>(args: &'a [Value], index: usize, name: &str) -> Result<&'a str, S
 /// A string that may be absent; nil reads as the empty string.
 fn optional_str_arg<'a>(args: &'a [Value], index: usize, name: &str) -> Result<&'a str, String> {
     match args.get(index) {
-        None | Some(Value::Nil) => Ok(""),
+        None => Ok(""),
+        Some(v) if v.is_nil() => Ok(""),
         _ => str_arg(args, index, name),
     }
 }
 
 fn integer_arg(args: &[Value], index: usize, name: &str) -> Result<i64, String> {
-    match args.get(index) {
-        Some(Value::Int(value)) => Ok(*value),
-        Some(Value::BigInt(_)) => Err(format!("{} is too large", name)),
-        Some(Value::Float(value)) if value.fract() == 0.0 && value.is_finite() => Ok(*value as i64),
-        Some(Value::Float(_)) => Err(format!("{} must be an integer", name)),
-        Some(value) => Err(format!(
+    let Some(value) = args.get(index) else {
+        return Err(format!("{} must be provided", name));
+    };
+    match value.view() {
+        crate::vm::value::ValueView::Int(v) => Ok(v),
+        crate::vm::value::ValueView::BigInt(_) => Err(format!("{} is too large", name)),
+        crate::vm::value::ValueView::Float(v) if v.fract() == 0.0 && v.is_finite() => Ok(v as i64),
+        crate::vm::value::ValueView::Float(_) => Err(format!("{} must be an integer", name)),
+        _ => Err(format!(
             "{} must be an integer, got {}",
             name,
             value.type_name()
         )),
-        None => Err(format!("{} must be provided", name)),
     }
 }
 
@@ -391,7 +394,7 @@ fn builtin_hmac(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn builtin_equals(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let a = str_arg(args, 0, "a")?;
     let b = str_arg(args, 1, "b")?;
-    Ok(vec![Value::Bool(a.as_bytes().ct_eq(b.as_bytes()).into())])
+    Ok(vec![Value::bool(a.as_bytes().ct_eq(b.as_bytes()).into())])
 }
 
 fn builtin_pbkdf2(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -506,7 +509,7 @@ fn builtin_password_verify(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, S
     } else {
         return Err("hash is not an argon2 or bcrypt hash".to_string());
     };
-    Ok(vec![Value::Bool(matches)])
+    Ok(vec![Value::bool(matches)])
 }
 
 // ---------------------------------------------------------------------------
@@ -910,7 +913,7 @@ fn builtin_verify(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let encoding = encoding_arg(args, 5)?;
     // A malformed signature is simply not a valid one.
     let Ok(signature) = decode(signature, encoding, "signature") else {
-        return Ok(vec![Value::Bool(false)]);
+        return Ok(vec![Value::FALSE]);
     };
     let valid = match parse_public_key(pem)? {
         PublicKey::Rsa(key) => rsa_verify(key, message.as_bytes(), &signature, hash, padding)?,
@@ -923,7 +926,7 @@ fn builtin_verify(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             ));
         }
     };
-    Ok(vec![Value::Bool(valid)])
+    Ok(vec![Value::bool(valid)])
 }
 
 fn builtin_public_encrypt(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -995,7 +998,7 @@ fn builtin_random_int(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
         return Err("min must not be greater than max".to_string());
     }
     let value = OsRng.gen_range(min..=max);
-    Ok(vec![Value::Int(value)])
+    Ok(vec![Value::int(value)])
 }
 
 /// A random (version 4) UUID [RFC 9562].

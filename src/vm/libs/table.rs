@@ -5,11 +5,11 @@ use std::rc::Rc;
 
 use crate::vm::libs::args::{frozen, int_arg, opt_int_arg, table_arg};
 use crate::vm::machine::VM;
-use crate::vm::value::{Value, VmTable};
+use crate::vm::value::{BorrowedRc, Value, ValueView, VmTable};
 
 const MAX_CREATE: i64 = 100_000_000;
 
-fn writable<'a>(args: &'a [Value], name: &str) -> Result<&'a Rc<RefCell<VmTable>>, String> {
+fn writable<'a>(args: &'a [Value], name: &str) -> Result<BorrowedRc<'a, RefCell<VmTable>>, String> {
     let t = table_arg(args, 0, name)?;
     if t.borrow().frozen {
         return Err("attempted to mutate a frozen table".to_string());
@@ -20,7 +20,7 @@ fn writable<'a>(args: &'a [Value], name: &str) -> Result<&'a Rc<RefCell<VmTable>
 fn new_table(vm: &mut VM, table: VmTable) -> Value {
     let rc = Rc::new(RefCell::new(table));
     vm.gc.register_table(&rc);
-    Value::Table(rc)
+    Value::table(rc)
 }
 
 /// Every key and value of a table in iteration order: the array part, then
@@ -28,13 +28,13 @@ fn new_table(vm: &mut VM, table: VmTable) -> Value {
 pub(crate) fn entries(table: &VmTable) -> Vec<(Value, Value)> {
     let mut out = Vec::with_capacity(table.array.len() + table.fields.len());
     for (i, v) in table.array.iter().enumerate() {
-        if !matches!(v, Value::Nil) {
+        if !v.is_nil() {
             out.push((Value::from_usize(i + 1), v.clone()));
         }
     }
     for key in crate::vm::table::sorted_keys(table) {
         let value = crate::vm::table::raw_get(table, &key);
-        if !matches!(value, Value::Nil) {
+        if !value.is_nil() {
             out.push((key, value));
         }
     }
@@ -44,13 +44,10 @@ pub(crate) fn entries(table: &VmTable) -> Vec<(Value, Value)> {
 /// Number of non-nil entries, including named keys (`#t` only counts the
 /// array part).
 fn table_length(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let t = table_arg(args, 0, "t")?.borrow();
-    let mut n = t.array.iter().filter(|v| !matches!(v, Value::Nil)).count();
-    n += t
-        .fields
-        .values()
-        .filter(|v| !matches!(v, Value::Nil))
-        .count();
+    let t_handle = table_arg(args, 0, "t")?;
+    let t = t_handle.borrow();
+    let mut n = t.array.iter().filter(|v| !v.is_nil()).count();
+    n += t.fields.values().filter(|v| !v.is_nil()).count();
     if let Some(general) = &t.general {
         n += general.len();
     }
@@ -91,7 +88,7 @@ fn table_remove(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let len = tbl.array.len() as i64;
     let pos = opt_int_arg(args, 1, "pos", len)?;
     if len == 0 && (pos == 0 || pos == len) {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
     if pos < 1 || pos > len {
         return Err(format!("position {} is out of bounds (1 to {})", pos, len));
@@ -113,13 +110,14 @@ fn range(args: &[Value], first: usize, len: usize) -> Result<(usize, usize), Str
 /// Joins `t[i..j]` with `sep`. Strings and numbers are joined as they print;
 /// anything else is an error, as in Lua.
 fn table_concat(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let t = table_arg(args, 0, "t")?.borrow();
-    let sep = match args.get(1) {
-        None | Some(Value::Nil) => String::new(),
-        Some(Value::String(s)) => s.to_string(),
-        Some(v @ (Value::Int(_) | Value::BigInt(_) | Value::Float(_))) => v.to_string(),
-        Some(other) => {
-            return Err(format!("sep must be a string, got {}", other.type_name()));
+    let t_handle = table_arg(args, 0, "t")?;
+    let t = t_handle.borrow();
+    let sep = match args.get(1).map(Value::view) {
+        None | Some(ValueView::Nil) => String::new(),
+        Some(ValueView::String(s)) => s.to_string(),
+        Some(ValueView::Int(_) | ValueView::BigInt(_) | ValueView::Float(_)) => args[1].to_string(),
+        Some(_) => {
+            return Err(format!("sep must be a string, got {}", args[1].type_name()));
         }
     };
     let (i, j) = range(args, 2, t.array.len())?;
@@ -128,15 +126,16 @@ fn table_concat(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         if idx > i {
             out.push_str(&sep);
         }
-        match &t.array[idx - 1] {
-            Value::String(s) => out.push_str(s),
-            v @ (Value::Int(_) | Value::BigInt(_) | Value::Float(_)) => {
-                out.push_str(&v.to_string())
+        let item = &t.array[idx - 1];
+        match item.view() {
+            ValueView::String(s) => out.push_str(&s),
+            ValueView::Int(_) | ValueView::BigInt(_) | ValueView::Float(_) => {
+                out.push_str(&item.to_string())
             }
-            other => {
+            _ => {
                 return Err(format!(
                     "invalid value (a {}) at index {} in table for 'concat'",
-                    other.type_name(),
+                    item.type_name(),
                     idx
                 ));
             }
@@ -154,9 +153,9 @@ fn table_create(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     if n > MAX_CREATE {
         return Err(format!("n exceeds the maximum ({})", MAX_CREATE));
     }
-    let value = args.get(1).cloned().unwrap_or(Value::Nil);
+    let value = args.get(1).cloned().unwrap_or(Value::NIL);
     let mut table = VmTable::new();
-    if !matches!(value, Value::Nil) {
+    if !value.is_nil() {
         table.array = vec![value; n as usize];
     }
     Ok(vec![new_table(vm, table)])
@@ -165,9 +164,10 @@ fn table_create(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// `find(t, v, init?)`: the first key in the array part holding `v`,
 /// searching from `init`, then any other key holding it.
 fn table_find(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let t = table_arg(args, 0, "t")?.borrow();
-    let needle = args.get(1).cloned().unwrap_or(Value::Nil);
-    if matches!(needle, Value::Nil) {
+    let t_handle = table_arg(args, 0, "t")?;
+    let t = t_handle.borrow();
+    let needle = args.get(1).cloned().unwrap_or(Value::NIL);
+    if needle.is_nil() {
         return Err("value must be provided".to_string());
     }
     let init = opt_int_arg(args, 2, "init", 1)?.max(1) as usize;
@@ -183,12 +183,13 @@ fn table_find(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             }
         }
     }
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 fn table_keys(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let keys = {
-        let t = table_arg(args, 0, "t")?.borrow();
+        let t_handle = table_arg(args, 0, "t")?;
+        let t = t_handle.borrow();
         entries(&t).into_iter().map(|(k, _)| k).collect::<Vec<_>>()
     };
     let mut table = VmTable::new();
@@ -198,7 +199,8 @@ fn table_keys(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
 fn table_values(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let values = {
-        let t = table_arg(args, 0, "t")?.borrow();
+        let t_handle = table_arg(args, 0, "t")?;
+        let t = t_handle.borrow();
         entries(&t).into_iter().map(|(_, v)| v).collect::<Vec<_>>()
     };
     let mut table = VmTable::new();
@@ -216,7 +218,8 @@ fn table_pack(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 const MAX_UNPACK: usize = 8000;
 
 fn table_unpack(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let t = table_arg(args, 0, "t")?.borrow();
+    let t_handle = table_arg(args, 0, "t")?;
+    let t = t_handle.borrow();
     let (i, j) = range(args, 1, t.array.len())?;
     if j < i {
         return Ok(Vec::new());
@@ -233,11 +236,11 @@ fn table_unpack(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn table_freeze(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let t = table_arg(args, 0, "t")?;
     t.borrow_mut().frozen = true;
-    Ok(vec![Value::Table(t.clone())])
+    Ok(vec![Value::table(t.to_rc())])
 }
 
 fn table_isfrozen(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    Ok(vec![Value::Bool(table_arg(args, 0, "t")?.borrow().frozen)])
+    Ok(vec![Value::bool(table_arg(args, 0, "t")?.borrow().frozen)])
 }
 
 fn table_clear(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -252,7 +255,8 @@ fn table_clear(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// A shallow copy. The metatable is shared; the copy is never frozen.
 fn table_clone(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let copy = {
-        let tbl = table_arg(args, 0, "t")?.borrow();
+        let tbl_handle = table_arg(args, 0, "t")?;
+        let tbl = tbl_handle.borrow();
         let mut copy = VmTable::new();
         copy.array = tbl.array.clone();
         copy.fields = tbl.fields.clone();
@@ -306,31 +310,13 @@ fn merge_sort(
 /// Sorts the array part in place, by `<` or by `cmp(a, b)` returning true
 /// when `a` must come first. The sort is stable.
 fn table_sort(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let t = writable(args, "t")?.clone();
+    let t = writable(args, "t")?.to_rc();
     let mut items = std::mem::take(&mut t.borrow_mut().array);
     let result = match args.get(1) {
         // Equal integers or strings cannot be told apart, so lists of only
         // one of them need no stability and take the standard library's sort.
-        None | Some(Value::Nil) if items.iter().all(|v| matches!(v, Value::Int(_))) => {
-            items.sort_unstable_by_key(|v| match v {
-                Value::Int(i) => *i,
-                _ => 0,
-            });
-            Ok(())
-        }
-        None | Some(Value::Nil) if items.iter().all(|v| matches!(v, Value::String(_))) => {
-            items.sort_unstable_by(|a, b| match (a, b) {
-                (Value::String(x), Value::String(y)) => x.cmp(y),
-                _ => std::cmp::Ordering::Equal,
-            });
-            Ok(())
-        }
-        None | Some(Value::Nil) => merge_sort(&mut items, |a, b| match (a, b) {
-            (Value::Int(x), Value::Int(y)) => Ok(x < y),
-            (Value::String(x), Value::String(y)) => Ok(x < y),
-            _ => crate::vm::ops::eval_lt(a, b)
-                .map_err(|_| format!("cannot compare {} with {}", a.type_name(), b.type_name())),
-        }),
+        None => sort_default(&mut items),
+        Some(v) if v.is_nil() => sort_default(&mut items),
         Some(cmp) => {
             let cmp = cmp.clone();
             merge_sort(&mut items, |a, b| {
@@ -345,16 +331,34 @@ fn table_sort(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     result.map(|_| Vec::new())
 }
 
+fn sort_default(items: &mut Vec<Value>) -> Result<(), String> {
+    if items.iter().all(Value::is_int) {
+        items.sort_unstable_by_key(|v| v.as_int().unwrap_or(0));
+        return Ok(());
+    }
+    if items.iter().all(Value::is_string) {
+        items.sort_unstable_by(|a, b| a.as_str().cmp(&b.as_str()));
+        return Ok(());
+    }
+    merge_sort(items, |a, b| match (a.view(), b.view()) {
+        (ValueView::Int(x), ValueView::Int(y)) => Ok(x < y),
+        (ValueView::String(x), ValueView::String(y)) => Ok(x.as_str() < y.as_str()),
+        _ => crate::vm::ops::eval_lt(a, b)
+            .map_err(|_| format!("cannot compare {} with {}", a.type_name(), b.type_name())),
+    })
+}
+
 /// `move(a1, f, e, t, a2?)`: copies `a1[f..e]` to `a2[t..]` (or within
 /// `a1`), handling overlap, and returns the destination.
 fn table_move(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let src = table_arg(args, 0, "a1")?.clone();
+    let src = table_arg(args, 0, "a1")?.to_rc();
     let f = int_arg(args, 1, "f")?;
     let e = int_arg(args, 2, "e")?;
     let t = int_arg(args, 3, "t")?;
     let dest = match args.get(4) {
-        None | Some(Value::Nil) => src.clone(),
-        _ => table_arg(args, 4, "a2")?.clone(),
+        None => src.clone(),
+        Some(v) if v.is_nil() => src.clone(),
+        _ => table_arg(args, 4, "a2")?.to_rc(),
     };
     if e >= f {
         if f < 1 && e >= i64::MAX + f {
@@ -364,20 +368,20 @@ fn table_move(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         if t > i64::MAX - count + 1 {
             return Err("destination wrap around".to_string());
         }
-        let source = Value::Table(src.clone());
-        let target = Value::Table(dest.clone());
         let overlapping = Rc::ptr_eq(&src, &dest) && t > f && t <= e;
+        let source = Value::table(src);
+        let target = Value::table(dest.clone());
         let order: Box<dyn Iterator<Item = i64>> = if overlapping {
             Box::new((0..count).rev())
         } else {
             Box::new(0..count)
         };
         for k in order {
-            let v = vm.table_get(&source, &Value::Int(f + k))?;
-            vm.table_set(&target, Value::Int(t + k), v)?;
+            let v = vm.table_get(&source, &Value::int(f + k))?;
+            vm.table_set(&target, Value::int(t + k), v)?;
         }
     }
-    Ok(vec![Value::Table(dest)])
+    Ok(vec![Value::table(dest)])
 }
 
 pub fn create_table_lib() -> Value {

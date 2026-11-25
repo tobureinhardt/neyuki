@@ -120,6 +120,8 @@ pub struct VM {
     /// hook, or a debugger stepping or holding line breakpoints). The
     /// dispatch loop tests only this.
     pub trap: bool,
+    /// True when either a debug hook or DAP session is attached (`Call`/`Return` fast guard).
+    pub debug_active: bool,
     /// Active DAP debug session, if any (`neyuki dap`). `None` keeps
     /// breakpoint checks to a single predictable branch.
     pub dap: Option<DapSession>,
@@ -156,6 +158,20 @@ pub struct VM {
     pub limits: ExecutionLimits,
     /// Capability-based sandbox permissions.
     pub permissions: Permissions,
+    #[cfg(neyuki_threaded)]
+    pub(crate) cur_consts: *const Value,
+    #[cfg(neyuki_threaded)]
+    pub(crate) cur_exec: *const crate::bytecode::exec::ExecProgram,
+    #[cfg(neyuki_threaded)]
+    pub(crate) cur_closure: *const VmClosure,
+    #[cfg(neyuki_threaded)]
+    pub(crate) cur_upvals: *const Rc<crate::vm::value::Upvalue>,
+    #[cfg(neyuki_threaded)]
+    pub(crate) run_target_depth: usize,
+    #[cfg(neyuki_threaded)]
+    pub(crate) run_result: Option<Value>,
+    #[cfg(neyuki_threaded)]
+    pub(crate) run_err: Option<String>,
 }
 
 impl Default for VM {
@@ -171,7 +187,7 @@ fn value_has_mutable_state(val: &Value) -> bool {
         // `json.null` is a frozen thread-local sentinel compared by `Rc::ptr_eq`.
         return false;
     }
-    matches!(val, Value::Table(_) | Value::Closure(_) | Value::Buffer(_))
+    val.is_table() || val.is_closure() || val.is_buffer()
 }
 
 fn table_needs_deep_clone(tbl: &VmTable) -> bool {
@@ -188,16 +204,15 @@ fn deep_clone_value(val: &Value) -> Value {
     if crate::vm::libs::json::is_null(val) {
         return val.clone();
     }
-    match val {
-        Value::Table(t) => Value::Table(deep_clone_table(&t.borrow())),
-        other => {
-            debug_assert!(
-                !value_has_mutable_state(other),
-                "unexpected mutable value in BuiltinTemplate: {}",
-                other.type_name()
-            );
-            other.clone()
-        }
+    if let Some(t) = val.as_table() {
+        Value::table(deep_clone_table(&t.borrow()))
+    } else {
+        debug_assert!(
+            !value_has_mutable_state(val),
+            "unexpected mutable value in BuiltinTemplate: {}",
+            val.type_name()
+        );
+        val.clone()
     }
 }
 
@@ -253,13 +268,11 @@ impl BuiltinTemplate {
         // so every VM gets its own isolated `_G` table + metatable.
         let g_key = StrRef::from("_G");
         let g_meta = match scratch.globals.remove(&g_key) {
-            Some(Value::Table(t)) => t
-                .borrow()
-                .metatable
-                .as_ref()
-                .map(|m| m.borrow().clone())
+            Some(v) => v
+                .as_table()
+                .and_then(|t| t.borrow().metatable.as_ref().map(|m| m.borrow().clone()))
                 .unwrap_or_default(),
-            _ => VmTable::new(),
+            None => VmTable::new(),
         };
         let g_meta_needs_deep = table_needs_deep_clone(&g_meta);
         debug_assert!(
@@ -282,7 +295,7 @@ impl BuiltinTemplate {
         ];
         let mut libs = Vec::with_capacity(raw_libs.len());
         for (name, val) in raw_libs {
-            if let Value::Table(t) = val {
+            if let Some(t) = val.as_table() {
                 let tbl = t.borrow().clone();
                 let needs_deep = table_needs_deep_clone(&tbl);
                 libs.push((name, StrRef::from(name), tbl, needs_deep));
@@ -330,19 +343,34 @@ impl VM {
             in_hook: false,
             hook_countdown: 0,
             trap: false,
+            debug_active: false,
             dap: None,
             in_eval: false,
             open_upvalues: Vec::new(),
             top: 0,
             modules: HashMap::new(),
             script_dir: None,
-            string_lib: Value::Nil,
+            string_lib: Value::NIL,
             returned: Vec::new(),
             error_trace: None,
             max_call_depth: default_max_call_depth(),
             tasks: Default::default(),
             limits: ExecutionLimits::new(),
             permissions: Permissions::allow_all(),
+            #[cfg(neyuki_threaded)]
+            cur_consts: std::ptr::null(),
+            #[cfg(neyuki_threaded)]
+            cur_exec: std::ptr::null(),
+            #[cfg(neyuki_threaded)]
+            cur_closure: std::ptr::null(),
+            #[cfg(neyuki_threaded)]
+            cur_upvals: std::ptr::null(),
+            #[cfg(neyuki_threaded)]
+            run_target_depth: 0,
+            #[cfg(neyuki_threaded)]
+            run_result: None,
+            #[cfg(neyuki_threaded)]
+            run_err: None,
         }
     }
 
@@ -365,11 +393,11 @@ impl VM {
             });
             globals.insert(
                 tpl.g_key.clone(),
-                Value::Table(Rc::new(RefCell::new(g_table))),
+                Value::table(Rc::new(RefCell::new(g_table))),
             );
 
             for (name, key, tbl, needs_deep) in &tpl.libs {
-                let lib = Value::Table(if *needs_deep {
+                let lib = Value::table(if *needs_deep {
                     deep_clone_table(tbl)
                 } else {
                     Rc::new(RefCell::new(tbl.clone()))
@@ -421,7 +449,7 @@ impl VM {
     }
 
     pub fn register_native(&mut self, def: &'static NativeDef) {
-        self.set_global(def.name, Value::Native(def));
+        self.set_global(def.name, Value::native(def));
     }
 
     pub fn execute(&mut self, proto: Proto) -> Result<Value, String> {
@@ -443,7 +471,7 @@ impl VM {
 
         // Ensure stack has enough capacity for main frame
         let max_reg = closure.proto.max_registers as usize;
-        self.stack.resize(max_reg + 1, Value::Nil);
+        self.stack.resize(max_reg + 1, Value::NIL);
 
         self.frames.push(CallFrame::new(closure, 0));
         self.catch_panics(|vm| vm.run())
@@ -485,16 +513,17 @@ impl VM {
     #[inline]
     pub(crate) fn set_reg_grow(&mut self, idx: usize, val: Value) {
         if idx >= self.stack.len() {
-            self.stack.resize(idx + 1, Value::Nil);
+            self.stack.resize(idx + 1, Value::NIL);
         }
         self.stack[idx] = val;
     }
 
-    /// Recomputes `trap` after a hook, debugger, or limit setting changed.
+    /// Recomputes `trap` and `debug_active` after a hook, debugger, or limit setting changed.
     pub fn update_trap(&mut self) {
         let hook_wants = self.hook.as_ref().is_some_and(|h| h.on_line || h.count > 0);
         let debugger_wants = self.dap.as_ref().is_some_and(|d| d.wants_lines());
         self.trap = hook_wants || debugger_wants || self.limits.is_active();
+        self.debug_active = self.hook.is_some() || self.dap.is_some();
     }
 
     /// Full collection with finalizers: mark, extract the finalizer queue,
@@ -549,7 +578,7 @@ impl VM {
         let mut settled_freed = 0;
         let mut first_err: Option<String> = None;
         for (rc, handler) in queue {
-            let arg = Value::Table(rc.clone());
+            let arg = Value::table(rc.clone());
             let res = self.call_function(handler.clone(), std::slice::from_ref(&arg));
             let (cleared, freed) = self.gc.settle_table(rc, res.is_ok(), internal);
             if let Some(ptr) = cleared {
@@ -591,7 +620,7 @@ impl VM {
         let dropped = self.gc.reap_young();
         if dropped > 0
             && self.gc.bytes_allocated <= self.gc.threshold * 3 / 4
-            && self.gc.nursery_reaps_since_cycle < 4
+            && self.gc.nursery_reaps_since_cycle < 12
         {
             self.gc.nursery_reaps_since_cycle += 1;
             self.gc.last_freed = dropped;
@@ -665,8 +694,9 @@ mod tests {
         let (stmts, _pool) = parser.parse_program().expect("syntax error");
         let proto = compile_to_proto(&stmts);
         let res = vm.execute(proto).expect("execution error");
-        assert!(
-            matches!(res, Value::Int(7)),
+        assert_eq!(
+            res.as_int(),
+            Some(7),
             "survivor must resume intact through gc, got {}",
             res
         );
@@ -757,8 +787,8 @@ mod tests {
     #[test]
     fn test_vm_mod_zero_message() {
         let err = crate::vm::ops::eval_mod(
-            &crate::vm::value::Value::Int(1),
-            &crate::vm::value::Value::Int(0),
+            &crate::vm::value::Value::int(1),
+            &crate::vm::value::Value::int(0),
         )
         .unwrap_err();
         assert_eq!(err, "modulo by zero");
@@ -781,8 +811,8 @@ mod tests {
     #[test]
     fn test_vm_idiv_zero_message() {
         let err = crate::vm::ops::eval_idiv(
-            &crate::vm::value::Value::Int(1),
-            &crate::vm::value::Value::Int(0),
+            &crate::vm::value::Value::int(1),
+            &crate::vm::value::Value::int(0),
         )
         .unwrap_err();
         assert_eq!(err, "division by zero");
@@ -1781,11 +1811,11 @@ return path .. \" \" .. params.name .. \" \" .. http.encode(\"a b\")";
         let mut inner = VmTable::new();
         inner.fields.insert(StrRef::from("sep"), Value::str("/"));
         let mut mt = VmTable::new();
-        mt.fields.insert(StrRef::from("tag"), Value::Int(1));
+        mt.fields.insert(StrRef::from("tag"), Value::int(1));
         let mut root = VmTable::new();
         root.fields.insert(
             StrRef::from("path"),
-            Value::Table(Rc::new(RefCell::new(inner))),
+            Value::table(Rc::new(RefCell::new(inner))),
         );
         root.metatable = Some(Rc::new(RefCell::new(mt)));
 
@@ -1794,7 +1824,12 @@ return path .. \" \" .. params.name .. \" \" .. http.encode(\"a b\")";
         let clone2 = deep_clone_table(&root);
 
         // Mutate nested table and metatable on clone1; clone2 and root must be untouched.
-        if let Some(Value::Table(p1)) = clone1.borrow().fields.get("path") {
+        if let Some(p1) = clone1
+            .borrow()
+            .fields
+            .get("path")
+            .and_then(|v| v.as_table())
+        {
             p1.borrow_mut()
                 .fields
                 .insert(StrRef::from("sep"), Value::str("\\"));
@@ -1806,11 +1841,16 @@ return path .. \" \" .. params.name .. \" \" .. http.encode(\"a b\")";
             .unwrap()
             .borrow_mut()
             .fields
-            .insert(StrRef::from("tag"), Value::Int(99));
+            .insert(StrRef::from("tag"), Value::int(99));
 
-        let sep2 = match clone2.borrow().fields.get("path") {
-            Some(Value::Table(p2)) => p2.borrow().fields.get("sep").unwrap().to_string(),
-            _ => panic!("missing nested table"),
+        let sep2 = match clone2
+            .borrow()
+            .fields
+            .get("path")
+            .and_then(|v| v.as_table())
+        {
+            Some(p2) => p2.borrow().fields.get("sep").unwrap().to_string(),
+            None => panic!("missing nested table"),
         };
         let tag2 = clone2
             .borrow()
@@ -1823,7 +1863,7 @@ return path .. \" \" .. params.name .. \" \" .. http.encode(\"a b\")";
             .unwrap()
             .clone();
         assert_eq!(sep2, "/");
-        assert_eq!(tag2, Value::Int(1));
+        assert_eq!(tag2, Value::int(1));
     }
 
     #[test]

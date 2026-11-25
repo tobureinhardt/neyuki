@@ -50,10 +50,10 @@ pub fn fold_builtin_call_scoped(
 fn literal_value(expr: &Expr) -> Option<Value> {
     match expr {
         Expr::Literal { value, .. } => Some(match value {
-            Literal::Nil => Value::Nil,
-            Literal::Bool(b) => Value::Bool(*b),
+            Literal::Nil => Value::NIL,
+            Literal::Bool(b) => Value::bool(*b),
             Literal::Int(i) => Value::from_bigint(i.clone()),
-            Literal::Float(f) => Value::Float(*f),
+            Literal::Float(f) => Value::float(*f),
             Literal::String(s) => Value::str(s),
         }),
         _ => None,
@@ -61,13 +61,14 @@ fn literal_value(expr: &Expr) -> Option<Value> {
 }
 
 fn value_expr(value: &Value) -> Option<Expr> {
-    Some(match value {
-        Value::Nil => Expr::nil(),
-        Value::Bool(b) => Expr::bool(*b),
-        Value::Int(i) => Expr::int(*i),
-        Value::BigInt(i) => Expr::int((**i).clone()),
-        Value::Float(f) => Expr::float(*f),
-        Value::String(s) => Expr::string(s.to_string()),
+    use crate::vm::value::ValueView;
+    Some(match value.view() {
+        ValueView::Nil => Expr::nil(),
+        ValueView::Bool(b) => Expr::bool(b),
+        ValueView::Int(i) => Expr::int(i),
+        ValueView::BigInt(i) => Expr::int(i.clone()),
+        ValueView::Float(f) => Expr::float(f),
+        ValueView::String(s) => Expr::string(s.to_string()),
         _ => return None,
     })
 }

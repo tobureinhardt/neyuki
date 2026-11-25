@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use super::dap_json::{self, Json};
 use crate::vm::machine::VM;
-use crate::vm::value::{Value, VmClosure};
+use crate::vm::value::{Value, ValueView, VmClosure};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StepKind {
@@ -191,9 +191,9 @@ pub fn output(vm: &mut VM, category: &str, text: &str) {
 }
 
 fn preview(v: &Value) -> String {
-    match v {
-        Value::String(s) => format!("{:?}", &**s),
-        Value::Table(t) => {
+    match v.view() {
+        ValueView::String(s) => format!("{:?}", s.as_str()),
+        ValueView::Table(t) => {
             let t = t.borrow();
             let named = t.fields.len() + t.general.as_ref().map_or(0, |g| g.len());
             match (t.array.len(), named) {
@@ -203,7 +203,7 @@ fn preview(v: &Value) -> String {
                 (n, m) => format!("{{...}} ({} items, {} keys)", n, m),
             }
         }
-        other => other.to_string(),
+        _ => v.to_string(),
     }
 }
 
@@ -235,7 +235,7 @@ fn frame_variables(vm: &VM, index: usize) -> Vec<(String, Value)> {
                 .stack
                 .get(frame.base + info.reg as usize)
                 .cloned()
-                .unwrap_or(Value::Nil);
+                .unwrap_or(Value::NIL);
             out.retain(|(name, _)| *name != info.name);
             out.push((info.name.clone(), value));
         }
@@ -473,9 +473,10 @@ fn stack_trace(vm: &mut VM, request: &Json, args: &Json) {
 }
 
 fn child_ref(vm: &mut VM, value: &Value) -> usize {
-    match value {
-        Value::Table(_) => session(vm).register(VarRef::Value(value.clone())),
-        _ => 0,
+    if value.is_table() {
+        session(vm).register(VarRef::Value(value.clone()))
+    } else {
+        0
     }
 }
 
@@ -491,16 +492,19 @@ fn variables(vm: &mut VM, reference: usize) -> Json {
                 .filter_map(|n| vm.globals.get(n.as_str()).cloned().map(|v| (n, v)))
                 .collect()
         }
-        Some(VarRef::Value(Value::Table(t))) => crate::vm::libs::table::entries(&t.borrow())
-            .into_iter()
-            .map(|(k, v)| {
-                let name = match &k {
-                    Value::String(s) => s.to_string(),
-                    other => format!("[{}]", preview(other)),
-                };
-                (name, v)
-            })
-            .collect(),
+        Some(VarRef::Value(ref val)) if val.is_table() => {
+            let t = val.as_table().unwrap();
+            crate::vm::libs::table::entries(&t.borrow())
+                .into_iter()
+                .map(|(k, v)| {
+                    let name = match k.as_str() {
+                        Some(s) => s.to_string(),
+                        None => format!("[{}]", preview(&k)),
+                    };
+                    (name, v)
+                })
+                .collect()
+        }
         _ => Vec::new(),
     };
     let mut out = Vec::with_capacity(pairs.len());
@@ -532,7 +536,7 @@ fn evaluate(vm: &mut VM, expr: &str, frame: Option<usize>) -> Result<Value, Stri
     );
     let proto =
         crate::compiler::compile_program(&source, "evaluate", crate::compiler::Options::UNCHECKED)?;
-    let chunk = Value::Closure(Rc::new(VmClosure {
+    let chunk = Value::closure(Rc::new(VmClosure {
         proto: Rc::new(proto),
         upvalues: Vec::new(),
     }));
@@ -540,10 +544,10 @@ fn evaluate(vm: &mut VM, expr: &str, frame: Option<usize>) -> Result<Value, Stri
     vm.in_eval = true;
     let result = vm
         .call_function(chunk, &[])
-        .and_then(|f| vm.call_function(f.into_iter().next().unwrap_or(Value::Nil), &args));
+        .and_then(|f| vm.call_function(f.into_iter().next().unwrap_or(Value::NIL), &args));
     vm.in_eval = false;
     vm.error_trace = None;
-    Ok(result?.into_iter().next().unwrap_or(Value::Nil))
+    Ok(result?.into_iter().next().unwrap_or(Value::NIL))
 }
 
 const TERMINATED: &str = "debugging terminated";
@@ -684,6 +688,7 @@ fn pause(vm: &mut VM, reason: &str) -> Result<(), String> {
 pub fn run_dap_session() -> Result<(), String> {
     let mut vm = VM::new();
     vm.dap = Some(DapSession::stdio());
+    vm.update_trap();
     serve(&mut vm);
     Ok(())
 }
@@ -744,6 +749,7 @@ mod tests {
             Box::new(io::Cursor::new(input)),
             Box::new(Shared(out.clone())),
         ));
+        vm.update_trap();
         serve(&mut vm);
         let bytes = out.lock().unwrap().clone();
         let mut reader = io::BufReader::new(io::Cursor::new(bytes));

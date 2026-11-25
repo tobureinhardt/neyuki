@@ -7,9 +7,9 @@ use crate::compiler::thir::nodes::{
     ThirParam, ThirStmt, ThirStmtKind, ThirTableEntry,
 };
 use crate::compiler::thir::typeck::{
-    TypeContext, infer_binary_type, infer_body_return_type, infer_call_type, infer_index_type,
-    infer_literal_type, infer_member_type, infer_table_type, infer_unary_type,
-    is_module_import_member,
+    TypeContext, extract_if_narrowing, infer_binary_type, infer_body_return_type, infer_call_type,
+    infer_for_var_types, infer_index_type, infer_literal_type, infer_member_type, infer_table_type,
+    infer_unary_type, is_module_import_member,
 };
 use crate::sema::types::NeyukiType;
 
@@ -212,12 +212,39 @@ impl ThirLowerer {
                 else_branch,
             } => {
                 let cond = self.lower_expr(condition);
+                let narrowing = extract_if_narrowing(&cond);
+
                 self.ctx.enter_scope();
+                let saved_then = narrowing.then_branch.and_then(|(id, narrowed)| {
+                    let prev = self.ctx.bindings.get(id.0 as usize).map(|b| b.ty.clone())?;
+                    if narrowed != NeyukiType::Any && narrowed != prev {
+                        self.ctx.bindings[id.0 as usize].ty = narrowed;
+                        Some((id, prev))
+                    } else {
+                        None
+                    }
+                });
                 let then_b = self.lower_block(then_branch);
+                if let Some((id, prev)) = saved_then {
+                    self.ctx.bindings[id.0 as usize].ty = prev;
+                }
                 self.ctx.exit_scope();
+
                 let else_b = else_branch.as_ref().map(|b| {
                     self.ctx.enter_scope();
+                    let saved_else = narrowing.else_branch.and_then(|(id, narrowed)| {
+                        let prev = self.ctx.bindings.get(id.0 as usize).map(|b| b.ty.clone())?;
+                        if narrowed != NeyukiType::Any && narrowed != prev {
+                            self.ctx.bindings[id.0 as usize].ty = narrowed;
+                            Some((id, prev))
+                        } else {
+                            None
+                        }
+                    });
                     let lb = self.lower_block(b);
+                    if let Some((id, prev)) = saved_else {
+                        self.ctx.bindings[id.0 as usize].ty = prev;
+                    }
                     self.ctx.exit_scope();
                     lb
                 });
@@ -229,15 +256,14 @@ impl ThirLowerer {
             }
             HirStmtKind::For { vars, source, body } => {
                 let lowered_src = self.lower_expr(source);
+                let var_tys = infer_for_var_types(&lowered_src.ty, vars.len());
                 self.ctx.enter_scope();
                 let mut bindings = Vec::with_capacity(vars.len());
-                for v in vars {
-                    bindings.push(self.ctx.alloc_binding(
-                        v.clone(),
-                        BindingKind::Local,
-                        false,
-                        NeyukiType::Any,
-                    ));
+                for (v, ty) in vars.iter().zip(var_tys) {
+                    bindings.push(
+                        self.ctx
+                            .alloc_binding(v.clone(), BindingKind::Local, false, ty),
+                    );
                 }
                 let lowered_body = self.lower_block(body);
                 self.ctx.exit_scope();

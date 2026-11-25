@@ -9,7 +9,7 @@ use rand::{Rng, RngCore, SeedableRng};
 
 use crate::vm::libs::args::number_arg;
 use crate::vm::machine::VM;
-use crate::vm::value::{Value, VmTable};
+use crate::vm::value::{Value, ValueView, VmTable};
 
 thread_local! {
     /// Seeded from the OS until a script calls `math.randomseed`.
@@ -25,7 +25,7 @@ fn num(args: &[Value], index: usize, name: &str) -> Result<f64, String> {
 }
 
 fn float(value: f64) -> Result<Vec<Value>, String> {
-    Ok(vec![Value::Float(value)])
+    Ok(vec![Value::float(value)])
 }
 
 fn float_to_integer(value: f64) -> Result<Value, String> {
@@ -37,7 +37,7 @@ fn float_to_integer(value: f64) -> Result<Value, String> {
 /// Integers pass through rounding unchanged; floats are rounded by `f`.
 fn round_with(args: &[Value], name: &str, f: fn(f64) -> f64) -> Result<Vec<Value>, String> {
     match args.first() {
-        Some(v @ (Value::Int(_) | Value::BigInt(_))) => Ok(vec![v.clone()]),
+        Some(v) if v.is_int() => Ok(vec![v.clone()]),
         _ => Ok(vec![float_to_integer(f(num(args, 0, name)?))?]),
     }
 }
@@ -59,30 +59,30 @@ fn math_trunc(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn math_abs(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    Ok(vec![match args.first() {
-        Some(Value::Int(i)) => match i.checked_abs() {
-            Some(a) => Value::Int(a),
-            None => Value::from_bigint(BigInt::from(*i).abs()),
+    Ok(vec![match args.first().map(Value::view) {
+        Some(ValueView::Int(i)) => match i.checked_abs() {
+            Some(a) => Value::int(a),
+            None => Value::from_bigint(BigInt::from(i).abs()),
         },
-        Some(Value::BigInt(i)) => Value::from_bigint(i.abs()),
-        _ => Value::Float(num(args, 0, "n")?.abs()),
+        Some(ValueView::BigInt(i)) => Value::from_bigint(i.abs()),
+        _ => Value::float(num(args, 0, "n")?.abs()),
     }])
 }
 
 fn math_sign(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    Ok(vec![match args.first() {
-        Some(Value::Int(i)) => Value::Int(i.signum()),
-        Some(Value::BigInt(i)) => Value::Int(if i.is_negative() { -1 } else { 1 }),
+    Ok(vec![match args.first().map(Value::view) {
+        Some(ValueView::Int(i)) => Value::int(i.signum()),
+        Some(ValueView::BigInt(i)) => Value::int(if i.is_negative() { -1 } else { 1 }),
         _ => {
             let n = num(args, 0, "n")?;
             if n.is_nan() {
-                Value::Float(n)
+                Value::float(n)
             } else if n > 0.0 {
-                Value::Int(1)
+                Value::int(1)
             } else if n < 0.0 {
-                Value::Int(-1)
+                Value::int(-1)
             } else {
-                Value::Int(0)
+                Value::int(0)
             }
         }
     }])
@@ -114,7 +114,8 @@ fn math_log(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         return Err("log expects a non-negative number".to_string());
     }
     match args.get(1) {
-        None | Some(Value::Nil) => float(value.ln()),
+        None => float(value.ln()),
+        Some(v) if v.is_nil() => float(value.ln()),
         Some(_) => {
             let base = num(args, 1, "base")?;
             if base <= 0.0 || base == 1.0 {
@@ -184,7 +185,8 @@ fn math_acos(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn math_atan(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let y = num(args, 0, "y")?;
     match args.get(1) {
-        None | Some(Value::Nil) => float(y.atan()),
+        None => float(y.atan()),
+        Some(v) if v.is_nil() => float(y.atan()),
         Some(_) => float(y.atan2(num(args, 1, "x")?)),
     }
 }
@@ -194,11 +196,14 @@ fn math_atan2(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn math_fmod(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    if let (Some(Value::Int(a)), Some(Value::Int(b))) = (args.first(), args.get(1)) {
-        if *b == 0 {
+    if let (Some(a), Some(b)) = (
+        args.first().and_then(Value::as_int),
+        args.get(1).and_then(Value::as_int),
+    ) {
+        if b == 0 {
             return Err("fmod divisor must not be zero".to_string());
         }
-        return Ok(vec![Value::Int(a.checked_rem(*b).unwrap_or(0))]);
+        return Ok(vec![Value::int(a.checked_rem(b).unwrap_or(0))]);
     }
     let a = num(args, 0, "a")?;
     let b = num(args, 1, "b")?;
@@ -211,18 +216,18 @@ fn math_fmod(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn math_modf(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let value = num(args, 0, "n")?;
     if value.is_infinite() {
-        return Ok(vec![Value::Float(value), Value::Float(0.0)]);
+        return Ok(vec![Value::float(value), Value::float(0.0)]);
     }
     Ok(vec![
-        Value::Float(value.trunc()),
-        Value::Float(value.fract()),
+        Value::float(value.trunc()),
+        Value::float(value.fract()),
     ])
 }
 
 fn math_frexp(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let value = num(args, 0, "n")?;
     if value == 0.0 || !value.is_finite() {
-        return Ok(vec![Value::Float(value), Value::Int(0)]);
+        return Ok(vec![Value::float(value), Value::int(0)]);
     }
     let exponent_mask = 0x7ffu64 << 52;
     // Subnormals are scaled up first so the exponent field is populated.
@@ -234,8 +239,8 @@ fn math_frexp(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let raw_exponent = ((bits & exponent_mask) >> 52) as i64;
     let mantissa = f64::from_bits((bits & !exponent_mask) | (1022u64 << 52));
     Ok(vec![
-        Value::Float(mantissa),
-        Value::Int(raw_exponent - bias),
+        Value::float(mantissa),
+        Value::int(raw_exponent - bias),
     ])
 }
 
@@ -250,22 +255,22 @@ fn math_ldexp(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn math_isfinite(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    Ok(vec![Value::Bool(match args.first() {
-        Some(Value::Int(_) | Value::BigInt(_)) => true,
+    Ok(vec![Value::bool(match args.first() {
+        Some(v) if v.is_int() => true,
         _ => num(args, 0, "n")?.is_finite(),
     })])
 }
 
 fn math_isinf(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    Ok(vec![Value::Bool(match args.first() {
-        Some(Value::Int(_) | Value::BigInt(_)) => false,
+    Ok(vec![Value::bool(match args.first() {
+        Some(v) if v.is_int() => false,
         _ => num(args, 0, "n")?.is_infinite(),
     })])
 }
 
 fn math_isnan(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    Ok(vec![Value::Bool(match args.first() {
-        Some(Value::Int(_) | Value::BigInt(_)) => false,
+    Ok(vec![Value::bool(match args.first() {
+        Some(v) if v.is_int() => false,
         _ => num(args, 0, "n")?.is_nan(),
     })])
 }
@@ -274,22 +279,22 @@ fn math_isnan(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// `math.max(1, 5, 3)` and `math.max(scores)` work.
 fn collect_numbers(args: &[Value], name: &str) -> Result<Vec<Value>, String> {
     fn push(value: &Value, out: &mut Vec<Value>, depth: usize) -> Result<(), String> {
-        match value {
-            Value::Int(_) | Value::BigInt(_) | Value::Float(_) => {
-                out.push(value.clone());
-                Ok(())
-            }
-            Value::Table(t) if depth < 16 => {
-                for item in &t.borrow().array {
-                    push(item, out, depth + 1)?;
-                }
-                Ok(())
-            }
-            other => Err(format!(
-                "expected numbers or arrays of numbers, got {}",
-                other.type_name()
-            )),
+        if value.is_number() {
+            out.push(value.clone());
+            return Ok(());
         }
+        if let Some(t) = value.as_table()
+            && depth < 16
+        {
+            for item in &t.borrow().array {
+                push(item, out, depth + 1)?;
+            }
+            return Ok(());
+        }
+        Err(format!(
+            "expected numbers or arrays of numbers, got {}",
+            value.type_name()
+        ))
     }
     let mut out = Vec::with_capacity(args.len());
     for value in args {
@@ -323,9 +328,9 @@ fn math_min(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn math_clamp(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let n = args.first().cloned().unwrap_or(Value::Nil);
-    let min = args.get(1).cloned().unwrap_or(Value::Nil);
-    let max = args.get(2).cloned().unwrap_or(Value::Nil);
+    let n = args.first().cloned().unwrap_or(Value::NIL);
+    let min = args.get(1).cloned().unwrap_or(Value::NIL);
+    let max = args.get(2).cloned().unwrap_or(Value::NIL);
     for (value, name) in [(&n, "n"), (&min, "min"), (&max, "max")] {
         if !value.is_number() {
             return Err(format!("{} must be a number", name));
@@ -363,13 +368,13 @@ fn math_map(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn integer_bound(value: &Value, name: &str) -> Result<BigInt, String> {
-    match value {
-        Value::Int(i) => Ok(BigInt::from(*i)),
-        Value::BigInt(i) => Ok((**i).clone()),
-        Value::Float(f) if f.is_finite() && f.fract() == 0.0 => {
-            BigInt::from_f64(*f).ok_or_else(|| format!("{} must be an integer", name))
+    match value.view() {
+        ValueView::Int(i) => Ok(BigInt::from(i)),
+        ValueView::BigInt(i) => Ok(i.clone()),
+        ValueView::Float(f) if f.is_finite() && f.fract() == 0.0 => {
+            BigInt::from_f64(f).ok_or_else(|| format!("{} must be an integer", name))
         }
-        Value::Nil => Err(format!("{} must be provided", name)),
+        ValueView::Nil => Err(format!("{} must be provided", name)),
         _ => Err(format!("{} must be an integer", name)),
     }
 }
@@ -378,7 +383,7 @@ fn integer_bound(value: &Value, name: &str) -> Result<BigInt, String> {
 /// sampling over the range's bytes.
 fn random_between(min: BigInt, max: BigInt) -> Value {
     if let (Some(lo), Some(hi)) = (min.to_i64(), max.to_i64()) {
-        return Value::Int(with_rng(|rng| rng.gen_range(lo..=hi)));
+        return Value::int(with_rng(|rng| rng.gen_range(lo..=hi)));
     }
     let range = &max - &min;
     let bit_count = range.bits();
@@ -403,20 +408,21 @@ fn random_between(min: BigInt, max: BigInt) -> Value {
 /// `random()` is a float in [0, 1), `random(m)` an integer in 1..=m and
 /// `random(min, max)` an integer in min..=max. Bounds may be any size.
 fn math_random(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let first = args.first().unwrap_or(&Value::Nil);
-    let second = args.get(1).unwrap_or(&Value::Nil);
-    match (first, second) {
-        (Value::Nil, Value::Nil) => float(with_rng(|rng| rng.gen_range(0.0..1.0))),
-        (m, Value::Nil) => {
-            let m = integer_bound(m, "m")?;
+    let nil = Value::NIL;
+    let first = args.first().unwrap_or(&nil);
+    let second = args.get(1).unwrap_or(&nil);
+    match (first.view(), second.view()) {
+        (ValueView::Nil, ValueView::Nil) => float(with_rng(|rng| rng.gen_range(0.0..1.0))),
+        (_, ValueView::Nil) => {
+            let m = integer_bound(first, "m")?;
             if m < BigInt::from(1) {
                 return Err("m must be greater than or equal to 1".to_string());
             }
             Ok(vec![random_between(BigInt::from(1), m)])
         }
-        (min, max) => {
-            let min = integer_bound(min, "min")?;
-            let max = integer_bound(max, "max")?;
+        _ => {
+            let min = integer_bound(first, "min")?;
+            let max = integer_bound(second, "max")?;
             if min > max {
                 return Err("min must be less than or equal to max".to_string());
             }
@@ -428,16 +434,19 @@ fn math_random(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// Reseeds `math.random`, making its sequence repeatable; without a seed
 /// it goes back to OS entropy.
 fn math_randomseed(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let rng = match args.first() {
-        None | Some(Value::Nil) => StdRng::from_entropy(),
-        Some(Value::Int(i)) => StdRng::seed_from_u64(*i as u64),
-        Some(Value::Float(f)) => StdRng::seed_from_u64(f.to_bits()),
-        Some(Value::BigInt(i)) => {
+    let rng = match args.first().map(Value::view) {
+        None | Some(ValueView::Nil) => StdRng::from_entropy(),
+        Some(ValueView::Int(i)) => StdRng::seed_from_u64(i as u64),
+        Some(ValueView::Float(f)) => StdRng::seed_from_u64(f.to_bits()),
+        Some(ValueView::BigInt(i)) => {
             let low = i.iter_u64_digits().next().unwrap_or(0);
             StdRng::seed_from_u64(low)
         }
-        Some(other) => {
-            return Err(format!("seed must be a number, got {}", other.type_name()));
+        Some(_) => {
+            return Err(format!(
+                "seed must be a number, got {}",
+                args[0].type_name()
+            ));
         }
     };
     RNG.with(|cell| *cell.borrow_mut() = rng);
@@ -521,7 +530,8 @@ pub(crate) fn perlin_noise(x: f64, y: f64, z: f64) -> f64 {
 fn math_noise(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let coordinate = |index: usize, name: &str| -> Result<f64, String> {
         match args.get(index) {
-            None | Some(Value::Nil) if index > 0 => Ok(0.0),
+            None if index > 0 => Ok(0.0),
+            Some(v) if index > 0 && v.is_nil() => Ok(0.0),
             _ => {
                 let value = num(args, index, name)?;
                 if !value.is_finite() {
@@ -587,12 +597,12 @@ pub fn create_math_lib() -> Value {
         "tanh" => math_tanh,
         "trunc" => math_trunc,
     }
-    table.set_str("pi", Value::Float(std::f64::consts::PI));
-    table.set_str("tau", Value::Float(std::f64::consts::TAU));
-    table.set_str("e", Value::Float(std::f64::consts::E));
-    table.set_str("phi", Value::Float(std::f64::consts::GOLDEN_RATIO));
-    table.set_str("sqrt2", Value::Float(std::f64::consts::SQRT_2));
-    table.set_str("huge", Value::Float(f64::INFINITY));
-    table.set_str("nan", Value::Float(f64::NAN));
+    table.set_str("pi", Value::float(std::f64::consts::PI));
+    table.set_str("tau", Value::float(std::f64::consts::TAU));
+    table.set_str("e", Value::float(std::f64::consts::E));
+    table.set_str("phi", Value::float(std::f64::consts::GOLDEN_RATIO));
+    table.set_str("sqrt2", Value::float(std::f64::consts::SQRT_2));
+    table.set_str("huge", Value::float(f64::INFINITY));
+    table.set_str("nan", Value::float(f64::NAN));
     crate::vm::libs::args::frozen(table)
 }

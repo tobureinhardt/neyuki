@@ -169,6 +169,12 @@ fn read_constant(bytes: &[u8], cursor: &mut usize) -> Result<Constant, String> {
 
 fn read_instruction(bytes: &[u8], cursor: &mut usize, version: u8) -> Result<Instruction, String> {
     let tag = read_u8(bytes, cursor)?;
+    if tag >= 75 && version < 9 {
+        return Err(format!(
+            "instruction tag {} requires bytecode format 9 (file is format {})",
+            tag, version
+        ));
+    }
     if tag >= 66 && version < 8 {
         return Err(format!(
             "instruction tag {} requires bytecode format 8 (file is format {})",
@@ -525,6 +531,16 @@ fn read_instruction(bytes: &[u8], cursor: &mut usize, version: u8) -> Result<Ins
             a: read_u8(bytes, cursor)?,
             k: read_u16(bytes, cursor)?,
             jump_if_false: read_i16(bytes, cursor)?,
+        }),
+        75 => Ok(Instruction::IDivK {
+            dst: read_u8(bytes, cursor)?,
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
+        }),
+        76 => Ok(Instruction::ModK {
+            dst: read_u8(bytes, cursor)?,
+            a: read_u8(bytes, cursor)?,
+            k: read_u16(bytes, cursor)?,
         }),
         _ => Err(format!("unknown instruction tag: {}", tag)),
     }

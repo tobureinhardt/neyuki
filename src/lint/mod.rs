@@ -12,21 +12,41 @@ use crate::diagnostics::error_code::ErrorCode;
 use crate::diagnostics::severity::Severity;
 use crate::diagnostics::span::Span;
 
-/// Checks source and returns its diagnostics ordered by position. A syntax
-/// error stops the check and is the only diagnostic.
+/// Checks source and returns its diagnostics ordered by position. When the
+/// parser recovers from syntax errors, all collected syntax diagnostics are
+/// returned together.
 pub fn lint_source(source: &str) -> Vec<Diagnostic> {
-    let parsed = match crate::compiler::parse(source) {
-        Ok(parsed) => parsed,
-        Err(err) => return vec![syntax_error(&err)],
+    let parsed = crate::compiler::parse_with_recovery(source);
+    let mut diagnostics = if parsed.errors.is_empty() {
+        crate::sema::analyze_with_spans_and_attrs(
+            &parsed.stmts,
+            source,
+            &parsed.spans,
+            &parsed.attributes,
+        )
+    } else {
+        parsed
+            .errors
+            .iter()
+            .map(crate::parser::ParseError::to_diagnostic)
+            .collect()
     };
-    let mut diagnostics = crate::sema::analyze_with_spans(&parsed.stmts, source, &parsed.spans);
     diagnostics.sort_by_key(|d| {
         d.primary_label
             .as_ref()
             .map(|l| (l.span.start.line, l.span.start.column))
             .unwrap_or((0, 0))
     });
-    diagnostics.dedup_by(|a, b| a.code == b.code && a.message == b.message);
+    diagnostics.dedup_by(|a, b| {
+        a.code == b.code
+            && a.message == b.message
+            && a.primary_label
+                .as_ref()
+                .map(|l| (l.span.start.line, l.span.start.column))
+                == b.primary_label
+                    .as_ref()
+                    .map(|l| (l.span.start.line, l.span.start.column))
+    });
     // Appended after the dedup above, which collapses equal messages and
     // would drop a second identical escape on a nearby line.
     diagnostics.extend(escape_diagnostics(source));
@@ -375,5 +395,85 @@ local b = "\x89""#,
             json
         );
         assert!(json.contains("\"line\":1"), "{}", json);
+    }
+
+    #[test]
+    fn lint_reports_multiple_syntax_errors_together() {
+        let source = "local = 1\nlocal ok = 2\nlocal y = +\nprint(ok)\n";
+        let diags = lint_source(source);
+        assert!(
+            diags.len() >= 2,
+            "expected multiple syntax errors, got: {:?}",
+            diags
+        );
+        let lines: Vec<u32> = diags
+            .iter()
+            .filter_map(|d| d.primary_label.as_ref().map(|l| l.span.start.line))
+            .collect();
+        assert!(lines.contains(&1), "{:?}", lines);
+        assert!(lines.iter().any(|&l| l >= 3), "{:?}", lines);
+    }
+
+    #[test]
+    fn attributes_allow_and_deprecated_work_in_lint() {
+        let source = "\
+@allow(unused)
+local kept = 1
+local x = 10
+if true then
+    @allow(shadow)
+    local x = 20
+    @allow(unused)
+    local _y = x
+end
+@deprecated(\"use new_fn\")
+local function old_fn(): int
+    return x
+end
+print(old_fn())
+";
+        let diags = lint_source(source);
+        assert!(
+            !diags.iter().any(|d| d.code == Some(ErrorCode::W0001)),
+            "unexpected unused warning: {:?}",
+            diags
+        );
+        assert!(
+            !diags.iter().any(|d| d.code == Some(ErrorCode::W0003)),
+            "unexpected shadow warning: {:?}",
+            diags
+        );
+        let dep = diags
+            .iter()
+            .find(|d| d.code == Some(ErrorCode::W0008))
+            .expect("expected deprecation warning");
+        assert!(dep.message.contains("old_fn"));
+        assert!(dep.message.contains("use new_fn"));
+        assert!(
+            !diags.iter().any(|d| d.code == Some(ErrorCode::W0005)),
+            "deprecation must not be tagged as a redundant operation: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn invalid_attributes_have_their_own_code() {
+        let source = "@allow
+local a = 1
+@deprecated(42)
+local function f() end
+print(a, f)
+";
+        let diags = lint_source(source);
+        let invalid: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(ErrorCode::W0007))
+            .collect();
+        assert_eq!(invalid.len(), 2, "{:?}", diags);
+        assert!(
+            !diags.iter().any(|d| d.code == Some(ErrorCode::W0005)),
+            "{:?}",
+            diags
+        );
     }
 }

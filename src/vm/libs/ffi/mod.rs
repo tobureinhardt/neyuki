@@ -207,23 +207,25 @@ pub(crate) fn open_library(path: &std::path::Path) -> Result<Library, String> {
 // ---------------------------------------------------------------------------
 
 fn parse_signature(tbl: &VmTable) -> Result<(Vec<FfiType>, FfiType), String> {
-    let ret = match tbl.get_str("returns") {
-        Value::Nil => FfiType::Void,
-        Value::String(s) => FfiType::parse(&s)?,
-        other => {
+    let ret_val = tbl.get_str("returns");
+    let ret = match ret_val.view() {
+        crate::vm::value::ValueView::Nil => FfiType::Void,
+        crate::vm::value::ValueView::String(s) => FfiType::parse(&s)?,
+        _ => {
             return Err(format!(
                 "signature 'returns' must be a string, got {}",
-                other.type_name()
+                ret_val.type_name()
             ));
         }
     };
     let mut args = Vec::new();
-    match tbl.get_str("args") {
-        Value::Nil => {}
-        Value::Table(arg_tbl) => {
+    let args_val = tbl.get_str("args");
+    match args_val.view() {
+        crate::vm::value::ValueView::Nil => {}
+        crate::vm::value::ValueView::Table(arg_tbl) => {
             let arg_tbl = arg_tbl.borrow();
             for (idx, val) in arg_tbl.array.iter().enumerate() {
-                let Value::String(s) = val else {
+                let Some(s) = val.as_str() else {
                     return Err(format!(
                         "signature args[{}] must be a type string, got {}",
                         idx + 1,
@@ -237,10 +239,10 @@ fn parse_signature(tbl: &VmTable) -> Result<(Vec<FfiType>, FfiType), String> {
                 args.push(ty);
             }
         }
-        other => {
+        _ => {
             return Err(format!(
                 "signature 'args' must be an array of type names, got {}",
-                other.type_name()
+                args_val.type_name()
             ));
         }
     }
@@ -250,8 +252,9 @@ fn parse_signature(tbl: &VmTable) -> Result<(Vec<FfiType>, FfiType), String> {
 
 fn builtin_open(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let path = match args.first() {
-        None | Some(Value::Nil) => "",
-        Some(Value::String(s)) => &**s,
+        None => "",
+        Some(v) if v.is_nil() => "",
+        Some(v) if v.is_string() => v.as_str().unwrap(),
         Some(other) => {
             return Err(format!(
                 "path must be a string or nil, got {}",
@@ -271,7 +274,7 @@ fn builtin_open(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     {
         let sigs = sigs_tbl.borrow();
         for (name, sig_val) in sigs.fields.iter() {
-            let Value::Table(sig_tbl) = sig_val else {
+            let Some(sig_tbl) = sig_val.as_table() else {
                 return Err(format!("signature for '{}' must be a table", name.0.str));
             };
             let (arg_tys, ret_ty) = parse_signature(&sig_tbl.borrow())?;
@@ -314,7 +317,7 @@ fn builtin_open(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
     Ok(vec![
         Value::from_usize(id as usize),
-        Value::Table(Rc::new(RefCell::new(sym_map))),
+        Value::table(Rc::new(RefCell::new(sym_map))),
     ])
 }
 
@@ -335,30 +338,30 @@ fn value_to_abi_arg(
         FfiType::U64 | FfiType::USize => Ok(AbiArg::Int(val_to_u64(val, "u64")?)),
         FfiType::F32 => Ok(AbiArg::F32(val_to_f64(val, "f32")? as f32)),
         FfiType::F64 => Ok(AbiArg::F64(val_to_f64(val, "f64")?)),
-        FfiType::Ptr => match val {
-            Value::Nil => Ok(AbiArg::Int(0)),
-            Value::Int(i) => Ok(AbiArg::Int(*i as u64)),
-            Value::Buffer(b) => {
+        FfiType::Ptr => match val.view() {
+            crate::vm::value::ValueView::Nil => Ok(AbiArg::Int(0)),
+            crate::vm::value::ValueView::Int(i) => Ok(AbiArg::Int(i as u64)),
+            crate::vm::value::ValueView::Buffer(b) => {
                 let mut buf = b.borrow_mut();
                 Ok(AbiArg::Int(buf.data.as_mut_ptr() as usize as u64))
             }
-            other => Err(format!(
+            _ => Err(format!(
                 "expected pointer (int, buffer, or nil), got {}",
-                other.type_name()
+                val.type_name()
             )),
         },
-        FfiType::CStr => match val {
-            Value::Nil => Ok(AbiArg::Int(0)),
-            Value::String(s) => {
-                let cs = CString::new(&**s)
+        FfiType::CStr => match val.view() {
+            crate::vm::value::ValueView::Nil => Ok(AbiArg::Int(0)),
+            crate::vm::value::ValueView::String(s) => {
+                let cs = CString::new(s.as_str())
                     .map_err(|_| "string argument contains interior NUL byte".to_string())?;
                 let ptr = cs.as_ptr() as usize as u64;
                 cstrings.push(cs);
                 Ok(AbiArg::Int(ptr))
             }
-            other => Err(format!(
+            _ => Err(format!(
                 "expected string or nil for cstr argument, got {}",
-                other.type_name()
+                val.type_name()
             )),
         },
         FfiType::Void => Err("void cannot be an argument".to_string()),
@@ -366,44 +369,44 @@ fn value_to_abi_arg(
 }
 
 fn val_to_i64(val: &Value, ty: &str) -> Result<i64, String> {
-    match val {
-        Value::Int(i) => Ok(*i),
-        Value::Float(f) if f.is_finite() => Ok(*f as i64),
-        Value::BigInt(b) => num_traits::ToPrimitive::to_i64(&**b)
+    match val.view() {
+        crate::vm::value::ValueView::Int(i) => Ok(i),
+        crate::vm::value::ValueView::Float(f) if f.is_finite() => Ok(f as i64),
+        crate::vm::value::ValueView::BigInt(b) => num_traits::ToPrimitive::to_i64(b)
             .ok_or_else(|| format!("integer out of range for {}", ty)),
-        other => Err(format!(
+        _ => Err(format!(
             "expected number for {}, got {}",
             ty,
-            other.type_name()
+            val.type_name()
         )),
     }
 }
 
 fn val_to_u64(val: &Value, ty: &str) -> Result<u64, String> {
-    match val {
-        Value::Int(i) if *i >= 0 => Ok(*i as u64),
-        Value::Int(i) => Ok(*i as u64),
-        Value::Float(f) if f.is_finite() && *f >= 0.0 => Ok(*f as u64),
-        Value::BigInt(b) => num_traits::ToPrimitive::to_u64(&**b)
+    match val.view() {
+        crate::vm::value::ValueView::Int(i) if i >= 0 => Ok(i as u64),
+        crate::vm::value::ValueView::Int(i) => Ok(i as u64),
+        crate::vm::value::ValueView::Float(f) if f.is_finite() && f >= 0.0 => Ok(f as u64),
+        crate::vm::value::ValueView::BigInt(b) => num_traits::ToPrimitive::to_u64(b)
             .ok_or_else(|| format!("integer out of range for {}", ty)),
-        other => Err(format!(
+        _ => Err(format!(
             "expected number for {}, got {}",
             ty,
-            other.type_name()
+            val.type_name()
         )),
     }
 }
 
 fn val_to_f64(val: &Value, ty: &str) -> Result<f64, String> {
-    match val {
-        Value::Int(i) => Ok(*i as f64),
-        Value::Float(f) => Ok(*f),
-        Value::BigInt(b) => num_traits::ToPrimitive::to_f64(&**b)
+    match val.view() {
+        crate::vm::value::ValueView::Int(i) => Ok(i as f64),
+        crate::vm::value::ValueView::Float(f) => Ok(f),
+        crate::vm::value::ValueView::BigInt(b) => num_traits::ToPrimitive::to_f64(b)
             .ok_or_else(|| format!("number out of range for {}", ty)),
-        other => Err(format!(
+        _ => Err(format!(
             "expected number for {}, got {}",
             ty,
-            other.type_name()
+            val.type_name()
         )),
     }
 }
@@ -454,7 +457,7 @@ fn builtin_close(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         ext::forget_services(lib_id);
         ext::unload_when_idle(lib);
     }
-    Ok(vec![Value::Bool(closed)])
+    Ok(vec![Value::bool(closed)])
 }
 
 // ---------------------------------------------------------------------------
@@ -467,7 +470,7 @@ fn builtin_load_extension(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Str
     let (id, fn_map) = ext::load_extension(vm, &resolved, path)?;
     Ok(vec![
         Value::from_usize(id as usize),
-        Value::Table(Rc::new(RefCell::new(fn_map))),
+        Value::table(Rc::new(RefCell::new(fn_map))),
     ])
 }
 
@@ -519,14 +522,14 @@ fn builtin_alloc(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         allocs.borrow_mut().insert(addr, AllocEntry { len });
     });
     FFI_ALLOCATED_BYTES.with(|b| b.set(b.get().saturating_add(len)));
-    Ok(vec![Value::Int(addr as i64)])
+    Ok(vec![Value::int(addr as i64)])
 }
 
 fn builtin_free(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     vm.permissions.check_ffi_memory()?;
     let addr = ptr_arg_usize(args, 0, "ptr")?;
     if addr == 0 {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
     let entry = ALLOCS
         .with(|allocs| allocs.borrow_mut().remove(&addr))
@@ -537,7 +540,7 @@ fn builtin_free(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         let slice = std::ptr::slice_from_raw_parts_mut(addr as *mut u8, entry.len);
         drop(Box::from_raw(slice));
     }
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 /// Checks that `[addr + offset, addr + offset + size)` lies completely inside a
@@ -588,36 +591,36 @@ fn check_unchecked_ptr(addr: usize, offset: usize) -> Result<*mut u8, String> {
 unsafe fn read_typed_ptr(ptr: *const u8, ty: FfiType, checked_cstr: bool) -> Result<Value, String> {
     unsafe {
         let val = match ty {
-            FfiType::Bool => Value::Bool(ptr.read_unaligned() != 0),
-            FfiType::I8 => Value::Int(i64::from(ptr.cast::<i8>().read_unaligned())),
-            FfiType::U8 => Value::Int(i64::from(ptr.read_unaligned())),
-            FfiType::I16 => Value::Int(i64::from(ptr.cast::<i16>().read_unaligned())),
-            FfiType::U16 => Value::Int(i64::from(ptr.cast::<u16>().read_unaligned())),
-            FfiType::I32 => Value::Int(i64::from(ptr.cast::<i32>().read_unaligned())),
-            FfiType::U32 => Value::Int(i64::from(ptr.cast::<u32>().read_unaligned())),
-            FfiType::I64 | FfiType::ISize => Value::Int(ptr.cast::<i64>().read_unaligned()),
+            FfiType::Bool => Value::bool(ptr.read_unaligned() != 0),
+            FfiType::I8 => Value::int(i64::from(ptr.cast::<i8>().read_unaligned())),
+            FfiType::U8 => Value::int(i64::from(ptr.read_unaligned())),
+            FfiType::I16 => Value::int(i64::from(ptr.cast::<i16>().read_unaligned())),
+            FfiType::U16 => Value::int(i64::from(ptr.cast::<u16>().read_unaligned())),
+            FfiType::I32 => Value::int(i64::from(ptr.cast::<i32>().read_unaligned())),
+            FfiType::U32 => Value::int(i64::from(ptr.cast::<u32>().read_unaligned())),
+            FfiType::I64 | FfiType::ISize => Value::int(ptr.cast::<i64>().read_unaligned()),
             FfiType::U64 | FfiType::USize => {
                 let v = ptr.cast::<u64>().read_unaligned();
                 if v <= i64::MAX as u64 {
-                    Value::Int(v as i64)
+                    Value::int(v as i64)
                 } else {
                     Value::from_bigint(num_bigint::BigInt::from(v))
                 }
             }
-            FfiType::F32 => Value::Float(f64::from(ptr.cast::<f32>().read_unaligned())),
-            FfiType::F64 => Value::Float(ptr.cast::<f64>().read_unaligned()),
+            FfiType::F32 => Value::float(f64::from(ptr.cast::<f32>().read_unaligned())),
+            FfiType::F64 => Value::float(ptr.cast::<f64>().read_unaligned()),
             FfiType::Ptr => {
                 let p = ptr.cast::<usize>().read_unaligned();
                 if p == 0 {
-                    Value::Nil
+                    Value::NIL
                 } else {
-                    Value::Int(p as i64)
+                    Value::int(p as i64)
                 }
             }
             FfiType::CStr => {
                 let cptr = ptr.cast::<*const c_char>().read_unaligned();
                 if cptr.is_null() {
-                    Value::Nil
+                    Value::NIL
                 } else if checked_cstr {
                     return read_cstring_checked(cptr as usize, 65536).map(Value::string);
                 } else {
@@ -717,16 +720,13 @@ fn write_impl(vm: &mut VM, args: &[Value], checked: bool) -> Result<Vec<Value>, 
                 .write_unaligned(val_to_f64(val, "f32")? as f32),
             FfiType::F64 => ptr.cast::<f64>().write_unaligned(val_to_f64(val, "f64")?),
             FfiType::Ptr => {
-                let p = match val {
-                    Value::Nil => 0usize,
-                    Value::Int(i) => {
-                        usize::try_from(*i).map_err(|_| format!("invalid pointer address {}", i))?
+                let p = match val.view() {
+                    crate::vm::value::ValueView::Nil => 0usize,
+                    crate::vm::value::ValueView::Int(i) => {
+                        usize::try_from(i).map_err(|_| format!("invalid pointer address {}", i))?
                     }
-                    other => {
-                        return Err(format!(
-                            "expected pointer or nil, got {}",
-                            other.type_name()
-                        ));
+                    _ => {
+                        return Err(format!("expected pointer or nil, got {}", val.type_name()));
                     }
                 };
                 ptr.cast::<usize>().write_unaligned(p);
@@ -736,7 +736,7 @@ fn write_impl(vm: &mut VM, args: &[Value], checked: bool) -> Result<Vec<Value>, 
             }
         }
     }
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 fn builtin_write(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -791,16 +791,17 @@ fn read_cstring_impl(vm: &mut VM, args: &[Value], checked: bool) -> Result<Vec<V
     } else {
         vm.permissions.check_ffi_unsafe_memory()?;
     }
-    let addr = match args.first() {
-        None | Some(Value::Nil) => return Ok(vec![Value::Nil]),
-        Some(Value::Int(0)) => return Ok(vec![Value::Nil]),
-        Some(Value::Int(i)) => {
-            usize::try_from(*i).map_err(|_| format!("invalid ptr address {}", i))?
+    let addr = match args.first().map(crate::vm::value::Value::view) {
+        None | Some(crate::vm::value::ValueView::Nil | crate::vm::value::ValueView::Int(0)) => {
+            return Ok(vec![Value::NIL]);
         }
-        Some(other) => {
+        Some(crate::vm::value::ValueView::Int(i)) => {
+            usize::try_from(i).map_err(|_| format!("invalid ptr address {}", i))?
+        }
+        Some(_) => {
             return Err(format!(
                 "ptr must be an integer or nil, got {}",
-                other.type_name()
+                args[0].type_name()
             ));
         }
     };
@@ -834,7 +835,7 @@ fn builtin_read_cstring_unsafe(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>
 fn builtin_sizeof(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let ty_str = str_arg(args, 0, "type")?;
     let size = FfiType::parse(ty_str)?.byte_size()?;
-    Ok(vec![Value::Int(size as i64)])
+    Ok(vec![Value::int(size as i64)])
 }
 
 #[cfg(test)]
@@ -846,22 +847,22 @@ mod tests {
     #[test]
     fn test_ffi_alloc_read_write_bounds_and_double_free() {
         let mut vm = VM::new();
-        let ptr = builtin_alloc(&mut vm, &[Value::Int(16)]).unwrap()[0].clone();
+        let ptr = builtin_alloc(&mut vm, &[Value::int(16)]).unwrap()[0].clone();
         builtin_write(
             &mut vm,
             &[
                 ptr.clone(),
                 Value::str("i32"),
-                Value::Int(-12345),
-                Value::Int(4),
+                Value::int(-12345),
+                Value::int(4),
             ],
         )
         .unwrap();
-        let val = builtin_read(&mut vm, &[ptr.clone(), Value::str("i32"), Value::Int(4)]).unwrap();
+        let val = builtin_read(&mut vm, &[ptr.clone(), Value::str("i32"), Value::int(4)]).unwrap();
         assert_eq!(val[0].to_string(), "-12345");
 
         // Out-of-bounds read rejected cleanly
-        let oob = builtin_read(&mut vm, &[ptr.clone(), Value::str("i64"), Value::Int(12)]);
+        let oob = builtin_read(&mut vm, &[ptr.clone(), Value::str("i64"), Value::int(12)]);
         assert!(oob.unwrap_err().contains("out of bounds"));
 
         // Free and double-free check
@@ -883,16 +884,16 @@ mod tests {
         abs_sig.set_str("returns", Value::str("i32"));
 
         let mut sigs = VmTable::new();
-        sigs.set_str("strlen", Value::Table(Rc::new(RefCell::new(strlen_sig))));
-        sigs.set_str("abs", Value::Table(Rc::new(RefCell::new(abs_sig))));
+        sigs.set_str("strlen", Value::table(Rc::new(RefCell::new(strlen_sig))));
+        sigs.set_str("abs", Value::table(Rc::new(RefCell::new(abs_sig))));
 
         let opened = builtin_open(
             &mut vm,
-            &[Value::Nil, Value::Table(Rc::new(RefCell::new(sigs)))],
+            &[Value::NIL, Value::table(Rc::new(RefCell::new(sigs)))],
         )
         .unwrap();
         let lib_id = opened[0].clone();
-        let Value::Table(sym_map) = &opened[1] else {
+        let Some(sym_map) = opened[1].as_table() else {
             panic!("expected symbol map");
         };
         let strlen_idx = sym_map.borrow().get_str("strlen");
@@ -905,7 +906,7 @@ mod tests {
         .unwrap();
         assert_eq!(len_res[0].to_string(), "9");
 
-        let abs_res = builtin_call(&mut vm, &[lib_id.clone(), abs_idx, Value::Int(-99)]).unwrap();
+        let abs_res = builtin_call(&mut vm, &[lib_id.clone(), abs_idx, Value::int(-99)]).unwrap();
         assert_eq!(abs_res[0].to_string(), "99");
 
         builtin_close(&mut vm, &[lib_id]).unwrap();
@@ -921,7 +922,7 @@ mod tests {
         let mut vm_denied = VM::new();
         vm_denied.set_permissions(Permissions::deny_all());
         assert!(
-            builtin_alloc(&mut vm_denied, &[Value::Int(8)])
+            builtin_alloc(&mut vm_denied, &[Value::int(8)])
                 .unwrap_err()
                 .contains("permission denied")
         );
@@ -934,30 +935,30 @@ mod tests {
         vm.set_limits(ExecutionLimits::new().with_heap_limit(1024));
 
         // Respect `--max-memory` on `ffi.alloc`
-        let too_big = builtin_alloc(&mut vm, &[Value::Int(2048)]).unwrap_err();
+        let too_big = builtin_alloc(&mut vm, &[Value::int(2048)]).unwrap_err();
         assert!(too_big.contains("memory limit exceeded"), "got: {too_big}");
 
-        let ptr = builtin_alloc(&mut vm, &[Value::Int(16)]).unwrap()[0].clone();
-        let Value::Int(base_addr) = ptr else {
+        let ptr = builtin_alloc(&mut vm, &[Value::int(16)]).unwrap()[0].clone();
+        let Some(base_addr) = ptr.as_int() else {
             panic!("expected integer pointer");
         };
 
         // Valid interior pointer read/write
-        let interior = Value::Int(base_addr + 8);
+        let interior = Value::int(base_addr + 8);
         builtin_write(
             &mut vm,
             &[
                 interior.clone(),
                 Value::str("i32"),
-                Value::Int(77),
-                Value::Int(0),
+                Value::int(77),
+                Value::int(0),
             ],
         )
         .unwrap();
         assert_eq!(
             builtin_read(
                 &mut vm,
-                &[interior.clone(), Value::str("i32"), Value::Int(0)]
+                &[interior.clone(), Value::str("i32"), Value::int(0)]
             )
             .unwrap()[0]
                 .to_string(),
@@ -965,12 +966,12 @@ mod tests {
         );
 
         // Interior pointer reading past end of allocation must fail
-        let interior_oob = builtin_read(&mut vm, &[interior, Value::str("i64"), Value::Int(4)]);
+        let interior_oob = builtin_read(&mut vm, &[interior, Value::str("i64"), Value::int(4)]);
         assert!(interior_oob.unwrap_err().contains("out of bounds"));
 
         // One-past-the-end pointer must fail
-        let past_end = Value::Int(base_addr + 16);
-        assert!(builtin_read(&mut vm, &[past_end, Value::str("u8"), Value::Int(0)]).is_err());
+        let past_end = Value::int(base_addr + 16);
+        assert!(builtin_read(&mut vm, &[past_end, Value::str("u8"), Value::int(0)]).is_err());
 
         // `readCString` without NUL before end of allocation must fail cleanly
         builtin_write(
@@ -978,8 +979,8 @@ mod tests {
             &[
                 ptr.clone(),
                 Value::str("u8"),
-                Value::Int(65),
-                Value::Int(14),
+                Value::int(65),
+                Value::int(14),
             ],
         )
         .unwrap();
@@ -988,31 +989,31 @@ mod tests {
             &[
                 ptr.clone(),
                 Value::str("u8"),
-                Value::Int(66),
-                Value::Int(15),
+                Value::int(66),
+                Value::int(15),
             ],
         )
         .unwrap();
-        let cstr_oob = builtin_read_cstring(&mut vm, &[Value::Int(base_addr + 14), Value::Int(64)]);
+        let cstr_oob = builtin_read_cstring(&mut vm, &[Value::int(base_addr + 14), Value::int(64)]);
         assert!(cstr_oob.unwrap_err().contains("out of bounds"));
 
         // Arbitrary unowned integer must fail safe `read`/`write`/`readCString`
         assert!(
             builtin_read(
                 &mut vm,
-                &[Value::Int(0x1234), Value::str("u8"), Value::Int(0)]
+                &[Value::int(0x1234), Value::str("u8"), Value::int(0)]
             )
             .is_err()
         );
-        assert!(builtin_read_cstring(&mut vm, &[Value::Int(0x1234)]).is_err());
+        assert!(builtin_read_cstring(&mut vm, &[Value::int(0x1234)]).is_err());
 
         // Free and verify post-free access (use-after-free) fails
         builtin_free(&mut vm, std::slice::from_ref(&ptr)).unwrap();
-        assert!(builtin_read(&mut vm, &[ptr.clone(), Value::str("u8"), Value::Int(0)]).is_err());
+        assert!(builtin_read(&mut vm, &[ptr.clone(), Value::str("u8"), Value::int(0)]).is_err());
         assert!(
             builtin_write(
                 &mut vm,
-                &[ptr.clone(), Value::str("u8"), Value::Int(1), Value::Int(0)]
+                &[ptr.clone(), Value::str("u8"), Value::int(1), Value::int(0)]
             )
             .is_err()
         );
@@ -1031,7 +1032,7 @@ mod tests {
     }
 
     fn empty_sigs() -> Value {
-        Value::Table(Rc::new(RefCell::new(VmTable::new())))
+        Value::table(Rc::new(RefCell::new(VmTable::new())))
     }
 
     #[cfg(unix)]
@@ -1044,7 +1045,7 @@ mod tests {
             let err = builtin_open(&mut vm, &[Value::str(name), empty_sigs()]).err();
             assert!(err.is_some(), "{name} must not load by search path");
         }
-        let err = builtin_open(&mut vm, &[Value::Nil, empty_sigs()])
+        let err = builtin_open(&mut vm, &[Value::NIL, empty_sigs()])
             .err()
             .unwrap();
         assert!(err.contains("permission denied"), "{err}");
@@ -1057,14 +1058,14 @@ mod tests {
     #[test]
     fn allow_list_blocks_unchecked_memory_ops() {
         let mut vm = allow_list_vm(&["/opt/lib/demo.so"]);
-        let target = Value::Int(0x1000);
+        let target = Value::int(0x1000);
         assert!(
             builtin_read_unsafe(&mut vm, &[target.clone(), Value::str("i32")])
                 .unwrap_err()
                 .contains("unrestricted")
         );
         assert!(
-            builtin_write_unsafe(&mut vm, &[target.clone(), Value::str("i32"), Value::Int(1)])
+            builtin_write_unsafe(&mut vm, &[target.clone(), Value::str("i32"), Value::int(1)])
                 .unwrap_err()
                 .contains("unrestricted")
         );
@@ -1074,8 +1075,8 @@ mod tests {
                 .contains("unrestricted")
         );
         // Checked operations on ffi.alloc memory keep working.
-        let ptr = builtin_alloc(&mut vm, &[Value::Int(8)]).unwrap()[0].clone();
-        builtin_write(&mut vm, &[ptr.clone(), Value::str("i32"), Value::Int(7)]).unwrap();
+        let ptr = builtin_alloc(&mut vm, &[Value::int(8)]).unwrap()[0].clone();
+        builtin_write(&mut vm, &[ptr.clone(), Value::str("i32"), Value::int(7)]).unwrap();
         assert_eq!(
             builtin_read(&mut vm, &[ptr.clone(), Value::str("i32")]).unwrap()[0].to_string(),
             "7"
@@ -1159,7 +1160,7 @@ mod tests {
             "#,
             lib.display()
         );
-        assert_eq!(run_script(&mut vm, &src).unwrap(), Value::Bool(true));
+        assert_eq!(run_script(&mut vm, &src).unwrap(), Value::TRUE);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1196,7 +1197,7 @@ mod tests {
             "#,
             lib.display()
         );
-        assert_eq!(run_script(&mut vm, &src).unwrap(), Value::Bool(true));
+        assert_eq!(run_script(&mut vm, &src).unwrap(), Value::TRUE);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

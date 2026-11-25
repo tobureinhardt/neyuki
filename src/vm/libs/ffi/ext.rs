@@ -425,31 +425,36 @@ impl ExtState {
 
     /// Converts a host value for the extension.
     fn export(&mut self, value: Value) -> NeyukiExtValue {
-        match value {
-            Value::Nil => NeyukiExtValue::nil(),
-            Value::Bool(b) => NeyukiExtValue::from_bool(b),
-            Value::Int(i) => NeyukiExtValue::from_int(i),
-            Value::Float(f) => NeyukiExtValue::from_float(f),
-            Value::String(ref s) => {
-                let bytes = s.as_bytes();
-                let out = NeyukiExtValue::from_bytes(bytes);
-                // The string's heap bytes do not move while a clone of the
-                // value keeps them alive.
-                self.keep.push(value);
-                out
-            }
-            other => self.new_handle(other),
+        if let Some(s) = value.as_str() {
+            let out = NeyukiExtValue::from_bytes(s.as_bytes());
+            // The string's heap bytes do not move while a clone of the
+            // value keeps them alive.
+            self.keep.push(value);
+            return out;
         }
+        if let Some(i) = value.as_int() {
+            return NeyukiExtValue::from_int(i);
+        }
+        if let Some(f) = value.as_float() {
+            return NeyukiExtValue::from_float(f);
+        }
+        if let Some(b) = value.as_bool() {
+            return NeyukiExtValue::from_bool(b);
+        }
+        if value.is_nil() {
+            return NeyukiExtValue::nil();
+        }
+        self.new_handle(value)
     }
 
     /// Converts a value from the extension. `MULTI` is refused here; only a
     /// function's top-level return may carry several values.
     fn import(&self, ext: &NeyukiExtValue) -> Result<Value, String> {
         match ext.tag {
-            EXT_TAG_NIL => Ok(Value::Nil),
-            EXT_TAG_BOOL => Ok(Value::Bool(ext.i != 0)),
-            EXT_TAG_INT => Ok(Value::Int(ext.i)),
-            EXT_TAG_FLOAT => Ok(Value::Float(ext.f)),
+            EXT_TAG_NIL => Ok(Value::NIL),
+            EXT_TAG_BOOL => Ok(Value::bool(ext.i != 0)),
+            EXT_TAG_INT => Ok(Value::int(ext.i)),
+            EXT_TAG_FLOAT => Ok(Value::float(ext.f)),
             EXT_TAG_STRING => Ok(Value::string(unsafe { lossy(ext.ptr, ext.len) })),
             EXT_TAG_HANDLE => self.lookup(ext.i),
             EXT_TAG_ERROR => Err(error_message(ext)),
@@ -462,13 +467,10 @@ impl ExtState {
     }
 
     fn import_table(&self, ext: &NeyukiExtValue) -> Result<Rc<RefCell<VmTable>>, String> {
-        match self.import(ext)? {
-            Value::Table(t) => Ok(t),
-            other => Err(format!(
-                "expected a table handle, got {}",
-                other.type_name()
-            )),
-        }
+        let v = self.import(ext)?;
+        let kind = v.type_name();
+        v.into_table()
+            .map_err(|_| format!("expected a table handle, got {}", kind))
     }
 
     /// The VM of the innermost active extension call. Never null: a frame
@@ -551,19 +553,25 @@ unsafe extern "C" fn api_handle_kind(value: NeyukiExtValue) -> u32 {
     if value.tag != EXT_TAG_HANDLE {
         return EXT_KIND_INVALID;
     }
-    in_frame(|s| s.lookup(value.i)).map_or(EXT_KIND_INVALID, |v| match v {
-        Value::Table(_) => EXT_KIND_TABLE,
-        Value::Closure(_) | Value::Native(_) => EXT_KIND_FUNCTION,
-        Value::Buffer(_) => EXT_KIND_BUFFER,
-        Value::BigInt(_) => EXT_KIND_BIGINT,
-        _ => EXT_KIND_INVALID,
+    in_frame(|s| s.lookup(value.i)).map_or(EXT_KIND_INVALID, |v| {
+        if v.is_table() {
+            EXT_KIND_TABLE
+        } else if v.is_callable() {
+            EXT_KIND_FUNCTION
+        } else if v.is_buffer() {
+            EXT_KIND_BUFFER
+        } else if v.is_bigint() {
+            EXT_KIND_BIGINT
+        } else {
+            EXT_KIND_INVALID
+        }
     })
 }
 
 unsafe extern "C" fn api_new_table(array_hint: usize, field_hint: usize) -> NeyukiExtValue {
     api_value(|s| {
         let t = VmTable::with_capacity(array_hint.min(1 << 16), field_hint.min(1 << 16));
-        Ok(s.new_handle(Value::Table(Rc::new(RefCell::new(t)))))
+        Ok(s.new_handle(Value::table(Rc::new(RefCell::new(t)))))
     })
 }
 
@@ -585,7 +593,7 @@ unsafe extern "C" fn api_table_set(
         let t = s.import_table(&table)?;
         let key = s.import(&key)?;
         let value = s.import(&value)?;
-        if matches!(key, Value::Nil) {
+        if key.is_nil() {
             return Err("table key is nil".to_string());
         }
         let old = {
@@ -646,7 +654,7 @@ unsafe extern "C" fn api_call(
     // script, including other extension calls.
     let prepared = in_frame(|s| {
         let f = s.import(&func)?;
-        if !matches!(f, Value::Closure(_) | Value::Native(_)) {
+        if !f.is_callable() {
             return Err(format!("attempt to call a {} value", f.type_name()));
         }
         let ext_args: &[NeyukiExtValue] = if argc == 0 || argv.is_null() {
@@ -700,7 +708,7 @@ unsafe extern "C" fn api_new_buffer(data: *const u8, len: usize) -> NeyukiExtVal
         } else {
             VmBuffer::from_bytes(unsafe { std::slice::from_raw_parts(data, len) }.to_vec())
         };
-        Ok(s.new_handle(Value::Buffer(Rc::new(RefCell::new(buf)))))
+        Ok(s.new_handle(Value::buffer(Rc::new(RefCell::new(buf)))))
     })
 }
 
@@ -709,15 +717,14 @@ unsafe extern "C" fn api_buffer_data(
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
 ) -> bool {
-    let found = in_frame(|s| match s.import(&buffer)? {
-        Value::Buffer(b) => {
+    let found = in_frame(|s| {
+        let v = s.import(&buffer)?;
+        if let Some(b) = v.as_buffer() {
             let mut b = b.borrow_mut();
             Ok((b.data.as_mut_ptr(), b.data.len()))
+        } else {
+            Err(format!("expected a buffer handle, got {}", v.type_name()))
         }
-        other => Err(format!(
-            "expected a buffer handle, got {}",
-            other.type_name()
-        )),
     });
     match found {
         Ok((ptr, len)) => {
@@ -928,12 +935,13 @@ fn ext_pump(
         let _frame = FrameGuard::push(vm);
         let ret = unsafe { pump(wait.as_secs_f64(), user_data) };
         let value = STATE.with(|s| s.borrow().import(&ret))?;
-        match value {
-            Value::Table(_) => Ok(value),
-            other => Err(format!(
+        if value.is_table() {
+            Ok(value)
+        } else {
+            Err(format!(
                 "native event pump returned {} instead of an events table",
-                other.type_name()
-            )),
+                value.type_name()
+            ))
         }
     }
 }
@@ -1384,10 +1392,9 @@ pub(super) mod tests {
     }
 
     fn idx(map: &VmTable, name: &str) -> usize {
-        match map.get_str(name) {
-            Value::Int(i) => i as usize,
-            _ => panic!("missing {name}"),
-        }
+        map.get_str(name)
+            .as_int()
+            .unwrap_or_else(|| panic!("missing {name}")) as usize
     }
 
     #[test]
@@ -1395,9 +1402,9 @@ pub(super) mod tests {
         let mut vm = VM::new();
         let (id, map) = load(&mut vm);
         let f = idx(&map, "add_ints");
-        let res = call_ext(&mut vm, id, f, &[Value::Int(19), Value::Int(23)]).unwrap();
-        assert_eq!(res, vec![Value::Int(42)]);
-        let err = call_ext(&mut vm, id, f, &[Value::Int(1)]).unwrap_err();
+        let res = call_ext(&mut vm, id, f, &[Value::int(19), Value::int(23)]).unwrap();
+        assert_eq!(res, vec![Value::int(42)]);
+        let err = call_ext(&mut vm, id, f, &[Value::int(1)]).unwrap_err();
         assert_eq!(err, "expected two integers");
     }
 
@@ -1407,22 +1414,22 @@ pub(super) mod tests {
         let (id, map) = load(&mut vm);
         let mut t = VmTable::new();
         for i in [5, 6, 7] {
-            t.array.push(Value::Int(i));
+            t.array.push(Value::int(i));
         }
         t.set_str("name", Value::str("nums"));
-        let t = Value::Table(Rc::new(RefCell::new(t)));
+        let t = Value::table(Rc::new(RefCell::new(t)));
         let res = call_ext(&mut vm, id, idx(&map, "inspect"), &[t]).unwrap();
-        assert_eq!(res, vec![Value::Int(18), Value::Int(3), Value::str("nums")]);
+        assert_eq!(res, vec![Value::int(18), Value::int(3), Value::str("nums")]);
 
-        let res = call_ext(&mut vm, id, idx(&map, "range"), &[Value::Int(4)]).unwrap();
-        let Value::Table(out) = &res[0] else {
+        let res = call_ext(&mut vm, id, idx(&map, "range"), &[Value::int(4)]).unwrap();
+        let Some(out) = res[0].as_table() else {
             panic!("expected a table")
         };
         let out = out.borrow();
         assert_eq!(out.array.len(), 4);
-        assert_eq!(out.get_str("count"), Value::Int(4));
+        assert_eq!(out.get_str("count"), Value::int(4));
 
-        let err = call_ext(&mut vm, id, idx(&map, "inspect"), &[Value::Int(1)]).unwrap_err();
+        let err = call_ext(&mut vm, id, idx(&map, "inspect"), &[Value::int(1)]).unwrap_err();
         assert_eq!(err, "expected a table");
     }
 
@@ -1437,7 +1444,7 @@ pub(super) mod tests {
         )
         .unwrap();
         let fns = vm.execute(proto).unwrap();
-        let Value::Table(t) = fns else {
+        let Some(t) = fns.as_table() else {
             panic!("expected a table")
         };
         let fns = t.borrow().array.clone();
@@ -1445,15 +1452,15 @@ pub(super) mod tests {
             &mut vm,
             id,
             idx(&map, "apply"),
-            &[fns[0].clone(), Value::Int(20)],
+            &[fns[0].clone(), Value::int(20)],
         )
         .unwrap();
-        assert_eq!(res, vec![Value::Int(41)]);
+        assert_eq!(res, vec![Value::int(41)]);
         let err = call_ext(
             &mut vm,
             id,
             idx(&map, "apply"),
-            &[fns[1].clone(), Value::Nil],
+            &[fns[1].clone(), Value::NIL],
         )
         .unwrap_err();
         assert!(err.contains("boom"), "{err}");
@@ -1463,7 +1470,7 @@ pub(super) mod tests {
     fn persistent_handles_outlive_the_call_and_local_ones_do_not() {
         let mut vm = VM::new();
         let (id, map) = load(&mut vm);
-        let t = Value::Table(Rc::new(RefCell::new(VmTable::new())));
+        let t = Value::table(Rc::new(RefCell::new(VmTable::new())));
         call_ext(&mut vm, id, idx(&map, "keep"), std::slice::from_ref(&t)).unwrap();
         let res = call_ext(&mut vm, id, idx(&map, "kept"), &[]).unwrap();
         assert_eq!(res, vec![t]);
@@ -1480,7 +1487,7 @@ pub(super) mod tests {
         let f = idx(&map, "can_read");
         assert_eq!(
             call_ext(&mut vm, id, f, &[Value::str("/etc/hosts")]).unwrap(),
-            vec![Value::Bool(true)]
+            vec![Value::TRUE]
         );
         vm.set_permissions(Permissions::deny_all());
         let err = call_ext(&mut vm, id, f, &[Value::str("/etc/hosts")]).unwrap_err();
@@ -1497,7 +1504,7 @@ pub(super) mod tests {
             .insert(StrRef::from("EXT"), Value::from_usize(id as usize));
         vm.globals.insert(
             StrRef::from("F"),
-            Value::Table(Rc::new(RefCell::new(map.clone()))),
+            Value::table(Rc::new(RefCell::new(map.clone()))),
         );
         (vm, id, map)
     }
@@ -1512,7 +1519,7 @@ pub(super) mod tests {
         vm.globals
             .get(&StrRef::from(name))
             .cloned()
-            .unwrap_or(Value::Nil)
+            .unwrap_or(Value::NIL)
     }
 
     #[test]
@@ -1520,10 +1527,7 @@ pub(super) mod tests {
         let mut vm = VM::new();
         let (id, map) = load(&mut vm);
         let f = idx(&map, "service");
-        assert_eq!(
-            call_ext(&mut vm, id, f, &[]).unwrap(),
-            vec![Value::Bool(true)]
-        );
+        assert_eq!(call_ext(&mut vm, id, f, &[]).unwrap(), vec![Value::TRUE]);
         forget_services(id);
         let none = unsafe { (API.lookup_service)(b"test.service".as_ptr(), 12) };
         assert!(none.is_null());
@@ -1542,7 +1546,7 @@ pub(super) mod tests {
              _G.before = _G.count",
         )
         .expect("program runs");
-        assert!(matches!(global(&vm, "before"), Value::Nil));
+        assert!(global(&vm, "before").is_nil());
         assert_eq!(global(&vm, "count").to_string(), "1");
         assert_eq!(global(&vm, "first").to_string(), "tick");
     }
@@ -1550,12 +1554,12 @@ pub(super) mod tests {
     #[test]
     fn outside_a_task_the_extension_pumps_in_place() {
         let (mut vm, id, map) = script_vm();
-        let res = call_ext(&mut vm, id, idx(&map, "park"), &[Value::Float(5.0)]).unwrap();
-        let Value::Table(t) = &res[0] else {
+        let res = call_ext(&mut vm, id, idx(&map, "park"), &[Value::float(5.0)]).unwrap();
+        let Some(t) = res[0].as_table() else {
             panic!("expected the events table")
         };
         assert_eq!(t.borrow().array, vec![Value::str("tick")]);
-        let err = call_ext(&mut vm, id, idx(&map, "park"), &[Value::Float(-1.0)]).unwrap_err();
+        let err = call_ext(&mut vm, id, idx(&map, "park"), &[Value::float(-1.0)]).unwrap_err();
         assert!(err.contains("non-negative"), "{err}");
     }
 
@@ -1581,7 +1585,7 @@ pub(super) mod tests {
              error(\"stop before the delay\")",
         )
         .expect_err("the script stops itself");
-        assert!(matches!(global(&vm, "idle"), Value::Nil));
+        assert!(global(&vm, "idle").is_nil());
         let later = global(&vm, "later").to_string().parse::<f64>().unwrap();
         assert!(later > 25.0 && later <= 30.0, "{later}");
         let now = global(&vm, "now").to_string().parse::<f64>().unwrap();
@@ -1593,7 +1597,7 @@ pub(super) mod tests {
     fn the_extension_waker_is_installed() {
         let (mut vm, id, map) = script_vm();
         let res = call_ext(&mut vm, id, idx(&map, "waker"), &[]).unwrap();
-        assert_eq!(res, vec![Value::Bool(true)]);
+        assert_eq!(res, vec![Value::TRUE]);
         let before = WAKES.load(std::sync::atomic::Ordering::SeqCst);
         let waker = task::take_waker(&mut vm).expect("a waker");
         waker();

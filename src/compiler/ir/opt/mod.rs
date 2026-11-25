@@ -17,16 +17,16 @@ use crate::compiler::ir::inst::IrInst;
 use crate::compiler::ir::types::IrVar;
 use crate::vm::hash::{FxHashSet, new_set};
 
-pub use crate::compiler::value_tracking::value_tracking_cfg;
+pub use crate::compiler::value_tracking::{value_tracking_cfg, value_tracking_cfg_with};
 pub use const_fold::constant_propagation;
-pub use copy_prop::{copy_propagation, copy_propagation_cfg};
+pub use copy_prop::{copy_propagation, copy_propagation_cfg, copy_propagation_cfg_with};
 pub use cse::{common_subexpression_elimination, common_subexpression_elimination_cfg};
-pub use dce::{dead_code_elimination, dead_code_elimination_cfg};
+pub use dce::{dead_code_elimination, dead_code_elimination_cfg, dead_code_elimination_cfg_with};
 pub use inline::inline_functions;
 pub use loop_invariant::loop_invariant_code_motion;
-pub use peephole::peephole_cfg;
+pub use peephole::{peephole_cfg, peephole_cfg_with};
 pub use simplify_cfg::simplify_cfg;
-pub use strength_reduce::strength_reduction_cfg;
+pub use strength_reduce::{strength_reduction_cfg, strength_reduction_cfg_with};
 
 /// The variables nested functions capture. A closure holds the register of
 /// each captured variable, not a snapshot of its value, so these are aliased
@@ -64,6 +64,7 @@ pub fn optimize_cfg_with_level(cfg: &mut ControlFlowGraph, level: OptLevel) {
     }
 
     const MAX_FIXPOINT_ROUNDS: usize = 16;
+    let captured = captured_vars(cfg);
 
     for _ in 0..MAX_FIXPOINT_ROUNDS {
         let mut changed = false;
@@ -82,27 +83,27 @@ pub fn optimize_cfg_with_level(cfg: &mut ControlFlowGraph, level: OptLevel) {
         }
 
         // 3. Copy Propagation
-        if copy_propagation_cfg(cfg) {
+        if copy_propagation_cfg_with(cfg, &captured) {
             changed = true;
         }
 
         // 4. Value Tracking and Constant / Range Propagation
-        if value_tracking_cfg(cfg) {
+        if value_tracking_cfg_with(cfg, &captured) {
             changed = true;
         }
 
         // 5. Algebraic Simplification & Strength Reduction
-        if strength_reduction_cfg(cfg) {
+        if strength_reduction_cfg_with(cfg, &captured) {
             changed = true;
         }
 
         // 6. Dead Code Elimination
-        if dead_code_elimination_cfg(cfg) {
+        if dead_code_elimination_cfg_with(cfg, &captured) {
             changed = true;
         }
 
         // 7. Trivial Phi & Peephole Cleanups
-        if peephole_cfg(cfg) {
+        if peephole_cfg_with(cfg, &captured) {
             changed = true;
         }
 

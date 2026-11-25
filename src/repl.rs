@@ -7,7 +7,6 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Instant;
 
 use crate::vm::machine::VM;
-use crate::vm::value::Value;
 
 /// True when `err` looks like truncated input (hit EOF mid-construct)
 /// rather than a finished-but-wrong chunk. Callers keep reading on true
@@ -44,9 +43,10 @@ pub fn eval_chunk(vm: &mut VM, source: &str) -> Result<Option<String>, String> {
             crate::compiler::compile_program(source, "repl", crate::compiler::Options::UNCHECKED)?;
         let val = vm.execute(proto)?;
         crate::vm::libs::task::run_due(vm);
-        Ok(match val {
-            Value::Nil => None,
-            v => Some(v.to_string()),
+        Ok(if val.is_nil() {
+            None
+        } else {
+            Some(val.to_string())
         })
     };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
@@ -150,6 +150,7 @@ pub fn run_repl() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::value::Value;
 
     fn parse_err(src: &str) -> String {
         crate::compiler::compile_source(src).unwrap_err()
@@ -222,7 +223,7 @@ mod tests {
         READY.store(false, Ordering::SeqCst);
         fn mark_ready(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
             READY.store(true, Ordering::SeqCst);
-            Ok(vec![Value::Nil])
+            Ok(vec![Value::NIL])
         }
 
         let mut vm = VM::new();

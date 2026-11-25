@@ -2,7 +2,7 @@
 
 use crate::compiler::ir::block::ControlFlowGraph;
 use crate::compiler::ir::types::{IrLabel, IrVar};
-use crate::vm::hash::{FxHashMap, FxHashSet, new_set, set_with_capacity, with_capacity};
+use crate::vm::hash::{FxHashMap, FxHashSet, new_set, with_capacity};
 
 #[derive(Debug, Clone)]
 pub struct BlockLiveness {
@@ -57,7 +57,9 @@ impl LivenessInfo {
             return Self { blocks };
         }
 
-        let mut label_to_idx: FxHashMap<IrLabel, usize> = with_capacity(cfg.blocks.len());
+        let num_blocks = cfg.blocks.len();
+        let mut label_to_idx: FxHashMap<IrLabel, usize> = with_capacity(num_blocks);
+        let mut block_infos: Vec<BlockLiveness> = Vec::with_capacity(num_blocks);
 
         // 1. Calculate local use and def sets for each basic block
         for (idx, block) in cfg.blocks.iter().enumerate() {
@@ -76,27 +78,29 @@ impl LivenessInfo {
                 });
             }
 
-            blocks.insert(
-                block.label,
-                BlockLiveness {
-                    use_vars: block_use,
-                    def_vars: block_def,
-                    live_in: new_set(),
-                    live_out: new_set(),
-                },
-            );
+            block_infos.push(BlockLiveness {
+                use_vars: block_use,
+                def_vars: block_def,
+                live_in: new_set(),
+                live_out: new_set(),
+            });
         }
 
-        // 2. Iterative backward dataflow analysis
-        // out[B] = Union_{S in succ[B]} in[S]
-        // in[B] = use[B] Union (out[B] \ def[B])
-        //
-        // Blocks are visited in postorder (successors before predecessors),
-        // so straight-line dependency chains settle in one round and each
-        // loop nesting level costs roughly one more round. Visiting in raw
-        // layout order can propagate only one block per round and hit the
-        // iteration cap on loop-heavy functions.
-        let order = Self::reverse_postorder(cfg, &label_to_idx);
+        let succ_indices: Vec<Vec<usize>> = cfg
+            .blocks
+            .iter()
+            .map(|b| {
+                b.successors
+                    .iter()
+                    .filter_map(|s| label_to_idx.get(s).copied())
+                    .collect()
+            })
+            .collect();
+
+        // 2. Iterative backward dataflow analysis over dense block indices
+        let order = Self::postorder_indices(cfg, &label_to_idx, &succ_indices);
+        let mut scratch_out = new_set();
+        let mut scratch_in = new_set();
         let mut changed = true;
         let mut iterations = 0;
         const MAX_ITERATIONS: usize = 1000;
@@ -105,78 +109,74 @@ impl LivenessInfo {
             changed = false;
             iterations += 1;
 
-            for lbl in &order {
-                // Compute out[B]
-                let mut new_out = new_set();
-                if let Some(&idx) = label_to_idx.get(lbl) {
-                    for succ in &cfg.blocks[idx].successors {
-                        if let Some(succ_info) = blocks.get(succ) {
-                            new_out.extend(succ_info.live_in.iter().copied());
+            for &idx in &order {
+                scratch_out.clear();
+                for &succ_idx in &succ_indices[idx] {
+                    scratch_out.extend(block_infos[succ_idx].live_in.iter().copied());
+                }
+
+                scratch_in.clear();
+                {
+                    let b = &block_infos[idx];
+                    scratch_in.extend(b.use_vars.iter().copied());
+                    for v in &scratch_out {
+                        if !b.def_vars.contains(v) {
+                            scratch_in.insert(*v);
                         }
                     }
                 }
 
-                // Compute in[B] = use[B] Union (out[B] \ def[B]), borrowing
-                // the stored sets instead of cloning them every round.
-                let b = &blocks[lbl];
-                let mut new_in = set_with_capacity(b.use_vars.len() + new_out.len());
-                new_in.extend(b.use_vars.iter().copied());
-                for v in &new_out {
-                    if !b.def_vars.contains(v) {
-                        new_in.insert(*v);
-                    }
+                let cur = &mut block_infos[idx];
+                if cur.live_out != scratch_out {
+                    std::mem::swap(&mut cur.live_out, &mut scratch_out);
+                    changed = true;
                 }
-
-                let cur = blocks.get_mut(lbl).expect("block exists");
-                if cur.live_out != new_out || cur.live_in != new_in {
-                    cur.live_out = new_out;
-                    cur.live_in = new_in;
+                if cur.live_in != scratch_in {
+                    std::mem::swap(&mut cur.live_in, &mut scratch_in);
                     changed = true;
                 }
             }
         }
 
+        for (block, info) in cfg.blocks.iter().zip(block_infos) {
+            blocks.insert(block.label, info);
+        }
+
         Self { blocks }
     }
 
-    /// Postorder of the CFG from the entry (successors before predecessors),
-    /// with blocks unreachable from the entry appended in layout order. A
-    /// backward analysis that visits blocks in this order propagates straight
-    /// chains in one round and each loop level in one more, instead of one
-    /// block per round.
-    fn reverse_postorder(
+    fn postorder_indices(
         cfg: &ControlFlowGraph,
         label_to_idx: &FxHashMap<IrLabel, usize>,
-    ) -> Vec<IrLabel> {
-        let mut visited: FxHashSet<IrLabel> = set_with_capacity(cfg.blocks.len());
-        let mut post: Vec<IrLabel> = Vec::with_capacity(cfg.blocks.len());
-        // Seed with the entry plus every block, so unreachable blocks are covered
-        // while the entry's reachable region still comes first.
-        let mut seeds: Vec<IrLabel> = Vec::with_capacity(cfg.blocks.len() + 1);
-        seeds.push(cfg.entry_label);
-        for block in &cfg.blocks {
-            seeds.push(block.label);
+        succ_indices: &[Vec<usize>],
+    ) -> Vec<usize> {
+        let n = cfg.blocks.len();
+        let mut visited = vec![false; n];
+        let mut post: Vec<usize> = Vec::with_capacity(n);
+        let mut seeds: Vec<usize> = Vec::with_capacity(n + 1);
+        if let Some(&entry_idx) = label_to_idx.get(&cfg.entry_label) {
+            seeds.push(entry_idx);
         }
+        seeds.extend(0..n);
+
         for seed in seeds {
-            if visited.contains(&seed) {
+            if visited[seed] {
                 continue;
             }
-            let mut stack: Vec<(IrLabel, bool)> = vec![(seed, false)];
-            while let Some((lbl, expanded)) = stack.pop() {
+            let mut stack: Vec<(usize, bool)> = vec![(seed, false)];
+            while let Some((idx, expanded)) = stack.pop() {
                 if expanded {
-                    post.push(lbl);
+                    post.push(idx);
                     continue;
                 }
-                if !visited.insert(lbl) {
+                if visited[idx] {
                     continue;
                 }
-                let Some(&idx) = label_to_idx.get(&lbl) else {
-                    continue;
-                };
-                stack.push((lbl, true));
-                for succ in &cfg.blocks[idx].successors {
-                    if !visited.contains(succ) {
-                        stack.push((*succ, false));
+                visited[idx] = true;
+                stack.push((idx, true));
+                for &succ_idx in &succ_indices[idx] {
+                    if !visited[succ_idx] {
+                        stack.push((succ_idx, false));
                     }
                 }
             }

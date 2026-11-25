@@ -193,6 +193,8 @@ fn format_instruction(inst: &Instruction) -> String {
         Instruction::AddK { dst, a, k } => format!("ADDK         R{}, R{}, K{}", dst, a, k),
         Instruction::SubK { dst, a, k } => format!("SUBK         R{}, R{}, K{}", dst, a, k),
         Instruction::MulK { dst, a, k } => format!("MULK         R{}, R{}, K{}", dst, a, k),
+        Instruction::IDivK { dst, a, k } => format!("IDIVK        R{}, R{}, K{}", dst, a, k),
+        Instruction::ModK { dst, a, k } => format!("MODK         R{}, R{}, K{}", dst, a, k),
         Instruction::EqK {
             a,
             k,

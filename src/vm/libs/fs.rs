@@ -109,7 +109,7 @@ fn builtin_open(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         _ => return Err(format!("invalid open mode `{}` (expected r, w or a)", mode)),
     };
     result.map_err(|err| io_error("open", path, err))?;
-    Ok(vec![Value::Bool(true)])
+    Ok(vec![Value::TRUE])
 }
 
 /// Files at least this large are read on a worker thread when `read` is
@@ -199,7 +199,7 @@ fn builtin_write(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         fs::write(path, text)
     };
     result.map_err(|err| io_error("write", path, err))?;
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 fn builtin_exists(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -208,7 +208,7 @@ fn builtin_exists(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     if !bundled {
         vm.permissions.check_read(path)?;
     }
-    Ok(vec![Value::Bool(bundled || fs::metadata(path).is_ok())])
+    Ok(vec![Value::bool(bundled || fs::metadata(path).is_ok())])
 }
 
 /// `(path, recursive)`: removes a file, an empty directory, or with
@@ -227,7 +227,7 @@ fn builtin_remove(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         fs::remove_file(path)
     };
     result.map_err(|err| io_error("remove", path, err))?;
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 fn builtin_rename(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -238,7 +238,7 @@ fn builtin_rename(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     crate::app::check_writable(from)?;
     crate::app::check_writable(to)?;
     fs::rename(from, to).map_err(|err| format!("cannot rename `{}` to `{}`: {}", from, to, err))?;
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 fn builtin_mkdir(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -252,7 +252,7 @@ fn builtin_mkdir(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         fs::create_dir(path)
     };
     result.map_err(|err| io_error("create directory", path, err))?;
-    Ok(vec![Value::Nil])
+    Ok(vec![Value::NIL])
 }
 
 fn builtin_list(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -273,10 +273,10 @@ fn builtin_list(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn builtin_isdir(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let path = str_arg(args, 0, "path")?;
     if let Some(entry) = crate::app::entry(path) {
-        return Ok(vec![Value::Bool(entry == Entry::Dir)]);
+        return Ok(vec![Value::bool(entry == Entry::Dir)]);
     }
     vm.permissions.check_read(path)?;
-    Ok(vec![Value::Bool(
+    Ok(vec![Value::bool(
         fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()),
     )])
 }
@@ -293,18 +293,18 @@ fn builtin_copy(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         let data = data?;
         fs::write(to, &data)
             .map_err(|err| format!("cannot copy `{}` to `{}`: {}", from, to, err))?;
-        return Ok(vec![Value::Int(data.len() as i64)]);
+        return Ok(vec![Value::from_usize(data.len())]);
     }
     vm.permissions.check_read(from)?;
     let bytes =
         fs::copy(from, to).map_err(|err| format!("cannot copy `{}` to `{}`: {}", from, to, err))?;
-    Ok(vec![Value::Int(bytes as i64)])
+    Ok(vec![Value::from_u64(bytes)])
 }
 
 fn epoch_seconds(time: std::io::Result<std::time::SystemTime>) -> Value {
     time.ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map_or(Value::Nil, |since| Value::Float(since.as_secs_f64()))
+        .map_or(Value::NIL, |since| Value::float(since.as_secs_f64()))
 }
 
 /// `(path)`: a table describing the file or directory, or nil when nothing
@@ -317,22 +317,22 @@ fn builtin_info(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             Entry::File { size } => size as i64,
             Entry::Dir => 0,
         };
-        table.set_str("size", Value::Int(size));
-        table.set_str("isDir", Value::Bool(entry == Entry::Dir));
-        table.set_str("isFile", Value::Bool(entry != Entry::Dir));
-        table.set_str("readonly", Value::Bool(true));
-        table.set_str("bundled", Value::Bool(true));
+        table.set_str("size", Value::int(size));
+        table.set_str("isDir", Value::bool(entry == Entry::Dir));
+        table.set_str("isFile", Value::bool(entry != Entry::Dir));
+        table.set_str("readonly", Value::TRUE);
+        table.set_str("bundled", Value::TRUE);
         return Ok(vec![frozen(table)]);
     }
     vm.permissions.check_read(path)?;
     let Ok(metadata) = fs::metadata(path) else {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     };
     let mut table = VmTable::new();
-    table.set_str("size", Value::Int(metadata.len() as i64));
-    table.set_str("isDir", Value::Bool(metadata.is_dir()));
-    table.set_str("isFile", Value::Bool(metadata.is_file()));
-    table.set_str("readonly", Value::Bool(metadata.permissions().readonly()));
+    table.set_str("size", Value::from_u64(metadata.len()));
+    table.set_str("isDir", Value::bool(metadata.is_dir()));
+    table.set_str("isFile", Value::bool(metadata.is_file()));
+    table.set_str("readonly", Value::bool(metadata.permissions().readonly()));
     table.set_str("modified", epoch_seconds(metadata.modified()));
     table.set_str("created", epoch_seconds(metadata.created()));
     Ok(vec![frozen(table)])

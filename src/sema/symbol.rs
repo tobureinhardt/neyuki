@@ -25,6 +25,8 @@ pub struct Symbol {
     /// out.
     pub min_params: Option<usize>,
     pub is_vararg: bool,
+    pub allow_unused: bool,
+    pub deprecated: Option<String>,
 }
 
 impl Symbol {
@@ -48,6 +50,8 @@ impl Symbol {
             num_params: None,
             min_params: None,
             is_vararg: false,
+            allow_unused: false,
+            deprecated: None,
         }
     }
 }

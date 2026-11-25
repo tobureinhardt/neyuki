@@ -148,8 +148,17 @@ impl ExecutionLimits {
     /// Latches and returns an error if the interrupt flag is set or a limit
     /// was already tripped. Safe to call on backward jumps / calls even on the
     /// fast dispatch path.
-    #[inline]
+    #[inline(always)]
     pub fn check_interrupt(&mut self) -> Result<(), String> {
+        if self.tripped.is_some() || self.interrupt_flag.load(Ordering::Acquire) {
+            return self.check_interrupt_slow();
+        }
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn check_interrupt_slow(&mut self) -> Result<(), String> {
         if let Some(v) = &self.tripped {
             return Err(v.to_string());
         }

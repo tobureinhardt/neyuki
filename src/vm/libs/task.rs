@@ -158,7 +158,10 @@ impl Scheduler {
     /// Drops every queued resumption of `thread`. Background work it was
     /// waiting for still runs to the end, but its result is discarded.
     fn forget(&mut self, thread: &Rc<RefCell<VmTable>>) {
-        let same = |v: &Value| matches!(v, Value::Table(t) if Rc::ptr_eq(t, thread));
+        let same = |v: &Value| {
+            v.table_ptr()
+                .is_some_and(|p| std::ptr::eq(p, Rc::as_ptr(thread)))
+        };
         self.deferred.retain(|(t, _)| !same(t));
         self.sleeping.retain(|_, (t, _)| !same(t));
         self.pollers.retain(|(t, _)| !same(t));
@@ -185,7 +188,7 @@ pub fn create_task_lib() -> Value {
     b.set_str("cancel", crate::native!("task.cancel", task_cancel));
     b.frozen = true;
     drop(b);
-    Value::Table(t)
+    Value::table(t)
 }
 
 /// The thread for a `spawn`/`defer`/`delay` argument: a function becomes a
@@ -198,8 +201,8 @@ fn task_thread(
     index: usize,
 ) -> Result<Value, String> {
     let thread = match arg {
-        Some(f @ (Value::Closure(_) | Value::Native(_))) => coroutine::new_coroutine(vm, f.clone()),
-        Some(t @ Value::Table(_)) if t.type_name() == "thread" => t.clone(),
+        Some(f) if f.is_callable() => coroutine::new_coroutine(vm, f.clone()),
+        Some(t) if t.is_table() && t.type_name() == "thread" => t.clone(),
         _ => {
             return Err(format!(
                 "bad argument #{} to '{}' (function or thread expected)",
@@ -207,8 +210,8 @@ fn task_thread(
             ));
         }
     };
-    if let Value::Table(t) = &thread
-        && let Some(id) = coroutine_id(t)
+    if let Some(t) = thread.as_table()
+        && let Some(id) = coroutine_id(&t.to_rc())
     {
         vm.tasks.task_ids.insert(id);
     }
@@ -218,7 +221,8 @@ fn task_thread(
 /// A delay in seconds; nil means "as soon as possible".
 fn seconds_arg(args: &[Value], index: usize, func: &str) -> Result<f64, String> {
     let seconds = match args.get(index) {
-        None | Some(Value::Nil) => 0.0,
+        None => 0.0,
+        Some(v) if v.is_nil() => 0.0,
         Some(v) => crate::vm::libs::args::number(v).map_err(|_| {
             format!(
                 "bad argument #{} to '{}' (number expected)",
@@ -265,7 +269,7 @@ fn resume_with(vm: &mut VM, thread: Value, wake: Wake) {
         let outcome = match wake {
             Wake::Elapsed(since) => coroutine::coroutine_resume(
                 vm,
-                &[thread.clone(), Value::Float(since.elapsed().as_secs_f64())],
+                &[thread.clone(), Value::float(since.elapsed().as_secs_f64())],
             ),
             Wake::Args(args) => {
                 let mut resume_args = Vec::with_capacity(args.len() + 1);
@@ -277,7 +281,7 @@ fn resume_with(vm: &mut VM, thread: Value, wake: Wake) {
         };
         let failure = match outcome {
             Ok(res) => match res.first() {
-                Some(Value::Bool(false)) => {
+                Some(v) if v.as_bool() == Some(false) => {
                     Some(res.get(1).map(|v| v.to_string()).unwrap_or_default())
                 }
                 _ => None,
@@ -292,8 +296,8 @@ fn resume_with(vm: &mut VM, thread: Value, wake: Wake) {
     // A finished task is no longer one; dropping it here keeps the set from
     // growing with every task a long-running program starts.
     if !coroutine::is_suspended(vm, &thread)
-        && let Value::Table(t) = &thread
-        && let Some(id) = coroutine_id(t)
+        && let Some(t) = thread.as_table()
+        && let Some(id) = coroutine_id(&t.to_rc())
     {
         vm.tasks.task_ids.remove(&id);
     }
@@ -336,22 +340,26 @@ fn task_wait(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let at = deadline(start, seconds);
     if let Some(handle) = coroutine::yieldable_handle(vm) {
         vm.tasks
-            .sleep_until(at, Value::Table(handle), Wake::Elapsed(start));
+            .sleep_until(at, Value::table(handle), Wake::Elapsed(start));
         return coroutine::coroutine_yield(vm, &[]);
     }
     run_until(vm, Some(at));
-    Ok(vec![Value::Float(start.elapsed().as_secs_f64())])
+    Ok(vec![Value::float(start.elapsed().as_secs_f64())])
 }
 
 /// `task.cancel(thread)`: unschedules a task and closes its coroutine. If
 /// it was waiting for background work, that work's result is dropped.
 fn task_cancel(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let Some(Value::Table(thread)) = args.first().filter(|v| v.type_name() == "thread") else {
+    let Some(thread) = args
+        .first()
+        .filter(|v| v.type_name() == "thread")
+        .and_then(Value::as_table)
+    else {
         return Err("bad argument #1 to 'task.cancel' (thread expected)".to_string());
     };
-    vm.tasks.forget(thread);
+    vm.tasks.forget(&thread.to_rc());
     match coroutine::coroutine_close(vm, &args[..1])?.as_slice() {
-        [Value::Bool(false), message, ..] => Err(message.to_string()),
+        [first, message, ..] if first.as_bool() == Some(false) => Err(message.to_string()),
         _ => Ok(vec![]),
     }
 }
@@ -391,7 +399,7 @@ pub(crate) fn current_task(vm: &VM) -> Option<Value> {
     if !vm.tasks.task_ids.contains(&id) {
         return None;
     }
-    coroutine::yieldable_handle(vm).map(Value::Table)
+    coroutine::yieldable_handle(vm).map(Value::table)
 }
 
 /// Parks the running task (`thread`, from `current_task`) as a poller until
@@ -446,7 +454,7 @@ fn drain_completions(vm: &mut VM) {
 // SCHEDULING -----------------------------------------------------------------
 
 fn empty_events() -> Value {
-    Value::Table(Rc::new(RefCell::new(VmTable::new())))
+    Value::table(Rc::new(RefCell::new(VmTable::new())))
 }
 
 /// Serves the parked pollers: pumps the event loop for up to `wait`, wakes
@@ -466,7 +474,9 @@ fn service_pollers(vm: &mut VM, wait: Duration) {
     };
     match pumped {
         Ok(events) => {
-            let any = matches!(&events, Value::Table(t) if !t.borrow().array.is_empty());
+            let any = events
+                .as_table()
+                .is_some_and(|t| !t.borrow().array.is_empty());
             if any && let Some((thread, _)) = vm.tasks.pollers.pop_front() {
                 vm.tasks.ready.push_back((thread, Wake::Args(vec![events])));
             }
@@ -660,7 +670,7 @@ mod tests {
         vm.globals
             .get(&crate::vm::value::StrRef::from(name))
             .cloned()
-            .unwrap_or(Value::Nil)
+            .unwrap_or(Value::NIL)
     }
 
     #[test]
@@ -697,8 +707,8 @@ mod tests {
         )
         .expect_err("a failing task must fail the program");
         assert_eq!(err, "2 tasks raised an error");
-        assert!(matches!(global(&vm, "main_done"), Value::Bool(true)));
-        assert!(matches!(global(&vm, "ran"), Value::Bool(true)));
+        assert_eq!(global(&vm, "main_done").as_bool(), Some(true));
+        assert_eq!(global(&vm, "ran").as_bool(), Some(true));
     }
 
     #[test]
@@ -742,7 +752,7 @@ mod tests {
                         Ok(n * 2.0)
                     }
                 },
-                |_vm, doubled| Ok(vec![Value::Float(doubled)]),
+                |_vm, doubled| Ok(vec![Value::float(doubled)]),
             )
         }
         let mut vm = VM::new();
@@ -761,7 +771,7 @@ mod tests {
         assert_eq!(err, "a task raised an error");
         assert_eq!(global(&vm, "direct").to_string(), "42");
         assert_eq!(global(&vm, "sum").to_string(), "30");
-        assert!(matches!(global(&vm, "after"), Value::Nil));
+        assert!(global(&vm, "after").is_nil());
         // Six jobs of 100 ms plus one in place: well under the 700 ms they
         // would take one after another.
         assert!(start.elapsed() < std::time::Duration::from_millis(500));
@@ -777,7 +787,7 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     Ok(())
                 },
-                |_vm, ()| Ok(vec![Value::Bool(true)]),
+                |_vm, ()| Ok(vec![Value::TRUE]),
             )
         }
         let mut vm = VM::new();
@@ -789,7 +799,7 @@ mod tests {
              task.wait(0.15)",
         )
         .expect("program runs");
-        assert!(matches!(global(&vm, "got"), Value::Nil));
+        assert!(global(&vm, "got").is_nil());
         assert!(vm.tasks.is_idle());
     }
 
@@ -830,7 +840,7 @@ mod tests {
     fn fake_poll(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         let seconds = crate::vm::libs::args::number_arg(args, 0, "seconds")?;
         let pump: fn(&mut VM, Duration) -> Result<Value, String> =
-            if matches!(args.get(1), Some(Value::Bool(true))) {
+            if args.get(1).and_then(Value::as_bool) == Some(true) {
                 failing_pump
             } else {
                 fake_pump
@@ -894,7 +904,7 @@ mod tests {
              _G.before = _G.count",
         )
         .expect("program runs");
-        assert!(matches!(global(&vm, "before"), Value::Nil));
+        assert!(global(&vm, "before").is_nil());
         assert_eq!(global(&vm, "count").to_string(), "1");
         assert_eq!(global(&vm, "first").to_string(), "keydown");
     }
@@ -945,7 +955,7 @@ mod tests {
         )
         .expect("program runs");
         assert_eq!(global(&vm, "status").to_string(), "suspended");
-        assert!(matches!(global(&vm, "ran"), Value::Nil));
+        assert!(global(&vm, "ran").is_nil());
         assert!(vm.tasks.pollers.is_empty());
         assert!(vm.tasks.is_idle());
         assert!(start.elapsed() < Duration::from_secs(5));
@@ -985,7 +995,7 @@ mod tests {
         )
         .expect("program runs");
         assert_eq!(global(&vm, "seen").to_string(), "1");
-        assert!(matches!(global(&vm, "slept"), Value::Bool(true)));
+        assert_eq!(global(&vm, "slept").as_bool(), Some(true));
     }
 
     #[test]
@@ -998,7 +1008,7 @@ mod tests {
              end)",
         );
         assert!(err.is_err(), "the task error fails the program");
-        assert!(matches!(global(&vm, "failed"), Value::Nil));
+        assert!(global(&vm, "failed").is_nil());
         assert!(vm.tasks.is_idle());
     }
 
@@ -1033,7 +1043,7 @@ mod tests {
     #[test]
     fn test_plain_coroutines_do_not_yield_for_background_work() {
         fn slow(vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
-            crate::vm::libs::background::run(vm, || Ok(7), |_vm, n| Ok(vec![Value::Int(n)]))
+            crate::vm::libs::background::run(vm, || Ok(7), |_vm, n| Ok(vec![Value::int(n)]))
         }
         let mut vm = VM::new();
         vm.register_native(crate::native_def!("slow", slow));

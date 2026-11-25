@@ -30,24 +30,25 @@ fn dce_block(
     // never dead code — even when its target is never read again
     // (the explicit-release idiom `t = nil`). Chains like
     // `v10 = nil; v1 = v10` propagate nil-ness forward.
-    let mut nil_stores: FxHashSet<usize> = new_set();
+    let mut nil_stores: Vec<bool> = Vec::new();
     if block
         .instructions
         .iter()
         .any(|inst| matches!(inst, IrInst::LoadNil { .. }))
     {
+        nil_stores.resize(block.instructions.len(), false);
         let mut nil_known: FxHashSet<IrVar> = new_set();
         for (idx, inst) in block.instructions.iter().enumerate() {
             match inst {
                 IrInst::LoadNil { dst } => {
                     nil_known.insert(*dst);
-                    nil_stores.insert(idx);
+                    nil_stores[idx] = true;
                 }
                 IrInst::Move { dst, src } => {
                     nil_known.remove(dst);
                     if nil_known.contains(src) {
                         nil_known.insert(*dst);
-                        nil_stores.insert(idx);
+                        nil_stores[idx] = true;
                     }
                 }
                 _ => {
@@ -65,7 +66,8 @@ fn dce_block(
     let mut pos = block.instructions.len();
     for inst in block.instructions.drain(..).rev() {
         pos -= 1;
-        let is_dead = if is_pure_instruction(&inst) && !nil_stores.contains(&pos) {
+        let is_nil_store = nil_stores.get(pos).copied().unwrap_or(false);
+        let is_dead = if is_pure_instruction(&inst) && !is_nil_store {
             let mut has_def = false;
             let mut all_dead = true;
             inst.for_each_def(|dst| {
@@ -102,11 +104,17 @@ fn dce_block(
 // CFG-aware Dead Code Elimination using backward dataflow liveness analysis
 pub fn dead_code_elimination_cfg(cfg: &mut ControlFlowGraph) -> bool {
     let captured = super::captured_vars(cfg);
+    dead_code_elimination_cfg_with(cfg, &captured)
+}
 
+pub fn dead_code_elimination_cfg_with(
+    cfg: &mut ControlFlowGraph,
+    captured: &FxHashSet<IrVar>,
+) -> bool {
     // Fast path: an acyclic single-block CFG converges in one backward sweep
     // with empty live_out, without computing iterative liveness.
     if cfg.is_single_acyclic_block() {
-        return dce_block(&mut cfg.blocks[0], new_set(), &captured);
+        return dce_block(&mut cfg.blocks[0], new_set(), captured);
     }
 
     let mut any_changed = false;
@@ -127,7 +135,7 @@ pub fn dead_code_elimination_cfg(cfg: &mut ControlFlowGraph) -> bool {
                 .map(|b| b.live_out.clone())
                 .unwrap_or_else(new_set);
 
-            if dce_block(block, live_out, &captured) {
+            if dce_block(block, live_out, captured) {
                 changed = true;
                 any_changed = true;
             }

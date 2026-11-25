@@ -685,7 +685,7 @@ fn parse_instruction_line(line: &str) -> Result<Option<Instruction>, String> {
             let reg = parse_reg(parts.get(1).ok_or("CLOSEUPVAL missing reg")?)?;
             Ok(Some(Instruction::CloseUpval { reg }))
         }
-        "ADDK" | "SUBK" | "MULK" => {
+        "ADDK" | "SUBK" | "MULK" | "IDIVK" | "MODK" => {
             let dst = parse_reg(parts.get(1).ok_or_else(|| format!("{} missing dst", op))?)?;
             let a = parse_reg(parts.get(2).ok_or_else(|| format!("{} missing a", op))?)?;
             let k = parse_const_idx(parts.get(3).ok_or_else(|| format!("{} missing k", op))?)?;
@@ -693,6 +693,8 @@ fn parse_instruction_line(line: &str) -> Result<Option<Instruction>, String> {
                 "ADDK" => Instruction::AddK { dst, a, k },
                 "SUBK" => Instruction::SubK { dst, a, k },
                 "MULK" => Instruction::MulK { dst, a, k },
+                "IDIVK" => Instruction::IDivK { dst, a, k },
+                "MODK" => Instruction::ModK { dst, a, k },
                 _ => unreachable!("the outer match only lets constant arithmetic names through"),
             };
             Ok(Some(inst))

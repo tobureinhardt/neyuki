@@ -40,7 +40,9 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        # build.rs enables the threaded interpreter on the Linux and macOS
+        # targets; the Windows ones keep the loop interpreter.
+        run: cargo build --release --features threaded --target ${{ matrix.target }}
       - name: Package
         shell: bash
         run: |

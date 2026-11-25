@@ -170,7 +170,9 @@ fn verify_proto_depth(proto: &Proto, depth: usize) -> Result<(), BytecodeVerifyE
             }
             Instruction::AddK { dst, a, k }
             | Instruction::SubK { dst, a, k }
-            | Instruction::MulK { dst, a, k } => {
+            | Instruction::MulK { dst, a, k }
+            | Instruction::IDivK { dst, a, k }
+            | Instruction::ModK { dst, a, k } => {
                 check_reg(*dst, pc)?;
                 check_reg(*a, pc)?;
                 check_const(*k, pc)?;

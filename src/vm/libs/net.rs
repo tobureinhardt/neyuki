@@ -254,18 +254,18 @@ fn parts(id: u64) -> Result<(Arc<Shared>, Writer, Kind), String> {
 // --- argument helpers -------------------------------------------------------
 
 fn self_id(args: &[Value]) -> Result<u64, String> {
-    match args.first() {
-        Some(Value::Table(table)) => match table.borrow().get_str("_id") {
-            Value::Int(id) => Ok(id as u64),
-            _ => Err("expected an object (call methods with ':')".to_string()),
+    match args.first().and_then(Value::as_table) {
+        Some(table) => match table.borrow().get_str("_id").as_int() {
+            Some(id) => Ok(id as u64),
+            None => Err("expected an object (call methods with ':')".to_string()),
         },
-        _ => Err("expected an object (call methods with ':')".to_string()),
+        None => Err("expected an object (call methods with ':')".to_string()),
     }
 }
 
 fn string_arg(args: &[Value], index: usize, name: &str) -> Result<String, String> {
     match args.get(index) {
-        Some(Value::String(value)) => Ok(value.to_string()),
+        Some(v) if v.is_string() => Ok(v.as_str().unwrap().to_string()),
         Some(value) => Err(format!(
             "{} must be a string, got {}",
             name,
@@ -279,7 +279,8 @@ fn string_arg(args: &[Value], index: usize, name: &str) -> Result<String, String
 /// it takes, and 0 only checks.
 fn wait_arg(args: &[Value], index: usize) -> Result<Option<Duration>, String> {
     match args.get(index) {
-        None | Some(Value::Nil) => Ok(None),
+        None => Ok(None),
+        Some(v) if v.is_nil() => Ok(None),
         Some(value) => {
             let seconds = number(value).map_err(|_| "timeout must be a number".to_string())?;
             if !seconds.is_finite() || seconds < 0.0 {
@@ -297,7 +298,8 @@ fn port_arg(args: &[Value], index: usize) -> Result<u16, String> {
 
 fn timeout_arg(args: &[Value], index: usize) -> Result<Duration, String> {
     match args.get(index) {
-        None | Some(Value::Nil) => Ok(DEFAULT_TIMEOUT),
+        None => Ok(DEFAULT_TIMEOUT),
+        Some(v) if v.is_nil() => Ok(DEFAULT_TIMEOUT),
         Some(value) => {
             let seconds = number(value).map_err(|_| "timeout must be a number".to_string())?;
             if !seconds.is_finite() || seconds <= 0.0 {
@@ -310,13 +312,13 @@ fn timeout_arg(args: &[Value], index: usize) -> Result<Duration, String> {
 
 /// Bytes of a string or buffer argument.
 fn data_arg(args: &[Value], index: usize, name: &str) -> Result<(Vec<u8>, bool), String> {
-    match args.get(index) {
-        Some(Value::String(s)) => Ok((s.as_bytes().to_vec(), false)),
-        Some(Value::Buffer(b)) => Ok((b.borrow().data.clone(), true)),
-        Some(other) => Err(format!(
+    match args.get(index).map(crate::vm::value::Value::view) {
+        Some(crate::vm::value::ValueView::String(s)) => Ok((s.as_bytes().to_vec(), false)),
+        Some(crate::vm::value::ValueView::Buffer(b)) => Ok((b.borrow().data.clone(), true)),
+        Some(_) => Err(format!(
             "{} must be a string or buffer, got {}",
             name,
-            other.type_name()
+            args[index].type_name()
         )),
         None => Err(format!("{} must be provided", name)),
     }
@@ -326,7 +328,7 @@ fn data_arg(args: &[Value], index: usize, name: &str) -> Result<(Vec<u8>, bool),
 
 fn stream_table(id: u64) -> Value {
     let mut table = VmTable::new();
-    table.set_str("_id", Value::Int(id as i64));
+    table.set_str("_id", Value::int(id as i64));
     table.set_str("read", crate::native!("net.read", conn_read));
     table.set_str(
         "readAvailable",
@@ -345,7 +347,7 @@ fn websocket_table(id: u64) -> Value {
 
 fn websocket_fields(id: u64) -> VmTable {
     let mut table = VmTable::new();
-    table.set_str("_id", Value::Int(id as i64));
+    table.set_str("_id", Value::int(id as i64));
     table.set_str("send", crate::native!("net.send", ws_send));
     table.set_str("receive", crate::native!("net.receive", ws_receive));
     table.set_str("close", crate::native!("net.close", conn_close));
@@ -375,7 +377,7 @@ fn take_bytes(state: &mut State, n: usize) -> Result<Option<Vec<u8>>, String> {
 fn bytes_result(vm: &mut VM, data: Option<Vec<u8>>) -> Result<Vec<Value>, String> {
     match data {
         Some(data) => crate::vm::libs::buffer::new_buffer(vm, data),
-        None => Ok(vec![Value::Nil]),
+        None => Ok(vec![Value::NIL]),
     }
 }
 
@@ -438,14 +440,14 @@ fn write_all(vm: &mut VM, writer: Writer, data: Vec<u8>) -> Result<Vec<Value>, S
                 .map_err(|err| format!("write failed: {}", err))?;
             Ok(data.len())
         },
-        |_vm, written| Ok(vec![Value::Int(written as i64)]),
+        |_vm, written| Ok(vec![Value::int(written as i64)]),
     )
 }
 
 fn conn_at_eof(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let (shared, _, _) = parts(self_id(args)?)?;
     let state = lock(&shared.state);
-    Ok(vec![Value::Bool(
+    Ok(vec![Value::bool(
         state.eof && state.buf.is_empty() && state.messages.is_empty(),
     )])
 }
@@ -467,7 +469,7 @@ fn conn_is_open(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         }
         Err(_) => false,
     };
-    Ok(vec![Value::Bool(open)])
+    Ok(vec![Value::bool(open)])
 }
 
 // --- reader threads ---------------------------------------------------------
@@ -1178,39 +1180,39 @@ fn builtin_websocket(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> 
     vm.permissions.check_net(&url)?;
     let mut headers = Vec::new();
     let mut timeout = DEFAULT_TIMEOUT;
-    match args.get(1) {
-        None | Some(Value::Nil) => {}
-        Some(Value::Table(options)) => {
+    match args.get(1).map(crate::vm::value::Value::view) {
+        None | Some(crate::vm::value::ValueView::Nil) => {}
+        Some(crate::vm::value::ValueView::Table(options)) => {
             let options = options.borrow();
-            match options.get_str("headers") {
-                Value::Nil => {}
-                Value::Table(list) => {
+            let headers_val = options.get_str("headers");
+            match headers_val.view() {
+                crate::vm::value::ValueView::Nil => {}
+                crate::vm::value::ValueView::Table(list) => {
                     for (name, value) in list.borrow().fields.iter() {
-                        match value {
-                            Value::String(v) => headers.push(((**name).to_string(), v.to_string())),
-                            other => {
-                                return Err(format!(
-                                    "headers.{} must be a string, got {}",
-                                    &**name,
-                                    other.type_name()
-                                ));
-                            }
+                        if let Some(v) = value.as_str() {
+                            headers.push(((**name).to_string(), v.to_string()));
+                        } else {
+                            return Err(format!(
+                                "headers.{} must be a string, got {}",
+                                &**name,
+                                value.type_name()
+                            ));
                         }
                     }
                 }
-                other => {
+                _ => {
                     return Err(format!(
                         "headers must be a table, got {}",
-                        other.type_name()
+                        headers_val.type_name()
                     ));
                 }
             }
             timeout = timeout_arg(&[options.get_str("timeout")], 0)?;
         }
-        Some(other) => {
+        Some(_) => {
             return Err(format!(
                 "options must be a table, got {}",
-                other.type_name()
+                args[1].type_name()
             ));
         }
     }
@@ -1283,7 +1285,7 @@ fn take_message(state: &mut State) -> Result<Option<(bool, Vec<u8>)>, String> {
 
 fn message_values(vm: &mut VM, message: Option<(bool, Vec<u8>)>) -> Result<Vec<Value>, String> {
     match message {
-        None => Ok(vec![Value::Nil]),
+        None => Ok(vec![Value::NIL]),
         Some((true, data)) => Ok(vec![
             Value::string(String::from_utf8_lossy(&data).into_owned()),
             Value::str("text"),
@@ -1376,9 +1378,9 @@ fn builtin_ws_listen(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> 
         IpAddr::V4(_) => format!("{}:{}", host, bound.port()),
     };
     let mut table = VmTable::new();
-    table.set_str("_id", Value::Int(id as i64));
+    table.set_str("_id", Value::int(id as i64));
     table.set_str("host", Value::string(host));
-    table.set_str("port", Value::Int(i64::from(bound.port())));
+    table.set_str("port", Value::int(i64::from(bound.port())));
     table.set_str("url", Value::string(format!("ws://{}", authority)));
     table.set_str("accept", crate::native!("net.accept", ws_server_accept));
     table.set_str("close", crate::native!("net.close", ws_server_close));
@@ -1559,7 +1561,7 @@ fn ws_server_accept(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         },
         |_vm, accepted| {
             let Some(accepted) = accepted else {
-                return Ok(vec![Value::Nil]);
+                return Ok(vec![Value::NIL]);
             };
             let mut headers = VmTable::new();
             for (name, value) in &accepted.headers {
@@ -1588,7 +1590,7 @@ fn ws_server_close(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn ws_server_is_open(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let id = self_id(args)?;
     let open = LISTENERS.with(|listeners| listeners.borrow().contains_key(&id));
-    Ok(vec![Value::Bool(open)])
+    Ok(vec![Value::bool(open)])
 }
 
 // --- UDP --------------------------------------------------------------------
@@ -1625,7 +1627,7 @@ fn builtin_udp(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let host = string_arg(args, 0, "host")?;
     let port = port_arg(args, 1)?;
     vm.permissions.check_net(&format!("{}:{}", host, port))?;
-    let broadcast = matches!(args.get(2), Some(Value::Bool(true)));
+    let broadcast = args.get(2).and_then(Value::as_bool) == Some(true);
     let socket = UdpSocket::bind((host.as_str(), port))
         .map_err(|err| format!("cannot bind {}:{}: {}", host, port, err))?;
     let bound = socket
@@ -1643,9 +1645,9 @@ fn builtin_udp(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     UDP.with(|sockets| sockets.borrow_mut().insert(id, Udp { shared, socket }));
 
     let mut table = VmTable::new();
-    table.set_str("_id", Value::Int(id as i64));
+    table.set_str("_id", Value::int(id as i64));
     table.set_str("host", Value::string(bound.ip().to_string()));
-    table.set_str("port", Value::Int(i64::from(bound.port())));
+    table.set_str("port", Value::int(i64::from(bound.port())));
     table.set_str("send", crate::native!("net.send", udp_send));
     table.set_str("sendTo", crate::native!("net.sendTo", udp_send_to));
     table.set_str("receive", crate::native!("net.receive", udp_receive));
@@ -1735,7 +1737,7 @@ fn udp_send_to(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 .send_to(&data, addr)
                 .map_err(|err| format!("send failed: {}", err))
         },
-        |_vm, sent| Ok(vec![Value::Int(sent as i64)]),
+        |_vm, sent| Ok(vec![Value::int(sent as i64)]),
     )
 }
 
@@ -1749,7 +1751,7 @@ fn udp_send(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let sent = socket
         .send(&data)
         .map_err(|err| format!("send failed: {}", err))?;
-    Ok(vec![Value::Int(sent as i64)])
+    Ok(vec![Value::int(sent as i64)])
 }
 
 /// `udp:connect(host, port)`: sets the peer `send` goes to; from then on
@@ -1817,11 +1819,11 @@ fn datagram_values(
     datagram: Option<(Vec<u8>, SocketAddr)>,
 ) -> Result<Vec<Value>, String> {
     let Some((data, from)) = datagram else {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     };
     let mut values = crate::vm::libs::buffer::new_buffer(vm, data)?;
     values.push(Value::string(from.ip().to_string()));
-    values.push(Value::Int(i64::from(from.port())));
+    values.push(Value::int(i64::from(from.port())));
     Ok(values)
 }
 
@@ -1838,7 +1840,8 @@ fn udp_multicast(args: &[Value], join: bool) -> Result<Vec<Value>, String> {
         return Err(format!("{} is not a multicast address", group));
     }
     let interface = match args.get(2) {
-        None | Some(Value::Nil) => Ipv4Addr::UNSPECIFIED,
+        None => Ipv4Addr::UNSPECIFIED,
+        Some(v) if v.is_nil() => Ipv4Addr::UNSPECIFIED,
         Some(_) => {
             let text = string_arg(args, 2, "interface")?;
             text.parse()
@@ -1874,7 +1877,7 @@ fn udp_close(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 fn udp_is_open(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let id = self_id(args)?;
     let open = UDP.with(|sockets| sockets.borrow().contains_key(&id));
-    Ok(vec![Value::Bool(open)])
+    Ok(vec![Value::bool(open)])
 }
 
 // --- os.spawn ---------------------------------------------------------------
@@ -1891,9 +1894,10 @@ fn process_arg(args: &[Value]) -> Result<Arc<Process>, String> {
 }
 
 fn stdio_mode(options: &VmTable, name: &str) -> Result<Stdio, String> {
-    match options.get_str(name) {
-        Value::Nil => Ok(Stdio::inherit()),
-        Value::String(mode) => match &*mode {
+    let val = options.get_str(name);
+    match val.view() {
+        crate::vm::value::ValueView::Nil => Ok(Stdio::inherit()),
+        crate::vm::value::ValueView::String(mode) => match mode.as_str() {
             "pipe" => Ok(Stdio::piped()),
             "inherit" => Ok(Stdio::inherit()),
             "null" => Ok(Stdio::null()),
@@ -1902,10 +1906,10 @@ fn stdio_mode(options: &VmTable, name: &str) -> Result<Stdio, String> {
                 name, other
             )),
         },
-        other => Err(format!(
+        _ => Err(format!(
             "{} must be a string, got {}",
             name,
-            other.type_name()
+            val.type_name()
         )),
     }
 }
@@ -1916,28 +1920,27 @@ fn stdio_mode(options: &VmTable, name: &str) -> Result<Stdio, String> {
 /// (default) or `"null"`). Returns `{ pid, stdin, stdout, stderr, wait,
 /// kill, isRunning }`; the piped streams are connections.
 pub(crate) fn os_spawn(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let mut command = match args.first() {
-        Some(Value::String(line)) => {
-            vm.permissions.check_run_shell(line)?;
+    let mut command = match args.first().map(crate::vm::value::Value::view) {
+        Some(crate::vm::value::ValueView::String(line)) => {
+            vm.permissions.check_run_shell(&line)?;
             let mut command = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
             command
                 .arg(if cfg!(windows) { "/C" } else { "-c" })
-                .arg(&**line);
+                .arg(line.as_str());
             command
         }
-        Some(Value::Table(list)) => {
+        Some(crate::vm::value::ValueView::Table(list)) => {
             let list = list.borrow();
             let mut parts = Vec::with_capacity(list.array.len());
             for (index, part) in list.array.iter().enumerate() {
-                match part {
-                    Value::String(s) => parts.push(s.to_string()),
-                    other => {
-                        return Err(format!(
-                            "command[{}] must be a string, got {}",
-                            index + 1,
-                            other.type_name()
-                        ));
-                    }
+                if let Some(s) = part.as_str() {
+                    parts.push(s.to_string());
+                } else {
+                    return Err(format!(
+                        "command[{}] must be a string, got {}",
+                        index + 1,
+                        part.type_name()
+                    ));
                 }
             }
             let (program, rest) = parts.split_first().ok_or("command must not be empty")?;
@@ -1946,57 +1949,62 @@ pub(crate) fn os_spawn(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
             command.args(rest);
             command
         }
-        None | Some(Value::Nil) => return Err("command must be provided".to_string()),
-        Some(other) => {
+        None | Some(crate::vm::value::ValueView::Nil) => {
+            return Err("command must be provided".to_string());
+        }
+        Some(_) => {
             return Err(format!(
                 "command must be a string or a list of strings, got {}",
-                other.type_name()
+                args[0].type_name()
             ));
         }
     };
     let (mut stdin, mut stdout, mut stderr) =
         (Stdio::inherit(), Stdio::inherit(), Stdio::inherit());
     let mut show_window = false;
-    match args.get(1) {
-        None | Some(Value::Nil) => {}
-        Some(Value::Table(options)) => {
+    match args.get(1).map(crate::vm::value::Value::view) {
+        None | Some(crate::vm::value::ValueView::Nil) => {}
+        Some(crate::vm::value::ValueView::Table(options)) => {
             let options = options.borrow();
-            match options.get_str("cwd") {
-                Value::Nil => {}
-                Value::String(cwd) => {
-                    command.current_dir(&*cwd);
+            let cwd_val = options.get_str("cwd");
+            match cwd_val.view() {
+                crate::vm::value::ValueView::Nil => {}
+                crate::vm::value::ValueView::String(cwd) => {
+                    command.current_dir(cwd.as_str());
                 }
-                other => return Err(format!("cwd must be a string, got {}", other.type_name())),
+                _ => {
+                    return Err(format!("cwd must be a string, got {}", cwd_val.type_name()));
+                }
             }
-            match options.get_str("env") {
-                Value::Nil => {}
-                Value::Table(env) => {
+            let env_val = options.get_str("env");
+            match env_val.view() {
+                crate::vm::value::ValueView::Nil => {}
+                crate::vm::value::ValueView::Table(env) => {
                     for (key, value) in env.borrow().fields.iter() {
-                        match value {
-                            Value::String(v) => {
-                                command.env(&**key, &**v);
-                            }
-                            other => {
-                                return Err(format!(
-                                    "env.{} must be a string, got {}",
-                                    &**key,
-                                    other.type_name()
-                                ));
-                            }
+                        if let Some(v) = value.as_str() {
+                            command.env(&**key, v);
+                        } else {
+                            return Err(format!(
+                                "env.{} must be a string, got {}",
+                                &**key,
+                                value.type_name()
+                            ));
                         }
                     }
                 }
-                other => return Err(format!("env must be a table, got {}", other.type_name())),
+                _ => {
+                    return Err(format!("env must be a table, got {}", env_val.type_name()));
+                }
             }
             stdin = stdio_mode(&options, "stdin")?;
             stdout = stdio_mode(&options, "stdout")?;
             stderr = stdio_mode(&options, "stderr")?;
-            show_window = matches!(options.get_str("showWindow"), Value::Bool(true));
+            show_window = options.get_str("showWindow").as_bool() == Some(true);
         }
-        Some(other) => {
+        Some(_) => {
             return Err(format!(
                 "options must be a table, got {}",
-                other.type_name()
+                args[1].type_name()
             ));
         }
     }
@@ -2016,7 +2024,7 @@ pub(crate) fn os_spawn(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
         .map_err(|err| format!("cannot start process: {}", err))?;
     let pid = child.id();
     let mut table = VmTable::new();
-    table.set_str("pid", Value::Int(pid as i64));
+    table.set_str("pid", Value::int(pid as i64));
     if let Some(pipe) = child.stdin.take() {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
@@ -2056,7 +2064,7 @@ pub(crate) fn os_spawn(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
             }),
         )
     });
-    table.set_str("_id", Value::Int(id as i64));
+    table.set_str("_id", Value::int(id as i64));
     table.set_str("wait", crate::native!("process.wait", process_wait));
     table.set_str("kill", crate::native!("process.kill", process_kill));
     table.set_str(
@@ -2090,7 +2098,7 @@ fn process_wait(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 });
             }
         },
-        |_vm, code| Ok(vec![Value::Int(code)]),
+        |_vm, code| Ok(vec![Value::int(code)]),
     )
 }
 
@@ -2105,7 +2113,7 @@ fn process_kill(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
 fn process_is_running(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let process = process_arg(args)?;
-    Ok(vec![Value::Bool(process.poll()?.is_none())])
+    Ok(vec![Value::bool(process.poll()?.is_none())])
 }
 
 #[cfg(test)]

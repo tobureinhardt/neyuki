@@ -1,30 +1,32 @@
 //! Bytecode interpreter dispatch loop and loop-control helpers.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use num_integer::Integer as _;
 
-use crate::bytecode::instruction::{Instruction, MULTRET};
-use crate::bytecode::proto::{QuickOp, TableCacheSlot};
+use crate::bytecode::exec::{AlignedExec, ExecInst, TableCacheSlot};
+use crate::bytecode::instruction::MULTRET;
 use crate::vm::frame::CallFrame;
 use crate::vm::machine::{HookEvent, RUNNING_FRAME, VM};
 use crate::vm::ops;
-use crate::vm::value::{Upvalue, Value, VmClosure, VmTable};
+use crate::vm::value::{
+    INLINE_INT_MAX, INLINE_INT_MIN, TAG_RC_START, Upvalue, Value, ValueView, VmClosure, VmTable,
+};
 
 /// A register of the running frame. The interpreter loop only calls this
 /// with indices below `base + max_registers` of a verified prototype, and
 /// sizes the stack to cover that window before dispatching, so the bounds
 /// check is skipped.
 #[inline(always)]
-fn slot(stack: &[Value], idx: usize) -> &Value {
+pub(crate) fn slot(stack: &[Value], idx: usize) -> &Value {
     debug_assert!(idx < stack.len());
     // SAFETY: see above; the caller upholds `idx < stack.len()`.
     unsafe { stack.get_unchecked(idx) }
 }
 
 #[inline(always)]
-fn slot_mut(stack: &mut [Value], idx: usize) -> &mut Value {
+pub(crate) fn slot_mut(stack: &mut [Value], idx: usize) -> &mut Value {
     debug_assert!(idx < stack.len());
     // SAFETY: as for `slot`.
     unsafe { stack.get_unchecked_mut(idx) }
@@ -68,7 +70,7 @@ impl VM {
             }
         }
         if hook.on_line && new_line {
-            self.call_hook(&hook.func, &[Value::str("line"), Value::Int(line as i64)])?;
+            self.call_hook(&hook.func, &[Value::str("line"), Value::int(line as i64)])?;
         }
         Ok(())
     }
@@ -111,7 +113,11 @@ impl VM {
 
     fn run_mode<const TRAP: bool>(&mut self, target_depth: usize) -> Result<Option<Value>, String> {
         if self.frames.len() <= target_depth {
-            return Ok(Some(Value::Nil));
+            return Ok(Some(Value::NIL));
+        }
+        #[cfg(neyuki_threaded)]
+        if !TRAP {
+            return crate::vm::threaded::run_fast_threaded(self, target_depth);
         }
         let (closure, mut base, mut ip) = {
             let f = self.frames.last().expect(RUNNING_FRAME);
@@ -128,10 +134,11 @@ impl VM {
         }
         let window_end = base + closure.proto.max_registers as usize;
         if self.stack.len() < window_end {
-            self.stack.resize(window_end, Value::Nil);
+            self.stack.resize(window_end, Value::NIL);
         }
         let mut current_closure = closure;
-        let mut code: &[Instruction] = &current_closure.proto.instructions;
+        let mut exec = current_closure.proto.exec();
+        let mut code: &[Cell<AlignedExec>] = &exec.ops;
         let mut consts: &[Value] = current_closure.proto.values();
 
         // Register access relative to this frame. `reg!` reads, `set!` writes.
@@ -143,22 +150,7 @@ impl VM {
         macro_rules! set {
             ($r:expr, $v:expr) => {{
                 let v = $v;
-                let slot = slot_mut(&mut self.stack, base + $r as usize);
-                match v {
-                    Value::Int(new) => match slot {
-                        Value::Int(old) => *old = new,
-                        s => *s = Value::Int(new),
-                    },
-                    Value::Float(new) => match slot {
-                        Value::Float(old) => *old = new,
-                        s => *s = Value::Float(new),
-                    },
-                    Value::Bool(new) => match slot {
-                        Value::Bool(old) => *old = new,
-                        s => *s = Value::Bool(new),
-                    },
-                    other => *slot = other,
-                }
+                slot_mut(&mut self.stack, base + $r as usize).set_inplace(v);
             }};
         }
         macro_rules! sync_ip {
@@ -213,61 +205,35 @@ impl VM {
             (@impl $dst:expr, $a:expr, $b:expr, $checked:ident, $fop:tt, $slow:path, $event:literal, $fallback:block) => {{
                 let ra = &reg!($a);
                 let rb = &reg!($b);
-                match (ra, rb) {
-                    (Value::Int(x), Value::Int(y)) => match x.$checked(*y) {
-                        Some(r) => {
-                            let slot = slot_mut(&mut self.stack, base + $dst as usize);
-                            if let Value::Int(old) = slot {
-                                *old = r;
-                            } else {
-                                *slot = Value::Int(r);
-                            }
-                        }
-                        None => {
-                            let res = attempt!($slow(ra, rb));
-                            set!($dst, res);
-                        }
-                    },
-                    (Value::Float(x), Value::Float(y)) => {
-                        let r = x $fop y;
-                        let slot = slot_mut(&mut self.stack, base + $dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                    }
-                    (Value::Table(_), _) | (_, Value::Table(_)) => {
-                        if let Some(mm) = self.get_binop_metamethod(ra, rb, $event) {
-                            let (va, vb) = (ra.clone(), rb.clone());
-                            sync_ip!();
-                            self.call_binop_mm(mm, va, vb, base, $dst)?;
-                            continue;
-                        }
+                if ra.is_inline_int() && rb.is_inline_int() {
+                    let x = ra.as_inline_int_unchecked();
+                    let y = rb.as_inline_int_unchecked();
+                    if let Some(r) = x.$checked(y) {
+                        set!($dst, Value::int(r));
+                    } else {
                         let res = attempt!($slow(ra, rb));
                         set!($dst, res);
                     }
-                    _ => match (ra, rb) {
-                        (Value::Int(x), Value::Float(y)) => {
-                            let r = *x as f64 $fop *y;
-                            let slot = slot_mut(&mut self.stack, base + $dst as usize);
-                            if let Value::Float(old) = slot {
-                                *old = r;
-                            } else {
-                                *slot = Value::Float(r);
-                            }
-                        }
-                        (Value::Float(x), Value::Int(y)) => {
-                            let r = *x $fop *y as f64;
-                            let slot = slot_mut(&mut self.stack, base + $dst as usize);
-                            if let Value::Float(old) = slot {
-                                *old = r;
-                            } else {
-                                *slot = Value::Float(r);
-                            }
-                        }
-                        _ => $fallback,
-                    },
+                } else if ra.is_float() && rb.is_float() {
+                    let r = ra.as_float_unchecked() $fop rb.as_float_unchecked();
+                    set!($dst, Value::float(r));
+                } else if ra.is_table() || rb.is_table() {
+                    if let Some(mm) = self.get_binop_metamethod(ra, rb, $event) {
+                        let (va, vb) = (ra.clone(), rb.clone());
+                        sync_ip!();
+                        self.call_binop_mm(mm, va, vb, base, $dst)?;
+                        continue;
+                    }
+                    let res = attempt!($slow(ra, rb));
+                    set!($dst, res);
+                } else if ra.is_inline_int() && rb.is_float() {
+                    let r = (ra.as_inline_int_unchecked() as f64) $fop rb.as_float_unchecked();
+                    set!($dst, Value::float(r));
+                } else if ra.is_float() && rb.is_inline_int() {
+                    let r = ra.as_float_unchecked() $fop (rb.as_inline_int_unchecked() as f64);
+                    set!($dst, Value::float(r));
+                } else {
+                    $fallback
                 }
             }};
         }
@@ -277,7 +243,7 @@ impl VM {
             ($dst:expr, $a:expr, $b:expr, $slow:path, $event:literal) => {{
                 let ra = &reg!($a);
                 let rb = &reg!($b);
-                if matches!(ra, Value::Table(_)) || matches!(rb, Value::Table(_)) {
+                if ra.is_table() || rb.is_table() {
                     if let Some(mm) = self.get_binop_metamethod(ra, rb, $event) {
                         let (va, vb) = (ra.clone(), rb.clone());
                         sync_ip!();
@@ -295,20 +261,21 @@ impl VM {
                 ($a:expr, $b:expr, $jump:expr, $op:tt, $slow:path, $event:literal, $mm_swap:expr) => {{
                     let ra = &reg!($a);
                     let rb = &reg!($b);
-                    let holds = match (ra, rb) {
-                        (Value::Int(x), Value::Int(y)) => x $op y,
-                        (Value::Float(x), Value::Float(y)) => x $op y,
-                        (Value::Table(_), _) | (_, Value::Table(_)) => {
-                            let (l, r) = if $mm_swap { (rb, ra) } else { (ra, rb) };
-                            if let Some(mm) = self.get_binop_metamethod(l, r, $event) {
-                                let (vl, vr) = (l.clone(), r.clone());
-                                sync_ip!();
-                                self.call_cmp_mm(mm, vl, vr)?
-                            } else {
-                                attempt!($slow(ra, rb))
-                            }
+                    let holds = if ra.is_inline_int() && rb.is_inline_int() {
+                        ra.as_inline_int_unchecked() $op rb.as_inline_int_unchecked()
+                    } else if ra.is_float() && rb.is_float() {
+                        ra.as_float_unchecked() $op rb.as_float_unchecked()
+                    } else if ra.is_table() || rb.is_table() {
+                        let (l, r) = if $mm_swap { (rb, ra) } else { (ra, rb) };
+                        if let Some(mm) = self.get_binop_metamethod(l, r, $event) {
+                            let (vl, vr) = (l.clone(), r.clone());
+                            sync_ip!();
+                            self.call_cmp_mm(mm, vl, vr)?
+                        } else {
+                            attempt!($slow(ra, rb))
                         }
-                        _ => attempt!($slow(ra, rb)),
+                    } else {
+                        attempt!($slow(ra, rb))
                     };
                     if !holds {
                         jump!($jump);
@@ -319,63 +286,31 @@ impl VM {
             ($dst:expr, $a:expr, $k:expr, $checked:ident, $fop:tt, $slow:path, $event:literal) => {{
                 let ra = &reg!($a);
                 let rb = &consts[$k as usize];
-                match (ra, rb) {
-                    (Value::Table(_), _) | (_, Value::Table(_)) => {
-                        if let Some(mm) = self.get_binop_metamethod(ra, rb, $event) {
-                            let (va, vb) = (ra.clone(), rb.clone());
-                            sync_ip!();
-                            self.call_binop_mm(mm, va, vb, base, $dst)?;
-                        } else {
-                            let res = attempt!($slow(ra, rb));
-                            set!($dst, res);
-                        }
+                if ra.is_table() || rb.is_table() {
+                    if let Some(mm) = self.get_binop_metamethod(ra, rb, $event) {
+                        let (va, vb) = (ra.clone(), rb.clone());
+                        sync_ip!();
+                        self.call_binop_mm(mm, va, vb, base, $dst)?;
+                    } else {
+                        let res = attempt!($slow(ra, rb));
+                        set!($dst, res);
                     }
-                    _ => match (ra, rb) {
-                        (Value::Int(x), Value::Int(y)) => {
-                            if let Some(r) = x.$checked(*y) {
-                                let slot = slot_mut(&mut self.stack, base + $dst as usize);
-                                if let Value::Int(old) = slot {
-                                    *old = r;
-                                } else {
-                                    *slot = Value::Int(r);
-                                }
-                            } else {
-                                let res = attempt!($slow(ra, rb));
-                                set!($dst, res);
-                            }
-                        }
-                        (Value::Float(x), Value::Float(y)) => {
-                            let r = *x $fop *y;
-                            let slot = slot_mut(&mut self.stack, base + $dst as usize);
-                            if let Value::Float(old) = slot {
-                                *old = r;
-                            } else {
-                                *slot = Value::Float(r);
-                            }
-                        }
-                        (Value::Int(x), Value::Float(y)) => {
-                            let r = (*x as f64) $fop *y;
-                            let slot = slot_mut(&mut self.stack, base + $dst as usize);
-                            if let Value::Float(old) = slot {
-                                *old = r;
-                            } else {
-                                *slot = Value::Float(r);
-                            }
-                        }
-                        (Value::Float(x), Value::Int(y)) => {
-                            let r = *x $fop (*y as f64);
-                            let slot = slot_mut(&mut self.stack, base + $dst as usize);
-                            if let Value::Float(old) = slot {
-                                *old = r;
-                            } else {
-                                *slot = Value::Float(r);
-                            }
-                        }
-                        _ => {
-                            let res = attempt!($slow(ra, rb));
-                            set!($dst, res);
-                        }
-                    },
+                } else if ra.is_inline_int() && rb.is_inline_int() {
+                    if let Some(r) = ra.as_inline_int_unchecked().$checked(rb.as_inline_int_unchecked()) {
+                        set!($dst, Value::int(r));
+                    } else {
+                        let res = attempt!($slow(ra, rb));
+                        set!($dst, res);
+                    }
+                } else if ra.is_float() && rb.is_float() {
+                    set!($dst, Value::float(ra.as_float_unchecked() $fop rb.as_float_unchecked()));
+                } else if ra.is_inline_int() && rb.is_float() {
+                    set!($dst, Value::float((ra.as_inline_int_unchecked() as f64) $fop rb.as_float_unchecked()));
+                } else if ra.is_float() && rb.is_inline_int() {
+                    set!($dst, Value::float(ra.as_float_unchecked() $fop (rb.as_inline_int_unchecked() as f64)));
+                } else {
+                    let res = attempt!($slow(ra, rb));
+                    set!($dst, res);
                 }
             }};
         }
@@ -383,20 +318,21 @@ impl VM {
             ($a:expr, $k:expr, $jump:expr, $op:tt, $slow:path, $event:literal, $mm_swap:expr) => {{
                 let ra = &reg!($a);
                 let rb = &consts[$k as usize];
-                let holds = match (ra, rb) {
-                    (Value::Int(x), Value::Int(y)) => x $op y,
-                    (Value::Float(x), Value::Float(y)) => x $op y,
-                    (Value::Table(_), _) | (_, Value::Table(_)) => {
-                        let (l, r) = if $mm_swap { (rb, ra) } else { (ra, rb) };
-                        if let Some(mm) = self.get_binop_metamethod(l, r, $event) {
-                            let (vl, vr) = (l.clone(), r.clone());
-                            sync_ip!();
-                            self.call_cmp_mm(mm, vl, vr)?
-                        } else {
-                            attempt!($slow(ra, rb))
-                        }
+                let holds = if ra.is_inline_int() && rb.is_inline_int() {
+                    ra.as_inline_int_unchecked() $op rb.as_inline_int_unchecked()
+                } else if ra.is_float() && rb.is_float() {
+                    ra.as_float_unchecked() $op rb.as_float_unchecked()
+                } else if ra.is_table() || rb.is_table() {
+                    let (l, r) = if $mm_swap { (rb, ra) } else { (ra, rb) };
+                    if let Some(mm) = self.get_binop_metamethod(l, r, $event) {
+                        let (vl, vr) = (l.clone(), r.clone());
+                        sync_ip!();
+                        self.call_cmp_mm(mm, vl, vr)?
+                    } else {
+                        attempt!($slow(ra, rb))
                     }
-                    _ => attempt!($slow(ra, rb)),
+                } else {
+                    attempt!($slow(ra, rb))
                 };
                 if !holds {
                     jump!($jump);
@@ -405,52 +341,35 @@ impl VM {
         }
 
         // Immediate binary arithmetic: `i64` fast path, then `f64`, then
-        // metamethod / generic evaluator with `Value::Int(imm as i64)`.
+        // metamethod / generic evaluator with `Value::int(imm as i64)`.
         macro_rules! arith_imm {
             ($dst:expr, $a:expr, $imm:expr, $checked:ident, $fop:tt, $slow:path, $event:literal) => {{
                 let ra = &reg!($a);
                 let imm_i64 = $imm as i64;
-                match ra {
-                    Value::Int(x) => match x.$checked(imm_i64) {
-                        Some(r) => {
-                            let slot = slot_mut(&mut self.stack, base + $dst as usize);
-                            if let Value::Int(old) = slot {
-                                *old = r;
-                            } else {
-                                *slot = Value::Int(r);
-                            }
-                        }
-                        None => {
-                            let rb = Value::Int(imm_i64);
-                            let res = attempt!($slow(ra, &rb));
-                            set!($dst, res);
-                        }
-                    },
-                    Value::Float(x) => {
-                        let r = *x $fop (imm_i64 as f64);
-                        let slot = slot_mut(&mut self.stack, base + $dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                    }
-                    Value::Table(_) => {
-                        let rb = Value::Int(imm_i64);
-                        if let Some(mm) = self.get_binop_metamethod(ra, &rb, $event) {
-                            let va = ra.clone();
-                            sync_ip!();
-                            self.call_binop_mm(mm, va, rb, base, $dst)?;
-                            continue;
-                        }
+                if ra.is_inline_int() {
+                    if let Some(r) = ra.as_inline_int_unchecked().$checked(imm_i64) {
+                        set!($dst, Value::int(r));
+                    } else {
+                        let rb = Value::int(imm_i64);
                         let res = attempt!($slow(ra, &rb));
                         set!($dst, res);
                     }
-                    _ => {
-                        let rb = Value::Int(imm_i64);
-                        let res = attempt!($slow(ra, &rb));
-                        set!($dst, res);
+                } else if ra.is_float() {
+                    set!($dst, Value::float(ra.as_float_unchecked() $fop (imm_i64 as f64)));
+                } else if ra.is_table() {
+                    let rb = Value::int(imm_i64);
+                    if let Some(mm) = self.get_binop_metamethod(ra, &rb, $event) {
+                        let va = ra.clone();
+                        sync_ip!();
+                        self.call_binop_mm(mm, va, rb, base, $dst)?;
+                        continue;
                     }
+                    let res = attempt!($slow(ra, &rb));
+                    set!($dst, res);
+                } else {
+                    let rb = Value::int(imm_i64);
+                    let res = attempt!($slow(ra, &rb));
+                    set!($dst, res);
                 }
             }};
         }
@@ -459,24 +378,23 @@ impl VM {
             ($a:expr, $imm:expr, $jump:expr, $op:tt, $slow:path, $event:literal, $mm_swap:expr) => {{
                 let ra = &reg!($a);
                 let imm_i64 = $imm as i64;
-                let holds = match ra {
-                    Value::Int(x) => *x $op imm_i64,
-                    Value::Float(x) => *x $op (imm_i64 as f64),
-                    Value::Table(_) => {
-                        let rb = Value::Int(imm_i64);
-                        let (l, r) = if $mm_swap { (&rb, ra) } else { (ra, &rb) };
-                        if let Some(mm) = self.get_binop_metamethod(l, r, $event) {
-                            let (vl, vr) = (l.clone(), r.clone());
-                            sync_ip!();
-                            self.call_cmp_mm(mm, vl, vr)?
-                        } else {
-                            attempt!($slow(ra, &rb))
-                        }
-                    }
-                    _ => {
-                        let rb = Value::Int(imm_i64);
+                let holds = if ra.is_inline_int() {
+                    ra.as_inline_int_unchecked() $op imm_i64
+                } else if ra.is_float() {
+                    ra.as_float_unchecked() $op (imm_i64 as f64)
+                } else if ra.is_table() {
+                    let rb = Value::int(imm_i64);
+                    let (l, r) = if $mm_swap { (&rb, ra) } else { (ra, &rb) };
+                    if let Some(mm) = self.get_binop_metamethod(l, r, $event) {
+                        let (vl, vr) = (l.clone(), r.clone());
+                        sync_ip!();
+                        self.call_cmp_mm(mm, vl, vr)?
+                    } else {
                         attempt!($slow(ra, &rb))
                     }
+                } else {
+                    let rb = Value::int(imm_i64);
+                    attempt!($slow(ra, &rb))
                 };
                 if !holds {
                     jump!($jump);
@@ -485,19 +403,19 @@ impl VM {
         }
 
         loop {
-            let Some(&inst) = code.get(ip) else {
+            let cur_ip = ip;
+            let inst = unsafe { code.get_unchecked(cur_ip) }.get().0;
+            if matches!(inst, ExecInst::EndSentinel) {
                 // Fell off the end without a `Return`: treat as returning nothing.
                 sync_ip!();
-                if self.hook.is_some() {
+                if self.debug_active && self.hook.is_some() {
                     self.fire_hook(HookEvent::Return)?;
                 }
                 let frame = self.frames.pop().expect(RUNNING_FRAME);
-                if !self.open_upvalues.is_empty() {
-                    self.close_upvalues(frame.base);
-                }
+                self.close_upvalues_if_needed(frame.base);
                 if self.frames.len() == target_depth {
                     self.returned.clear();
-                    return Ok(Some(Value::Nil));
+                    return Ok(Some(Value::NIL));
                 }
                 let caller_frame = self.frames.last().expect(RUNNING_FRAME);
                 current_closure = caller_frame.closure.clone();
@@ -507,10 +425,11 @@ impl VM {
                     sync_ip!();
                     return Ok(None);
                 }
-                code = &current_closure.proto.instructions;
+                exec = current_closure.proto.exec();
+                code = &exec.ops;
                 consts = current_closure.proto.values();
                 continue;
-            };
+            }
             if TRAP {
                 // The frame's ip points past the instruction about to run,
                 // as it does while that instruction executes.
@@ -521,380 +440,79 @@ impl VM {
                     return Ok(None);
                 }
             }
-            let cur_ip = ip;
             ip += 1;
 
-            let mut deopted = false;
-            match current_closure.proto.quick_op(cur_ip) {
-                QuickOp::None => {}
-                QuickOp::AddInt { dst, a, b } => {
-                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b))
-                        && let Some(r) = x.checked_add(*y)
-                    {
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Int(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Int(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::AddFloat { dst, a, b } => {
-                    if let (Value::Float(x), Value::Float(y)) = (&reg!(a), &reg!(b)) {
-                        let r = *x + *y;
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::SubInt { dst, a, b } => {
-                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b))
-                        && let Some(r) = x.checked_sub(*y)
-                    {
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Int(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Int(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::SubFloat { dst, a, b } => {
-                    if let (Value::Float(x), Value::Float(y)) = (&reg!(a), &reg!(b)) {
-                        let r = *x - *y;
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::MulInt { dst, a, b } => {
-                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b))
-                        && let Some(r) = x.checked_mul(*y)
-                    {
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Int(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Int(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::MulFloat { dst, a, b } => {
-                    if let (Value::Float(x), Value::Float(y)) = (&reg!(a), &reg!(b)) {
-                        let r = *x * *y;
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::AddIntK { dst, a, imm } => {
-                    if let Value::Int(x) = &reg!(a)
-                        && let Some(r) = x.checked_add(imm)
-                    {
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Int(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Int(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::AddFloatK { dst, a, imm } => {
-                    if let Value::Float(x) = &reg!(a) {
-                        let r = *x + imm;
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::SubIntK { dst, a, imm } => {
-                    if let Value::Int(x) = &reg!(a)
-                        && let Some(r) = x.checked_sub(imm)
-                    {
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Int(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Int(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::SubFloatK { dst, a, imm } => {
-                    if let Value::Float(x) = &reg!(a) {
-                        let r = *x - imm;
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::MulIntK { dst, a, imm } => {
-                    if let Value::Int(x) = &reg!(a)
-                        && let Some(r) = x.checked_mul(imm)
-                    {
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Int(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Int(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::MulFloatK { dst, a, imm } => {
-                    if let Value::Float(x) = &reg!(a) {
-                        let r = *x * imm;
-                        let slot = slot_mut(&mut self.stack, base + dst as usize);
-                        if let Value::Float(old) = slot {
-                            *old = r;
-                        } else {
-                            *slot = Value::Float(r);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::LtInt {
-                    a,
-                    b,
-                    jump_if_false,
-                } => {
-                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b)) {
-                        if !(*x < *y) {
-                            jump!(jump_if_false);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::LeInt {
-                    a,
-                    b,
-                    jump_if_false,
-                } => {
-                    if let (Value::Int(x), Value::Int(y)) = (&reg!(a), &reg!(b)) {
-                        if !(*x <= *y) {
-                            jump!(jump_if_false);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::LtIntK {
-                    a,
-                    imm,
-                    jump_if_false,
-                } => {
-                    if let Value::Int(x) = &reg!(a) {
-                        if !(*x < imm) {
-                            jump!(jump_if_false);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::LeIntK {
-                    a,
-                    imm,
-                    jump_if_false,
-                } => {
-                    if let Value::Int(x) = &reg!(a) {
-                        if !(*x <= imm) {
-                            jump!(jump_if_false);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-                QuickOp::EqIntK {
-                    a,
-                    imm,
-                    jump_if_false,
-                } => {
-                    if let Value::Int(x) = &reg!(a) {
-                        if *x != imm {
-                            jump!(jump_if_false);
-                        }
-                        continue;
-                    }
-                    current_closure.proto.set_quick_op(cur_ip, QuickOp::None);
-                    deopted = true;
-                }
-            }
-
             match inst {
-                Instruction::LoadNil { dst } => set!(dst, Value::Nil),
-                Instruction::LoadBool { dst, val } => set!(dst, Value::Bool(val)),
-                Instruction::LoadInt { dst, val } => set!(dst, Value::Int(val as i64)),
-                Instruction::LoadK { dst, k } => set!(dst, consts[k as usize].clone()),
-                Instruction::Move { dst, src } => {
-                    let src_slot = slot(&self.stack, base + src as usize);
-                    match src_slot {
-                        Value::Int(i) => {
-                            let val = *i;
-                            let d = slot_mut(&mut self.stack, base + dst as usize);
-                            if let Value::Int(old) = d {
-                                *old = val;
-                            } else {
-                                *d = Value::Int(val);
-                            }
-                        }
-                        Value::Float(f) => {
-                            let val = *f;
-                            let d = slot_mut(&mut self.stack, base + dst as usize);
-                            if let Value::Float(old) = d {
-                                *old = val;
-                            } else {
-                                *d = Value::Float(val);
-                            }
-                        }
-                        Value::Bool(b) => {
-                            let val = *b;
-                            let d = slot_mut(&mut self.stack, base + dst as usize);
-                            if let Value::Bool(old) = d {
-                                *old = val;
-                            } else {
-                                *d = Value::Bool(val);
-                            }
-                        }
-                        _ => {
-                            let v = reg!(src).clone();
-                            set!(dst, v);
-                        }
-                    }
+                ExecInst::EndSentinel => unreachable!(),
+                ExecInst::LoadNil { dst } => set!(dst, Value::NIL),
+                ExecInst::LoadBool { dst, val } => set!(dst, Value::bool(val)),
+                ExecInst::LoadInt { dst, val } => set!(dst, Value::int(val as i64)),
+                ExecInst::LoadK { dst, k } => set!(dst, consts[k as usize].clone()),
+                ExecInst::Move { dst, src } => {
+                    let bits = slot(&self.stack, base + src as usize).bits();
+                    let val = if bits < TAG_RC_START {
+                        unsafe { Value::from_trivial_bits(bits) }
+                    } else {
+                        reg!(src).clone()
+                    };
+                    set!(dst, val);
                 }
-                Instruction::GetGlobal { dst, name_k } => {
-                    if let Some(val) = current_closure
-                        .proto
-                        .global_cache_get(cur_ip, self.globals_epoch)
-                    {
+                ExecInst::GetGlobal { dst, name_k, site } => {
+                    if let Some(val) = exec.global_cache_get(site, self.globals_epoch) {
                         set!(dst, val);
                         continue;
                     }
-                    let Value::String(name) = &consts[name_k as usize] else {
+                    let Some(name) = consts[name_k as usize].as_str_ref() else {
                         throw!("global name must be string");
                     };
-                    let val = self.globals.get(&**name).cloned().unwrap_or(Value::Nil);
-                    current_closure
-                        .proto
-                        .global_cache_set(cur_ip, self.globals_epoch, val.clone());
+                    let val = self.globals.get(&*name).cloned().unwrap_or(Value::NIL);
+                    exec.global_cache_set(site, self.globals_epoch, val.clone());
                     set!(dst, val);
                 }
-                Instruction::SetGlobal { src, name_k } => {
-                    let Value::String(name) = &consts[name_k as usize] else {
+                ExecInst::GetGlobalDynamic { dst, name_k } => {
+                    let Some(name) = consts[name_k as usize].as_str_ref() else {
+                        throw!("global name must be string");
+                    };
+                    let val = self.globals.get(&*name).cloned().unwrap_or(Value::NIL);
+                    set!(dst, val);
+                }
+                ExecInst::SetGlobal { src, name_k } => {
+                    let Some(name) = consts[name_k as usize].as_str_ref() else {
                         throw!("global name must be string");
                     };
                     let val = reg!(src).clone();
                     // Re-inserting an existing key would drop the old Rc for
                     // an identical one; a lookup first avoids that churn.
-                    if let Some(slot) = self.globals.get_mut(&**name) {
-                        *slot = val;
+                    if let Some(slot) = self.globals.get_mut(&*name) {
+                        slot.set_inplace(val);
                     } else {
-                        self.globals.insert(name.clone(), val);
+                        self.globals.insert(name.to_str_ref(), val);
                     }
                     self.globals_epoch = self.globals_epoch.wrapping_add(1);
                 }
-                Instruction::GetUpval { dst, upval_idx } => {
+                ExecInst::GetUpval { dst, upval_idx } => {
                     let uv = &current_closure.upvalues[upval_idx as usize];
                     match uv.location.get() {
                         Some(idx) => {
-                            let src = &self.stack[idx];
-                            match src {
-                                Value::Int(i) => {
-                                    let val = *i;
-                                    let slot = slot_mut(&mut self.stack, base + dst as usize);
-                                    if let Value::Int(old) = slot {
-                                        *old = val;
-                                    } else {
-                                        *slot = Value::Int(val);
-                                    }
-                                }
-                                Value::Float(f) => {
-                                    let val = *f;
-                                    let slot = slot_mut(&mut self.stack, base + dst as usize);
-                                    if let Value::Float(old) = slot {
-                                        *old = val;
-                                    } else {
-                                        *slot = Value::Float(val);
-                                    }
-                                }
-                                Value::Bool(b) => {
-                                    let val = *b;
-                                    let slot = slot_mut(&mut self.stack, base + dst as usize);
-                                    if let Value::Bool(old) = slot {
-                                        *old = val;
-                                    } else {
-                                        *slot = Value::Bool(val);
-                                    }
-                                }
-                                other => {
-                                    let v = other.clone();
-                                    set!(dst, v);
-                                }
-                            }
+                            let bits = self.stack[idx].bits();
+                            let v = if bits < TAG_RC_START {
+                                unsafe { Value::from_trivial_bits(bits) }
+                            } else {
+                                self.stack[idx].clone()
+                            };
+                            set!(dst, v);
                         }
                         None => {
-                            let val = uv.closed.borrow().clone();
+                            let val = uv.get_closed();
                             set!(dst, val);
                         }
                     }
                 }
-                Instruction::SetUpval { src, upval_idx } => {
+                ExecInst::SetUpval { src, upval_idx } => {
                     let val = reg!(src).clone();
                     self.upvalue_set(&current_closure.upvalues[upval_idx as usize], val);
                 }
-                Instruction::NewTable {
+                ExecInst::NewTable {
                     dst,
                     array_cap,
                     fields_cap,
@@ -912,43 +530,40 @@ impl VM {
                     let rc = Rc::new(RefCell::new(table));
                     let size = 64 + (array_cap as usize) * std::mem::size_of::<Value>();
                     self.gc.register_table_sized(&rc, size);
-                    set!(dst, Value::Table(rc));
+                    set!(dst, Value::table(rc));
                 }
-                Instruction::GetTable { dst, table, key } => {
+                ExecInst::GetTable { dst, table, key } => {
                     let tbl_val = &reg!(table);
                     let k = &reg!(key);
-                    if let (Value::Table(t), Value::Int(i)) = (tbl_val, k)
-                        && *i >= 1
-                    {
-                        let tbl = t.borrow();
-                        let idx = *i as usize - 1;
-                        if idx < tbl.array.len() {
-                            let val = match &tbl.array[idx] {
-                                Value::Int(n) => Value::Int(*n),
-                                Value::Float(f) => Value::Float(*f),
-                                Value::Bool(b) => Value::Bool(*b),
-                                other => other.clone(),
-                            };
-                            drop(tbl);
-                            set!(dst, val);
-                            continue;
-                        }
-                    } else if let (Value::Table(t), Value::String(s)) = (tbl_val, k) {
-                        let tbl = t.borrow();
-                        if let Some(v) = tbl.fields.get_by_strref(s) {
-                            let val = match v {
-                                Value::Int(n) => Value::Int(*n),
-                                Value::Float(f) => Value::Float(*f),
-                                Value::Bool(b) => Value::Bool(*b),
-                                other => other.clone(),
-                            };
-                            drop(tbl);
-                            set!(dst, val);
-                            continue;
-                        } else if tbl.metatable.is_none() {
-                            drop(tbl);
-                            set!(dst, Value::Nil);
-                            continue;
+                    if let Some(t) = tbl_val.as_table() {
+                        if let Some(i) = k.as_int()
+                            && i >= 1
+                        {
+                            let tbl = t.borrow();
+                            let idx = i as usize - 1;
+                            // A nil hole falls through so `__index` runs.
+                            if idx < tbl.array.len()
+                                && (!tbl.array[idx].is_nil() || tbl.metatable.is_none())
+                            {
+                                let val = tbl.array[idx].clone();
+                                drop(tbl);
+                                set!(dst, val);
+                                continue;
+                            }
+                        } else if let Some(s) = k.as_str_ref() {
+                            let tbl = t.borrow();
+                            if let Some(v) = tbl.fields.get_by_vmstr(s.as_ptr(), s.vm_str())
+                                && (!v.is_nil() || tbl.metatable.is_none())
+                            {
+                                let val = v.clone();
+                                drop(tbl);
+                                set!(dst, val);
+                                continue;
+                            } else if tbl.metatable.is_none() {
+                                drop(tbl);
+                                set!(dst, Value::NIL);
+                                continue;
+                            }
                         }
                     }
                     let val = match Self::table_get_fast(tbl_val, k) {
@@ -961,51 +576,53 @@ impl VM {
                     };
                     set!(dst, val);
                 }
-                Instruction::GetTableK { dst, table, key_k } => {
+                ExecInst::GetTableK {
+                    dst,
+                    table,
+                    key_k,
+                    site,
+                } => {
                     let tbl_val = &reg!(table);
                     let k = &consts[key_k as usize];
-                    if let (Value::Table(t), Value::String(s)) = (tbl_val, k) {
-                        let ptr = Rc::as_ptr(t) as usize;
+                    if let (Some(t), Some(s)) = (tbl_val.as_table(), k.as_str_ref()) {
+                        let ptr = t.as_ptr() as usize;
                         let tbl = t.borrow();
                         let shape = tbl.fields.shape_version();
-                        if let Some(ic) = current_closure.proto.table_cache_get(cur_ip)
+                        if let Some(ic) = exec.table_cache_get(site)
                             && ic.table_ptr == ptr
                             && ic.shape_version == shape
-                            && let Some(v) = tbl.fields.get_slot_keyed(ic.slot_idx, s)
+                            && let Some(v) = tbl.fields.get_slot_keyed_vmstr(
+                                ic.slot_idx as usize,
+                                s.as_ptr(),
+                                s.vm_str(),
+                            )
+                            && (!v.is_nil() || tbl.metatable.is_none())
                         {
-                            let val = match v {
-                                Value::Int(n) => Value::Int(*n),
-                                Value::Float(f) => Value::Float(*f),
-                                Value::Bool(b) => Value::Bool(*b),
-                                other => other.clone(),
-                            };
+                            let val = v.clone();
                             drop(tbl);
                             set!(dst, val);
                             continue;
                         }
-                        if let Some(slot_idx) = tbl.fields.find_index_by_strref(s)
+                        if let Some(slot_idx) =
+                            tbl.fields.find_index_by_vmstr(s.as_ptr(), s.vm_str())
                             && let Some(v) = tbl.fields.get_slot(slot_idx)
+                            && (!v.is_nil() || tbl.metatable.is_none())
                         {
-                            let val = match v {
-                                Value::Int(n) => Value::Int(*n),
-                                Value::Float(f) => Value::Float(*f),
-                                Value::Bool(b) => Value::Bool(*b),
-                                other => other.clone(),
-                            };
+                            let val = v.clone();
                             drop(tbl);
-                            current_closure.proto.table_cache_set(
-                                cur_ip,
+                            exec.table_cache_set(
+                                site,
                                 TableCacheSlot {
                                     table_ptr: ptr,
                                     shape_version: shape,
-                                    slot_idx,
+                                    slot_idx: slot_idx as u32,
                                 },
                             );
                             set!(dst, val);
                             continue;
                         } else if tbl.metatable.is_none() {
                             drop(tbl);
-                            set!(dst, Value::Nil);
+                            set!(dst, Value::NIL);
                             continue;
                         }
                     }
@@ -1019,7 +636,20 @@ impl VM {
                     };
                     set!(dst, val);
                 }
-                Instruction::GetImport {
+                ExecInst::GetTableKDynamic { dst, table, key_k } => {
+                    let tbl_val = &reg!(table);
+                    let k = &consts[key_k as usize];
+                    let val = match Self::table_get_fast(tbl_val, k) {
+                        Some(v) => v,
+                        None => {
+                            let tbl = tbl_val.clone();
+                            sync_ip!();
+                            self.table_get(&tbl, k)?
+                        }
+                    };
+                    set!(dst, val);
+                }
+                ExecInst::GetImport {
                     dst,
                     mod_k,
                     field_k,
@@ -1029,21 +659,20 @@ impl VM {
                     // Fast path: resolved under this epoch with the
                     // module still metatable-free. One epoch read, one
                     // pointer check, one clone instead of two hashes.
-                    if let Some(cached) = current_closure
-                        .proto
-                        .import_cached(site, self.globals_epoch)
-                    {
+                    if let Some(cached) = exec.import_cached(site, self.globals_epoch) {
                         set!(dst, cached);
                     } else {
                         let (mname, fname) =
                             match (&consts[mod_k as usize], &consts[field_k as usize]) {
-                                (Value::String(m), Value::String(f)) => (m.clone(), f.clone()),
+                                (m, f) if m.is_string() && f.is_string() => {
+                                    (m.to_str_ref().unwrap(), f.to_str_ref().unwrap())
+                                }
                                 _ => throw!("import names must be strings"),
                             };
                         // Dynamic resolution, exactly what GetGlobal
                         // plus GetTableK do: missing globals read nil.
-                        let module_val = self.globals.get(&*mname).cloned().unwrap_or(Value::Nil);
-                        let fkey = Value::String(fname);
+                        let module_val = self.globals.get(&*mname).cloned().unwrap_or(Value::NIL);
+                        let fkey = Value::str_ref(fname);
                         let value = match Self::table_get_fast(&module_val, &fkey) {
                             Some(v) => v,
                             None => {
@@ -1055,18 +684,16 @@ impl VM {
                         // a frozen, metatable-free module with a present
                         // non-nil field. Misses, user tables and anything
                         // with a metatable stay fully dynamic.
-                        if let Value::Table(t) = &module_val {
+                        if let Some(t) = module_val.as_table() {
                             let cacheable = {
                                 let tbl = t.borrow();
-                                tbl.frozen
-                                    && tbl.metatable.is_none()
-                                    && !matches!(value, Value::Nil)
+                                tbl.frozen && tbl.metatable.is_none() && !value.is_nil()
                             };
                             if cacheable {
-                                current_closure.proto.import_store(
+                                exec.import_store(
                                     site,
                                     self.globals_epoch,
-                                    t.clone(),
+                                    t.to_rc(),
                                     value.clone(),
                                 );
                             }
@@ -1074,44 +701,42 @@ impl VM {
                         set!(dst, value);
                     }
                 }
-                Instruction::SetTable { table, key, val } => {
+                ExecInst::SetTable { table, key, val } => {
                     let tbl_val = &reg!(table);
                     let k = &reg!(key);
                     let v = &reg!(val);
-                    if let (Value::Table(t), Value::Int(i)) = (tbl_val, k)
-                        && *i >= 1
-                        && !matches!(v, Value::Nil)
+                    if let Some(t) = tbl_val.as_table()
+                        && !v.is_nil()
                     {
-                        let mut tbl = t.borrow_mut();
-                        if !tbl.frozen {
-                            let idx = *i as usize - 1;
-                            if idx < tbl.array.len() {
-                                match (v, &mut tbl.array[idx]) {
-                                    (Value::Int(n), Value::Int(o)) => *o = *n,
-                                    (Value::Float(n), Value::Float(o)) => *o = *n,
-                                    (Value::Bool(n), Value::Bool(o)) => *o = *n,
-                                    (v_other, slot) => *slot = v_other.clone(),
+                        if let Some(i) = k.as_int()
+                            && i >= 1
+                        {
+                            let mut tbl = t.borrow_mut();
+                            if !tbl.frozen {
+                                let idx = i as usize - 1;
+                                if idx < tbl.array.len() {
+                                    tbl.array[idx].assign_ref(v);
+                                    continue;
+                                } else if idx == tbl.array.len()
+                                    && tbl.metatable.is_none()
+                                    && tbl.general.is_none()
+                                {
+                                    tbl.array.push(v.clone());
+                                    continue;
                                 }
-                                continue;
-                            } else if idx == tbl.array.len()
-                                && tbl.metatable.is_none()
-                                && tbl.general.is_none()
-                            {
-                                tbl.array.push(v.clone());
-                                continue;
                             }
-                        }
-                    } else if let (Value::Table(t), Value::String(s)) = (tbl_val, k)
-                        && !matches!(v, Value::Nil)
-                    {
-                        let mut tbl = t.borrow_mut();
-                        if !tbl.frozen {
-                            if tbl.metatable.is_none() {
-                                tbl.fields.set_by_strref(s, v);
-                                continue;
-                            } else if let Some(slot) = tbl.fields.get_mut_by_strref(s) {
-                                crate::vm::table::assign_value(slot, v);
-                                continue;
+                        } else if let Some(s) = k.as_str_ref() {
+                            let mut tbl = t.borrow_mut();
+                            if !tbl.frozen {
+                                if tbl.metatable.is_none() {
+                                    tbl.fields.set_by_vmstr(s.as_ptr(), s.vm_str(), v);
+                                    continue;
+                                } else if let Some(slot) =
+                                    tbl.fields.get_mut_by_vmstr(s.as_ptr(), s.vm_str())
+                                {
+                                    crate::vm::table::assign_value(slot, v);
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -1121,50 +746,60 @@ impl VM {
                         self.table_set(&tbl, k, v)?;
                     }
                 }
-                Instruction::SetTableK { table, key_k, val } => {
+                ExecInst::SetTableK {
+                    table,
+                    key_k,
+                    val,
+                    site,
+                } => {
                     let tbl_val = &reg!(table);
                     let k = &consts[key_k as usize];
                     let v = &reg!(val);
-                    if let (Value::Table(t), Value::String(s)) = (tbl_val, k)
-                        && !matches!(v, Value::Nil)
+                    if let (Some(t), Some(s)) = (tbl_val.as_table(), k.as_str_ref())
+                        && !v.is_nil()
                     {
-                        let ptr = Rc::as_ptr(t) as usize;
+                        let ptr = t.as_ptr() as usize;
                         let mut tbl = t.borrow_mut();
                         if !tbl.frozen {
                             let shape = tbl.fields.shape_version();
-                            if let Some(ic) = current_closure.proto.table_cache_get(cur_ip)
+                            if let Some(ic) = exec.table_cache_get(site)
                                 && ic.table_ptr == ptr
                                 && ic.shape_version == shape
-                                && tbl.fields.set_slot_keyed(ic.slot_idx, s, v.clone())
+                                && let Some(slot_v) = tbl.fields.get_slot_keyed_mut_vmstr(
+                                    ic.slot_idx as usize,
+                                    s.as_ptr(),
+                                    s.vm_str(),
+                                )
                             {
+                                slot_v.assign_ref(v);
                                 continue;
                             }
-                            if let Some(slot_idx) = tbl.fields.find_index_by_strref(s) {
+                            if let Some(slot_idx) =
+                                tbl.fields.find_index_by_vmstr(s.as_ptr(), s.vm_str())
+                            {
                                 tbl.fields.set_slot(slot_idx, v.clone());
                                 drop(tbl);
-                                current_closure.proto.table_cache_set(
-                                    cur_ip,
+                                exec.table_cache_set(
+                                    site,
                                     TableCacheSlot {
                                         table_ptr: ptr,
                                         shape_version: shape,
-                                        slot_idx,
+                                        slot_idx: slot_idx as u32,
                                     },
                                 );
                                 continue;
                             } else if tbl.metatable.is_none() {
-                                tbl.fields.insert(s.clone(), v.clone());
+                                let slot_idx = tbl.fields.insert_cached(s.to_str_ref(), v.clone());
                                 let new_shape = tbl.fields.shape_version();
-                                if let Some(slot_idx) = tbl.fields.find_index_by_strref(s) {
-                                    drop(tbl);
-                                    current_closure.proto.table_cache_set(
-                                        cur_ip,
-                                        TableCacheSlot {
-                                            table_ptr: ptr,
-                                            shape_version: new_shape,
-                                            slot_idx,
-                                        },
-                                    );
-                                }
+                                drop(tbl);
+                                exec.table_cache_set(
+                                    site,
+                                    TableCacheSlot {
+                                        table_ptr: ptr,
+                                        shape_version: new_shape,
+                                        slot_idx: slot_idx as u32,
+                                    },
+                                );
                                 continue;
                             }
                         }
@@ -1175,15 +810,25 @@ impl VM {
                         self.table_set(&tbl, k, v)?;
                     }
                 }
-                Instruction::AppendArray { table, src } => {
+                ExecInst::SetTableKDynamic { table, key_k, val } => {
+                    let tbl_val = &reg!(table);
+                    let k = &consts[key_k as usize];
+                    let v = &reg!(val);
+                    if !Self::table_set_fast(tbl_val, k, v) {
+                        let (tbl, k, v) = (tbl_val.clone(), k.clone(), v.clone());
+                        sync_ip!();
+                        self.table_set(&tbl, k, v)?;
+                    }
+                }
+                ExecInst::AppendArray { table, src } => {
                     let val = reg!(src).clone();
-                    if let Value::Table(t) = &reg!(table) {
+                    if let Some(t) = reg!(table).as_table() {
                         t.borrow_mut().array.push(val);
                     } else {
                         throw!("cannot append to non-table");
                     }
                 }
-                Instruction::SetList {
+                ExecInst::SetList {
                     table,
                     base: list,
                     count,
@@ -1195,8 +840,8 @@ impl VM {
                         start + count as usize
                     };
                     let end = end.min(self.stack.len());
-                    if let Value::Table(t) = &reg!(table) {
-                        let t = t.clone();
+                    if let Some(t) = reg!(table).as_table() {
+                        let t = t.to_rc();
                         let mut tbl = t.borrow_mut();
                         tbl.array.reserve(end.saturating_sub(start));
                         tbl.array.extend(self.stack[start..end].iter().cloned());
@@ -1204,13 +849,13 @@ impl VM {
                         throw!("cannot SetList to non-table");
                     }
                 }
-                Instruction::TForCall { base: b, retc } => {
+                ExecInst::TForCall { base: b, retc } => {
                     sync_ip!();
                     self.tfor_call(base, b, retc)?;
                 }
-                Instruction::TForLoop { base: b, jump } => {
+                ExecInst::TForLoop { base: b, jump } => {
                     let first_var = reg!(b + 3).clone();
-                    if matches!(first_var, Value::Nil) {
+                    if first_var.is_nil() {
                         // Exit loop: jump forward past the back-jump
                         jump!(jump);
                     } else {
@@ -1218,176 +863,479 @@ impl VM {
                         set!(b + 2, first_var);
                     }
                 }
-                Instruction::CloseUpval { reg } => {
+                ExecInst::CloseUpval { reg } => {
                     if !self.open_upvalues.is_empty() {
                         self.close_upvalue_at(base + reg as usize);
                     }
                 }
-                Instruction::Add { dst, a, b } => {
-                    if !deopted {
-                        match (&reg!(a), &reg!(b)) {
-                            (Value::Int(_), Value::Int(_)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::AddInt { dst, a, b }),
-                            (Value::Float(_), Value::Float(_)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::AddFloat { dst, a, b }),
-                            _ => {}
-                        }
+                ExecInst::AddInt { dst, a, b } => {
+                    let ra = &reg!(a);
+                    let rb = &reg!(b);
+                    if ra.is_inline_int()
+                        && rb.is_inline_int()
+                        && let Some(r) = ra
+                            .as_inline_int_unchecked()
+                            .checked_add(rb.as_inline_int_unchecked())
+                    {
+                        set!(dst, Value::int(r));
+                        continue;
                     }
-                    arith!(
-                        dst,
-                        a,
-                        b,
-                        checked_add,
-                        +,
-                        ops::eval_add,
-                        "__add",
-                        into ops::eval_add_into
-                    )
+                    code[cur_ip].set(AlignedExec(ExecInst::AddGeneric { dst, a, b }));
+                    arith!(dst, a, b, checked_add, +, ops::eval_add, "__add", into ops::eval_add_into)
                 }
-                Instruction::AddI { dst, a, imm } => {
+                ExecInst::AddFloat { dst, a, b } => {
+                    let ra = &reg!(a);
+                    let rb = &reg!(b);
+                    if ra.is_float() && rb.is_float() {
+                        let r = ra.as_float_unchecked() + rb.as_float_unchecked();
+                        set!(dst, Value::float(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::AddGeneric { dst, a, b }));
+                    arith!(dst, a, b, checked_add, +, ops::eval_add, "__add", into ops::eval_add_into)
+                }
+                ExecInst::Add { dst, a, b } => {
+                    let ra = &reg!(a);
+                    let rb = &reg!(b);
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::AddInt { dst, a, b }));
+                    } else if ra.is_float() && rb.is_float() {
+                        code[cur_ip].set(AlignedExec(ExecInst::AddFloat { dst, a, b }));
+                    }
+                    arith!(dst, a, b, checked_add, +, ops::eval_add, "__add", into ops::eval_add_into)
+                }
+                ExecInst::AddGeneric { dst, a, b } => {
+                    arith!(dst, a, b, checked_add, +, ops::eval_add, "__add", into ops::eval_add_into)
+                }
+                ExecInst::AddIntI { dst, a, imm } => {
+                    let ra = &reg!(a);
+                    if ra.is_inline_int()
+                        && let Some(r) = ra.as_inline_int_unchecked().checked_add(imm as i64)
+                    {
+                        set!(dst, Value::int(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::AddIGeneric { dst, a, imm }));
                     arith_imm!(dst, a, imm, checked_add, +, ops::eval_add, "__add")
                 }
-                Instruction::AddK { dst, a, k } => {
-                    if !deopted {
-                        match (&reg!(a), &consts[k as usize]) {
-                            (Value::Int(_), Value::Int(imm)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::AddIntK { dst, a, imm: *imm }),
-                            (Value::Float(_), Value::Float(imm)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::AddFloatK { dst, a, imm: *imm }),
-                            _ => {}
-                        }
+                ExecInst::AddI { dst, a, imm } => {
+                    if reg!(a).is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::AddIntI { dst, a, imm }));
+                    }
+                    arith_imm!(dst, a, imm, checked_add, +, ops::eval_add, "__add")
+                }
+                ExecInst::AddIGeneric { dst, a, imm } => {
+                    arith_imm!(dst, a, imm, checked_add, +, ops::eval_add, "__add")
+                }
+                ExecInst::AddIntK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_inline_int()
+                        && rb.is_inline_int()
+                        && let Some(r) = ra
+                            .as_inline_int_unchecked()
+                            .checked_add(rb.as_inline_int_unchecked())
+                    {
+                        set!(dst, Value::int(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::AddKGeneric { dst, a, k }));
+                    arith_k!(dst, a, k, checked_add, +, ops::eval_add, "__add")
+                }
+                ExecInst::AddFloatK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_float() && rb.is_float() {
+                        let r = ra.as_float_unchecked() + rb.as_float_unchecked();
+                        set!(dst, Value::float(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::AddKGeneric { dst, a, k }));
+                    arith_k!(dst, a, k, checked_add, +, ops::eval_add, "__add")
+                }
+                ExecInst::AddK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::AddIntK { dst, a, k }));
+                    } else if ra.is_float() && rb.is_float() {
+                        code[cur_ip].set(AlignedExec(ExecInst::AddFloatK { dst, a, k }));
                     }
                     arith_k!(dst, a, k, checked_add, +, ops::eval_add, "__add")
                 }
-                Instruction::Sub { dst, a, b } => {
-                    if !deopted {
-                        match (&reg!(a), &reg!(b)) {
-                            (Value::Int(_), Value::Int(_)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::SubInt { dst, a, b }),
-                            (Value::Float(_), Value::Float(_)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::SubFloat { dst, a, b }),
-                            _ => {}
-                        }
-                    }
-                    arith!(
-                        dst,
-                        a,
-                        b,
-                        checked_sub,
-                        -,
-                        ops::eval_sub,
-                        "__sub",
-                        into ops::eval_sub_into
-                    )
+                ExecInst::AddKGeneric { dst, a, k } => {
+                    arith_k!(dst, a, k, checked_add, +, ops::eval_add, "__add")
                 }
-                Instruction::SubI { dst, a, imm } => {
+                ExecInst::SubInt { dst, a, b } => {
+                    let ra = &reg!(a);
+                    let rb = &reg!(b);
+                    if ra.is_inline_int()
+                        && rb.is_inline_int()
+                        && let Some(r) = ra
+                            .as_inline_int_unchecked()
+                            .checked_sub(rb.as_inline_int_unchecked())
+                    {
+                        set!(dst, Value::int(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::SubGeneric { dst, a, b }));
+                    arith!(dst, a, b, checked_sub, -, ops::eval_sub, "__sub", into ops::eval_sub_into)
+                }
+                ExecInst::SubFloat { dst, a, b } => {
+                    let ra = &reg!(a);
+                    let rb = &reg!(b);
+                    if ra.is_float() && rb.is_float() {
+                        let r = ra.as_float_unchecked() - rb.as_float_unchecked();
+                        set!(dst, Value::float(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::SubGeneric { dst, a, b }));
+                    arith!(dst, a, b, checked_sub, -, ops::eval_sub, "__sub", into ops::eval_sub_into)
+                }
+                ExecInst::Sub { dst, a, b } => {
+                    let ra = &reg!(a);
+                    let rb = &reg!(b);
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::SubInt { dst, a, b }));
+                    } else if ra.is_float() && rb.is_float() {
+                        code[cur_ip].set(AlignedExec(ExecInst::SubFloat { dst, a, b }));
+                    }
+                    arith!(dst, a, b, checked_sub, -, ops::eval_sub, "__sub", into ops::eval_sub_into)
+                }
+                ExecInst::SubGeneric { dst, a, b } => {
+                    arith!(dst, a, b, checked_sub, -, ops::eval_sub, "__sub", into ops::eval_sub_into)
+                }
+                ExecInst::SubIntI { dst, a, imm } => {
+                    let ra = &reg!(a);
+                    if ra.is_inline_int()
+                        && let Some(r) = ra.as_inline_int_unchecked().checked_sub(imm as i64)
+                    {
+                        set!(dst, Value::int(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::SubIGeneric { dst, a, imm }));
                     arith_imm!(dst, a, imm, checked_sub, -, ops::eval_sub, "__sub")
                 }
-                Instruction::SubK { dst, a, k } => {
-                    if !deopted {
-                        match (&reg!(a), &consts[k as usize]) {
-                            (Value::Int(_), Value::Int(imm)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::SubIntK { dst, a, imm: *imm }),
-                            (Value::Float(_), Value::Float(imm)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::SubFloatK { dst, a, imm: *imm }),
-                            _ => {}
-                        }
+                ExecInst::SubI { dst, a, imm } => {
+                    if reg!(a).is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::SubIntI { dst, a, imm }));
+                    }
+                    arith_imm!(dst, a, imm, checked_sub, -, ops::eval_sub, "__sub")
+                }
+                ExecInst::SubIGeneric { dst, a, imm } => {
+                    arith_imm!(dst, a, imm, checked_sub, -, ops::eval_sub, "__sub")
+                }
+                ExecInst::SubIntK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_inline_int()
+                        && rb.is_inline_int()
+                        && let Some(r) = ra
+                            .as_inline_int_unchecked()
+                            .checked_sub(rb.as_inline_int_unchecked())
+                    {
+                        set!(dst, Value::int(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::SubKGeneric { dst, a, k }));
+                    arith_k!(dst, a, k, checked_sub, -, ops::eval_sub, "__sub")
+                }
+                ExecInst::SubFloatK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_float() && rb.is_float() {
+                        let r = ra.as_float_unchecked() - rb.as_float_unchecked();
+                        set!(dst, Value::float(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::SubKGeneric { dst, a, k }));
+                    arith_k!(dst, a, k, checked_sub, -, ops::eval_sub, "__sub")
+                }
+                ExecInst::SubK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::SubIntK { dst, a, k }));
+                    } else if ra.is_float() && rb.is_float() {
+                        code[cur_ip].set(AlignedExec(ExecInst::SubFloatK { dst, a, k }));
                     }
                     arith_k!(dst, a, k, checked_sub, -, ops::eval_sub, "__sub")
                 }
-                Instruction::Mul { dst, a, b } => {
-                    if !deopted {
-                        match (&reg!(a), &reg!(b)) {
-                            (Value::Int(_), Value::Int(_)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::MulInt { dst, a, b }),
-                            (Value::Float(_), Value::Float(_)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::MulFloat { dst, a, b }),
-                            _ => {}
-                        }
+                ExecInst::SubKGeneric { dst, a, k } => {
+                    arith_k!(dst, a, k, checked_sub, -, ops::eval_sub, "__sub")
+                }
+                ExecInst::MulInt { dst, a, b } => {
+                    let ra = &reg!(a);
+                    let rb = &reg!(b);
+                    if ra.is_inline_int()
+                        && rb.is_inline_int()
+                        && let Some(r) = ra
+                            .as_inline_int_unchecked()
+                            .checked_mul(rb.as_inline_int_unchecked())
+                    {
+                        set!(dst, Value::int(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::MulGeneric { dst, a, b }));
+                    arith!(dst, a, b, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::MulFloat { dst, a, b } => {
+                    let ra = &reg!(a);
+                    let rb = &reg!(b);
+                    if ra.is_float() && rb.is_float() {
+                        let r = ra.as_float_unchecked() * rb.as_float_unchecked();
+                        set!(dst, Value::float(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::MulGeneric { dst, a, b }));
+                    arith!(dst, a, b, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::Mul { dst, a, b } => {
+                    let ra = &reg!(a);
+                    let rb = &reg!(b);
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::MulInt { dst, a, b }));
+                    } else if ra.is_float() && rb.is_float() {
+                        code[cur_ip].set(AlignedExec(ExecInst::MulFloat { dst, a, b }));
                     }
                     arith!(dst, a, b, checked_mul, *, ops::eval_mul, "__mul")
                 }
-                Instruction::MulI { dst, a, imm } => {
+                ExecInst::MulGeneric { dst, a, b } => {
+                    arith!(dst, a, b, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::MulIntI { dst, a, imm } => {
+                    let ra = &reg!(a);
+                    if ra.is_inline_int()
+                        && let Some(r) = ra.as_inline_int_unchecked().checked_mul(imm as i64)
+                    {
+                        set!(dst, Value::int(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::MulIGeneric { dst, a, imm }));
                     arith_imm!(dst, a, imm, checked_mul, *, ops::eval_mul, "__mul")
                 }
-                Instruction::MulK { dst, a, k } => {
-                    if !deopted {
-                        match (&reg!(a), &consts[k as usize]) {
-                            (Value::Int(_), Value::Int(imm)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::MulIntK { dst, a, imm: *imm }),
-                            (Value::Float(_), Value::Float(imm)) => current_closure
-                                .proto
-                                .set_quick_op(cur_ip, QuickOp::MulFloatK { dst, a, imm: *imm }),
-                            _ => {}
-                        }
+                ExecInst::MulI { dst, a, imm } => {
+                    if reg!(a).is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::MulIntI { dst, a, imm }));
+                    }
+                    arith_imm!(dst, a, imm, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::MulIGeneric { dst, a, imm } => {
+                    arith_imm!(dst, a, imm, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::MulIntK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_inline_int()
+                        && rb.is_inline_int()
+                        && let Some(r) = ra
+                            .as_inline_int_unchecked()
+                            .checked_mul(rb.as_inline_int_unchecked())
+                    {
+                        set!(dst, Value::int(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::MulKGeneric { dst, a, k }));
+                    arith_k!(dst, a, k, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::MulFloatK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_float() && rb.is_float() {
+                        let r = ra.as_float_unchecked() * rb.as_float_unchecked();
+                        set!(dst, Value::float(r));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::MulKGeneric { dst, a, k }));
+                    arith_k!(dst, a, k, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::MulK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::MulIntK { dst, a, k }));
+                    } else if ra.is_float() && rb.is_float() {
+                        code[cur_ip].set(AlignedExec(ExecInst::MulFloatK { dst, a, k }));
                     }
                     arith_k!(dst, a, k, checked_mul, *, ops::eval_mul, "__mul")
                 }
-                Instruction::Div { dst, a, b } => {
+                ExecInst::MulKGeneric { dst, a, k } => {
+                    arith_k!(dst, a, k, checked_mul, *, ops::eval_mul, "__mul")
+                }
+                ExecInst::Div { dst, a, b } => {
                     arith_slow!(dst, a, b, ops::eval_div, "__div")
                 }
-                Instruction::IDiv { dst, a, b } => {
-                    // Fast path for small ints; the zero divisor,
-                    // MIN/-1 overflow, floats, BigInts and metamethods
-                    // keep going through the generic evaluator so
-                    // semantics cannot drift.
+                ExecInst::IDiv { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    let res = match (ra, rb) {
-                        (Value::Int(x), Value::Int(y)) => {
-                            if *y == 0 || (*x == i64::MIN && *y == -1) {
-                                attempt!(ops::eval_idiv(ra, rb))
-                            } else {
-                                Value::Int(x.div_floor(y))
-                            }
-                        }
-                        _ => attempt!(ops::eval_idiv(ra, rb)),
-                    };
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        let x = ra.as_inline_int_unchecked();
+                        let y = rb.as_inline_int_unchecked();
+                        let val = if x >= 0 && y > 0 {
+                            x / y
+                        } else if y == 0 || (x == i64::MIN && y == -1) {
+                            let res = attempt!(ops::eval_idiv(ra, rb));
+                            set!(dst, res);
+                            continue;
+                        } else {
+                            num_integer::Integer::div_floor(&x, &y)
+                        };
+                        set!(dst, Value::int(val));
+                    } else {
+                        let res = attempt!(ops::eval_idiv(ra, rb));
+                        set!(dst, res);
+                    }
+                }
+                ExecInst::IDivIntPow2 { dst, a, shift } => {
+                    let ra = &reg!(a);
+                    if ra.is_inline_int() {
+                        set!(dst, Value::int(ra.as_inline_int_unchecked() >> shift));
+                        continue;
+                    }
+                    let y = 1i64 << shift;
+                    let res = attempt!(ops::eval_idiv(ra, &Value::int(y)));
                     set!(dst, res);
                 }
-                Instruction::Mod { dst, a, b } => {
+                ExecInst::IDivIntK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        let x = ra.as_inline_int_unchecked();
+                        let y = rb.as_inline_int_unchecked();
+                        let val = if x >= 0 {
+                            x / y
+                        } else {
+                            num_integer::Integer::div_floor(&x, &y)
+                        };
+                        set!(dst, Value::int(val));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::IDivKGeneric { dst, a, k }));
+                    let res = attempt!(ops::eval_idiv(ra, rb));
+                    set!(dst, res);
+                }
+                ExecInst::IDivK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_inline_int() && rb.is_inline_int() && rb.as_inline_int_unchecked() > 0
+                    {
+                        let x = ra.as_inline_int_unchecked();
+                        let y = rb.as_inline_int_unchecked();
+                        if (y as u64).is_power_of_two() {
+                            let shift = y.trailing_zeros() as u8;
+                            code[cur_ip].set(AlignedExec(ExecInst::IDivIntPow2 { dst, a, shift }));
+                            set!(dst, Value::int(x >> shift));
+                        } else {
+                            code[cur_ip].set(AlignedExec(ExecInst::IDivIntK { dst, a, k }));
+                            let val = if x >= 0 {
+                                x / y
+                            } else {
+                                num_integer::Integer::div_floor(&x, &y)
+                            };
+                            set!(dst, Value::int(val));
+                        }
+                    } else {
+                        let res = attempt!(ops::eval_idiv(ra, rb));
+                        set!(dst, res);
+                    }
+                }
+                ExecInst::IDivKGeneric { dst, a, k } => {
+                    let res = attempt!(ops::eval_idiv(&reg!(a), &consts[k as usize]));
+                    set!(dst, res);
+                }
+                ExecInst::ModIntPow2 { dst, a, shift } => {
+                    let ra = &reg!(a);
+                    if ra.is_inline_int() {
+                        set!(
+                            dst,
+                            Value::int(ra.as_inline_int_unchecked() & ((1i64 << shift) - 1))
+                        );
+                        continue;
+                    }
+                    let y = 1i64 << shift;
+                    let res = attempt!(ops::eval_mod(ra, &Value::int(y)));
+                    set!(dst, res);
+                }
+                ExecInst::ModIntK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        let x = ra.as_inline_int_unchecked();
+                        let y = rb.as_inline_int_unchecked();
+                        let val = if x >= 0 { x % y } else { x.mod_floor(&y) };
+                        set!(dst, Value::int(val));
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::ModKGeneric { dst, a, k }));
+                    let res = attempt!(ops::eval_mod(ra, rb));
+                    set!(dst, res);
+                }
+                ExecInst::ModK { dst, a, k } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_inline_int() && rb.is_inline_int() && rb.as_inline_int_unchecked() > 0
+                    {
+                        let x = ra.as_inline_int_unchecked();
+                        let y = rb.as_inline_int_unchecked();
+                        if (y as u64).is_power_of_two() {
+                            let shift = y.trailing_zeros() as u8;
+                            code[cur_ip].set(AlignedExec(ExecInst::ModIntPow2 { dst, a, shift }));
+                            set!(dst, Value::int(x & ((1i64 << shift) - 1)));
+                        } else {
+                            code[cur_ip].set(AlignedExec(ExecInst::ModIntK { dst, a, k }));
+                            let val = if x >= 0 { x % y } else { x.mod_floor(&y) };
+                            set!(dst, Value::int(val));
+                        }
+                    } else {
+                        let res = attempt!(ops::eval_mod(ra, rb));
+                        set!(dst, res);
+                    }
+                }
+                ExecInst::ModKGeneric { dst, a, k } => {
+                    let res = attempt!(ops::eval_mod(&reg!(a), &consts[k as usize]));
+                    set!(dst, res);
+                }
+                ExecInst::Mod { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    let res = match (ra, rb) {
-                        (Value::Int(x), Value::Int(y)) => {
-                            if *y == 0 {
-                                attempt!(ops::eval_mod(ra, rb))
-                            } else if *y == -1 {
-                                Value::Int(0)
-                            } else {
-                                Value::Int(x.mod_floor(y))
-                            }
-                        }
-                        (Value::BigInt(x), Value::Int(y)) => {
-                            if *y == 0 {
-                                attempt!(ops::eval_mod(ra, rb))
-                            } else {
-                                Value::Int(ops::bigint_mod_floor_i64(x, *y))
-                            }
-                        }
-                        _ => attempt!(ops::eval_mod(ra, rb)),
-                    };
-                    set!(dst, res);
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        let x = ra.as_inline_int_unchecked();
+                        let y = rb.as_inline_int_unchecked();
+                        let val = if y == 0 {
+                            let res = attempt!(ops::eval_mod(ra, rb));
+                            set!(dst, res);
+                            continue;
+                        } else if y == -1 {
+                            0
+                        } else if x >= 0 && y > 0 {
+                            x % y
+                        } else {
+                            x.mod_floor(&y)
+                        };
+                        set!(dst, Value::int(val));
+                    } else if let (Some(x), Some(y)) = (ra.as_bigint(), rb.as_int()) {
+                        let res = if y == 0 {
+                            attempt!(ops::eval_mod(ra, rb))
+                        } else {
+                            Value::int(ops::bigint_mod_floor_i64(x, y))
+                        };
+                        set!(dst, res);
+                    } else {
+                        let res = attempt!(ops::eval_mod(ra, rb));
+                        set!(dst, res);
+                    }
                 }
-                Instruction::Pow { dst, a, b } => {
+                ExecInst::Pow { dst, a, b } => {
                     arith_slow!(dst, a, b, ops::eval_pow, "__pow")
                 }
-                Instruction::BitAnd { dst, a, b } => {
+                ExecInst::BitAnd { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    if let (Value::Int(x), Value::Int(y)) = (ra, rb) {
-                        set!(dst, Value::Int(x & y));
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        set!(
+                            dst,
+                            Value::int(ra.as_inline_int_unchecked() & rb.as_inline_int_unchecked())
+                        );
                     } else {
                         attempt!(ops::eval_bitand_into(
                             &mut self.stack,
@@ -1397,11 +1345,14 @@ impl VM {
                         ));
                     }
                 }
-                Instruction::BitOr { dst, a, b } => {
+                ExecInst::BitOr { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    if let (Value::Int(x), Value::Int(y)) = (ra, rb) {
-                        set!(dst, Value::Int(x | y));
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        set!(
+                            dst,
+                            Value::int(ra.as_inline_int_unchecked() | rb.as_inline_int_unchecked())
+                        );
                     } else {
                         attempt!(ops::eval_bitor_into(
                             &mut self.stack,
@@ -1411,11 +1362,14 @@ impl VM {
                         ));
                     }
                 }
-                Instruction::BitXor { dst, a, b } => {
+                ExecInst::BitXor { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    if let (Value::Int(x), Value::Int(y)) = (ra, rb) {
-                        set!(dst, Value::Int(x ^ y));
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        set!(
+                            dst,
+                            Value::int(ra.as_inline_int_unchecked() ^ rb.as_inline_int_unchecked())
+                        );
                     } else {
                         attempt!(ops::eval_bitxor_into(
                             &mut self.stack,
@@ -1425,28 +1379,28 @@ impl VM {
                         ));
                     }
                 }
-                Instruction::Shl { dst, a, b } => {
+                ExecInst::Shl { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    match (ra, rb) {
-                        (Value::Int(x), Value::Int(y)) if *x >= 0 && *y >= 0 => {
-                            let res = if *x == 0 {
-                                Value::Int(0)
+                    match (ra.view(), rb.view()) {
+                        (ValueView::Int(x), ValueView::Int(y)) if x >= 0 && y >= 0 => {
+                            let res = if x == 0 {
+                                Value::int(0)
                             } else {
                                 let headroom = x.leading_zeros().saturating_sub(1) as i64;
                                 let headroom128 = (64 + x.leading_zeros() as i64).saturating_sub(1);
-                                if *y <= headroom {
-                                    Value::Int(x << *y)
-                                } else if *y <= headroom128 {
-                                    Value::from_i128((*x as i128) << *y)
+                                if y <= headroom {
+                                    Value::int(x << y)
+                                } else if y <= headroom128 {
+                                    Value::from_i128((x as i128) << y)
                                 } else {
                                     let x_bits = 64 - x.leading_zeros() as u64;
-                                    if (*y as u64) <= ops::MAX_INT_BITS
-                                        && x_bits.saturating_add(*y as u64) <= ops::MAX_INT_BITS
+                                    if (y as u64) <= ops::MAX_INT_BITS
+                                        && x_bits.saturating_add(y as u64) <= ops::MAX_INT_BITS
                                     {
-                                        Value::BigInt(std::rc::Rc::new(
-                                            num_bigint::BigInt::from(*x) << (*y as usize),
-                                        ))
+                                        Value::from_bigint(
+                                            num_bigint::BigInt::from(x) << (y as usize),
+                                        )
                                     } else {
                                         attempt!(ops::eval_shl(ra, rb))
                                     }
@@ -1454,8 +1408,8 @@ impl VM {
                             };
                             set!(dst, res);
                         }
-                        (Value::BigInt(_), Value::Int(y)) if *y >= 0 => {
-                            let shift = *y as u64;
+                        (ValueView::BigInt(_), ValueView::Int(y)) if y >= 0 => {
+                            let shift = y as u64;
                             attempt!(ops::eval_shl_bigint_into(
                                 &mut self.stack,
                                 base + dst as usize,
@@ -1469,25 +1423,25 @@ impl VM {
                         }
                     }
                 }
-                Instruction::Shr { dst, a, b } => {
+                ExecInst::Shr { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    match (ra, rb) {
-                        (Value::Int(x), Value::Int(y)) => {
-                            if *y < 0 {
+                    match (ra.view(), rb.view()) {
+                        (ValueView::Int(x), ValueView::Int(y)) => {
+                            if y < 0 {
                                 let res = attempt!(ops::eval_shr(ra, rb));
                                 set!(dst, res);
                             } else {
-                                let res = if *y >= 64 {
-                                    Value::Int(if *x < 0 { -1 } else { 0 })
+                                let res = if y >= 64 {
+                                    Value::int(if x < 0 { -1 } else { 0 })
                                 } else {
-                                    Value::Int(x >> *y)
+                                    Value::int(x >> y)
                                 };
                                 set!(dst, res);
                             }
                         }
-                        (Value::BigInt(_), Value::Int(y)) if *y >= 0 => {
-                            let shift = *y as u64;
+                        (ValueView::BigInt(_), ValueView::Int(y)) if y >= 0 => {
+                            let shift = y as u64;
                             ops::eval_shr_bigint_into(
                                 &mut self.stack,
                                 base + dst as usize,
@@ -1502,37 +1456,37 @@ impl VM {
                     }
                 }
 
-                Instruction::ShlI { dst, a, imm } => {
+                ExecInst::ShlI { dst, a, imm } => {
                     let ra = &reg!(a);
-                    match ra {
-                        Value::Int(x) if *x >= 0 => {
-                            let res = if *x == 0 {
-                                Value::Int(0)
+                    match ra.view() {
+                        ValueView::Int(x) if x >= 0 => {
+                            let res = if x == 0 {
+                                Value::int(0)
                             } else {
                                 let shift = imm as u32;
                                 let headroom = x.leading_zeros().saturating_sub(1);
                                 let headroom128 = (64 + x.leading_zeros()).saturating_sub(1);
                                 if shift <= headroom {
-                                    Value::Int(x << shift)
+                                    Value::int(x << shift)
                                 } else if shift <= headroom128 {
-                                    Value::from_i128((*x as i128) << shift)
+                                    Value::from_i128((x as i128) << shift)
                                 } else {
                                     let x_bits = 64 - x.leading_zeros() as u64;
                                     if (shift as u64) <= ops::MAX_INT_BITS
                                         && x_bits.saturating_add(shift as u64) <= ops::MAX_INT_BITS
                                     {
-                                        Value::BigInt(std::rc::Rc::new(
-                                            num_bigint::BigInt::from(*x) << (imm as usize),
-                                        ))
+                                        Value::from_bigint(
+                                            num_bigint::BigInt::from(x) << (imm as usize),
+                                        )
                                     } else {
-                                        let rb = Value::Int(imm as i64);
+                                        let rb = Value::int(imm as i64);
                                         attempt!(ops::eval_shl(ra, &rb))
                                     }
                                 }
                             };
                             set!(dst, res);
                         }
-                        Value::BigInt(_) => {
+                        ValueView::BigInt(_) => {
                             attempt!(ops::eval_shl_bigint_into(
                                 &mut self.stack,
                                 base + dst as usize,
@@ -1541,24 +1495,24 @@ impl VM {
                             ));
                         }
                         _ => {
-                            let rb = Value::Int(imm as i64);
+                            let rb = Value::int(imm as i64);
                             let res = attempt!(ops::eval_shl(ra, &rb));
                             set!(dst, res);
                         }
                     }
                 }
-                Instruction::ShrI { dst, a, imm } => {
+                ExecInst::ShrI { dst, a, imm } => {
                     let ra = &reg!(a);
-                    match ra {
-                        Value::Int(x) => {
+                    match ra.view() {
+                        ValueView::Int(x) => {
                             let res = if imm >= 64 {
-                                Value::Int(if *x < 0 { -1 } else { 0 })
+                                Value::int(if x < 0 { -1 } else { 0 })
                             } else {
-                                Value::Int(x >> imm)
+                                Value::int(x >> imm)
                             };
                             set!(dst, res);
                         }
-                        Value::BigInt(_) => {
+                        ValueView::BigInt(_) => {
                             ops::eval_shr_bigint_into(
                                 &mut self.stack,
                                 base + dst as usize,
@@ -1567,123 +1521,120 @@ impl VM {
                             );
                         }
                         _ => {
-                            let rb = Value::Int(imm as i64);
+                            let rb = Value::int(imm as i64);
                             let res = attempt!(ops::eval_shr(ra, &rb));
                             set!(dst, res);
                         }
                     }
                 }
 
-                Instruction::LShl { dst, a, b } => {
+                ExecInst::LShl { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    let res = match (ra, rb) {
-                        (Value::Int(x), Value::Int(y)) => {
-                            let word = *x as u64;
-                            let bits = if *y < 0 { usize::MAX } else { *y as usize };
-                            let val = if bits >= 64 { 0 } else { word << bits };
-                            Value::from_u64(val)
-                        }
-                        _ => attempt!(ops::eval_lshl(ra, rb)),
+                    let res = if let (Some(x), Some(y)) = (ra.as_int(), rb.as_int()) {
+                        let word = x as u64;
+                        let bits = if y < 0 { usize::MAX } else { y as usize };
+                        let val = if bits >= 64 { 0 } else { word << bits };
+                        Value::from_u64(val)
+                    } else {
+                        attempt!(ops::eval_lshl(ra, rb))
                     };
                     set!(dst, res);
                 }
-                Instruction::LShr { dst, a, b } => {
+                ExecInst::LShr { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    let res = match (ra, rb) {
-                        (Value::Int(x), Value::Int(y)) => {
-                            let word = *x as u64;
-                            let bits = if *y < 0 { usize::MAX } else { *y as usize };
-                            let val = if bits >= 64 { 0 } else { word >> bits };
-                            Value::from_u64(val)
-                        }
-                        _ => attempt!(ops::eval_lshr(ra, rb)),
+                    let res = if let (Some(x), Some(y)) = (ra.as_int(), rb.as_int()) {
+                        let word = x as u64;
+                        let bits = if y < 0 { usize::MAX } else { y as usize };
+                        let val = if bits >= 64 { 0 } else { word >> bits };
+                        Value::from_u64(val)
+                    } else {
+                        attempt!(ops::eval_lshr(ra, rb))
                     };
                     set!(dst, res);
                 }
-                Instruction::Concat { dst, a, b } => {
+                ExecInst::Concat { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    let res = match (ra, rb) {
-                        (Value::String(x), Value::String(y)) => {
-                            let mut s = String::with_capacity(x.len() + y.len());
-                            s.push_str(x);
-                            s.push_str(y);
-                            Value::string(s)
+                    let res = if let (Some(x), Some(y)) = (ra.as_str(), rb.as_str()) {
+                        let mut s = String::with_capacity(x.len() + y.len());
+                        s.push_str(x);
+                        s.push_str(y);
+                        Value::string(s)
+                    } else if ra.is_table() || rb.is_table() {
+                        if let Some(mm) = self.get_binop_metamethod(ra, rb, "__concat") {
+                            let (va, vb) = (ra.clone(), rb.clone());
+                            sync_ip!();
+                            self.call_binop_mm(mm, va, vb, base, dst)?;
+                            continue;
                         }
-                        (Value::Table(_), _) | (_, Value::Table(_)) => {
-                            if let Some(mm) = self.get_binop_metamethod(ra, rb, "__concat") {
-                                let (va, vb) = (ra.clone(), rb.clone());
-                                sync_ip!();
-                                self.call_binop_mm(mm, va, vb, base, dst)?;
-                                continue;
-                            }
-                            Value::string(format!("{}{}", ra, rb))
-                        }
-                        _ => Value::string(format!("{}{}", ra, rb)),
+                        Value::string(format!("{}{}", ra, rb))
+                    } else {
+                        Value::string(format!("{}{}", ra, rb))
                     };
                     set!(dst, res);
                 }
-                Instruction::Unm { dst, src } => {
+                ExecInst::Unm { dst, src } => {
                     let v = &reg!(src);
-                    match v {
-                        Value::Int(i) if *i != i64::MIN => set!(dst, Value::Int(-i)),
-                        Value::Float(f) => set!(dst, Value::Float(-f)),
-                        Value::Table(_) => {
-                            if let Some(mm) = self.get_unop_metamethod(v, "__unm") {
-                                let v = v.clone();
-                                sync_ip!();
-                                let res = self.call_function(mm, &[v])?;
-                                set!(dst, res.into_iter().next().unwrap_or(Value::Nil));
-                                continue;
-                            }
-                            throw!("unary minus expects a number");
+                    if v.is_inline_int() {
+                        set!(dst, Value::int(-v.as_inline_int_unchecked()));
+                    } else if v.is_float() {
+                        set!(dst, Value::float(-v.as_float_unchecked()));
+                    } else if v.is_table() {
+                        if let Some(mm) = self.get_unop_metamethod(v, "__unm") {
+                            let v = v.clone();
+                            sync_ip!();
+                            let res = self.call_function(mm, &[v])?;
+                            set!(dst, res.into_iter().next().unwrap_or(Value::NIL));
+                            continue;
                         }
-                        _ => attempt!(ops::eval_unm_into(
+                        throw!("unary minus expects a number");
+                    } else {
+                        attempt!(ops::eval_unm_into(
                             &mut self.stack,
                             base + dst as usize,
                             base + src as usize,
-                        )),
+                        ));
                     }
                 }
-                Instruction::Not { dst, src } => {
+                ExecInst::Not { dst, src } => {
                     let truthy = reg!(src).is_truthy();
-                    set!(dst, Value::Bool(!truthy));
+                    set!(dst, Value::bool(!truthy));
                 }
-                Instruction::Len { dst, src } => {
+                ExecInst::Len { dst, src } => {
                     let v = &reg!(src);
-                    let len = match v {
-                        Value::String(s) => s.len(),
-                        Value::Table(t) => {
+                    let len = match v.view() {
+                        ValueView::String(s) => s.len(),
+                        ValueView::Table(t) => {
                             if let Some(mm) = self.get_unop_metamethod(v, "__len") {
                                 let v = v.clone();
                                 sync_ip!();
                                 let res = self.call_function(mm, &[v])?;
-                                set!(dst, res.into_iter().next().unwrap_or(Value::Nil));
+                                set!(dst, res.into_iter().next().unwrap_or(Value::NIL));
                                 continue;
                             }
                             t.borrow().array.len()
                         }
-                        Value::Buffer(b) => b.borrow().len(),
+                        ValueView::Buffer(b) => b.borrow().len(),
                         _ => throw!("len expects string, table or buffer"),
                     };
                     set!(dst, Value::from_usize(len));
                 }
-                Instruction::BitNot { dst, src } => {
+                ExecInst::BitNot { dst, src } => {
                     let res = attempt!(ops::eval_bitnot(&reg!(src)));
                     set!(dst, res);
                 }
-                Instruction::Coalesce { dst, a, b } => {
+                ExecInst::Coalesce { dst, a, b } => {
                     let va = &reg!(a);
-                    let res = if matches!(va, Value::Nil) {
+                    let res = if va.is_nil() {
                         reg!(b).clone()
                     } else {
                         va.clone()
                     };
                     set!(dst, res);
                 }
-                Instruction::Eq {
+                ExecInst::Eq {
                     a,
                     b,
                     jump_if_false,
@@ -1693,7 +1644,7 @@ impl VM {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::Ne {
+                ExecInst::Ne {
                     a,
                     b,
                     jump_if_false,
@@ -1703,77 +1654,159 @@ impl VM {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::Lt {
+                ExecInst::LtInt {
                     a,
                     b,
                     jump_if_false,
                 } => {
-                    if !deopted && matches!((&reg!(a), &reg!(b)), (Value::Int(_), Value::Int(_))) {
-                        current_closure.proto.set_quick_op(
-                            cur_ip,
-                            QuickOp::LtInt {
-                                a,
-                                b,
-                                jump_if_false,
-                            },
-                        );
+                    let ra = &reg!(a);
+                    let rb = &reg!(b);
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        if !(ra.as_inline_int_unchecked() < rb.as_inline_int_unchecked()) {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::LtGeneric {
+                        a,
+                        b,
+                        jump_if_false,
+                    }));
+                    compare!(a, b, jump_if_false, <, ops::eval_lt, "__lt", false)
+                }
+                ExecInst::Lt {
+                    a,
+                    b,
+                    jump_if_false,
+                } => {
+                    if reg!(a).is_inline_int() && reg!(b).is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::LtInt {
+                            a,
+                            b,
+                            jump_if_false,
+                        }));
                     }
                     compare!(a, b, jump_if_false, <, ops::eval_lt, "__lt", false)
                 }
-                Instruction::Le {
+                ExecInst::LtGeneric {
                     a,
                     b,
                     jump_if_false,
                 } => {
-                    if !deopted && matches!((&reg!(a), &reg!(b)), (Value::Int(_), Value::Int(_))) {
-                        current_closure.proto.set_quick_op(
-                            cur_ip,
-                            QuickOp::LeInt {
-                                a,
-                                b,
-                                jump_if_false,
-                            },
-                        );
+                    compare!(a, b, jump_if_false, <, ops::eval_lt, "__lt", false)
+                }
+                ExecInst::LeInt {
+                    a,
+                    b,
+                    jump_if_false,
+                } => {
+                    let ra = &reg!(a);
+                    let rb = &reg!(b);
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        if !(ra.as_inline_int_unchecked() <= rb.as_inline_int_unchecked()) {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::LeGeneric {
+                        a,
+                        b,
+                        jump_if_false,
+                    }));
+                    compare!(a, b, jump_if_false, <=, ops::eval_le, "__le", false)
+                }
+                ExecInst::Le {
+                    a,
+                    b,
+                    jump_if_false,
+                } => {
+                    if reg!(a).is_inline_int() && reg!(b).is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::LeInt {
+                            a,
+                            b,
+                            jump_if_false,
+                        }));
                     }
                     compare!(a, b, jump_if_false, <=, ops::eval_le, "__le", false)
                 }
-                Instruction::Gt {
+                ExecInst::LeGeneric {
+                    a,
+                    b,
+                    jump_if_false,
+                } => {
+                    compare!(a, b, jump_if_false, <=, ops::eval_le, "__le", false)
+                }
+                ExecInst::Gt {
                     a,
                     b,
                     jump_if_false,
                 } => {
                     compare!(a, b, jump_if_false, >, ops::eval_gt, "__lt", true)
                 }
-                Instruction::Ge {
+                ExecInst::Ge {
                     a,
                     b,
                     jump_if_false,
                 } => {
                     compare!(a, b, jump_if_false, >=, ops::eval_ge, "__le", true)
                 }
-                Instruction::EqK {
+                ExecInst::EqIntK {
+                    a,
+                    k,
+                    jump_if_false,
+                } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        if ra.as_inline_int_unchecked() != rb.as_inline_int_unchecked() {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::EqKGeneric {
+                        a,
+                        k,
+                        jump_if_false,
+                    }));
+                    let va = ra.clone();
+                    let vb = rb.clone();
+                    let is_eq = self.values_equal_val(&va, &vb, ip)?;
+                    if !is_eq {
+                        jump!(jump_if_false);
+                    }
+                }
+                ExecInst::EqK {
                     a,
                     k,
                     jump_if_false,
                 } => {
                     let va = self.stack[base + a as usize].clone();
                     let vb = consts[k as usize].clone();
-                    if !deopted && let (Value::Int(_), Value::Int(imm)) = (&va, &vb) {
-                        current_closure.proto.set_quick_op(
-                            cur_ip,
-                            QuickOp::EqIntK {
-                                a,
-                                imm: *imm,
-                                jump_if_false,
-                            },
-                        );
+                    if va.is_inline_int() && vb.is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::EqIntK {
+                            a,
+                            k,
+                            jump_if_false,
+                        }));
                     }
                     let is_eq = self.values_equal_val(&va, &vb, ip)?;
                     if !is_eq {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::NeK {
+                ExecInst::EqKGeneric {
+                    a,
+                    k,
+                    jump_if_false,
+                } => {
+                    let va = self.stack[base + a as usize].clone();
+                    let vb = consts[k as usize].clone();
+                    let is_eq = self.values_equal_val(&va, &vb, ip)?;
+                    if !is_eq {
+                        jump!(jump_if_false);
+                    }
+                }
+                ExecInst::NeK {
                     a,
                     k,
                     jump_if_false,
@@ -1785,144 +1818,305 @@ impl VM {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::LtK {
+                ExecInst::LtIntK {
                     a,
                     k,
                     jump_if_false,
                 } => {
-                    if !deopted
-                        && let (Value::Int(_), Value::Int(imm)) = (&reg!(a), &consts[k as usize])
-                    {
-                        current_closure.proto.set_quick_op(
-                            cur_ip,
-                            QuickOp::LtIntK {
-                                a,
-                                imm: *imm,
-                                jump_if_false,
-                            },
-                        );
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        if !(ra.as_inline_int_unchecked() < rb.as_inline_int_unchecked()) {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::LtKGeneric {
+                        a,
+                        k,
+                        jump_if_false,
+                    }));
+                    compare_k!(a, k, jump_if_false, <, ops::eval_lt, "__lt", false)
+                }
+                ExecInst::LtK {
+                    a,
+                    k,
+                    jump_if_false,
+                } => {
+                    if reg!(a).is_inline_int() && consts[k as usize].is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::LtIntK {
+                            a,
+                            k,
+                            jump_if_false,
+                        }));
                     }
                     compare_k!(a, k, jump_if_false, <, ops::eval_lt, "__lt", false)
                 }
-                Instruction::LeK {
+                ExecInst::LtKGeneric {
                     a,
                     k,
                     jump_if_false,
                 } => {
-                    if !deopted
-                        && let (Value::Int(_), Value::Int(imm)) = (&reg!(a), &consts[k as usize])
-                    {
-                        current_closure.proto.set_quick_op(
-                            cur_ip,
-                            QuickOp::LeIntK {
-                                a,
-                                imm: *imm,
-                                jump_if_false,
-                            },
-                        );
+                    compare_k!(a, k, jump_if_false, <, ops::eval_lt, "__lt", false)
+                }
+                ExecInst::LeIntK {
+                    a,
+                    k,
+                    jump_if_false,
+                } => {
+                    let ra = &reg!(a);
+                    let rb = &consts[k as usize];
+                    if ra.is_inline_int() && rb.is_inline_int() {
+                        if !(ra.as_inline_int_unchecked() <= rb.as_inline_int_unchecked()) {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::LeKGeneric {
+                        a,
+                        k,
+                        jump_if_false,
+                    }));
+                    compare_k!(a, k, jump_if_false, <=, ops::eval_le, "__le", false)
+                }
+                ExecInst::LeK {
+                    a,
+                    k,
+                    jump_if_false,
+                } => {
+                    if reg!(a).is_inline_int() && consts[k as usize].is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::LeIntK {
+                            a,
+                            k,
+                            jump_if_false,
+                        }));
                     }
                     compare_k!(a, k, jump_if_false, <=, ops::eval_le, "__le", false)
                 }
-                Instruction::GtK {
+                ExecInst::LeKGeneric {
+                    a,
+                    k,
+                    jump_if_false,
+                } => {
+                    compare_k!(a, k, jump_if_false, <=, ops::eval_le, "__le", false)
+                }
+                ExecInst::GtK {
                     a,
                     k,
                     jump_if_false,
                 } => {
                     compare_k!(a, k, jump_if_false, >, ops::eval_gt, "__lt", true)
                 }
-                Instruction::GeK {
+                ExecInst::GeK {
                     a,
                     k,
                     jump_if_false,
                 } => {
                     compare_k!(a, k, jump_if_false, >=, ops::eval_ge, "__le", true)
                 }
-                Instruction::EqI {
+                ExecInst::EqI {
                     a,
                     imm,
                     jump_if_false,
                 } => {
-                    let is_eq = match &reg!(a) {
-                        Value::Int(x) => *x == imm as i64,
-                        Value::Float(x) => *x == imm as f64,
-                        _ => false,
+                    let ra = &reg!(a);
+                    let is_eq = if ra.is_inline_int() {
+                        ra.as_inline_int_unchecked() == imm as i64
+                    } else if ra.is_float() {
+                        ra.as_float_unchecked() == imm as f64
+                    } else {
+                        false
                     };
                     if !is_eq {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::NeI {
+                ExecInst::NeI {
                     a,
                     imm,
                     jump_if_false,
                 } => {
-                    let is_eq = match &reg!(a) {
-                        Value::Int(x) => *x == imm as i64,
-                        Value::Float(x) => *x == imm as f64,
-                        _ => false,
+                    let ra = &reg!(a);
+                    let is_eq = if ra.is_inline_int() {
+                        ra.as_inline_int_unchecked() == imm as i64
+                    } else if ra.is_float() {
+                        ra.as_float_unchecked() == imm as f64
+                    } else {
+                        false
                     };
                     if is_eq {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::LtI {
+                ExecInst::LtIntI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    let ra = &reg!(a);
+                    if ra.is_inline_int() {
+                        if !(ra.as_inline_int_unchecked() < imm as i64) {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::LtIGeneric {
+                        a,
+                        imm,
+                        jump_if_false,
+                    }));
+                    compare_imm!(a, imm, jump_if_false, <, ops::eval_lt, "__lt", false)
+                }
+                ExecInst::LtI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    if reg!(a).is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::LtIntI {
+                            a,
+                            imm,
+                            jump_if_false,
+                        }));
+                    }
+                    compare_imm!(a, imm, jump_if_false, <, ops::eval_lt, "__lt", false)
+                }
+                ExecInst::LtIGeneric {
                     a,
                     imm,
                     jump_if_false,
                 } => {
                     compare_imm!(a, imm, jump_if_false, <, ops::eval_lt, "__lt", false)
                 }
-                Instruction::LeI {
+                ExecInst::LeIntI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    let ra = &reg!(a);
+                    if ra.is_inline_int() {
+                        if !(ra.as_inline_int_unchecked() <= imm as i64) {
+                            jump!(jump_if_false);
+                        }
+                        continue;
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::LeIGeneric {
+                        a,
+                        imm,
+                        jump_if_false,
+                    }));
+                    compare_imm!(a, imm, jump_if_false, <=, ops::eval_le, "__le", false)
+                }
+                ExecInst::LeI {
+                    a,
+                    imm,
+                    jump_if_false,
+                } => {
+                    if reg!(a).is_inline_int() {
+                        code[cur_ip].set(AlignedExec(ExecInst::LeIntI {
+                            a,
+                            imm,
+                            jump_if_false,
+                        }));
+                    }
+                    compare_imm!(a, imm, jump_if_false, <=, ops::eval_le, "__le", false)
+                }
+                ExecInst::LeIGeneric {
                     a,
                     imm,
                     jump_if_false,
                 } => {
                     compare_imm!(a, imm, jump_if_false, <=, ops::eval_le, "__le", false)
                 }
-                Instruction::GtI {
+                ExecInst::GtI {
                     a,
                     imm,
                     jump_if_false,
                 } => {
                     compare_imm!(a, imm, jump_if_false, >, ops::eval_gt, "__lt", true)
                 }
-                Instruction::GeI {
+                ExecInst::GeI {
                     a,
                     imm,
                     jump_if_false,
                 } => {
                     compare_imm!(a, imm, jump_if_false, >=, ops::eval_ge, "__le", true)
                 }
-                Instruction::Test { reg, jump_if_false } => {
+                ExecInst::Test { reg, jump_if_false } => {
                     if !reg!(reg).is_truthy() {
                         jump!(jump_if_false);
                     }
                 }
-                Instruction::Jump { offset } => {
+                ExecInst::Jump { offset } => {
                     if !TRAP && offset < 0 {
                         attempt!(self.limits.check_interrupt());
                     }
                     jump!(offset);
                 }
-                Instruction::ForPrep { base: b, jump } => {
+                ExecInst::ForPrep { base: b, jump } => {
                     let step = &reg!(b + 2);
-                    match step {
-                        Value::Int(0) => throw!("numeric for step cannot be zero"),
-                        Value::Float(f) if *f == 0.0 => {
+                    match step.view() {
+                        ValueView::Int(0) => throw!("numeric for step cannot be zero"),
+                        ValueView::Float(0.0) => {
                             throw!("numeric for step cannot be zero")
                         }
                         _ => {}
                     }
                     let init = &reg!(b);
-                    if let (Value::Int(i), Value::Int(s)) = (init, step)
-                        && let Some(diff) = i.checked_sub(*s)
-                    {
-                        let slot = slot_mut(&mut self.stack, base + b as usize);
-                        if let Value::Int(old) = slot {
-                            *old = diff;
-                        } else {
-                            *slot = Value::Int(diff);
+                    let limit = &reg!(b + 1);
+                    let target_ip = (ip as isize + jump as isize) as usize;
+                    if init.is_inline_int() && limit.is_inline_int() && step.is_inline_int() {
+                        let i = init.as_inline_int_unchecked();
+                        let lim = limit.as_inline_int_unchecked();
+                        let s = step.as_inline_int_unchecked();
+                        if s != 0
+                            && let Some(diff) = i.checked_sub(s)
+                        {
+                            let iters: i128 = if (s > 0 && i <= lim) || (s < 0 && i >= lim) {
+                                ((lim as i128 - i as i128) / (s as i128)) + 1
+                            } else {
+                                0
+                            };
+                            // `ForLoopCount*` only accept inline ints, so
+                            // both the index and the count must fit in one.
+                            if (INLINE_INT_MIN..=INLINE_INT_MAX).contains(&diff)
+                                && (0..=INLINE_INT_MAX as i128).contains(&iters)
+                                && let Some(
+                                    ExecInst::ForLoop { base: fb, jump: fj }
+                                    | ExecInst::ForLoopInt { base: fb, jump: fj }
+                                    | ExecInst::ForLoopCount { base: fb, jump: fj }
+                                    | ExecInst::ForLoopCount1 { base: fb, jump: fj }
+                                    | ExecInst::ForLoopGeneric { base: fb, jump: fj },
+                                ) = code.get(target_ip).map(|c| c.get().0)
+                                && fb == b
+                            {
+                                let specialized = if s == 1 {
+                                    ExecInst::ForLoopCount1 { base: fb, jump: fj }
+                                } else {
+                                    ExecInst::ForLoopCount { base: fb, jump: fj }
+                                };
+                                code[target_ip].set(AlignedExec(specialized));
+                                set!(b, Value::int(diff));
+                                set!(b + 1, Value::int(iters as i64));
+                                jump!(jump);
+                                continue;
+                            }
                         }
+                    }
+                    if let Some(
+                        ExecInst::ForLoopCount { base: fb, jump: fj }
+                        | ExecInst::ForLoopCount1 { base: fb, jump: fj },
+                    ) = code.get(target_ip).map(|c| c.get().0)
+                    {
+                        code[target_ip].set(AlignedExec(ExecInst::ForLoop { base: fb, jump: fj }));
+                    }
+                    if init.is_inline_int()
+                        && step.is_inline_int()
+                        && let Some(diff) = init
+                            .as_inline_int_unchecked()
+                            .checked_sub(step.as_inline_int_unchecked())
+                    {
+                        set!(b, Value::int(diff));
                         jump!(jump);
                         continue;
                     }
@@ -1930,44 +2124,132 @@ impl VM {
                     set!(b, init_minus_step);
                     jump!(jump);
                 }
-                Instruction::ForLoop { base: b, jump } => {
-                    let idx = &reg!(b);
-                    let limit = &reg!(b + 1);
-                    let step = &reg!(b + 2);
-                    // All-integer loops are the common case and need no
-                    // allocation or generic dispatch at all.
-                    if let (Value::Int(i), Value::Int(lim), Value::Int(st)) = (idx, limit, step)
-                        && let Some(next) = i.checked_add(*st)
-                    {
-                        let again = if *st >= 0 { next <= *lim } else { next >= *lim };
-                        let slot_b = slot_mut(&mut self.stack, base + b as usize);
-                        if let Value::Int(old) = slot_b {
-                            *old = next;
-                        } else {
-                            *slot_b = Value::Int(next);
+                ExecInst::ForLoopCount { base: b, jump } => {
+                    let rem_val = &reg!(b + 1);
+                    let rem = if rem_val.is_inline_int() {
+                        rem_val.as_inline_int_unchecked()
+                    } else {
+                        code[cur_ip].set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
+                        throw!("invalid loop state");
+                    };
+                    if rem > 0 {
+                        let idx_val = &reg!(b);
+                        let step_val = &reg!(b + 2);
+                        if !idx_val.is_inline_int() || !step_val.is_inline_int() {
+                            code[cur_ip]
+                                .set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
+                            throw!("invalid loop state");
                         }
-                        if again {
-                            let slot_v = slot_mut(&mut self.stack, base + (b + 3) as usize);
-                            if let Value::Int(old) = slot_v {
-                                *old = next;
-                            } else {
-                                *slot_v = Value::Int(next);
-                            }
-                            jump!(jump);
-                        }
-                        continue;
+                        let next = idx_val
+                            .as_inline_int_unchecked()
+                            .wrapping_add(step_val.as_inline_int_unchecked());
+                        set!(b + 1, Value::int(rem - 1));
+                        set!(b, Value::int(next));
+                        set!(b + 3, Value::int(next));
+                        jump!(jump);
                     }
-                    match step {
-                        Value::Int(0) => throw!("numeric for step cannot be zero"),
-                        Value::Float(f) if *f == 0.0 => {
+                    continue;
+                }
+                ExecInst::ForLoopCount1 { base: b, jump } => {
+                    let rem_val = &reg!(b + 1);
+                    let rem = if rem_val.is_inline_int() {
+                        rem_val.as_inline_int_unchecked()
+                    } else {
+                        code[cur_ip].set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
+                        throw!("invalid loop state");
+                    };
+                    if rem > 0 {
+                        let idx_val = &reg!(b);
+                        if !idx_val.is_inline_int() {
+                            code[cur_ip]
+                                .set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
+                            throw!("invalid loop state");
+                        }
+                        let next = idx_val.as_inline_int_unchecked().wrapping_add(1);
+                        set!(b + 1, Value::int(rem - 1));
+                        set!(b, Value::int(next));
+                        set!(b + 3, Value::int(next));
+                        jump!(jump);
+                    }
+                    continue;
+                }
+                ExecInst::ForLoopInt { base: b, jump } => {
+                    let idx_v = &reg!(b);
+                    let lim_v = &reg!(b + 1);
+                    let step_v = &reg!(b + 2);
+                    if idx_v.is_inline_int() && lim_v.is_inline_int() && step_v.is_inline_int() {
+                        let i = idx_v.as_inline_int_unchecked();
+                        let lim = lim_v.as_inline_int_unchecked();
+                        let st = step_v.as_inline_int_unchecked();
+                        if let Some(next) = i.checked_add(st) {
+                            let again = if st >= 0 { next <= lim } else { next >= lim };
+                            set!(b, Value::int(next));
+                            if again {
+                                set!(b + 3, Value::int(next));
+                                jump!(jump);
+                            }
+                            continue;
+                        }
+                    }
+                    code[cur_ip].set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
+                    let step = &reg!(b + 2);
+                    match step.view() {
+                        ValueView::Int(0) => throw!("numeric for step cannot be zero"),
+                        ValueView::Float(0.0) => {
                             throw!("numeric for step cannot be zero")
                         }
                         _ => {}
                     }
-                    let is_positive = match step {
-                        Value::Int(i) => *i >= 0,
-                        Value::BigInt(i) => num_traits::Signed::is_positive(&**i),
-                        Value::Float(f) => *f >= 0.0,
+                    let is_positive = match step.view() {
+                        ValueView::Int(i) => i >= 0,
+                        ValueView::BigInt(i) => num_traits::Signed::is_positive(i),
+                        ValueView::Float(f) => f >= 0.0,
+                        _ => true,
+                    };
+                    let idx = &reg!(b);
+                    let limit = &reg!(b + 1);
+                    let next_idx = attempt!(ops::eval_add(idx, step));
+                    let loop_again = if is_positive {
+                        attempt!(ops::eval_le(&next_idx, limit))
+                    } else {
+                        attempt!(ops::eval_ge(&next_idx, limit))
+                    };
+                    set!(b, next_idx.clone());
+                    if loop_again {
+                        set!(b + 3, next_idx);
+                        jump!(jump);
+                    }
+                }
+                ExecInst::ForLoop { base: b, jump } => {
+                    let idx = &reg!(b);
+                    let limit = &reg!(b + 1);
+                    let step = &reg!(b + 2);
+                    if idx.is_inline_int() && limit.is_inline_int() && step.is_inline_int() {
+                        let i = idx.as_inline_int_unchecked();
+                        let lim = limit.as_inline_int_unchecked();
+                        let st = step.as_inline_int_unchecked();
+                        if let Some(next) = i.checked_add(st) {
+                            code[cur_ip].set(AlignedExec(ExecInst::ForLoopInt { base: b, jump }));
+                            let again = if st >= 0 { next <= lim } else { next >= lim };
+                            set!(b, Value::int(next));
+                            if again {
+                                set!(b + 3, Value::int(next));
+                                jump!(jump);
+                            }
+                            continue;
+                        }
+                    }
+                    match step.view() {
+                        ValueView::Int(0) => throw!("numeric for step cannot be zero"),
+                        ValueView::Float(0.0) => {
+                            throw!("numeric for step cannot be zero")
+                        }
+                        _ => {}
+                    }
+                    let is_positive = match step.view() {
+                        ValueView::Int(i) => i >= 0,
+                        ValueView::BigInt(i) => num_traits::Signed::is_positive(i),
+                        ValueView::Float(f) => f >= 0.0,
                         _ => true,
                     };
                     let next_idx = attempt!(ops::eval_add(idx, step));
@@ -1982,7 +2264,50 @@ impl VM {
                         jump!(jump);
                     }
                 }
-                Instruction::Closure { dst, proto_idx } => {
+                ExecInst::ForLoopGeneric { base: b, jump } => {
+                    let idx = &reg!(b);
+                    let limit = &reg!(b + 1);
+                    let step = &reg!(b + 2);
+                    if idx.is_inline_int() && limit.is_inline_int() && step.is_inline_int() {
+                        let i = idx.as_inline_int_unchecked();
+                        let lim = limit.as_inline_int_unchecked();
+                        let st = step.as_inline_int_unchecked();
+                        if let Some(next) = i.checked_add(st) {
+                            let again = if st >= 0 { next <= lim } else { next >= lim };
+                            set!(b, Value::int(next));
+                            if again {
+                                set!(b + 3, Value::int(next));
+                                jump!(jump);
+                            }
+                            continue;
+                        }
+                    }
+                    match step.view() {
+                        ValueView::Int(0) => throw!("numeric for step cannot be zero"),
+                        ValueView::Float(0.0) => {
+                            throw!("numeric for step cannot be zero")
+                        }
+                        _ => {}
+                    }
+                    let is_positive = match step.view() {
+                        ValueView::Int(i) => i >= 0,
+                        ValueView::BigInt(i) => num_traits::Signed::is_positive(i),
+                        ValueView::Float(f) => f >= 0.0,
+                        _ => true,
+                    };
+                    let next_idx = attempt!(ops::eval_add(idx, step));
+                    let loop_again = if is_positive {
+                        attempt!(ops::eval_le(&next_idx, limit))
+                    } else {
+                        attempt!(ops::eval_ge(&next_idx, limit))
+                    };
+                    set!(b, next_idx.clone());
+                    if loop_again {
+                        set!(b + 3, next_idx);
+                        jump!(jump);
+                    }
+                }
+                ExecInst::Closure { dst, proto_idx } => {
                     let child_proto = current_closure.proto.protos[proto_idx as usize].clone();
                     let mut upvalues = Vec::with_capacity(child_proto.upvalues.len());
                     for updesc in &child_proto.upvalues {
@@ -1993,17 +2318,303 @@ impl VM {
                                 .upvalues
                                 .get(updesc.index as usize)
                                 .cloned()
-                                .unwrap_or_else(|| Upvalue::closed(Value::Nil));
+                                .unwrap_or_else(|| Upvalue::closed(Value::NIL));
                             upvalues.push(up);
                         }
                     }
-                    let new_closure = Value::Closure(Rc::new(VmClosure {
+                    let new_closure = Value::closure(Rc::new(VmClosure {
                         proto: child_proto,
                         upvalues,
                     }));
                     set!(dst, new_closure);
                 }
-                Instruction::Call { callee, argc, retc } => {
+                ExecInst::TailCall { callee, argc } => {
+                    let args_start = base + callee as usize + 1;
+                    let args_end = if argc == MULTRET {
+                        self.top.max(args_start)
+                    } else {
+                        args_start + argc as usize
+                    };
+                    let actual_argc = args_end - args_start;
+                    if args_end > self.stack.len() {
+                        self.stack.resize(args_end, Value::NIL);
+                    }
+                    sync_ip!();
+
+                    if base >= 1
+                        && let Some(callee_closure) = reg!(callee).as_closure()
+                    {
+                        let callee_closure = callee_closure.to_rc();
+                        let same_closure = Rc::ptr_eq(&current_closure, &callee_closure);
+                        let (max_registers, num_params, is_vararg) = {
+                            let proto = &callee_closure.proto;
+                            (
+                                proto.max_registers as usize,
+                                proto.num_params as usize,
+                                proto.is_vararg,
+                            )
+                        };
+                        if same_closure && !is_vararg && argc != MULTRET && !self.debug_active {
+                            if !TRAP {
+                                attempt!(self.limits.check_interrupt());
+                            }
+                            self.close_upvalues_if_needed(base);
+                            let needed = base + max_registers;
+                            if needed >= self.stack.len() {
+                                self.stack.resize(needed + 1, Value::NIL);
+                            }
+                            let copy_n = actual_argc.min(num_params);
+                            for k in 0..copy_n {
+                                let src_idx = args_start + k;
+                                let dst_idx = base + k;
+                                let bits = slot(&self.stack, src_idx).bits();
+                                let v = if bits < TAG_RC_START {
+                                    unsafe { Value::from_trivial_bits(bits) }
+                                } else {
+                                    std::mem::replace(
+                                        slot_mut(&mut self.stack, src_idx),
+                                        Value::NIL,
+                                    )
+                                };
+                                slot_mut(&mut self.stack, dst_idx).set_inplace(v);
+                            }
+                            for k in copy_n..num_params {
+                                slot_mut(&mut self.stack, base + k).set_inplace(Value::NIL);
+                            }
+                            ip = 0;
+                            continue;
+                        }
+
+                        if !TRAP {
+                            attempt!(self.limits.check_interrupt());
+                        }
+                        let mut next_closure = if same_closure {
+                            None
+                        } else {
+                            Some(callee_closure)
+                        };
+                        self.close_upvalues_if_needed(base);
+                        let caller_dest = base - 1;
+                        let callee_abs = base + callee as usize;
+                        let shift = callee_abs - caller_dest;
+                        let len = args_end - callee_abs;
+                        for k in 0..len {
+                            let v = std::mem::replace(&mut self.stack[callee_abs + k], Value::NIL);
+                            self.stack[caller_dest + k] = v;
+                        }
+                        if self.top > callee_abs {
+                            self.top -= shift;
+                        }
+                        let needed = base + max_registers;
+                        if needed >= self.stack.len() {
+                            self.stack.resize(needed + 1, Value::NIL);
+                        }
+                        for i in actual_argc..num_params {
+                            self.stack[base + i] = Value::NIL;
+                        }
+                        if is_vararg && actual_argc > num_params {
+                            let varargs =
+                                self.stack[base + num_params..base + actual_argc].to_vec();
+                            let frame_closure = match &next_closure {
+                                Some(c) => Rc::clone(c),
+                                None => Rc::clone(&current_closure),
+                            };
+                            let want_ret = self.frames.last().expect(RUNNING_FRAME).want_ret;
+                            *self.frames.last_mut().expect(RUNNING_FRAME) =
+                                CallFrame::with_varargs(frame_closure, base, varargs)
+                                    .wanting(want_ret);
+                        } else if let Some(c) = &next_closure {
+                            let frame = self.frames.last_mut().expect(RUNNING_FRAME);
+                            frame.closure = Rc::clone(c);
+                            frame.ip = 0;
+                            frame.clear_varargs();
+                        } else {
+                            let frame = self.frames.last_mut().expect(RUNNING_FRAME);
+                            frame.ip = 0;
+                            frame.clear_varargs();
+                        }
+                        if self.debug_active {
+                            if self.hook.is_some() {
+                                self.fire_hook(HookEvent::TailCall)?;
+                            }
+                            if self.dap.is_some() {
+                                let active = next_closure.as_ref().unwrap_or(&current_closure);
+                                let func_name =
+                                    active.proto.name.as_deref().unwrap_or("<anonymous>");
+                                crate::dap::check_break(self, func_name)?;
+                            }
+                        }
+                        if let Some(next) = next_closure.take() {
+                            if !next.proto.is_verified() {
+                                crate::bytecode::verify_proto(&next.proto)
+                                    .map_err(|e| e.to_string())?;
+                                next.proto.mark_verified();
+                            }
+                            current_closure = next;
+                            exec = current_closure.proto.exec();
+                            code = &exec.ops;
+                            consts = current_closure.proto.values();
+                        }
+                        ip = 0;
+                        continue;
+                    }
+
+                    // Fallback when `base == 0` or callee is Native / Table: run regular Call with MULTRET
+                    // and let the trailing `Return { count: MULTRET }` at `ip` return results.
+                    match reg!(callee).view() {
+                        ValueView::Closure(callee_closure) => {
+                            let callee_closure = callee_closure.to_rc();
+                            if self.call_depth() >= self.max_call_depth {
+                                throw!(
+                                    "call stack overflow: exceeded maximum call depth of {}",
+                                    self.max_call_depth
+                                );
+                            }
+                            let same_closure = Rc::ptr_eq(&current_closure, &callee_closure);
+                            let (max_registers, num_params, is_vararg) = {
+                                let proto = &callee_closure.proto;
+                                (
+                                    proto.max_registers as usize,
+                                    proto.num_params as usize,
+                                    proto.is_vararg,
+                                )
+                            };
+                            let mut next_closure = if same_closure {
+                                None
+                            } else {
+                                Some(callee_closure)
+                            };
+                            let new_base = args_start;
+                            let needed = new_base + max_registers;
+                            if needed >= self.stack.len() {
+                                self.stack.resize(needed + 1, Value::NIL);
+                            }
+                            for i in actual_argc..num_params {
+                                self.stack[new_base + i] = Value::NIL;
+                            }
+                            let frame_closure = match &next_closure {
+                                Some(c) => Rc::clone(c),
+                                None => Rc::clone(&current_closure),
+                            };
+                            let new_frame = if is_vararg && actual_argc > num_params {
+                                let varargs = self.stack
+                                    [new_base + num_params..new_base + actual_argc]
+                                    .to_vec();
+                                CallFrame::with_varargs(frame_closure, new_base, varargs)
+                            } else {
+                                CallFrame::new(frame_closure, new_base)
+                            }
+                            .wanting(MULTRET);
+                            self.frames.push(new_frame);
+                            if self.debug_active {
+                                if self.hook.is_some()
+                                    && let Err(err) = self.fire_hook(HookEvent::Call)
+                                {
+                                    self.frames.pop();
+                                    sync_ip!();
+                                    return Err(err);
+                                }
+                                if self.dap.is_some() {
+                                    let active = next_closure.as_ref().unwrap_or(&current_closure);
+                                    let func_name =
+                                        active.proto.name.as_deref().unwrap_or("<anonymous>");
+                                    if let Err(err) = crate::dap::check_break(self, func_name) {
+                                        self.frames.pop();
+                                        sync_ip!();
+                                        return Err(err);
+                                    }
+                                }
+                            }
+                            if let Some(next) = next_closure.take() {
+                                if !next.proto.is_verified() {
+                                    crate::bytecode::verify_proto(&next.proto)
+                                        .map_err(|e| e.to_string())?;
+                                    next.proto.mark_verified();
+                                }
+                                current_closure = next;
+                                exec = current_closure.proto.exec();
+                                code = &exec.ops;
+                                consts = current_closure.proto.values();
+                            }
+                            base = new_base;
+                            ip = 0;
+                            continue;
+                        }
+                        ValueView::Native(def) => {
+                            let func = def.func;
+                            const INLINE_NATIVE_ARGS: usize = 8;
+                            let mut inline_args = [const { Value::NIL }; INLINE_NATIVE_ARGS];
+                            let heap_args: Vec<Value>;
+                            let args: &[Value] = if actual_argc <= INLINE_NATIVE_ARGS {
+                                for (dst, src) in inline_args[..actual_argc]
+                                    .iter_mut()
+                                    .zip(&self.stack[args_start..args_end])
+                                {
+                                    *dst = src.clone();
+                                }
+                                &inline_args[..actual_argc]
+                            } else {
+                                heap_args = self.stack[args_start..args_end].to_vec();
+                                &heap_args
+                            };
+                            if self.debug_active
+                                && self.hook.is_some()
+                                && let Err(err) = self.fire_hook(HookEvent::Call)
+                            {
+                                sync_ip!();
+                                return Err(err);
+                            }
+                            match func(self, args) {
+                                Ok(results) => {
+                                    if self.debug_active
+                                        && self.hook.is_some()
+                                        && let Err(err) = self.fire_hook(HookEvent::Return)
+                                    {
+                                        sync_ip!();
+                                        return Err(err);
+                                    }
+                                    self.store_call_results(callee, MULTRET, results);
+                                    if self.trap != TRAP {
+                                        sync_ip!();
+                                        return Ok(None);
+                                    }
+                                }
+                                Err(err) if self.is_yielding => {
+                                    if let Some(co_id) = self.current_co
+                                        && let Some(co_rc) = self.co_state(co_id)
+                                    {
+                                        let mut cs = co_rc.borrow_mut();
+                                        cs.yield_callee = callee;
+                                        cs.yield_retc = MULTRET;
+                                    }
+                                    return Err(err);
+                                }
+                                Err(err) => return Err(err),
+                            }
+                        }
+                        ValueView::Table(t) => {
+                            let handler = t.borrow().metamethod("__call");
+                            let callee_val = reg!(callee).clone();
+                            if let Some(handler) = handler {
+                                let mut call_args = Vec::with_capacity(actual_argc + 1);
+                                call_args.push(callee_val);
+                                call_args.extend_from_slice(&self.stack[args_start..args_end]);
+                                let results = self.call_function(handler, &call_args)?;
+                                self.store_call_results(callee, MULTRET, results);
+                                if self.trap != TRAP {
+                                    sync_ip!();
+                                    return Ok(None);
+                                }
+                            } else {
+                                throw!("attempted to call non-function ({:?})", callee_val);
+                            }
+                        }
+                        _ => {
+                            throw!("attempted to call non-function ({:?})", reg!(callee));
+                        }
+                    }
+                }
+                ExecInst::Call { callee, argc, retc } => {
                     let args_start = base + callee as usize + 1;
                     // MULTRET args run from the first argument register up to
                     // whatever the previous instruction left on the stack.
@@ -2014,40 +2625,20 @@ impl VM {
                     };
                     let argc = args_end - args_start;
                     if args_end > self.stack.len() {
-                        self.stack.resize(args_end, Value::Nil);
+                        self.stack.resize(args_end, Value::NIL);
                     }
                     sync_ip!();
 
-                    match &reg!(callee) {
-                        Value::Closure(callee_closure) => {
-                            // Tail call: this `Call` is immediately
-                            // followed by `Return` of its own results, so
-                            // the current frame is replaced instead of
-                            // pushing a new one, giving proper tail calls
-                            // constant stack space. Only the exact shape
-                            // the compilers emit for `return f(...)`
-                            // qualifies (MULTRET on both sides with the
-                            // results starting at the callee slot): any
-                            // extra value would need an instruction
-                            // between the two, which fails the adjacency
-                            // check. A frame with no caller (base 0)
-                            // cannot be replaced.
-                            let tail = retc == MULTRET
-                                && base >= 1
-                                && matches!(
-                                    code.get(ip),
-                                    Some(Instruction::Return {
-                                        base: ret,
-                                        count: MULTRET,
-                                    }) if *ret == callee
-                                );
-                            if !tail && self.call_depth() >= self.max_call_depth {
+                    match reg!(callee).view() {
+                        ValueView::Closure(callee_closure) => {
+                            let callee_closure = callee_closure.to_rc();
+                            if self.call_depth() >= self.max_call_depth {
                                 throw!(
                                     "call stack overflow: exceeded maximum call depth of {}",
                                     self.max_call_depth
                                 );
                             }
-                            let same_closure = Rc::ptr_eq(&current_closure, callee_closure);
+                            let same_closure = Rc::ptr_eq(&current_closure, &callee_closure);
                             let (max_registers, num_params, is_vararg) = {
                                 let proto = &callee_closure.proto;
                                 (
@@ -2056,56 +2647,18 @@ impl VM {
                                     proto.is_vararg,
                                 )
                             };
-                            // On recursive calls (`same_closure`), `current_closure`
-                            // already owns the active reference so only the frame
-                            // needs a clone (1 bump instead of 2). On ordinary
-                            // calls, `next_closure` is moved into `current_closure`
-                            // after pushing a clone into the frame (2 bumps total,
-                            // zero extra refcount churn, and DAP borrows its name
-                            // without allocating).
                             let mut next_closure = if same_closure {
                                 None
                             } else {
-                                Some(Rc::clone(callee_closure))
+                                Some(callee_closure)
                             };
-                            // For a tail call the callee window slides
-                            // down one slot so it sits exactly where a
-                            // call from our caller would put it, and the
-                            // callee inherits our return obligation.
-                            let (new_base, want_ret) = if tail {
-                                let cur = self.frames.pop().expect(RUNNING_FRAME);
-                                if !self.open_upvalues.is_empty() {
-                                    self.close_upvalues(cur.base);
-                                }
-                                // Relocate the whole callee window so the
-                                // callee sits where our caller put us
-                                // (`cur.base - 1`) and the arguments
-                                // follow; the new frame keeps our base so
-                                // its results land in our caller's slot.
-                                let caller_dest = cur.base - 1;
-                                let callee_abs = cur.base + callee as usize;
-                                let shift = callee_abs - caller_dest;
-                                let len = args_end - callee_abs;
-                                for k in 0..len {
-                                    let v = std::mem::replace(
-                                        &mut self.stack[callee_abs + k],
-                                        Value::Nil,
-                                    );
-                                    self.stack[caller_dest + k] = v;
-                                }
-                                if self.top > callee_abs {
-                                    self.top -= shift;
-                                }
-                                (cur.base, cur.want_ret)
-                            } else {
-                                (args_start, retc)
-                            };
+                            let new_base = args_start;
                             let needed = new_base + max_registers;
                             if needed >= self.stack.len() {
-                                self.stack.resize(needed + 1, Value::Nil);
+                                self.stack.resize(needed + 1, Value::NIL);
                             }
                             for i in argc..num_params {
-                                self.stack[new_base + i] = Value::Nil;
+                                self.stack[new_base + i] = Value::NIL;
                             }
                             let frame_closure = match &next_closure {
                                 Some(c) => Rc::clone(c),
@@ -2118,28 +2671,25 @@ impl VM {
                             } else {
                                 CallFrame::new(frame_closure, new_base)
                             }
-                            .wanting(want_ret);
+                            .wanting(retc);
                             self.frames.push(new_frame);
-                            if self.hook.is_some() {
-                                let event = if tail {
-                                    HookEvent::TailCall
-                                } else {
-                                    HookEvent::Call
-                                };
-                                if let Err(err) = self.fire_hook(event) {
+                            if self.debug_active {
+                                if self.hook.is_some()
+                                    && let Err(err) = self.fire_hook(HookEvent::Call)
+                                {
                                     self.frames.pop();
                                     sync_ip!();
                                     return Err(err);
                                 }
-                            }
-                            if self.dap.is_some() {
-                                let active = next_closure.as_ref().unwrap_or(&current_closure);
-                                let func_name =
-                                    active.proto.name.as_deref().unwrap_or("<anonymous>");
-                                if let Err(err) = crate::dap::check_break(self, func_name) {
-                                    self.frames.pop();
-                                    sync_ip!();
-                                    return Err(err);
+                                if self.dap.is_some() {
+                                    let active = next_closure.as_ref().unwrap_or(&current_closure);
+                                    let func_name =
+                                        active.proto.name.as_deref().unwrap_or("<anonymous>");
+                                    if let Err(err) = crate::dap::check_break(self, func_name) {
+                                        self.frames.pop();
+                                        sync_ip!();
+                                        return Err(err);
+                                    }
                                 }
                             }
                             if let Some(next) = next_closure.take() {
@@ -2149,20 +2699,18 @@ impl VM {
                                     next.proto.mark_verified();
                                 }
                                 current_closure = next;
-                                code = &current_closure.proto.instructions;
+                                exec = current_closure.proto.exec();
+                                code = &exec.ops;
                                 consts = current_closure.proto.values();
                             }
                             base = new_base;
                             ip = 0;
                             continue;
                         }
-                        Value::Native(def) => {
+                        ValueView::Native(def) => {
                             let func = def.func;
-                            // Natives take a slice of owned values; copy small
-                            // argument lists onto the stack to avoid a heap
-                            // allocation on every native call.
                             const INLINE_NATIVE_ARGS: usize = 8;
-                            let mut inline_args = [const { Value::Nil }; INLINE_NATIVE_ARGS];
+                            let mut inline_args = [const { Value::NIL }; INLINE_NATIVE_ARGS];
                             let heap_args: Vec<Value>;
                             let args: &[Value] = if argc <= INLINE_NATIVE_ARGS {
                                 for (dst, src) in inline_args[..argc]
@@ -2176,7 +2724,8 @@ impl VM {
                                 heap_args = self.stack[args_start..args_end].to_vec();
                                 &heap_args
                             };
-                            if self.hook.is_some()
+                            if self.debug_active
+                                && self.hook.is_some()
                                 && let Err(err) = self.fire_hook(HookEvent::Call)
                             {
                                 sync_ip!();
@@ -2184,13 +2733,14 @@ impl VM {
                             }
                             match func(self, args) {
                                 Ok(results) => {
-                                    if self.hook.is_some()
+                                    if self.debug_active
+                                        && self.hook.is_some()
                                         && let Err(err) = self.fire_hook(HookEvent::Return)
                                     {
                                         sync_ip!();
                                         return Err(err);
                                     }
-                                    self.store_call_results(callee, retc, &results);
+                                    self.store_call_results(callee, retc, results);
                                     if self.trap != TRAP {
                                         sync_ip!();
                                         return Ok(None);
@@ -2209,7 +2759,7 @@ impl VM {
                                 Err(err) => return Err(err),
                             }
                         }
-                        Value::Table(t) => {
+                        ValueView::Table(t) => {
                             let handler = t.borrow().metamethod("__call");
                             let callee_val = reg!(callee).clone();
                             if let Some(handler) = handler {
@@ -2217,7 +2767,7 @@ impl VM {
                                 call_args.push(callee_val);
                                 call_args.extend_from_slice(&self.stack[args_start..args_end]);
                                 let results = self.call_function(handler, &call_args)?;
-                                self.store_call_results(callee, retc, &results);
+                                self.store_call_results(callee, retc, results);
                                 if self.trap != TRAP {
                                     sync_ip!();
                                     return Ok(None);
@@ -2226,19 +2776,44 @@ impl VM {
                                 throw!("attempted to call non-function ({:?})", callee_val);
                             }
                         }
-                        other => {
-                            throw!("attempted to call non-function ({:?})", other);
+                        _ => {
+                            throw!("attempted to call non-function ({:?})", reg!(callee));
                         }
                     }
                 }
-                Instruction::Return { base: ret, count } => {
-                    if self.hook.is_some() {
+                ExecInst::Return { base: ret, count } => {
+                    if self.debug_active && self.hook.is_some() {
                         sync_ip!();
                         self.fire_hook(HookEvent::Return)?;
                     }
                     let frame = self.frames.pop().expect(RUNNING_FRAME);
                     if !self.open_upvalues.is_empty() {
                         self.close_upvalues(frame.base);
+                    }
+                    if count == 1 && frame.want_ret <= 1 && self.frames.len() > target_depth {
+                        let ret_idx = frame.base + ret as usize;
+                        let caller_dest = frame.base - 1;
+                        let bits = slot(&self.stack, ret_idx).bits();
+                        let v = if bits < TAG_RC_START {
+                            unsafe { Value::from_trivial_bits(bits) }
+                        } else {
+                            std::mem::replace(slot_mut(&mut self.stack, ret_idx), Value::NIL)
+                        };
+                        slot_mut(&mut self.stack, caller_dest).set_inplace(v);
+                        let caller_frame = self.frames.last().expect(RUNNING_FRAME);
+                        if !Rc::ptr_eq(&current_closure, &caller_frame.closure) {
+                            current_closure = caller_frame.closure.clone();
+                            exec = current_closure.proto.exec();
+                            code = &exec.ops;
+                            consts = current_closure.proto.values();
+                        }
+                        base = caller_frame.base;
+                        ip = caller_frame.ip;
+                        if self.trap != TRAP {
+                            sync_ip!();
+                            return Ok(None);
+                        }
+                        continue;
                     }
                     let ret_start = frame.base + ret as usize;
                     let ret_end = if count == MULTRET {
@@ -2253,7 +2828,7 @@ impl VM {
                         self.returned.clear();
                         self.returned
                             .extend(self.stack[ret_start..ret_end].iter().cloned());
-                        let top_val = self.returned.first().cloned().unwrap_or(Value::Nil);
+                        let top_val = self.returned.first().cloned().unwrap_or(Value::NIL);
                         return Ok(Some(top_val));
                     }
                     // The results land where the caller's `Call` put the callee.
@@ -2265,67 +2840,28 @@ impl VM {
                     };
                     let needed = caller_dest + wanted;
                     if needed > self.stack.len() {
-                        self.stack.resize(needed, Value::Nil);
+                        self.stack.resize(needed, Value::NIL);
                     }
-                    // Values move down the stack in order; the source and
-                    // destination windows may overlap, which is fine when
-                    // copying front to back since caller_dest < ret_start.
                     if wanted == 1 && nret == 1 {
-                        let src = &mut self.stack[ret_start];
-                        match src {
-                            Value::Int(n) => {
-                                let val = *n;
-                                let dest_slot = &mut self.stack[caller_dest];
-                                if let Value::Int(old) = dest_slot {
-                                    *old = val;
-                                } else {
-                                    *dest_slot = Value::Int(val);
-                                }
-                            }
-                            Value::Float(f) => {
-                                let val = *f;
-                                let dest_slot = &mut self.stack[caller_dest];
-                                if let Value::Float(old) = dest_slot {
-                                    *old = val;
-                                } else {
-                                    *dest_slot = Value::Float(val);
-                                }
-                            }
-                            _ => {
-                                let v = std::mem::replace(src, Value::Nil);
-                                self.stack[caller_dest] = v;
-                            }
-                        }
+                        let bits = self.stack[ret_start].bits();
+                        let v = if bits < TAG_RC_START {
+                            unsafe { Value::from_trivial_bits(bits) }
+                        } else {
+                            std::mem::replace(&mut self.stack[ret_start], Value::NIL)
+                        };
+                        self.stack[caller_dest].set_inplace(v);
                     } else {
                         for i in 0..wanted {
                             if i < nret {
-                                let src = &mut self.stack[ret_start + i];
-                                match src {
-                                    Value::Int(n) => {
-                                        let val = *n;
-                                        let dest_slot = &mut self.stack[caller_dest + i];
-                                        if let Value::Int(old) = dest_slot {
-                                            *old = val;
-                                        } else {
-                                            *dest_slot = Value::Int(val);
-                                        }
-                                    }
-                                    Value::Float(f) => {
-                                        let val = *f;
-                                        let dest_slot = &mut self.stack[caller_dest + i];
-                                        if let Value::Float(old) = dest_slot {
-                                            *old = val;
-                                        } else {
-                                            *dest_slot = Value::Float(val);
-                                        }
-                                    }
-                                    _ => {
-                                        let v = std::mem::replace(src, Value::Nil);
-                                        self.stack[caller_dest + i] = v;
-                                    }
-                                }
+                                let bits = self.stack[ret_start + i].bits();
+                                let v = if bits < TAG_RC_START {
+                                    unsafe { Value::from_trivial_bits(bits) }
+                                } else {
+                                    std::mem::replace(&mut self.stack[ret_start + i], Value::NIL)
+                                };
+                                self.stack[caller_dest + i].set_inplace(v);
                             } else {
-                                self.stack[caller_dest + i] = Value::Nil;
+                                self.stack[caller_dest + i].set_inplace(Value::NIL);
                             }
                         }
                     }
@@ -2335,7 +2871,8 @@ impl VM {
                     let caller_frame = self.frames.last().expect(RUNNING_FRAME);
                     if !Rc::ptr_eq(&current_closure, &caller_frame.closure) {
                         current_closure = caller_frame.closure.clone();
-                        code = &current_closure.proto.instructions;
+                        exec = current_closure.proto.exec();
+                        code = &exec.ops;
                         consts = current_closure.proto.values();
                     }
                     base = caller_frame.base;
@@ -2346,7 +2883,7 @@ impl VM {
                     }
                     continue;
                 }
-                Instruction::Vararg { dst, count } => {
+                ExecInst::Vararg { dst, count } => {
                     let all = count == 0 || count == MULTRET;
                     let frame = self.frames.last().expect(RUNNING_FRAME);
                     let cnt = if all {
@@ -2356,12 +2893,12 @@ impl VM {
                     };
                     let dest = base + dst as usize;
                     if dest + cnt > self.stack.len() {
-                        self.stack.resize(dest + cnt, Value::Nil);
+                        self.stack.resize(dest + cnt, Value::NIL);
                     }
                     let frame = self.frames.last().expect(RUNNING_FRAME);
                     let varargs = frame.varargs();
                     for i in 0..cnt {
-                        let val = varargs.get(i).cloned().unwrap_or(Value::Nil);
+                        let val = varargs.get(i).cloned().unwrap_or(Value::NIL);
                         self.stack[dest + i] = val;
                     }
                     if all {
@@ -2374,13 +2911,20 @@ impl VM {
 
     /// `==` with the `__eq` metamethod fallback for two tables.
     #[inline]
-    fn values_equal(&mut self, base: usize, a: u8, b: u8, ip: usize) -> Result<bool, String> {
+    pub(crate) fn values_equal(
+        &mut self,
+        base: usize,
+        a: u8,
+        b: u8,
+        ip: usize,
+    ) -> Result<bool, String> {
         let va = &self.stack[base + a as usize];
         let vb = &self.stack[base + b as usize];
         if va == vb {
             return Ok(true);
         }
-        if let (Value::Table(_), Value::Table(_)) = (va, vb)
+        if va.is_table()
+            && vb.is_table()
             && let Some(mm) = self.get_binop_metamethod(va, vb, "__eq")
         {
             let (va, vb) = (va.clone(), vb.clone());
@@ -2391,11 +2935,17 @@ impl VM {
     }
 
     #[inline]
-    fn values_equal_val(&mut self, va: &Value, vb: &Value, ip: usize) -> Result<bool, String> {
+    pub(crate) fn values_equal_val(
+        &mut self,
+        va: &Value,
+        vb: &Value,
+        ip: usize,
+    ) -> Result<bool, String> {
         if va == vb {
             return Ok(true);
         }
-        if let (Value::Table(_), Value::Table(_)) = (va, vb)
+        if va.is_table()
+            && vb.is_table()
             && let Some(mm) = self.get_binop_metamethod(va, vb, "__eq")
         {
             self.frames.last_mut().expect(RUNNING_FRAME).ip = ip;
@@ -2406,24 +2956,24 @@ impl VM {
 
     /// The generic-for step. `b` is the loop's base register: iterator,
     /// state, control, then the loop variables.
-    fn tfor_call(&mut self, base: usize, b: u8, retc: u8) -> Result<(), String> {
+    pub(crate) fn tfor_call(&mut self, base: usize, b: u8, retc: u8) -> Result<(), String> {
         let iter_idx = base + b as usize;
         let var_base = iter_idx + 3;
         let retc_usize = retc as usize;
         if var_base + retc_usize > self.stack.len() {
-            self.stack.resize(var_base + retc_usize, Value::Nil);
+            self.stack.resize(var_base + retc_usize, Value::NIL);
         }
 
         // Fast path: direct iteration over a plain table (`for k, v in t`) or
         // after `pairs(t)` rewrites the iterator slot to the table on step 1.
-        let direct_table = match &self.stack[iter_idx] {
-            Value::Table(t) => t.borrow().metamethod("__call").is_none(),
-            Value::Native(def)
-                if std::ptr::eq(*def, crate::vm::builtins::NEXT)
-                    && matches!(self.stack[iter_idx + 2], Value::Nil)
-                    && matches!(self.stack[iter_idx + 1], Value::Table(_)) =>
+        let direct_table = match self.stack[iter_idx].view() {
+            ValueView::Table(t) => t.borrow().metamethod("__call").is_none(),
+            ValueView::Native(def)
+                if std::ptr::eq(def, crate::vm::builtins::NEXT)
+                    && self.stack[iter_idx + 2].is_nil()
+                    && self.stack[iter_idx + 1].is_table() =>
             {
-                let tbl = std::mem::replace(&mut self.stack[iter_idx + 1], Value::Nil);
+                let tbl = std::mem::replace(&mut self.stack[iter_idx + 1], Value::NIL);
                 self.stack[iter_idx] = tbl;
                 true
             }
@@ -2431,9 +2981,9 @@ impl VM {
         };
         if direct_table {
             let (head, tail) = self.stack.split_at_mut(iter_idx + 1);
-            if let Value::Table(t) = &head[iter_idx] {
+            if let Some(t) = head[iter_idx].as_table() {
                 let (state_slice, rest) = tail.split_at_mut(2);
-                Self::table_for_step_into(t, &mut state_slice[0], &mut rest[..retc_usize]);
+                Self::table_for_step_into(&t, &mut state_slice[0], &mut rest[..retc_usize]);
                 return Ok(());
             }
         }
@@ -2443,10 +2993,10 @@ impl VM {
         let ctrl = self.stack[iter_idx + 2].clone();
         let results = self.call_function(iter_fn, &[state, ctrl])?;
         if var_base + retc_usize > self.stack.len() {
-            self.stack.resize(var_base + retc_usize, Value::Nil);
+            self.stack.resize(var_base + retc_usize, Value::NIL);
         }
         for i in 0..retc_usize {
-            self.stack[var_base + i] = results.get(i).cloned().unwrap_or(Value::Nil);
+            self.stack[var_base + i] = results.get(i).cloned().unwrap_or(Value::NIL);
         }
         Ok(())
     }
@@ -2464,7 +3014,7 @@ impl VM {
                 vars[0] = key;
                 vars[1] = value;
                 for slot in &mut vars[2..] {
-                    *slot = Value::Nil;
+                    *slot = Value::NIL;
                 }
             } else if let Some(slot) = vars.first_mut() {
                 *slot = value;
@@ -2472,48 +3022,45 @@ impl VM {
         }
 
         let tbl = t.borrow();
-        let mut next_index = match state_slot {
-            Value::Int(i) => *i as usize,
-            Value::Table(_) => usize::MAX,
+        let mut next_index = match state_slot.view() {
+            ValueView::Int(i) => i as usize,
+            ValueView::Table(_) => usize::MAX,
             _ => 0,
         };
         while next_index < tbl.array.len() {
             let v = &tbl.array[next_index];
             next_index += 1;
-            if !matches!(v, Value::Nil) {
+            if !v.is_nil() {
                 let v = v.clone();
                 drop(tbl);
                 let idx_val = Value::from_usize(next_index);
-                *state_slot = idx_val.clone();
+                state_slot.set_inplace(idx_val.clone());
                 write_entry(vars, idx_val, v);
                 return;
             }
         }
-        let snapshot = match state_slot {
-            Value::Table(snapshot) => snapshot,
-            _ => {
-                if tbl.fields.is_empty() && tbl.general.is_none() {
-                    drop(tbl);
-                    for slot in vars {
-                        *slot = Value::Nil;
-                    }
-                    return;
+        let snapshot = if let Some(snapshot) = state_slot.as_table() {
+            snapshot.to_rc()
+        } else {
+            if tbl.fields.is_empty() && tbl.general.is_none() {
+                drop(tbl);
+                for slot in vars {
+                    *slot = Value::NIL;
                 }
-                let mut keys = crate::vm::table::sorted_keys(&tbl);
-                keys.reverse();
-                let mut snapshot = VmTable::new();
-                snapshot.array = keys;
-                *state_slot = Value::Table(Rc::new(RefCell::new(snapshot)));
-                match state_slot {
-                    Value::Table(s) => s,
-                    _ => unreachable!("just assigned Value::Table"),
-                }
+                return;
             }
+            let mut keys = crate::vm::table::sorted_keys(&tbl);
+            keys.reverse();
+            let mut snapshot = VmTable::new();
+            snapshot.array = keys;
+            let rc = Rc::new(RefCell::new(snapshot));
+            *state_slot = Value::table(rc.clone());
+            rc
         };
         let mut snapshot = snapshot.borrow_mut();
         while let Some(key) = snapshot.array.pop() {
             let value = tbl.raw_get(&key);
-            if !matches!(value, Value::Nil) {
+            if !value.is_nil() {
                 drop(snapshot);
                 drop(tbl);
                 write_entry(vars, key, value);
@@ -2523,7 +3070,7 @@ impl VM {
         drop(snapshot);
         drop(tbl);
         for slot in vars {
-            *slot = Value::Nil;
+            *slot = Value::NIL;
         }
     }
 }

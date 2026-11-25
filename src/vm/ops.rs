@@ -1,16 +1,16 @@
 //! Arithmetic, bitwise and comparison operators.
-//
-// Every operator has an `i64` fast path that the interpreter loop inlines,
-// and falls back to `BigInt` when an operand is already big or the `i64`
-// result overflows. Results always go through `Value::from_bigint`, which
-// demotes back to `Int` whenever the answer fits.
+//!
+//! Every operator has a fast inline integer / float path, and falls back to
+//! `BigInt` when an operand is already big or the `i64` result overflows.
+//! Results always go through `Value::from_bigint`, which demotes back to `Int`
+//! whenever the answer fits.
 
 use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer as _;
 use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
-use std::rc::Rc;
+use std::borrow::Cow;
 
-use crate::vm::value::Value;
+use crate::vm::value::{Value, ValueView};
 
 /// The largest integer, in bits, that arithmetic will produce (about 315,000
 /// decimal digits). Past this, multiplying, raising to a power or shifting
@@ -43,13 +43,11 @@ pub fn pow_result_bits(base: &BigInt, exp: u64) -> u64 {
     (log2 * exp as f64).ceil() as u64
 }
 
-use std::borrow::Cow;
-
 pub fn to_bigint(v: &Value) -> Result<BigInt, String> {
-    match v {
-        Value::Int(i) => Ok(BigInt::from(*i)),
-        Value::BigInt(i) => Ok((**i).clone()),
-        Value::Float(f) => {
+    match v.view() {
+        ValueView::Int(i) => Ok(BigInt::from(i)),
+        ValueView::BigInt(i) => Ok(i.clone()),
+        ValueView::Float(f) => {
             BigInt::from_f64(f.trunc()).ok_or_else(|| "cannot convert float to integer".to_string())
         }
         _ => Err("expected integer".to_string()),
@@ -58,10 +56,10 @@ pub fn to_bigint(v: &Value) -> Result<BigInt, String> {
 
 #[inline]
 pub fn to_bigint_cow<'a>(v: &'a Value) -> Result<Cow<'a, BigInt>, String> {
-    match v {
-        Value::Int(i) => Ok(Cow::Owned(BigInt::from(*i))),
-        Value::BigInt(i) => Ok(Cow::Borrowed(&**i)),
-        Value::Float(f) => BigInt::from_f64(f.trunc())
+    match v.view() {
+        ValueView::Int(i) => Ok(Cow::Owned(BigInt::from(i))),
+        ValueView::BigInt(i) => Ok(Cow::Borrowed(i)),
+        ValueView::Float(f) => BigInt::from_f64(f.trunc())
             .map(Cow::Owned)
             .ok_or_else(|| "cannot convert float to integer".to_string()),
         _ => Err("expected integer".to_string()),
@@ -111,36 +109,16 @@ fn bigint_div_u64(ia: &BigInt, divisor: u64) -> Value {
     Value::from_bigint(BigInt::from_biguint(Sign::Plus, BigUint::new(q_u32)))
 }
 
-/// Normalizes a `Value::BigInt` slot back to `Value::Int` if an in-place
-/// mutation shrunk it into the `i64` range.
-#[inline]
-fn demote_if_small(slot: &mut Value) {
-    if let Value::BigInt(rc) = slot
-        && rc.bits() <= 64
-        && let Some(i) = rc.to_i64()
-    {
-        *slot = Value::Int(i);
-    }
-}
-
 /// Mutates `stack[slot]` in place when it holds a uniquely-owned `Rc<BigInt>`
-/// (`strong_count == 1`), then demotes back to `Value::Int` if it fits in
-/// `i64`. Returns `true` when mutated in place.
+/// (`strong_count == 1`), then demotes back to `Int` if it fits in `i64`.
 #[inline]
 fn mutate_unique_bigint(stack: &mut [Value], slot: usize, f: impl FnOnce(&mut BigInt)) -> bool {
-    if let Value::BigInt(rc) = &mut stack[slot]
-        && let Some(big) = Rc::get_mut(rc)
-    {
-        f(big);
-        demote_if_small(&mut stack[slot]);
-        return true;
-    }
-    false
+    stack[slot].with_unique_bigint_mut(f)
 }
 
 /// Mutates `stack[dst]` in place against `stack[other]` (`dst != other`) when
 /// `stack[dst]` holds a uniquely-owned `Rc<BigInt>`, then demotes back to
-/// `Value::Int` if it fits in `i64`.
+/// `Int` if it fits in `i64`.
 #[inline]
 fn mutate_unique_bigint_with(
     stack: &mut [Value],
@@ -149,7 +127,7 @@ fn mutate_unique_bigint_with(
     f: impl FnOnce(&mut BigInt, &Value),
 ) -> bool {
     debug_assert_ne!(dst, other);
-    if !matches!(&stack[dst], Value::BigInt(rc) if Rc::strong_count(rc) == 1) {
+    if !stack[dst].is_bigint() {
         return false;
     }
     let (dst_slot, other_slot): (&mut Value, &Value) = if dst < other {
@@ -159,14 +137,7 @@ fn mutate_unique_bigint_with(
         let (left, right) = stack.split_at_mut(dst);
         (&mut right[0], &left[other])
     };
-    if let Value::BigInt(rc) = dst_slot
-        && let Some(big) = Rc::get_mut(rc)
-    {
-        f(big, other_slot);
-        demote_if_small(dst_slot);
-        return true;
-    }
-    false
+    dst_slot.with_unique_bigint_mut(|big| f(big, other_slot))
 }
 
 /// Evaluates `stack[dst] = stack[a] + stack[b]` in one pass (no redundant type
@@ -174,10 +145,20 @@ fn mutate_unique_bigint_with(
 /// `BigInt` operand.
 #[inline]
 pub fn eval_add_into(stack: &mut [Value], dst: usize, a: usize, b: usize) -> Result<(), String> {
-    let bits_needed = match (&stack[a], &stack[b]) {
-        (Value::BigInt(ia), Value::BigInt(ib)) => Some(ia.bits().max(ib.bits()) + 1),
-        (Value::BigInt(ia), Value::Int(_)) => Some(ia.bits().max(64) + 1),
-        (Value::Int(_), Value::BigInt(ib)) => Some(ib.bits().max(64) + 1),
+    if let (Some(ia), Some(ib)) = (stack[a].as_int(), stack[b].as_int()) {
+        if let Some(sum) = ia.checked_add(ib) {
+            if !stack[dst].try_set_unique_heap_int(sum) {
+                stack[dst] = Value::int(sum);
+            }
+        } else {
+            stack[dst] = Value::from_i128(ia as i128 + ib as i128);
+        }
+        return Ok(());
+    }
+    let bits_needed = match (stack[a].view(), stack[b].view()) {
+        (ValueView::BigInt(ia), ValueView::BigInt(ib)) => Some(ia.bits().max(ib.bits()) + 1),
+        (ValueView::BigInt(ia), ValueView::Int(_)) => Some(ia.bits().max(64) + 1),
+        (ValueView::Int(_), ValueView::BigInt(ib)) => Some(ib.bits().max(64) + 1),
         _ => None,
     };
     if let Some(bits) = bits_needed {
@@ -188,24 +169,18 @@ pub fn eval_add_into(stack: &mut [Value], dst: usize, a: usize, b: usize) -> Res
             }
         } else if dst == a || dst == b {
             let other = if dst == a { b } else { a };
-            if mutate_unique_bigint_with(stack, dst, other, |big, rhs| match rhs {
-                Value::BigInt(rb) => *big += &**rb,
-                Value::Int(ib) => *big += *ib,
+            if mutate_unique_bigint_with(stack, dst, other, |big, rhs| match rhs.view() {
+                ValueView::BigInt(rb) => *big += rb,
+                ValueView::Int(ib) => *big += ib,
                 _ => unreachable!("checked above"),
             }) {
                 return Ok(());
             }
         }
-        let res = match (&stack[a], &stack[b]) {
-            (Value::BigInt(ia), Value::Int(ib)) => Value::from_bigint(&**ia + *ib),
-            (Value::Int(ia), Value::BigInt(ib)) => Value::from_bigint(*ia + &**ib),
-            (Value::BigInt(ia), Value::BigInt(ib)) => {
-                if ia.is_negative() == ib.is_negative() {
-                    Value::BigInt(Rc::new(&**ia + &**ib))
-                } else {
-                    Value::from_bigint(&**ia + &**ib)
-                }
-            }
+        let res = match (stack[a].view(), stack[b].view()) {
+            (ValueView::BigInt(ia), ValueView::Int(ib)) => Value::from_bigint(ia + ib),
+            (ValueView::Int(ia), ValueView::BigInt(ib)) => Value::from_bigint(ia + ib),
+            (ValueView::BigInt(ia), ValueView::BigInt(ib)) => Value::from_bigint(ia + ib),
             _ => unreachable!("checked above"),
         };
         stack[dst] = res;
@@ -219,37 +194,41 @@ pub fn eval_add_into(stack: &mut [Value], dst: usize, a: usize, b: usize) -> Res
 /// when `dst == a` holds a uniquely-owned `BigInt`.
 #[inline]
 pub fn eval_sub_into(stack: &mut [Value], dst: usize, a: usize, b: usize) -> Result<(), String> {
-    let bits_needed = match (&stack[a], &stack[b]) {
-        (Value::BigInt(ia), Value::BigInt(ib)) => Some(ia.bits().max(ib.bits()) + 1),
-        (Value::BigInt(ia), Value::Int(_)) => Some(ia.bits().max(64) + 1),
-        (Value::Int(_), Value::BigInt(ib)) => Some(ib.bits().max(64) + 1),
+    if let (Some(ia), Some(ib)) = (stack[a].as_int(), stack[b].as_int()) {
+        if let Some(diff) = ia.checked_sub(ib) {
+            if !stack[dst].try_set_unique_heap_int(diff) {
+                stack[dst] = Value::int(diff);
+            }
+        } else {
+            stack[dst] = Value::from_i128(ia as i128 - ib as i128);
+        }
+        return Ok(());
+    }
+    let bits_needed = match (stack[a].view(), stack[b].view()) {
+        (ValueView::BigInt(ia), ValueView::BigInt(ib)) => Some(ia.bits().max(ib.bits()) + 1),
+        (ValueView::BigInt(ia), ValueView::Int(_)) => Some(ia.bits().max(64) + 1),
+        (ValueView::Int(_), ValueView::BigInt(ib)) => Some(ib.bits().max(64) + 1),
         _ => None,
     };
     if let Some(bits) = bits_needed {
         check_int_bits(bits)?;
         if dst == a && dst == b {
-            stack[dst] = Value::Int(0);
+            stack[dst] = Value::small_int(0);
             return Ok(());
         }
         if dst == a
-            && mutate_unique_bigint_with(stack, dst, b, |big, rhs| match rhs {
-                Value::BigInt(rb) => *big -= &**rb,
-                Value::Int(ib) => *big -= *ib,
+            && mutate_unique_bigint_with(stack, dst, b, |big, rhs| match rhs.view() {
+                ValueView::BigInt(rb) => *big -= rb,
+                ValueView::Int(ib) => *big -= ib,
                 _ => unreachable!("checked above"),
             })
         {
             return Ok(());
         }
-        let res = match (&stack[a], &stack[b]) {
-            (Value::BigInt(ia), Value::Int(ib)) => Value::from_bigint(&**ia - *ib),
-            (Value::Int(ia), Value::BigInt(ib)) => Value::from_bigint(*ia - &**ib),
-            (Value::BigInt(ia), Value::BigInt(ib)) => {
-                if ia.is_negative() != ib.is_negative() {
-                    Value::BigInt(Rc::new(&**ia - &**ib))
-                } else {
-                    Value::from_bigint(&**ia - &**ib)
-                }
-            }
+        let res = match (stack[a].view(), stack[b].view()) {
+            (ValueView::BigInt(ia), ValueView::Int(ib)) => Value::from_bigint(ia - ib),
+            (ValueView::Int(ia), ValueView::BigInt(ib)) => Value::from_bigint(ia - ib),
+            (ValueView::BigInt(ia), ValueView::BigInt(ib)) => Value::from_bigint(ia - ib),
             _ => unreachable!("checked above"),
         };
         stack[dst] = res;
@@ -271,20 +250,16 @@ fn eval_bitop_into(
     fallback: fn(&Value, &Value) -> Result<Value, String>,
 ) -> Result<(), String> {
     if (dst == a || dst == b)
-        && matches!(
-            (&stack[a], &stack[b]),
-            (Value::BigInt(_), Value::BigInt(_))
-                | (Value::BigInt(_), Value::Int(_))
-                | (Value::Int(_), Value::BigInt(_))
-        )
+        && ((stack[a].is_bigint() && (stack[b].is_bigint() || stack[b].is_int()))
+            || (stack[a].is_int() && stack[b].is_bigint()))
     {
         if dst == a && dst == b {
             // `x & x == x`, `x | x == x`, `x ^ x == 0` handled cleanly by fallback.
         } else {
             let other = if dst == a { b } else { a };
-            if mutate_unique_bigint_with(stack, dst, other, |big, rhs| match rhs {
-                Value::BigInt(rb) => assign_op(big, rb),
-                Value::Int(ib) => assign_op(big, &BigInt::from(*ib)),
+            if mutate_unique_bigint_with(stack, dst, other, |big, rhs| match rhs.view() {
+                ValueView::BigInt(rb) => assign_op(big, rb),
+                ValueView::Int(ib) => assign_op(big, &BigInt::from(ib)),
                 _ => unreachable!("checked above"),
             }) {
                 return Ok(());
@@ -330,11 +305,11 @@ pub fn eval_shl_bigint_into(
     a: usize,
     shift: u64,
 ) -> Result<(), String> {
-    let Value::BigInt(src) = &stack[a] else {
-        unreachable!("caller matched Value::BigInt");
+    let Some(src) = stack[a].as_bigint() else {
+        unreachable!("caller matched BigInt");
     };
     if src.is_zero() {
-        stack[dst] = Value::Int(0);
+        stack[dst] = Value::small_int(0);
         return Ok(());
     }
     // Check total bit width in `u64` before casting `shift` to `usize` so
@@ -344,20 +319,18 @@ pub fn eval_shl_bigint_into(
     if dst == a && mutate_unique_bigint(stack, dst, |big| *big <<= shift_usize) {
         return Ok(());
     }
-    let Value::BigInt(src) = &stack[a] else {
-        unreachable!("caller matched Value::BigInt");
+    let Some(src) = stack[a].as_bigint() else {
+        unreachable!("caller matched BigInt");
     };
-    stack[dst] = Value::BigInt(Rc::new(&**src << shift_usize));
+    stack[dst] = Value::from_bigint(src << shift_usize);
     Ok(())
 }
 
 /// Fast arithmetic right shift on a `BigInt` for a `u64` shift count.
-/// Checks `shift >= b.bits()` in `u64` before narrowing to `usize` so large
-/// shifts never truncate on 32-bit targets (`wasm32`, `i686`).
 #[inline]
 pub fn bigint_shr_u64(b: &BigInt, shift: u64) -> Value {
     if shift >= b.bits() {
-        return Value::Int(if b.is_negative() { -1 } else { 0 });
+        return Value::small_int(if b.is_negative() { -1 } else { 0 });
     }
     let shift_usize = shift as usize;
     if b.bits() <= 128 {
@@ -371,14 +344,11 @@ pub fn bigint_shr_u64(b: &BigInt, shift: u64) -> Value {
             let mag = ((m - 1) >> shift_usize) + 1;
             const I64_MIN_MAG: u128 = 1u128 << 63;
             if mag < I64_MIN_MAG {
-                return Value::Int(-(mag as i64));
+                return Value::int(-(mag as i64));
             } else if mag == I64_MIN_MAG {
-                return Value::Int(i64::MIN);
+                return Value::int(i64::MIN);
             } else {
-                return Value::BigInt(Rc::new(BigInt::from_biguint(
-                    Sign::Minus,
-                    BigUint::from(mag),
-                )));
+                return Value::from_bigint(BigInt::from_biguint(Sign::Minus, BigUint::from(mag)));
             }
         }
     }
@@ -390,17 +360,17 @@ pub fn bigint_shr_u64(b: &BigInt, shift: u64) -> Value {
 /// owned.
 #[inline]
 pub fn eval_shr_bigint_into(stack: &mut [Value], dst: usize, a: usize, shift: u64) {
-    let Value::BigInt(src) = &stack[a] else {
-        unreachable!("caller matched Value::BigInt");
+    let Some(src) = stack[a].as_bigint() else {
+        unreachable!("caller matched BigInt");
     };
     if shift == 0 {
         if dst != a {
-            stack[dst] = Value::BigInt(Rc::clone(src));
+            stack[dst] = stack[a].clone();
         }
         return;
     }
     if shift >= src.bits() {
-        stack[dst] = Value::Int(if src.is_negative() { -1 } else { 0 });
+        stack[dst] = Value::small_int(if src.is_negative() { -1 } else { 0 });
         return;
     }
     if src.bits() <= 128 && src.bits() - shift <= 63 {
@@ -411,8 +381,8 @@ pub fn eval_shr_bigint_into(stack: &mut [Value], dst: usize, a: usize, shift: u6
     if dst == a && mutate_unique_bigint(stack, dst, |big| *big >>= shift_usize) {
         return;
     }
-    let Value::BigInt(src) = &stack[a] else {
-        unreachable!("caller matched Value::BigInt");
+    let Some(src) = stack[a].as_bigint() else {
+        unreachable!("caller matched BigInt");
     };
     stack[dst] = bigint_shr_u64(src, shift);
 }
@@ -442,10 +412,15 @@ pub fn bigint_mod_floor_i64(ia: &BigInt, ib: i64) -> i64 {
 
 #[inline]
 pub fn to_f64(v: &Value) -> Result<f64, String> {
-    match v {
-        Value::Float(f) => Ok(*f),
-        Value::Int(i) => Ok(*i as f64),
-        Value::BigInt(i) => i
+    if v.is_float() {
+        return Ok(v.as_float_unchecked());
+    }
+    if v.is_inline_int() {
+        return Ok(v.as_inline_int_unchecked() as f64);
+    }
+    match v.view() {
+        ValueView::Int(i) => Ok(i as f64),
+        ValueView::BigInt(i) => i
             .to_f64()
             .ok_or_else(|| "integer overflow in float conversion".to_string()),
         _ => Err("expected number".to_string()),
@@ -454,103 +429,111 @@ pub fn to_f64(v: &Value) -> Result<f64, String> {
 
 #[inline]
 pub fn eval_add(a: &Value, b: &Value) -> Result<Value, String> {
-    match (a, b) {
-        (Value::Int(ia), Value::Int(ib)) => {
-            if let Some(r) = ia.checked_add(*ib) {
-                Ok(Value::Int(r))
-            } else {
-                Ok(Value::from_i128(*ia as i128 + *ib as i128))
-            }
-        }
-        (Value::BigInt(ia), Value::Int(ib)) => {
+    if a.is_inline_int() && b.is_inline_int() {
+        let ia = a.as_inline_int_unchecked();
+        let ib = b.as_inline_int_unchecked();
+        return Ok(Value::int(ia + ib));
+    }
+    if a.is_float() && b.is_float() {
+        return Ok(Value::float(
+            a.as_float_unchecked() + b.as_float_unchecked(),
+        ));
+    }
+    match (a.view(), b.view()) {
+        (ValueView::Int(ia), ValueView::Int(ib)) => match ia.checked_add(ib) {
+            Some(r) => Ok(Value::int(r)),
+            None => Ok(Value::from_i128(ia as i128 + ib as i128)),
+        },
+        (ValueView::BigInt(ia), ValueView::Int(ib)) => {
             check_int_bits(ia.bits().max(64) + 1)?;
-            Ok(Value::from_bigint(&**ia + *ib))
+            Ok(Value::from_bigint(ia + ib))
         }
-        (Value::Int(ia), Value::BigInt(ib)) => {
+        (ValueView::Int(ia), ValueView::BigInt(ib)) => {
             check_int_bits(ib.bits().max(64) + 1)?;
-            Ok(Value::from_bigint(*ia + &**ib))
+            Ok(Value::from_bigint(ia + ib))
         }
-        (Value::BigInt(ia), Value::BigInt(ib)) => {
+        (ValueView::BigInt(ia), ValueView::BigInt(ib)) => {
             check_int_bits(ia.bits().max(ib.bits()) + 1)?;
-            if ia.is_negative() == ib.is_negative() {
-                Ok(Value::BigInt(Rc::new(&**ia + &**ib)))
-            } else {
-                Ok(Value::from_bigint(&**ia + &**ib))
-            }
+            Ok(Value::from_bigint(ia + ib))
         }
-        _ => Ok(Value::Float(to_f64(a)? + to_f64(b)?)),
+        _ => Ok(Value::float(to_f64(a)? + to_f64(b)?)),
     }
 }
 
 #[inline]
 pub fn eval_sub(a: &Value, b: &Value) -> Result<Value, String> {
-    match (a, b) {
-        (Value::Int(ia), Value::Int(ib)) => {
-            if let Some(r) = ia.checked_sub(*ib) {
-                Ok(Value::Int(r))
-            } else {
-                Ok(Value::from_i128(*ia as i128 - *ib as i128))
-            }
-        }
-        (Value::BigInt(ia), Value::Int(ib)) => {
+    if a.is_inline_int() && b.is_inline_int() {
+        let ia = a.as_inline_int_unchecked();
+        let ib = b.as_inline_int_unchecked();
+        return Ok(Value::int(ia - ib));
+    }
+    if a.is_float() && b.is_float() {
+        return Ok(Value::float(
+            a.as_float_unchecked() - b.as_float_unchecked(),
+        ));
+    }
+    match (a.view(), b.view()) {
+        (ValueView::Int(ia), ValueView::Int(ib)) => match ia.checked_sub(ib) {
+            Some(r) => Ok(Value::int(r)),
+            None => Ok(Value::from_i128(ia as i128 - ib as i128)),
+        },
+        (ValueView::BigInt(ia), ValueView::Int(ib)) => {
             check_int_bits(ia.bits().max(64) + 1)?;
-            Ok(Value::from_bigint(&**ia - *ib))
+            Ok(Value::from_bigint(ia - ib))
         }
-        (Value::Int(ia), Value::BigInt(ib)) => {
+        (ValueView::Int(ia), ValueView::BigInt(ib)) => {
             check_int_bits(ib.bits().max(64) + 1)?;
-            Ok(Value::from_bigint(*ia - &**ib))
+            Ok(Value::from_bigint(ia - ib))
         }
-        (Value::BigInt(ia), Value::BigInt(ib)) => {
+        (ValueView::BigInt(ia), ValueView::BigInt(ib)) => {
             check_int_bits(ia.bits().max(ib.bits()) + 1)?;
-            if ia.is_negative() != ib.is_negative() {
-                Ok(Value::BigInt(Rc::new(&**ia - &**ib)))
-            } else {
-                Ok(Value::from_bigint(&**ia - &**ib))
-            }
+            Ok(Value::from_bigint(ia - ib))
         }
-        _ => Ok(Value::Float(to_f64(a)? - to_f64(b)?)),
+        _ => Ok(Value::float(to_f64(a)? - to_f64(b)?)),
     }
 }
 
 #[inline]
 pub fn eval_mul(a: &Value, b: &Value) -> Result<Value, String> {
-    match (a, b) {
-        (Value::Int(ia), Value::Int(ib)) => {
-            if let Some(r) = ia.checked_mul(*ib) {
-                Ok(Value::Int(r))
+    if a.is_float() && b.is_float() {
+        return Ok(Value::float(
+            a.as_float_unchecked() * b.as_float_unchecked(),
+        ));
+    }
+    match (a.view(), b.view()) {
+        (ValueView::Int(ia), ValueView::Int(ib)) => match ia.checked_mul(ib) {
+            Some(r) => Ok(Value::int(r)),
+            None => Ok(Value::from_i128(ia as i128 * ib as i128)),
+        },
+        (ValueView::BigInt(ia), ValueView::Int(ib)) => {
+            check_int_bits(ia.bits() + i64_bits(ib))?;
+            if ib == 0 {
+                Ok(Value::small_int(0))
+            } else if ib == 1 {
+                Ok(a.clone())
+            } else if ib == -1 {
+                Ok(Value::from_bigint(-ia))
             } else {
-                Ok(Value::from_i128(*ia as i128 * *ib as i128))
+                Ok(Value::from_bigint(ia * ib))
             }
         }
-        (Value::BigInt(ia), Value::Int(ib)) => {
-            check_int_bits(ia.bits() + i64_bits(*ib))?;
-            if *ib == 0 {
-                Ok(Value::Int(0))
-            } else if *ib == 1 {
-                Ok(Value::BigInt(ia.clone()))
-            } else if *ib == -1 {
-                Ok(Value::from_bigint(-&**ia))
+        (ValueView::Int(ia), ValueView::BigInt(ib)) => {
+            check_int_bits(i64_bits(ia) + ib.bits())?;
+            if ia == 0 {
+                Ok(Value::small_int(0))
+            } else if ia == 1 {
+                Ok(b.clone())
+            } else if ia == -1 {
+                Ok(Value::from_bigint(-ib))
             } else {
-                Ok(Value::BigInt(Rc::new(&**ia * *ib)))
+                Ok(Value::from_bigint(ia * ib))
             }
         }
-        (Value::Int(ia), Value::BigInt(ib)) => {
-            check_int_bits(i64_bits(*ia) + ib.bits())?;
-            if *ia == 0 {
-                Ok(Value::Int(0))
-            } else if *ia == 1 {
-                Ok(Value::BigInt(ib.clone()))
-            } else if *ia == -1 {
-                Ok(Value::from_bigint(-&**ib))
-            } else {
-                Ok(Value::BigInt(Rc::new(*ia * &**ib)))
-            }
-        }
-        (Value::BigInt(ia), Value::BigInt(ib)) => {
+        (ValueView::BigInt(ia), ValueView::BigInt(ib)) => {
             check_int_bits(ia.bits() + ib.bits())?;
-            Ok(Value::BigInt(Rc::new(&**ia * &**ib)))
+            Ok(Value::from_bigint(ia * ib))
         }
-        _ => Ok(Value::Float(to_f64(a)? * to_f64(b)?)),
+        _ => Ok(Value::float(to_f64(a)? * to_f64(b)?)),
     }
 }
 
@@ -558,47 +541,55 @@ pub fn eval_mul(a: &Value, b: &Value) -> Result<Value, String> {
 pub fn eval_div(a: &Value, b: &Value) -> Result<Value, String> {
     // `/` is always floating point and follows IEEE 754, so dividing by zero
     // gives an infinity or NaN. Only `//` and `%` treat it as an error.
-    Ok(Value::Float(to_f64(a)? / to_f64(b)?))
+    Ok(Value::float(to_f64(a)? / to_f64(b)?))
 }
 
 #[inline]
 pub fn eval_idiv(a: &Value, b: &Value) -> Result<Value, String> {
-    match (a, b) {
-        (Value::Int(ia), Value::Int(ib)) => {
-            if *ib == 0 {
+    if a.is_inline_int() && b.is_inline_int() {
+        let ia = a.as_inline_int_unchecked();
+        let ib = b.as_inline_int_unchecked();
+        if ib == 0 {
+            return Err("division by zero".to_string());
+        }
+        return Ok(Value::int(num_integer::Integer::div_floor(&ia, &ib)));
+    }
+    match (a.view(), b.view()) {
+        (ValueView::Int(ia), ValueView::Int(ib)) => {
+            if ib == 0 {
                 return Err("division by zero".to_string());
             }
-            if *ia == i64::MIN && *ib == -1 {
-                return Ok(Value::from_i128(*ia as i128 / *ib as i128));
+            if ia == i64::MIN && ib == -1 {
+                return Ok(Value::from_i128(ia as i128 / ib as i128));
             }
-            Ok(Value::Int(ia.div_floor(ib)))
+            Ok(Value::int(num_integer::Integer::div_floor(&ia, &ib)))
         }
-        (Value::BigInt(ia), Value::Int(ib)) => {
-            if *ib == 0 {
+        (ValueView::BigInt(ia), ValueView::Int(ib)) => {
+            if ib == 0 {
                 return Err("division by zero".to_string());
             }
-            if *ib == 1 {
-                return Ok(Value::BigInt(ia.clone()));
+            if ib == 1 {
+                return Ok(a.clone());
             }
-            if *ib == -1 {
-                return Ok(Value::from_bigint(-&**ia));
+            if ib == -1 {
+                return Ok(Value::from_bigint(-ia));
             }
-            if !ia.is_negative() && *ib > 0 {
-                return Ok(bigint_div_u64(ia, *ib as u64));
+            if !ia.is_negative() && ib > 0 {
+                return Ok(bigint_div_u64(ia, ib as u64));
             }
-            Ok(Value::from_bigint(ia.div_floor(&BigInt::from(*ib))))
+            Ok(Value::from_bigint(ia.div_floor(&BigInt::from(ib))))
         }
-        (Value::Int(ia), Value::BigInt(ib)) => {
+        (ValueView::Int(ia), ValueView::BigInt(ib)) => {
             if ib.is_zero() {
                 return Err("division by zero".to_string());
             }
-            if *ia == 0 || (*ia > 0) == (!ib.is_negative()) {
-                Ok(Value::Int(0))
+            if ia == 0 || (ia > 0) == (!ib.is_negative()) {
+                Ok(Value::small_int(0))
             } else {
-                Ok(Value::Int(-1))
+                Ok(Value::small_int(-1))
             }
         }
-        (Value::BigInt(ia), Value::BigInt(ib)) => {
+        (ValueView::BigInt(ia), ValueView::BigInt(ib)) => {
             if ib.is_zero() {
                 return Err("division by zero".to_string());
             }
@@ -609,9 +600,9 @@ pub fn eval_idiv(a: &Value, b: &Value) -> Result<Value, String> {
                 if let Some(ub) = ib.to_u64() {
                     return Ok(bigint_div_u64(ia, ub));
                 }
-                Ok(Value::from_bigint(&**ia / &**ib))
+                Ok(Value::from_bigint(ia / ib))
             } else {
-                Ok(Value::from_bigint(ia.div_floor(&**ib)))
+                Ok(Value::from_bigint(ia.div_floor(ib)))
             }
         }
         _ => {
@@ -620,50 +611,58 @@ pub fn eval_idiv(a: &Value, b: &Value) -> Result<Value, String> {
             if fb == 0.0 {
                 return Err("division by zero".to_string());
             }
-            Ok(Value::Float((fa / fb).floor()))
+            Ok(Value::float((fa / fb).floor()))
         }
     }
 }
 
 #[inline]
 pub fn eval_mod(a: &Value, b: &Value) -> Result<Value, String> {
-    match (a, b) {
-        (Value::Int(ia), Value::Int(ib)) => {
-            if *ib == 0 {
+    if a.is_inline_int() && b.is_inline_int() {
+        let ia = a.as_inline_int_unchecked();
+        let ib = b.as_inline_int_unchecked();
+        if ib == 0 {
+            return Err("modulo by zero".to_string());
+        }
+        return Ok(Value::int(ia.mod_floor(&ib)));
+    }
+    match (a.view(), b.view()) {
+        (ValueView::Int(ia), ValueView::Int(ib)) => {
+            if ib == 0 {
                 return Err("modulo by zero".to_string());
             }
-            if *ib == -1 {
-                Ok(Value::Int(0))
+            if ib == -1 {
+                Ok(Value::small_int(0))
             } else {
-                Ok(Value::Int(ia.mod_floor(ib)))
+                Ok(Value::int(ia.mod_floor(&ib)))
             }
         }
-        (Value::BigInt(ia), Value::Int(ib)) => {
-            if *ib == 0 {
+        (ValueView::BigInt(ia), ValueView::Int(ib)) => {
+            if ib == 0 {
                 return Err("modulo by zero".to_string());
             }
-            Ok(Value::Int(bigint_mod_floor_i64(ia, *ib)))
+            Ok(Value::int(bigint_mod_floor_i64(ia, ib)))
         }
-        (Value::Int(ia), Value::BigInt(ib)) => {
+        (ValueView::Int(ia), ValueView::BigInt(ib)) => {
             if ib.is_zero() {
                 return Err("modulo by zero".to_string());
             }
-            if *ia == 0 {
-                Ok(Value::Int(0))
-            } else if (*ia > 0) == (!ib.is_negative()) {
-                Ok(Value::Int(*ia))
+            if ia == 0 {
+                Ok(Value::small_int(0))
+            } else if (ia > 0) == (!ib.is_negative()) {
+                Ok(Value::int(ia))
             } else {
-                Ok(Value::from_bigint(*ia + &**ib))
+                Ok(Value::from_bigint(ia + ib))
             }
         }
-        (Value::BigInt(ia), Value::BigInt(ib)) => {
+        (ValueView::BigInt(ia), ValueView::BigInt(ib)) => {
             if ib.is_zero() {
                 return Err("modulo by zero".to_string());
             }
             if !ia.is_negative() && !ib.is_negative() {
-                Ok(Value::from_bigint(&**ia % &**ib))
+                Ok(Value::from_bigint(ia % ib))
             } else {
-                Ok(Value::from_bigint(ia.mod_floor(&**ib)))
+                Ok(Value::from_bigint(ia.mod_floor(ib)))
             }
         }
         _ => {
@@ -672,71 +671,71 @@ pub fn eval_mod(a: &Value, b: &Value) -> Result<Value, String> {
             if fb == 0.0 {
                 return Err("modulo by zero".to_string());
             }
-            Ok(Value::Float(fa - (fa / fb).floor() * fb))
+            Ok(Value::float(fa - (fa / fb).floor() * fb))
         }
     }
 }
 
 pub fn eval_pow(a: &Value, b: &Value) -> Result<Value, String> {
-    if let (Value::Int(ia), Value::Int(ib)) = (a, b)
-        && *ib >= 0
-        && let Ok(exp) = u32::try_from(*ib)
+    if let (ValueView::Int(ia), ValueView::Int(ib)) = (a.view(), b.view())
+        && ib >= 0
+        && let Ok(exp) = u32::try_from(ib)
     {
         return Ok(match ia.checked_pow(exp) {
-            Some(r) => Value::Int(r),
+            Some(r) => Value::int(r),
             None => {
-                if *ia == 2 {
+                if ia == 2 {
                     check_int_bits(exp as u64 + 1)?;
                     Value::from_bigint(BigInt::from(1) << exp)
-                } else if *ia == -2 {
+                } else if ia == -2 {
                     check_int_bits(exp as u64 + 1)?;
                     let bi = BigInt::from(1) << exp;
                     Value::from_bigint(if exp & 1 == 0 { bi } else { -bi })
                 } else {
-                    let base = BigInt::from(*ia);
+                    let base = BigInt::from(ia);
                     check_int_bits(pow_result_bits(&base, exp as u64))?;
                     Value::from_bigint(base.pow(exp))
                 }
             }
         });
     }
-    match (a, b) {
-        (Value::BigInt(ia), Value::Int(ib)) if *ib >= 0 => {
+    match (a.view(), b.view()) {
+        (ValueView::BigInt(ia), ValueView::Int(ib)) if ib >= 0 => {
             if ia.bits() <= 1 {
-                return Ok(Value::Int(if ia.is_zero() {
-                    if *ib == 0 { 1 } else { 0 }
+                return Ok(Value::small_int(if ia.is_zero() {
+                    if ib == 0 { 1 } else { 0 }
                 } else if ia.is_negative() && (ib & 1 != 0) {
                     -1
                 } else {
                     1
                 }));
             }
-            let exp = *ib as u64;
+            let exp = ib as u64;
             check_int_bits(pow_result_bits(ia, exp))?;
             let exp =
                 u32::try_from(exp).map_err(|_| "integer exponent is too large".to_string())?;
             Ok(Value::from_bigint(ia.pow(exp)))
         }
-        (Value::Int(ia), Value::BigInt(ib)) if ib.sign() != Sign::Minus => {
-            if *ia == 0 || *ia == 1 || *ia == -1 {
-                return Ok(Value::Int(if *ia == 0 {
+        (ValueView::Int(ia), ValueView::BigInt(ib)) if ib.sign() != Sign::Minus => {
+            if ia == 0 || ia == 1 || ia == -1 {
+                return Ok(Value::small_int(if ia == 0 {
                     if ib.is_zero() { 1 } else { 0 }
-                } else if *ia == -1 && ib.is_odd() {
+                } else if ia == -1 && ib.is_odd() {
                     -1
                 } else {
                     1
                 }));
             }
-            let base = BigInt::from(*ia);
+            let base = BigInt::from(ia);
             let exp = ib.to_u64().unwrap_or(u64::MAX);
             check_int_bits(pow_result_bits(&base, exp))?;
             let exp =
                 u32::try_from(exp).map_err(|_| "integer exponent is too large".to_string())?;
             Ok(Value::from_bigint(base.pow(exp)))
         }
-        (Value::BigInt(ia), Value::BigInt(ib)) if ib.sign() != Sign::Minus => {
+        (ValueView::BigInt(ia), ValueView::BigInt(ib)) if ib.sign() != Sign::Minus => {
             if ia.bits() <= 1 {
-                return Ok(Value::Int(if ia.is_zero() {
+                return Ok(Value::small_int(if ia.is_zero() {
                     if ib.is_zero() { 1 } else { 0 }
                 } else if ia.is_negative() && ib.is_odd() {
                     -1
@@ -751,28 +750,33 @@ pub fn eval_pow(a: &Value, b: &Value) -> Result<Value, String> {
             Ok(Value::from_bigint(ia.pow(exp)))
         }
 
-        _ => Ok(Value::Float(to_f64(a)?.powf(to_f64(b)?))),
+        _ => Ok(Value::float(to_f64(a)?.powf(to_f64(b)?))),
     }
 }
 
 pub fn eval_bitand(a: &Value, b: &Value) -> Result<Value, String> {
-    match (a, b) {
-        (Value::Int(ia), Value::Int(ib)) => Ok(Value::Int(ia & ib)),
-        (Value::BigInt(ia), Value::Int(ib)) => {
-            if *ib >= 0 {
-                Ok(Value::Int((low_word(a)? as i64) & *ib))
+    if a.is_inline_int() && b.is_inline_int() {
+        return Ok(Value::int(
+            a.as_inline_int_unchecked() & b.as_inline_int_unchecked(),
+        ));
+    }
+    match (a.view(), b.view()) {
+        (ValueView::Int(ia), ValueView::Int(ib)) => Ok(Value::int(ia & ib)),
+        (ValueView::BigInt(ia), ValueView::Int(ib)) => {
+            if ib >= 0 {
+                Ok(Value::int((low_word(a)? as i64) & ib))
             } else {
-                Ok(Value::from_bigint(&**ia & BigInt::from(*ib)))
+                Ok(Value::from_bigint(ia & BigInt::from(ib)))
             }
         }
-        (Value::Int(ia), Value::BigInt(ib)) => {
-            if *ia >= 0 {
-                Ok(Value::Int(*ia & (low_word(b)? as i64)))
+        (ValueView::Int(ia), ValueView::BigInt(ib)) => {
+            if ia >= 0 {
+                Ok(Value::int(ia & (low_word(b)? as i64)))
             } else {
-                Ok(Value::from_bigint(BigInt::from(*ia) & &**ib))
+                Ok(Value::from_bigint(BigInt::from(ia) & ib))
             }
         }
-        (Value::BigInt(ia), Value::BigInt(ib)) => Ok(Value::from_bigint(&**ia & &**ib)),
+        (ValueView::BigInt(ia), ValueView::BigInt(ib)) => Ok(Value::from_bigint(ia & ib)),
         _ => {
             let ca = to_bigint_cow(a)?;
             let cb = to_bigint_cow(b)?;
@@ -782,11 +786,20 @@ pub fn eval_bitand(a: &Value, b: &Value) -> Result<Value, String> {
 }
 
 pub fn eval_bitor(a: &Value, b: &Value) -> Result<Value, String> {
-    match (a, b) {
-        (Value::Int(ia), Value::Int(ib)) => Ok(Value::Int(ia | ib)),
-        (Value::BigInt(ia), Value::Int(ib)) => Ok(Value::from_bigint(&**ia | BigInt::from(*ib))),
-        (Value::Int(ia), Value::BigInt(ib)) => Ok(Value::from_bigint(BigInt::from(*ia) | &**ib)),
-        (Value::BigInt(ia), Value::BigInt(ib)) => Ok(Value::from_bigint(&**ia | &**ib)),
+    if a.is_inline_int() && b.is_inline_int() {
+        return Ok(Value::int(
+            a.as_inline_int_unchecked() | b.as_inline_int_unchecked(),
+        ));
+    }
+    match (a.view(), b.view()) {
+        (ValueView::Int(ia), ValueView::Int(ib)) => Ok(Value::int(ia | ib)),
+        (ValueView::BigInt(ia), ValueView::Int(ib)) => {
+            Ok(Value::from_bigint(ia | BigInt::from(ib)))
+        }
+        (ValueView::Int(ia), ValueView::BigInt(ib)) => {
+            Ok(Value::from_bigint(BigInt::from(ia) | ib))
+        }
+        (ValueView::BigInt(ia), ValueView::BigInt(ib)) => Ok(Value::from_bigint(ia | ib)),
         _ => {
             let ca = to_bigint_cow(a)?;
             let cb = to_bigint_cow(b)?;
@@ -796,11 +809,20 @@ pub fn eval_bitor(a: &Value, b: &Value) -> Result<Value, String> {
 }
 
 pub fn eval_bitxor(a: &Value, b: &Value) -> Result<Value, String> {
-    match (a, b) {
-        (Value::Int(ia), Value::Int(ib)) => Ok(Value::Int(ia ^ ib)),
-        (Value::BigInt(ia), Value::Int(ib)) => Ok(Value::from_bigint(&**ia ^ BigInt::from(*ib))),
-        (Value::Int(ia), Value::BigInt(ib)) => Ok(Value::from_bigint(BigInt::from(*ia) ^ &**ib)),
-        (Value::BigInt(ia), Value::BigInt(ib)) => Ok(Value::from_bigint(&**ia ^ &**ib)),
+    if a.is_inline_int() && b.is_inline_int() {
+        return Ok(Value::int(
+            a.as_inline_int_unchecked() ^ b.as_inline_int_unchecked(),
+        ));
+    }
+    match (a.view(), b.view()) {
+        (ValueView::Int(ia), ValueView::Int(ib)) => Ok(Value::int(ia ^ ib)),
+        (ValueView::BigInt(ia), ValueView::Int(ib)) => {
+            Ok(Value::from_bigint(ia ^ BigInt::from(ib)))
+        }
+        (ValueView::Int(ia), ValueView::BigInt(ib)) => {
+            Ok(Value::from_bigint(BigInt::from(ia) ^ ib))
+        }
+        (ValueView::BigInt(ia), ValueView::BigInt(ib)) => Ok(Value::from_bigint(ia ^ ib)),
         _ => {
             let ca = to_bigint_cow(a)?;
             let cb = to_bigint_cow(b)?;
@@ -811,23 +833,21 @@ pub fn eval_bitxor(a: &Value, b: &Value) -> Result<Value, String> {
 
 /// Arithmetic shift left that widens instead of dropping bits.
 fn shift_left(ia: &Value, shift: usize) -> Result<Value, String> {
-    match ia {
-        Value::Int(i) => {
-            if *i == 0 {
-                return Ok(Value::Int(0));
+    match ia.view() {
+        ValueView::Int(i) => {
+            if i == 0 {
+                return Ok(Value::small_int(0));
             }
-            // Shifting must not change the sign or lose a set bit: the number of
-            // leading sign bits says how far it can go without widening.
-            let headroom = if *i >= 0 {
+            let headroom = if i >= 0 {
                 i.leading_zeros() - 1
             } else {
                 i.leading_ones() - 1
             } as usize;
             if shift <= headroom {
-                return Ok(Value::Int(i << shift));
+                return Ok(Value::int(i << shift));
             }
-            let val128 = *i as i128;
-            let headroom128 = if *i >= 0 {
+            let val128 = i as i128;
+            let headroom128 = if i >= 0 {
                 val128.leading_zeros() - 1
             } else {
                 val128.leading_ones() - 1
@@ -835,21 +855,21 @@ fn shift_left(ia: &Value, shift: usize) -> Result<Value, String> {
             if shift <= headroom128 && ((val128 << shift) >> shift) == val128 {
                 return Ok(Value::from_i128(val128 << shift));
             }
-            let bits = i64_bits(*i);
+            let bits = i64_bits(i);
             check_int_bits(bits.saturating_add(shift as u64))?;
-            Ok(Value::from_bigint(BigInt::from(*i) << shift))
+            Ok(Value::from_bigint(BigInt::from(i) << shift))
         }
-        Value::BigInt(b) => {
+        ValueView::BigInt(b) => {
             if b.is_zero() {
-                return Ok(Value::Int(0));
+                return Ok(Value::small_int(0));
             }
             check_int_bits(b.bits().saturating_add(shift as u64))?;
-            Ok(Value::BigInt(Rc::new(&**b << shift)))
+            Ok(Value::from_bigint(b << shift))
         }
         _ => {
             let big = to_bigint_cow(ia)?;
             if big.is_zero() {
-                return Ok(Value::Int(0));
+                return Ok(Value::small_int(0));
             }
             check_int_bits(big.bits().saturating_add(shift as u64))?;
             Ok(Value::from_bigint(&*big << shift))
@@ -859,17 +879,17 @@ fn shift_left(ia: &Value, shift: usize) -> Result<Value, String> {
 
 /// Arithmetic shift right (floors towards negative infinity, like BigInt).
 fn shift_right(ia: &Value, shift: usize) -> Result<Value, String> {
-    match ia {
-        Value::Int(i) => Ok(Value::Int(if shift >= 64 {
-            if *i < 0 { -1 } else { 0 }
+    match ia.view() {
+        ValueView::Int(i) => Ok(Value::int(if shift >= 64 {
+            if i < 0 { -1 } else { 0 }
         } else {
             i >> shift
         })),
-        Value::BigInt(b) => Ok(bigint_shr_u64(b, shift as u64)),
+        ValueView::BigInt(b) => Ok(bigint_shr_u64(b, shift as u64)),
         _ => {
             let big = to_bigint_cow(ia)?;
             if shift as u64 >= big.bits() {
-                Ok(Value::Int(if big.is_negative() { -1 } else { 0 }))
+                Ok(Value::small_int(if big.is_negative() { -1 } else { 0 }))
             } else {
                 Ok(Value::from_bigint(&*big >> shift))
             }
@@ -878,10 +898,10 @@ fn shift_right(ia: &Value, shift: usize) -> Result<Value, String> {
 }
 
 fn shift_amount(b: &Value) -> Result<(bool, usize), String> {
-    match b {
-        Value::Int(i) => Ok((*i < 0, i.unsigned_abs() as usize)),
-        Value::BigInt(_) => Err("shift is too large".to_string()),
-        Value::Float(f) => {
+    match b.view() {
+        ValueView::Int(i) => Ok((i < 0, i.unsigned_abs() as usize)),
+        ValueView::BigInt(_) => Err("shift is too large".to_string()),
+        ValueView::Float(f) => {
             if !f.is_finite() {
                 return Err("cannot convert float to integer".to_string());
             }
@@ -919,9 +939,9 @@ pub fn eval_shr(a: &Value, b: &Value) -> Result<Value, String> {
 /// The low 64 bits of an integer, in two's complement.
 #[inline]
 pub fn low_word(v: &Value) -> Result<u64, String> {
-    match v {
-        Value::Int(i) => Ok(*i as u64),
-        Value::BigInt(b) => {
+    match v.view() {
+        ValueView::Int(i) => Ok(i as u64),
+        ValueView::BigInt(b) => {
             let low = b.iter_u64_digits().next().unwrap_or(0);
             if b.is_negative() {
                 Ok(low.wrapping_neg())
@@ -943,22 +963,22 @@ pub fn low_word(v: &Value) -> Result<u64, String> {
 
 pub fn eval_lshl(a: &Value, b: &Value) -> Result<Value, String> {
     let word = low_word(a)?;
-    let bits = match b {
-        Value::Int(i) => {
-            if *i < 0 {
+    let bits = match b.view() {
+        ValueView::Int(i) => {
+            if i < 0 {
                 usize::MAX
             } else {
-                usize::try_from(*i).unwrap_or(usize::MAX)
+                usize::try_from(i).unwrap_or(usize::MAX)
             }
         }
-        Value::BigInt(bi) => {
+        ValueView::BigInt(bi) => {
             if bi.is_negative() {
                 usize::MAX
             } else {
                 bi.to_usize().unwrap_or(usize::MAX)
             }
         }
-        Value::Float(f) => {
+        ValueView::Float(f) => {
             if !f.is_finite() {
                 return Err("cannot convert float to integer".to_string());
             }
@@ -977,22 +997,22 @@ pub fn eval_lshl(a: &Value, b: &Value) -> Result<Value, String> {
 
 pub fn eval_lshr(a: &Value, b: &Value) -> Result<Value, String> {
     let word = low_word(a)?;
-    let bits = match b {
-        Value::Int(i) => {
-            if *i < 0 {
+    let bits = match b.view() {
+        ValueView::Int(i) => {
+            if i < 0 {
                 usize::MAX
             } else {
-                usize::try_from(*i).unwrap_or(usize::MAX)
+                usize::try_from(i).unwrap_or(usize::MAX)
             }
         }
-        Value::BigInt(bi) => {
+        ValueView::BigInt(bi) => {
             if bi.is_negative() {
                 usize::MAX
             } else {
                 bi.to_usize().unwrap_or(usize::MAX)
             }
         }
-        Value::Float(f) => {
+        ValueView::Float(f) => {
             if !f.is_finite() {
                 return Err("cannot convert float to integer".to_string());
             }
@@ -1010,9 +1030,9 @@ pub fn eval_lshr(a: &Value, b: &Value) -> Result<Value, String> {
 }
 
 pub fn eval_bitnot(a: &Value) -> Result<Value, String> {
-    match a {
-        Value::Int(i) => Ok(Value::Int(!i)),
-        Value::BigInt(b) => Ok(Value::from_bigint(!&**b)),
+    match a.view() {
+        ValueView::Int(i) => Ok(Value::int(!i)),
+        ValueView::BigInt(b) => Ok(Value::from_bigint(!b)),
         _ => {
             let big = to_bigint_cow(a)?;
             Ok(Value::from_bigint(!&*big))
@@ -1021,13 +1041,19 @@ pub fn eval_bitnot(a: &Value) -> Result<Value, String> {
 }
 
 pub fn eval_unm(a: &Value) -> Result<Value, String> {
-    match a {
-        Value::Int(i) => Ok(match i.checked_neg() {
-            Some(r) => Value::Int(r),
-            None => Value::from_i128(-(*i as i128)),
+    if a.is_inline_int() {
+        return Ok(Value::int(-a.as_inline_int_unchecked()));
+    }
+    if a.is_float() {
+        return Ok(Value::float(-a.as_float_unchecked()));
+    }
+    match a.view() {
+        ValueView::Int(i) => Ok(match i.checked_neg() {
+            Some(r) => Value::int(r),
+            None => Value::from_i128(-(i as i128)),
         }),
-        Value::BigInt(b) => Ok(Value::from_bigint(-&**b)),
-        Value::Float(f) => Ok(Value::Float(-f)),
+        ValueView::BigInt(b) => Ok(Value::from_bigint(-b)),
+        ValueView::Float(f) => Ok(Value::float(-f)),
         _ => Err("unary minus expects a number".to_string()),
     }
 }
@@ -1038,23 +1064,23 @@ pub fn eval_unm(a: &Value) -> Result<Value, String> {
 #[inline]
 fn num_cmp(a: &Value, b: &Value) -> Result<Option<std::cmp::Ordering>, String> {
     use std::cmp::Ordering;
-    Ok(Some(match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Int(_), Value::BigInt(y)) => {
+    Ok(Some(match (a.view(), b.view()) {
+        (ValueView::Int(x), ValueView::Int(y)) => x.cmp(&y),
+        (ValueView::Int(_), ValueView::BigInt(y)) => {
             if y.is_negative() {
                 Ordering::Greater
             } else {
                 Ordering::Less
             }
         }
-        (Value::BigInt(x), Value::Int(_)) => {
+        (ValueView::BigInt(x), ValueView::Int(_)) => {
             if x.is_negative() {
                 Ordering::Less
             } else {
                 Ordering::Greater
             }
         }
-        (Value::BigInt(x), Value::BigInt(y)) => x.cmp(y),
+        (ValueView::BigInt(x), ValueView::BigInt(y)) => x.cmp(y),
         _ => return Ok(to_f64(a)?.partial_cmp(&to_f64(b)?)),
     }))
 }
@@ -1063,10 +1089,10 @@ macro_rules! compare_op {
     ($name:ident, $op:tt, $($pat:pat_param)|+) => {
         #[inline]
         pub fn $name(a: &Value, b: &Value) -> Result<bool, String> {
-            if let (Value::Int(ia), Value::Int(ib)) = (a, b) {
-                return Ok(ia $op ib);
+            if a.is_inline_int() && b.is_inline_int() {
+                return Ok(a.as_inline_int_unchecked() $op b.as_inline_int_unchecked());
             }
-            if let (Value::String(sa), Value::String(sb)) = (a, b) {
+            if let (Some(sa), Some(sb)) = (a.as_str(), b.as_str()) {
                 return Ok(sa $op sb);
             }
             Ok(matches!(num_cmp(a, b)?, Some($($pat)|+)))
@@ -1082,18 +1108,19 @@ compare_op!(eval_ge, >=, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
 
     #[test]
     fn test_ops_i128_overflow_and_demotion() {
-        let max = Value::Int(i64::MAX);
-        let one = Value::Int(1);
+        let max = Value::int(i64::MAX);
+        let one = Value::int(1);
         let add = eval_add(&max, &one).unwrap();
         assert_eq!(add.typeof_name(), "bigint");
         let sub = eval_sub(&add, &one).unwrap();
-        assert_eq!(sub, Value::Int(i64::MAX));
+        assert_eq!(sub, Value::int(i64::MAX));
 
-        let min = Value::Int(i64::MIN);
-        let neg_one = Value::Int(-1);
+        let min = Value::int(i64::MIN);
+        let neg_one = Value::int(-1);
         let idiv = eval_idiv(&min, &neg_one).unwrap();
         assert_eq!(idiv.typeof_name(), "bigint");
 
@@ -1104,15 +1131,15 @@ mod tests {
     #[test]
     fn test_ops_bigint_borrowed_arithmetic() {
         let b = Value::from_bigint(BigInt::from(1) << 100);
-        let two = Value::Int(2);
+        let two = Value::int(2);
         let mul = eval_mul(&b, &two).unwrap();
         assert_eq!(mul, Value::from_bigint(BigInt::from(1) << 101));
 
         let div = eval_idiv(&mul, &two).unwrap();
         assert_eq!(div, b);
 
-        let rem = eval_mod(&b, &Value::Int(1000)).unwrap();
-        assert!(matches!(rem, Value::Int(_)));
+        let rem = eval_mod(&b, &Value::int(1000)).unwrap();
+        assert!(rem.is_int());
     }
 
     #[test]
@@ -1144,10 +1171,10 @@ mod tests {
                 let std_mod = bi.mod_floor(&BigInt::from(div)).to_i64().unwrap();
                 assert_eq!(fast_mod, std_mod, "mismatch for {bi} % {div}");
 
-                let v_bi = Value::BigInt(Rc::new(bi.clone()));
-                let v_div = Value::Int(div);
+                let v_bi = Value::from_bigint(bi.clone());
+                let v_div = Value::int(div);
                 let eval_m = eval_mod(&v_bi, &v_div).unwrap();
-                assert_eq!(eval_m, Value::Int(std_mod));
+                assert_eq!(eval_m, Value::int(std_mod));
 
                 let eval_d = eval_idiv(&v_bi, &v_div).unwrap();
                 let std_d = Value::from_bigint(bi.div_floor(&BigInt::from(div)));
@@ -1159,10 +1186,10 @@ mod tests {
     #[test]
     fn test_low_word_equivalence() {
         let test_cases = [
-            (Value::Int(0), 0u64),
-            (Value::Int(-1), u64::MAX),
-            (Value::Int(-8), (-8i64) as u64),
-            (Value::Int(12345), 12345u64),
+            (Value::int(0), 0u64),
+            (Value::int(-1), u64::MAX),
+            (Value::int(-8), (-8i64) as u64),
+            (Value::int(12345), 12345u64),
             (
                 Value::from_bigint((BigInt::from(1i64) << 70) | BigInt::from(5i64)),
                 5u64,
@@ -1205,35 +1232,29 @@ mod tests {
                 let got = bigint_shr_u64(b, shift);
                 let expected = Value::from_bigint(b >> (shift as usize));
                 assert_eq!(got, expected, "shr mismatch for {b} >> {shift}");
-                if let Value::BigInt(ref bi) = got {
+                if let Some(bi) = got.as_bigint() {
                     assert!(
                         bi.to_i64().is_none(),
                         "unnormalized BigInt from {b} >> {shift}: {bi}"
                     );
                 }
             }
-            // Shift >= 2^32 must check `u64` range before narrowing to `usize`
-            // so 32-bit targets never truncate `1u64 << 32` to `0`.
             let huge_shift = 1u64 << 32;
-            let expected_huge = Value::Int(if b.is_negative() { -1 } else { 0 });
+            let expected_huge = Value::int(if b.is_negative() { -1 } else { 0 });
             assert_eq!(bigint_shr_u64(b, huge_shift), expected_huge);
-            let mut stack = vec![Value::BigInt(Rc::new(b.clone()))];
+            let mut stack = vec![Value::from_bigint(b.clone())];
             eval_shr_bigint_into(&mut stack, 0, 0, huge_shift);
             assert_eq!(stack[0], expected_huge);
         }
-        // Explicit i64::MIN boundary checks
         assert_eq!(
             bigint_shr_u64(&(-(BigInt::from(1i64) << 64u32)), 1),
-            Value::Int(i64::MIN)
+            Value::int(i64::MIN)
         );
         assert_eq!(
             bigint_shr_u64(&(-((BigInt::from(1i64) << 64u32) - 1i64)), 1),
-            Value::Int(i64::MIN)
+            Value::int(i64::MIN)
         );
-        assert!(matches!(
-            bigint_shr_u64(&(-((BigInt::from(1i64) << 64u32) + 1i64)), 1),
-            Value::BigInt(_)
-        ));
+        assert!(bigint_shr_u64(&(-((BigInt::from(1i64) << 64u32) + 1i64)), 1).is_bigint());
     }
 
     #[test]
@@ -1260,7 +1281,7 @@ mod tests {
         for a in &dividends {
             let va = Value::from_bigint(a.clone());
             for &d in &divisors_i64 {
-                let got = eval_idiv(&va, &Value::Int(d)).unwrap();
+                let got = eval_idiv(&va, &Value::int(d)).unwrap();
                 let expected = Value::from_bigint(a.div_floor(&BigInt::from(d)));
                 assert_eq!(got, expected, "idiv mismatch for {a} // {d}");
             }
@@ -1280,42 +1301,42 @@ mod tests {
         let neg_min_minus_1 = BigInt::from(i64::MIN) - 1i64;
 
         // 1. Unique owner dst == a mutates in place; demotes cleanly to i64::MAX / i64::MIN.
-        let mut stack = vec![Value::from_bigint(two_63.clone()), Value::Int(-1)];
+        let mut stack = vec![Value::from_bigint(two_63.clone()), Value::int(-1)];
         eval_add_into(&mut stack, 0, 0, 1).unwrap();
-        assert_eq!(stack[0], Value::Int(i64::MAX));
+        assert_eq!(stack[0], Value::int(i64::MAX));
 
-        let mut stack = vec![Value::from_bigint(neg_min_minus_1.clone()), Value::Int(1)];
+        let mut stack = vec![Value::from_bigint(neg_min_minus_1.clone()), Value::int(1)];
         eval_add_into(&mut stack, 0, 0, 1).unwrap();
-        assert_eq!(stack[0], Value::Int(i64::MIN));
+        assert_eq!(stack[0], Value::int(i64::MIN));
 
         // Unary negation in place: -(2^63) demotes cleanly to i64::MIN.
         let mut stack = vec![Value::from_bigint(two_63.clone())];
         eval_unm_into(&mut stack, 0, 0).unwrap();
-        assert_eq!(stack[0], Value::Int(i64::MIN));
+        assert_eq!(stack[0], Value::int(i64::MIN));
 
         // 2. Shared alias (strong_count >= 2) MUST NOT be mutated!
         let shared_rc = Rc::new(two_100.clone());
-        let mut stack = vec![Value::BigInt(Rc::clone(&shared_rc)), Value::Int(42)];
+        let mut stack = vec![Value::from_bigint_rc(Rc::clone(&shared_rc)), Value::int(42)];
         eval_add_into(&mut stack, 0, 0, 1).unwrap();
         assert_eq!(stack[0], Value::from_bigint(&two_100 + 42i64));
         assert_eq!(*shared_rc, two_100);
 
-        stack[0] = Value::BigInt(Rc::clone(&shared_rc));
+        stack[0] = Value::from_bigint_rc(Rc::clone(&shared_rc));
         eval_sub_into(&mut stack, 0, 0, 1).unwrap();
         assert_eq!(stack[0], Value::from_bigint(&two_100 - 42i64));
         assert_eq!(*shared_rc, two_100);
 
-        stack[0] = Value::BigInt(Rc::clone(&shared_rc));
+        stack[0] = Value::from_bigint_rc(Rc::clone(&shared_rc));
         eval_shr_bigint_into(&mut stack, 0, 0, 10);
         assert_eq!(stack[0], Value::from_bigint(&two_100 >> 10u32));
         assert_eq!(*shared_rc, two_100);
 
-        stack[0] = Value::BigInt(Rc::clone(&shared_rc));
+        stack[0] = Value::from_bigint_rc(Rc::clone(&shared_rc));
         eval_shl_bigint_into(&mut stack, 0, 0, 5).unwrap();
         assert_eq!(stack[0], Value::from_bigint(&two_100 << 5u32));
         assert_eq!(*shared_rc, two_100);
 
-        stack[0] = Value::BigInt(Rc::clone(&shared_rc));
+        stack[0] = Value::from_bigint_rc(Rc::clone(&shared_rc));
         eval_bitor_into(&mut stack, 0, 0, 1).unwrap();
         assert_eq!(stack[0], Value::from_bigint(&two_100 | BigInt::from(42i64)));
         assert_eq!(*shared_rc, two_100);
@@ -1323,25 +1344,21 @@ mod tests {
         // 3. Unique-owner dst == a reuses the exact Rc allocation (ptr_eq).
         let unique_rc = Rc::new(two_100.clone());
         let orig_ptr = Rc::as_ptr(&unique_rc);
-        let mut stack = vec![Value::BigInt(unique_rc), Value::Int(7)];
+        let mut stack = vec![Value::from_bigint_rc(unique_rc), Value::int(7)];
         eval_add_into(&mut stack, 0, 0, 1).unwrap();
-        let Value::BigInt(ref after_add) = stack[0] else {
-            panic!("expected BigInt");
-        };
-        assert_eq!(Rc::as_ptr(after_add), orig_ptr);
-        assert_eq!(**after_add, &two_100 + 7i64);
+        let after_add = stack[0].as_bigint().expect("expected BigInt");
+        assert_eq!(after_add as *const BigInt, orig_ptr);
+        assert_eq!(*after_add, &two_100 + 7i64);
 
         eval_bitor_into(&mut stack, 0, 0, 1).unwrap();
         eval_bitxor_into(&mut stack, 0, 0, 1).unwrap();
         eval_shl_bigint_into(&mut stack, 0, 0, 4).unwrap();
         eval_shr_bigint_into(&mut stack, 0, 0, 4);
-        let Value::BigInt(ref after_ops) = stack[0] else {
-            panic!("expected BigInt");
-        };
-        assert_eq!(Rc::as_ptr(after_ops), orig_ptr);
+        let after_ops = stack[0].as_bigint().expect("expected BigInt");
+        assert_eq!(after_ops as *const BigInt, orig_ptr);
 
         // 4. dst == b (commutative add) and dst == a == b (doubling / self-sub).
-        let mut stack = vec![Value::Int(7), Value::from_bigint(two_100.clone())];
+        let mut stack = vec![Value::int(7), Value::from_bigint(two_100.clone())];
         eval_add_into(&mut stack, 1, 0, 1).unwrap();
         assert_eq!(stack[1], Value::from_bigint(&two_100 + 7i64));
 
@@ -1351,19 +1368,19 @@ mod tests {
 
         let mut stack = vec![Value::from_bigint(two_100.clone())];
         eval_sub_into(&mut stack, 0, 0, 0).unwrap();
-        assert_eq!(stack[0], Value::Int(0));
+        assert_eq!(stack[0], Value::int(0));
 
         // 5. Bitwise AND demotion back to Int when masked to small positive int.
         let mut stack = vec![
             Value::from_bigint(&two_100 | BigInt::from(0xffi64)),
-            Value::Int(0x0f),
+            Value::int(0x0f),
         ];
         eval_bitand_into(&mut stack, 0, 0, 1).unwrap();
-        assert_eq!(stack[0], Value::Int(0x0f));
+        assert_eq!(stack[0], Value::int(0x0f));
 
         // 6. MAX_INT_BITS overflow check happens BEFORE mutation.
         let huge = BigInt::from(1i64) << (MAX_INT_BITS as usize);
-        let mut stack = vec![Value::from_bigint(huge.clone()), Value::Int(1)];
+        let mut stack = vec![Value::from_bigint(huge.clone()), Value::int(1)];
         assert!(eval_add_into(&mut stack, 0, 0, 1).is_err());
         assert_eq!(stack[0], Value::from_bigint(huge.clone()));
         assert!(eval_shl_bigint_into(&mut stack, 0, 0, 1).is_err());

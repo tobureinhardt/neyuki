@@ -8,8 +8,6 @@
 //! - string concatenation identities require the operand to be statically known
 //!   as a `string`.
 
-use std::collections::HashMap;
-
 use num_bigint::BigInt;
 use num_traits::{One, Zero};
 
@@ -18,6 +16,7 @@ use crate::compiler::ir::inst::IrInst;
 use crate::compiler::ir::types::{IrBinaryOp, IrConstant, IrUnaryOp, IrVar};
 use crate::compiler::value_tracking::{TrackedValue, eval_binop, eval_unop};
 use crate::sema::types::NeyukiType;
+use crate::vm::hash::{FxHashMap, FxHashSet, new_map};
 
 fn is_known_int(v: &TrackedValue) -> bool {
     matches!(
@@ -255,89 +254,114 @@ fn rewrite_binop(
 /// Performs intra-block algebraic simplification and strength reduction on `cfg`.
 pub fn strength_reduction_cfg(cfg: &mut ControlFlowGraph) -> bool {
     let captured = super::captured_vars(cfg);
+    strength_reduction_cfg_with(cfg, &captured)
+}
+
+pub fn strength_reduction_cfg_with(
+    cfg: &mut ControlFlowGraph,
+    captured: &FxHashSet<IrVar>,
+) -> bool {
     let mut changed = false;
+    let mut state: FxHashMap<IrVar, TrackedValue> = new_map();
+    let mut origins: FxHashMap<IrVar, UnOpOrigin> = new_map();
 
     for block in &mut cfg.blocks {
-        let mut state: HashMap<IrVar, TrackedValue> = HashMap::new();
-        let mut origins: HashMap<IrVar, UnOpOrigin> = HashMap::new();
-        let mut out = Vec::with_capacity(block.instructions.len());
+        state.clear();
+        origins.clear();
 
-        for inst in block.instructions.drain(..) {
+        for inst in &mut block.instructions {
             match inst {
-                IrInst::LoadConst { dst, ref val } => {
-                    state.insert(dst, TrackedValue::Const(val.clone()));
-                    origins.remove(&dst);
-                    out.push(inst);
+                IrInst::LoadConst { dst, val } => {
+                    state.insert(*dst, TrackedValue::Const(val.clone()));
+                    if !origins.is_empty() {
+                        origins.remove(dst);
+                    }
                 }
                 IrInst::LoadNil { dst } => {
-                    state.insert(dst, TrackedValue::Const(IrConstant::Nil));
-                    origins.remove(&dst);
-                    out.push(inst);
+                    state.insert(*dst, TrackedValue::Const(IrConstant::Nil));
+                    if !origins.is_empty() {
+                        origins.remove(dst);
+                    }
                 }
                 IrInst::Move { dst, src } => {
-                    let val = state.get(&src).cloned().unwrap_or(TrackedValue::Bottom);
-                    state.insert(dst, val);
-                    if let Some(orig) = origins.get(&src).cloned() {
-                        origins.insert(dst, orig);
-                    } else {
-                        origins.remove(&dst);
+                    let dst_v = *dst;
+                    let src_v = *src;
+                    let val = state.get(&src_v).cloned().unwrap_or(TrackedValue::Bottom);
+                    state.insert(dst_v, val);
+                    if let Some(orig) = origins.get(&src_v).cloned() {
+                        origins.insert(dst_v, orig);
+                    } else if !origins.is_empty() {
+                        origins.remove(&dst_v);
                     }
-                    out.push(inst);
                 }
                 IrInst::BinOp { dst, op, lhs, rhs } => {
-                    let l_val = if captured.contains(&lhs) {
-                        TrackedValue::Bottom
+                    let dst_v = *dst;
+                    let op_v = *op;
+                    let lhs_v = *lhs;
+                    let rhs_v = *rhs;
+                    let l_val = if captured.contains(&lhs_v) {
+                        &TrackedValue::Bottom
                     } else {
-                        state.get(&lhs).cloned().unwrap_or(TrackedValue::Bottom)
+                        state.get(&lhs_v).unwrap_or(&TrackedValue::Bottom)
                     };
-                    let r_val = if captured.contains(&rhs) {
-                        TrackedValue::Bottom
+                    let r_val = if captured.contains(&rhs_v) {
+                        &TrackedValue::Bottom
                     } else {
-                        state.get(&rhs).cloned().unwrap_or(TrackedValue::Bottom)
+                        state.get(&rhs_v).unwrap_or(&TrackedValue::Bottom)
                     };
-                    let res_val = eval_binop(op, &l_val, &r_val);
+                    let res_val = eval_binop(op_v, l_val, r_val);
 
-                    if !captured.contains(&dst)
-                        && !captured.contains(&lhs)
-                        && !captured.contains(&rhs)
-                        && let Some(rewritten) = rewrite_binop(dst, op, lhs, rhs, &l_val, &r_val)
+                    if !captured.contains(&dst_v)
+                        && !captured.contains(&lhs_v)
+                        && !captured.contains(&rhs_v)
+                        && let Some(rewritten) =
+                            rewrite_binop(dst_v, op_v, lhs_v, rhs_v, l_val, r_val)
                     {
                         changed = true;
                         match &rewritten {
                             IrInst::Move { src, .. } => {
                                 let v = state.get(src).cloned().unwrap_or(res_val);
-                                state.insert(dst, v);
+                                state.insert(dst_v, v);
                             }
                             IrInst::LoadConst { val, .. } => {
-                                state.insert(dst, TrackedValue::Const(val.clone()));
+                                state.insert(dst_v, TrackedValue::Const(val.clone()));
                             }
                             _ => {
-                                state.insert(dst, res_val);
+                                state.insert(dst_v, res_val);
                             }
                         }
-                        origins.remove(&dst);
-                        out.push(rewritten);
+                        if !origins.is_empty() {
+                            origins.remove(&dst_v);
+                        }
+                        *inst = rewritten;
                     } else {
                         if !captured.is_empty() {
                             state.retain(|var, _| !captured.contains(var));
-                            origins.retain(|var, _| !captured.contains(var));
+                            if !origins.is_empty() {
+                                origins.retain(|var, _| !captured.contains(var));
+                            }
                         }
-                        state.insert(dst, res_val);
-                        origins.remove(&dst);
-                        out.push(IrInst::BinOp { dst, op, lhs, rhs });
+                        state.insert(dst_v, res_val);
+                        if !origins.is_empty() {
+                            origins.remove(&dst_v);
+                        }
                     }
                 }
                 IrInst::UnOp { dst, op, src } => {
-                    let s_val = if captured.contains(&src) {
-                        TrackedValue::Bottom
+                    let dst_v = *dst;
+                    let op_v = *op;
+                    let src_v = *src;
+                    let s_val = if captured.contains(&src_v) {
+                        &TrackedValue::Bottom
                     } else {
-                        state.get(&src).cloned().unwrap_or(TrackedValue::Bottom)
+                        state.get(&src_v).unwrap_or(&TrackedValue::Bottom)
                     };
-                    let res_val = eval_unop(op, &s_val);
-                    let double_cancel = if !captured.contains(&dst) && !captured.contains(&src) {
-                        match origins.get(&src) {
+                    let res_val = eval_unop(op_v, s_val);
+                    let double_cancel = if !captured.contains(&dst_v) && !captured.contains(&src_v)
+                    {
+                        match origins.get(&src_v) {
                             Some(UnOpOrigin::Unary(IrUnaryOp::Not, inner))
-                                if op == IrUnaryOp::Not
+                                if op_v == IrUnaryOp::Not
                                     && !captured.contains(inner)
                                     && is_known_bool(
                                         state.get(inner).unwrap_or(&TrackedValue::Bottom),
@@ -346,7 +370,7 @@ pub fn strength_reduction_cfg(cfg: &mut ControlFlowGraph) -> bool {
                                 Some(*inner)
                             }
                             Some(UnOpOrigin::Unary(IrUnaryOp::Neg, inner))
-                                if op == IrUnaryOp::Neg
+                                if op_v == IrUnaryOp::Neg
                                     && !captured.contains(inner)
                                     && is_known_number(
                                         state.get(inner).unwrap_or(&TrackedValue::Bottom),
@@ -355,7 +379,7 @@ pub fn strength_reduction_cfg(cfg: &mut ControlFlowGraph) -> bool {
                                 Some(*inner)
                             }
                             Some(UnOpOrigin::Unary(IrUnaryOp::BitNot, inner))
-                                if op == IrUnaryOp::BitNot
+                                if op_v == IrUnaryOp::BitNot
                                     && !captured.contains(inner)
                                     && is_known_int(
                                         state.get(inner).unwrap_or(&TrackedValue::Bottom),
@@ -372,17 +396,21 @@ pub fn strength_reduction_cfg(cfg: &mut ControlFlowGraph) -> bool {
                     if let Some(inner) = double_cancel {
                         changed = true;
                         let v = state.get(&inner).cloned().unwrap_or(res_val);
-                        state.insert(dst, v);
-                        origins.remove(&dst);
-                        out.push(IrInst::Move { dst, src: inner });
+                        state.insert(dst_v, v);
+                        origins.remove(&dst_v);
+                        *inst = IrInst::Move {
+                            dst: dst_v,
+                            src: inner,
+                        };
                     } else {
-                        if op != IrUnaryOp::Not && !captured.is_empty() {
+                        if op_v != IrUnaryOp::Not && !captured.is_empty() {
                             state.retain(|var, _| !captured.contains(var));
-                            origins.retain(|var, _| !captured.contains(var));
+                            if !origins.is_empty() {
+                                origins.retain(|var, _| !captured.contains(var));
+                            }
                         }
-                        state.insert(dst, res_val);
-                        origins.insert(dst, UnOpOrigin::Unary(op, src));
-                        out.push(IrInst::UnOp { dst, op, src });
+                        state.insert(dst_v, res_val);
+                        origins.insert(dst_v, UnOpOrigin::Unary(op_v, src_v));
                     }
                 }
                 IrInst::Call { .. }
@@ -391,31 +419,35 @@ pub fn strength_reduction_cfg(cfg: &mut ControlFlowGraph) -> bool {
                 | IrInst::GetTable { .. }
                 | IrInst::SetTable { .. }
                 | IrInst::AppendArray { .. } => {
-                    state.retain(|var, _| !captured.contains(var));
-                    origins.retain(|var, _| !captured.contains(var));
-                    for d in inst.def_vars() {
-                        state.remove(&d);
-                        origins.remove(&d);
-                        origins.retain(|_, orig| match orig {
-                            UnOpOrigin::Unary(_, inner) => *inner != d,
-                        });
+                    if !captured.is_empty() {
+                        state.retain(|var, _| !captured.contains(var));
+                        if !origins.is_empty() {
+                            origins.retain(|var, _| !captured.contains(var));
+                        }
                     }
-                    out.push(inst);
+                    inst.for_each_def(|d| {
+                        state.remove(&d);
+                        if !origins.is_empty() {
+                            origins.remove(&d);
+                            origins.retain(|_, orig| match orig {
+                                UnOpOrigin::Unary(_, inner) => *inner != d,
+                            });
+                        }
+                    });
                 }
                 other => {
-                    for d in other.def_vars() {
+                    other.for_each_def(|d| {
                         state.remove(&d);
-                        origins.remove(&d);
-                        origins.retain(|_, orig| match orig {
-                            UnOpOrigin::Unary(_, inner) => *inner != d,
-                        });
-                    }
-                    out.push(other);
+                        if !origins.is_empty() {
+                            origins.remove(&d);
+                            origins.retain(|_, orig| match orig {
+                                UnOpOrigin::Unary(_, inner) => *inner != d,
+                            });
+                        }
+                    });
                 }
             }
         }
-
-        block.instructions = out;
     }
 
     changed

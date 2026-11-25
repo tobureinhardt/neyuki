@@ -67,7 +67,7 @@ fn utf8_codepoint(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(s[start..]
         .char_indices()
         .take_while(|(offset, _)| start + offset < end)
-        .map(|(_, c)| Value::Int(c as i64))
+        .map(|(_, c)| Value::int(c as i64))
         .collect())
 }
 
@@ -95,7 +95,7 @@ fn utf8_offset(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let i = opt_int_arg(args, 2, "i", default_i)?;
     let mut pos = pos_relat_start(i, s.len()) - 1;
     if pos > s.len() {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     }
     if n == 0 {
         while pos > 0 && !s.is_char_boundary(pos) {
@@ -123,7 +123,7 @@ fn utf8_offset(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     };
     Ok(vec![match found {
         Some(p) if p <= s.len() => Value::from_usize(p + 1),
-        _ => Value::Nil,
+        _ => Value::NIL,
     }])
 }
 
@@ -150,44 +150,43 @@ fn iterator(s: &str, step: Value) -> Value {
     meta.set_str("__call", step);
     let mut state = VmTable::new();
     state.set_str("s", Value::str(s));
-    state.set_str("pos", Value::Int(0));
+    state.set_str("pos", Value::small_int(0));
     state.metatable = Some(Rc::new(RefCell::new(meta)));
-    Value::Table(Rc::new(RefCell::new(state)))
+    Value::table(Rc::new(RefCell::new(state)))
 }
 
 /// The string and next byte offset an iterator table carries.
 fn iterator_state(
     args: &[Value],
 ) -> Option<(Rc<RefCell<VmTable>>, crate::vm::value::StrRef, usize)> {
-    let Some(Value::Table(state)) = args.first() else {
-        return None;
-    };
+    let state = args.first()?.as_table()?;
     let st = state.borrow();
-    let (Value::String(s), Value::Int(pos)) = (st.get_str("s"), st.get_str("pos")) else {
-        return None;
-    };
+    let s_val = st.get_str("s");
+    let pos_val = st.get_str("pos");
+    let s = s_val.to_str_ref()?;
+    let pos = pos_val.as_int()?;
     drop(st);
-    Some((state.clone(), s, pos as usize))
+    Some((state.to_rc(), s, pos as usize))
 }
 
 fn codes_step(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let Some((state, s, pos)) = iterator_state(args) else {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     };
     match s.get(pos..).and_then(|rest| rest.chars().next()) {
         Some(c) => {
             state
                 .borrow_mut()
                 .set_str("pos", Value::from_usize(pos + c.len_utf8()));
-            Ok(vec![Value::from_usize(pos + 1), Value::Int(c as i64)])
+            Ok(vec![Value::from_usize(pos + 1), Value::int(c as i64)])
         }
-        None => Ok(vec![Value::Nil]),
+        None => Ok(vec![Value::NIL]),
     }
 }
 
 fn chars_step(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let Some((state, s, pos)) = iterator_state(args) else {
-        return Ok(vec![Value::Nil]);
+        return Ok(vec![Value::NIL]);
     };
     match s.get(pos..).and_then(|rest| rest.chars().next()) {
         Some(c) => {
@@ -196,7 +195,7 @@ fn chars_step(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 .set_str("pos", Value::from_usize(pos + c.len_utf8()));
             Ok(vec![Value::string(c.to_string())])
         }
-        None => Ok(vec![Value::Nil]),
+        None => Ok(vec![Value::NIL]),
     }
 }
 

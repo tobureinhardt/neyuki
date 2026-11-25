@@ -6,7 +6,7 @@ use std::rc::{Rc, Weak};
 
 use crate::vm::buffer::VmBuffer;
 use crate::vm::hash::{FxHashMap, FxHashSet};
-use crate::vm::value::{StrRef, Value, VmClosure, VmTable};
+use crate::vm::value::{StrRef, Value, ValueView, VmClosure, VmTable};
 
 /// The VM's global table, passed in as a GC root.
 pub type Globals = FxHashMap<StrRef, Value>;
@@ -14,7 +14,7 @@ pub type Globals = FxHashMap<StrRef, Value>;
 /// Values the collector manages: marking anything else is a no-op, so
 /// weak tables only need to skip these.
 fn is_collectible(val: &Value) -> bool {
-    matches!(val, Value::Table(_) | Value::Buffer(_))
+    val.is_table() || val.is_buffer()
 }
 
 /// Pushes the tables `val` holds on to: the table itself, or for a closure the
@@ -24,10 +24,10 @@ fn push_tables(
     out: &mut Vec<Rc<RefCell<VmTable>>>,
     seen_closures: &mut FxHashSet<*const VmClosure>,
 ) {
-    match val {
-        Value::Table(t) => out.push(Rc::clone(t)),
-        Value::Closure(c) => {
-            let mut pending = vec![Rc::clone(c)];
+    match val.view() {
+        ValueView::Table(t) => out.push(t.to_rc()),
+        ValueView::Closure(c) => {
+            let mut pending = vec![c.to_rc()];
             while let Some(closure) = pending.pop() {
                 if !seen_closures.insert(Rc::as_ptr(&closure)) {
                     continue;
@@ -36,11 +36,11 @@ fn push_tables(
                     if upval.is_open() {
                         continue;
                     }
-                    match &*upval.closed.borrow() {
-                        Value::Closure(inner) => pending.push(Rc::clone(inner)),
-                        Value::Table(t) => out.push(Rc::clone(t)),
+                    upval.with_closed(|val| match val.view() {
+                        ValueView::Closure(inner) => pending.push(inner.to_rc()),
+                        ValueView::Table(t) => out.push(t.to_rc()),
                         _ => {}
-                    }
+                    });
                 }
             }
         }
@@ -56,10 +56,7 @@ pub fn table_weak_values(t: &Rc<RefCell<VmTable>>) -> bool {
         .metatable
         .as_ref()
         .and_then(|mt| mt.borrow().fields.get("__mode").cloned())
-        .and_then(|v| match v {
-            Value::String(s) => Some(s.contains('v')),
-            _ => None,
-        })
+        .and_then(|v| v.as_str().map(|s| s.contains('v')))
         .unwrap_or(false)
 }
 
@@ -67,9 +64,10 @@ pub fn table_weak_values(t: &Rc<RefCell<VmTable>>) -> bool {
 fn gc_handler(t: &Rc<RefCell<VmTable>>) -> Option<Value> {
     let mt = t.borrow().metatable.clone()?;
     let handler = mt.borrow().fields.get("__gc").cloned()?;
-    match handler {
-        Value::Closure(_) | Value::Native(_) => Some(handler),
-        _ => None,
+    if handler.is_callable() {
+        Some(handler)
+    } else {
+        None
     }
 }
 
@@ -286,36 +284,33 @@ impl GcTracker {
     pub fn write_barrier(&mut self, table: &Value, val: &Value) {
         // Only a table can be white, so storing anything else needs no
         // bookkeeping; this keeps the common case free of map lookups.
-        if !matches!(val, Value::Table(_)) {
+        if !val.is_table() {
             return;
         }
         let is_white = self.is_value_white(val);
-        if let Value::Table(t_rc) = table {
-            let t_ptr = Rc::as_ptr(t_rc);
-            if let Some((_, header)) = self.tables.get_mut(&t_ptr)
-                && header.color == GcColor::Black
-                && is_white
-            {
-                header.color = GcColor::Gray;
-                self.gray_stack.push(t_ptr);
-            }
+        if let Some(t_ptr) = table.table_ptr()
+            && let Some((_, header)) = self.tables.get_mut(&t_ptr)
+            && header.color == GcColor::Black
+            && is_white
+        {
+            header.color = GcColor::Gray;
+            self.gray_stack.push(t_ptr);
         }
     }
 
     fn is_value_white(&self, val: &Value) -> bool {
-        if let Value::Table(t_rc) = val {
-            let t_ptr = Rc::as_ptr(t_rc);
-            if let Some((_, header)) = self.tables.get(&t_ptr) {
-                return header.color == GcColor::White0 || header.color == GcColor::White1;
-            }
+        if let Some(t_ptr) = val.table_ptr()
+            && let Some((_, header)) = self.tables.get(&t_ptr)
+        {
+            return header.color == GcColor::White0 || header.color == GcColor::White1;
         }
         false
     }
 
     pub fn mark_value(&mut self, val: &Value) {
-        match val {
-            Value::Table(t_rc) => {
-                let t_ptr = Rc::as_ptr(t_rc);
+        match val.view() {
+            ValueView::Table(t_rc) => {
+                let t_ptr = t_rc.as_ptr();
                 if let Some((_, header)) = self.tables.get_mut(&t_ptr)
                     && (header.color == GcColor::White0 || header.color == GcColor::White1)
                 {
@@ -323,15 +318,18 @@ impl GcTracker {
                     self.gray_stack.push(t_ptr);
                 }
             }
-            Value::Buffer(b_rc) => {
-                let b_ptr = Rc::as_ptr(b_rc);
+            ValueView::Buffer(b_rc) => {
+                let b_ptr = b_rc.as_ptr();
                 if let Some((_, header)) = self.buffers.get_mut(&b_ptr)
                     && (header.color == GcColor::White0 || header.color == GcColor::White1)
                 {
                     header.color = GcColor::Black;
                 }
             }
-            Value::Closure(c) => self.mark_closure(c),
+            ValueView::Closure(c) => {
+                let c_rc = c.to_rc();
+                self.mark_closure(&c_rc);
+            }
             _ => {}
         }
     }
@@ -357,10 +355,11 @@ impl GcTracker {
                 if upval.is_open() {
                     continue;
                 }
-                let value = upval.closed.borrow().clone();
-                match value {
-                    Value::Closure(inner) => pending.push(inner),
-                    other => self.mark_value(&other),
+                let value = upval.get_closed();
+                if let Ok(inner) = value.into_closure() {
+                    pending.push(inner);
+                } else {
+                    upval.with_closed(|v| self.mark_value(v));
                 }
             }
         }
@@ -416,8 +415,13 @@ impl GcTracker {
                         }
                     }
                     if let Some(mt) = &tbl.metatable {
-                        let mt_val = Value::Table(mt.clone());
-                        self.mark_value(&mt_val);
+                        let mt_ptr = Rc::as_ptr(mt);
+                        if let Some((_, header)) = self.tables.get_mut(&mt_ptr)
+                            && (header.color == GcColor::White0 || header.color == GcColor::White1)
+                        {
+                            header.color = GcColor::Gray;
+                            self.gray_stack.push(mt_ptr);
+                        }
                     }
                 }
             }
@@ -493,11 +497,10 @@ impl GcTracker {
                 *const RefCell<VmTable>,
                 usize,
             >| {
-                if let Value::Table(target_rc) = val {
-                    let target_ptr = Rc::as_ptr(target_rc);
-                    if white_tables.contains_key(&target_ptr) {
-                        *internal_ref_counts.entry(target_ptr).or_insert(0) += 1;
-                    }
+                if let Some(target_ptr) = val.table_ptr()
+                    && white_tables.contains_key(&target_ptr)
+                {
+                    *internal_ref_counts.entry(target_ptr).or_insert(0) += 1;
                 }
             };
             for rc in white_tables.values() {
@@ -693,17 +696,17 @@ impl GcTracker {
         doomed_tables: &FxHashSet<*const RefCell<VmTable>>,
         doomed_buffers: &FxHashSet<*const RefCell<VmBuffer>>,
     ) {
-        let dead = |v: &Value| match v {
-            Value::Table(t) => doomed_tables.contains(&Rc::as_ptr(t)),
-            Value::Buffer(b) => doomed_buffers.contains(&Rc::as_ptr(b)),
+        let dead = |v: &Value| match v.view() {
+            ValueView::Table(t) => doomed_tables.contains(&t.as_ptr()),
+            ValueView::Buffer(b) => doomed_buffers.contains(&b.as_ptr()),
             _ => false,
         };
         for slot in tbl.array.iter_mut() {
             if dead(slot) {
-                *slot = Value::Nil;
+                *slot = Value::NIL;
             }
         }
-        while matches!(tbl.array.last(), Some(Value::Nil)) {
+        while tbl.array.last().is_some_and(|v| v.is_nil()) {
             tbl.array.pop();
         }
         tbl.fields.retain(|_, v| !dead(v));
@@ -920,7 +923,7 @@ mod tests {
 
         let rc = Rc::new(RefCell::new(VmTable::new()));
         gc.register_table(&rc);
-        rc.borrow_mut().set_str("self", Value::Table(rc.clone()));
+        rc.borrow_mut().set_str("self", Value::table(rc.clone()));
 
         assert_eq!(tracked(&gc), 1);
         drop(rc);
@@ -941,8 +944,8 @@ mod tests {
         gc.register_table(&a);
         gc.register_table(&b);
 
-        a.borrow_mut().set_str("other", Value::Table(b.clone()));
-        b.borrow_mut().set_str("other", Value::Table(a.clone()));
+        a.borrow_mut().set_str("other", Value::table(b.clone()));
+        b.borrow_mut().set_str("other", Value::table(a.clone()));
 
         assert_eq!(tracked(&gc), 2);
         drop(a);
@@ -966,9 +969,9 @@ mod tests {
         gc.register_table(&b);
         gc.register_table(&c);
 
-        a.borrow_mut().set_str("next", Value::Table(b.clone()));
-        b.borrow_mut().set_str("next", Value::Table(c.clone()));
-        c.borrow_mut().set_str("next", Value::Table(a.clone()));
+        a.borrow_mut().set_str("next", Value::table(b.clone()));
+        b.borrow_mut().set_str("next", Value::table(c.clone()));
+        c.borrow_mut().set_str("next", Value::table(a.clone()));
 
         assert_eq!(tracked(&gc), 3);
         drop(a);
@@ -993,8 +996,8 @@ mod tests {
 
         root_rc
             .borrow_mut()
-            .set_str("child", Value::Table(child_rc.clone()));
-        stack.push(Value::Table(root_rc.clone()));
+            .set_str("child", Value::table(child_rc.clone()));
+        stack.push(Value::table(root_rc.clone()));
 
         drop(child_rc);
 
@@ -1050,8 +1053,8 @@ mod tests {
         gc.register_table(&child_rc);
         gc.flush_young();
 
-        let parent_val = Value::Table(parent_rc.clone());
-        let child_val = Value::Table(child_rc.clone());
+        let parent_val = Value::table(parent_rc.clone());
+        let child_val = Value::table(child_rc.clone());
 
         gc.write_barrier(&parent_val, &child_val);
 
@@ -1073,17 +1076,17 @@ mod tests {
         let live_child = Rc::new(RefCell::new(VmTable::new()));
         gc.register_table(&live_child);
         root.borrow_mut()
-            .set_str("child", Value::Table(live_child.clone()));
+            .set_str("child", Value::table(live_child.clone()));
         drop(live_child);
-        stack.push(Value::Table(root.clone()));
+        stack.push(Value::table(root.clone()));
         drop(root);
 
         let a = Rc::new(RefCell::new(VmTable::new()));
         let b = Rc::new(RefCell::new(VmTable::new()));
         gc.register_table(&a);
         gc.register_table(&b);
-        a.borrow_mut().set_str("other", Value::Table(b.clone()));
-        b.borrow_mut().set_str("other", Value::Table(a.clone()));
+        a.borrow_mut().set_str("other", Value::table(b.clone()));
+        b.borrow_mut().set_str("other", Value::table(a.clone()));
         drop(a);
         drop(b);
 
@@ -1091,16 +1094,16 @@ mod tests {
         gc.register_table(&weak);
         let mt = Rc::new(RefCell::new(VmTable::new()));
         gc.register_table(&mt);
-        mt.borrow_mut().set_str("__mode", Value::String("v".into()));
+        mt.borrow_mut().set_str("__mode", Value::str("v"));
         weak.borrow_mut().metatable = Some(mt.clone());
         drop(mt);
         let dead = Rc::new(RefCell::new(VmTable::new()));
         gc.register_table(&dead);
         weak.borrow_mut()
             .fields
-            .insert(StrRef::from("item"), Value::Table(dead.clone()));
+            .insert(StrRef::from("item"), Value::table(dead.clone()));
         drop(dead);
-        stack.push(Value::Table(weak.clone()));
+        stack.push(Value::table(weak.clone()));
         drop(weak);
 
         (gc, stack, globals)
@@ -1178,10 +1181,10 @@ mod tests {
         gc.register_table(&cyc_b);
         cyc_a
             .borrow_mut()
-            .set_str("peer", Value::Table(cyc_b.clone()));
+            .set_str("peer", Value::table(cyc_b.clone()));
         cyc_b
             .borrow_mut()
-            .set_str("peer", Value::Table(cyc_a.clone()));
+            .set_str("peer", Value::table(cyc_a.clone()));
         drop(cyc_a);
         drop(cyc_b);
 
@@ -1199,7 +1202,7 @@ mod tests {
 
         // Subsequent full collection still collects the 2-node cycle and keeps `live`.
         let mut stack_with_live = stack;
-        stack_with_live.push(Value::Table(live.clone()));
+        stack_with_live.push(Value::table(live.clone()));
         let freed = collect_all(&mut gc, &stack_with_live, &globals);
         assert_eq!(freed, 2 * 64);
         assert_eq!(tracked(&gc), 1);

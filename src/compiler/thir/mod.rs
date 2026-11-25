@@ -99,4 +99,41 @@ return out, root";
             }
         ));
     }
+
+    #[test]
+    fn test_thir_narrows_if_branch_and_infers_for_loop_element_types() {
+        let code = "\
+local arr: {int} = {1, 2, 3}
+local total = 0
+for i, v in arr do
+  total += i + v
+end
+local maybe: string? = \"ok\"
+local res = \"\"
+if maybe != nil then
+  res = maybe
+end
+return total, res";
+        let stmts = compile_source(code).expect("syntax error");
+        let hir = lower_ast(&stmts, None, OptLevel::O1);
+        let thir = lower_hir_to_thir(&hir);
+
+        let i_binding = thir.bindings.iter().find(|b| b.name == "i").unwrap();
+        let v_binding = thir.bindings.iter().find(|b| b.name == "v").unwrap();
+        assert_eq!(i_binding.ty, NeyukiType::Int);
+        assert_eq!(v_binding.ty, NeyukiType::Int);
+
+        let if_stmt = thir
+            .items
+            .iter()
+            .find(|s| matches!(s.kind, ThirStmtKind::If { .. }))
+            .expect("expected if");
+        let ThirStmtKind::If { then_branch, .. } = &if_stmt.kind else {
+            unreachable!();
+        };
+        let ThirStmtKind::Assign { value, .. } = &then_branch[0].kind else {
+            panic!("expected assign in then_branch");
+        };
+        assert_eq!(value.ty, NeyukiType::String);
+    }
 }

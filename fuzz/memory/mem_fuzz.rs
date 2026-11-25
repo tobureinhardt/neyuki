@@ -59,15 +59,15 @@ pub fn fuzz_gc_cyclic_stress() {
         gc.register_table(&t5);
 
         // Cyclic ring: t1 -> t2 -> t3 -> t4 -> t5 -> t1
-        t1.borrow_mut().set_str("next", Value::Table(t2.clone()));
-        t2.borrow_mut().set_str("next", Value::Table(t3.clone()));
-        t3.borrow_mut().set_str("next", Value::Table(t4.clone()));
-        t4.borrow_mut().set_str("next", Value::Table(t5.clone()));
-        t5.borrow_mut().set_str("next", Value::Table(t1.clone()));
+        t1.borrow_mut().set_str("next", Value::table(t2.clone()));
+        t2.borrow_mut().set_str("next", Value::table(t3.clone()));
+        t3.borrow_mut().set_str("next", Value::table(t4.clone()));
+        t4.borrow_mut().set_str("next", Value::table(t5.clone()));
+        t5.borrow_mut().set_str("next", Value::table(t1.clone()));
 
         if cluster % 10 == 0 {
             // Keep 1 out of 10 clusters alive in roots
-            root_refs.push(Value::Table(t1));
+            root_refs.push(Value::table(t1));
         }
     }
 

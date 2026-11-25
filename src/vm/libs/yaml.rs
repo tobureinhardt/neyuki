@@ -69,13 +69,14 @@ fn builtin_decode_all(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
 }
 
 fn builtin_encode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let value = args.first().cloned().unwrap_or(Value::Nil);
+    let value = args.first().cloned().unwrap_or(Value::NIL);
     let indent = opt_int_arg(args, 1, "indent", 2)?;
     if !(1..=8).contains(&indent) {
         return Err("indent must be an integer between 1 and 8".to_string());
     }
     let sort_keys = match args.get(2) {
-        None | Some(Value::Nil) => true,
+        None => true,
+        Some(v) if v.is_nil() => true,
         _ => bool_arg(args, 2, "sortKeys")?,
     };
     let mut encoder = Encoder {
@@ -151,10 +152,10 @@ impl YamlKey {
     fn into_value(self) -> Value {
         match self {
             YamlKey::Str(s) => Value::string(s),
-            YamlKey::Int(i) => Value::Int(i),
+            YamlKey::Int(i) => Value::int(i),
             YamlKey::BigInt(bi) => Value::from_bigint(bi),
-            YamlKey::Bool(b) => Value::Bool(b),
-            YamlKey::Float(bits) => Value::Float(f64::from_bits(bits)),
+            YamlKey::Bool(b) => Value::bool(b),
+            YamlKey::Float(bits) => Value::float(f64::from_bits(bits)),
         }
     }
 
@@ -680,12 +681,12 @@ fn node_to_value(node: YamlNode, keep_null: bool) -> Result<Value, String> {
         YamlNode::Null => Ok(if keep_null {
             json::null_sentinel()
         } else {
-            Value::Nil
+            Value::NIL
         }),
-        YamlNode::Bool(b) => Ok(Value::Bool(b)),
-        YamlNode::Int(i) => Ok(Value::Int(i)),
+        YamlNode::Bool(b) => Ok(Value::bool(b)),
+        YamlNode::Int(i) => Ok(Value::int(i)),
         YamlNode::BigInt(bi) => Ok(Value::from_bigint(bi)),
-        YamlNode::Float(f) => Ok(Value::Float(f)),
+        YamlNode::Float(f) => Ok(Value::float(f)),
         YamlNode::String(s) => Ok(Value::string(s)),
         YamlNode::Seq(items) => {
             let mut out = Vec::with_capacity(items.len());
@@ -700,7 +701,7 @@ fn node_to_value(node: YamlNode, keep_null: bool) -> Result<Value, String> {
                 let val = node_to_value(v, keep_null)?;
                 tbl.raw_set(k.into_value(), val)?;
             }
-            Ok(Value::Table(Rc::new(RefCell::new(tbl))))
+            Ok(Value::table(Rc::new(RefCell::new(tbl))))
         }
     }
 }
@@ -711,7 +712,7 @@ fn decode_single(text: &str, keep_null: bool) -> Result<Value, String> {
         0 => Ok(if keep_null {
             json::null_sentinel()
         } else {
-            Value::Nil
+            Value::NIL
         }),
         1 => {
             let doc = docs.into_iter().next().unwrap_or(YamlNode::Null);
@@ -861,7 +862,7 @@ fn write_double_quoted(out: &mut String, s: &str) {
     out.push('"');
 }
 
-fn classify_table(t: &Rc<RefCell<VmTable>>) -> (bool, Vec<Value>, Vec<(Value, Value)>) {
+fn classify_table(t: &RefCell<VmTable>) -> (bool, Vec<Value>, Vec<(Value, Value)>) {
     let tbl = t.borrow();
     let marked = tbl
         .metatable
@@ -894,27 +895,31 @@ impl Encoder {
     }
 
     fn write_scalar(&mut self, value: &Value) -> Result<(), String> {
-        match value {
-            Value::Nil => self.out.push_str("null"),
-            Value::Table(_) if json::is_null(value) => self.out.push_str("null"),
-            Value::Bool(b) => self.out.push_str(if *b { "true" } else { "false" }),
-            Value::Int(i) => self.out.push_str(&i.to_string()),
-            Value::BigInt(bi) => self.out.push_str(&bi.to_string()),
-            Value::Float(f) => match json::format_float(*f) {
+        match value.view() {
+            crate::vm::value::ValueView::Nil => self.out.push_str("null"),
+            crate::vm::value::ValueView::Table(_) if json::is_null(value) => {
+                self.out.push_str("null")
+            }
+            crate::vm::value::ValueView::Bool(b) => {
+                self.out.push_str(if b { "true" } else { "false" })
+            }
+            crate::vm::value::ValueView::Int(i) => self.out.push_str(&i.to_string()),
+            crate::vm::value::ValueView::BigInt(bi) => self.out.push_str(&bi.to_string()),
+            crate::vm::value::ValueView::Float(f) => match json::format_float(f) {
                 Some(text) => self.out.push_str(&text),
                 None if f.is_nan() => self.out.push_str(".nan"),
                 None if f.is_sign_positive() => self.out.push_str(".inf"),
                 None => self.out.push_str("-.inf"),
             },
-            Value::String(s) => {
-                if is_safe_plain_string(s) {
-                    self.out.push_str(s);
+            crate::vm::value::ValueView::String(s) => {
+                if is_safe_plain_string(&s) {
+                    self.out.push_str(&s);
                 } else {
-                    write_double_quoted(&mut self.out, s);
+                    write_double_quoted(&mut self.out, &s);
                 }
             }
-            other => {
-                return Err(format!("cannot encode a {} as YAML", other.type_name()));
+            _ => {
+                return Err(format!("cannot encode a {} as YAML", value.type_name()));
             }
         }
         self.check_limit()
@@ -952,20 +957,22 @@ impl Encoder {
     }
 
     fn write_key(&mut self, key: &Value) -> Result<(), String> {
-        match key {
-            Value::String(s) => {
-                if is_safe_plain_string(s) {
-                    self.out.push_str(s);
+        match key.view() {
+            crate::vm::value::ValueView::String(s) => {
+                if is_safe_plain_string(&s) {
+                    self.out.push_str(&s);
                 } else {
-                    write_double_quoted(&mut self.out, s);
+                    write_double_quoted(&mut self.out, &s);
                 }
             }
-            Value::Int(_) | Value::BigInt(_) | Value::Bool(_) => self.write_scalar(key)?,
-            Value::Float(f) if !f.is_nan() => self.write_scalar(key)?,
-            other => {
+            crate::vm::value::ValueView::Int(_)
+            | crate::vm::value::ValueView::BigInt(_)
+            | crate::vm::value::ValueView::Bool(_) => self.write_scalar(key)?,
+            crate::vm::value::ValueView::Float(f) if !f.is_nan() => self.write_scalar(key)?,
+            _ => {
                 return Err(format!(
                     "cannot encode a table key of type {} as YAML",
-                    other.type_name()
+                    key.type_name()
                 ));
             }
         }
@@ -979,9 +986,9 @@ impl Encoder {
     }
 
     fn root(&mut self, value: &Value) -> Result<(), String> {
-        match value {
-            Value::Table(t) if !json::is_null(value) => {
-                let (is_array, items, mut entries) = classify_table(t);
+        match value.view() {
+            crate::vm::value::ValueView::Table(t) if !json::is_null(value) => {
+                let (is_array, items, mut entries) = classify_table(&t);
                 if is_array && items.is_empty() {
                     self.out.push_str("[]");
                     return Ok(());
@@ -990,7 +997,7 @@ impl Encoder {
                     self.out.push_str("{}");
                     return Ok(());
                 }
-                let ptr = Rc::as_ptr(t);
+                let ptr = t.as_ptr();
                 self.open.push(ptr);
                 let result = if is_array {
                     self.write_seq(&items, 0, false)
@@ -1003,8 +1010,8 @@ impl Encoder {
                 self.out.push('\n');
                 self.check_limit()
             }
-            Value::String(s) if can_use_block_literal(s) => {
-                self.write_block_literal(s, 1)?;
+            crate::vm::value::ValueView::String(s) if can_use_block_literal(&s) => {
+                self.write_block_literal(&s, 1)?;
                 self.out.push('\n');
                 self.check_limit()
             }
@@ -1024,17 +1031,17 @@ impl Encoder {
             return Err(format!("nesting is deeper than {} levels", MAX_DEPTH));
         }
         self.check_limit()?;
-        match value {
-            Value::String(s) if can_use_block_literal(s) => {
+        match value.view() {
+            crate::vm::value::ValueView::String(s) if can_use_block_literal(&s) => {
                 self.out.push(' ');
-                self.write_block_literal(s, child_level)
+                self.write_block_literal(&s, child_level)
             }
-            Value::Table(t) if !json::is_null(value) => {
-                let ptr = Rc::as_ptr(t);
+            crate::vm::value::ValueView::Table(t) if !json::is_null(value) => {
+                let ptr = t.as_ptr();
                 if self.open.contains(&ptr) {
                     return Err("cannot encode a table that contains itself".to_string());
                 }
-                let (is_array, items, mut entries) = classify_table(t);
+                let (is_array, items, mut entries) = classify_table(&t);
                 if is_array && items.is_empty() {
                     self.out.push_str(" []");
                     return Ok(());
@@ -1098,17 +1105,17 @@ impl Encoder {
                 self.push_indent(level);
             }
             self.out.push('-');
-            match item {
-                Value::String(s) if can_use_block_literal(s) => {
+            match item.view() {
+                crate::vm::value::ValueView::String(s) if can_use_block_literal(&s) => {
                     self.out.push(' ');
-                    self.write_block_literal(s, level + 1)?;
+                    self.write_block_literal(&s, level + 1)?;
                 }
-                Value::Table(t) if !json::is_null(item) => {
-                    let ptr = Rc::as_ptr(t);
+                crate::vm::value::ValueView::Table(t) if !json::is_null(item) => {
+                    let ptr = t.as_ptr();
                     if self.open.contains(&ptr) {
                         return Err("cannot encode a table that contains itself".to_string());
                     }
-                    let (is_array, sub_items, mut sub_entries) = classify_table(t);
+                    let (is_array, sub_items, mut sub_entries) = classify_table(&t);
                     if is_array && sub_items.is_empty() {
                         self.out.push_str(" []");
                     } else if !is_array && sub_entries.is_empty() {
@@ -1138,13 +1145,13 @@ impl Encoder {
 }
 
 fn key_sort_repr(v: &Value) -> (u8, String) {
-    match v {
-        Value::String(s) => (0, s.to_string()),
-        Value::Int(i) => (1, format!("{:020}", i)),
-        Value::BigInt(bi) => (1, bi.to_string()),
-        Value::Float(f) => (2, f.to_string()),
-        Value::Bool(b) => (3, b.to_string()),
-        other => (4, other.type_name().to_string()),
+    match v.view() {
+        crate::vm::value::ValueView::String(s) => (0, s.to_string()),
+        crate::vm::value::ValueView::Int(i) => (1, format!("{:020}", i)),
+        crate::vm::value::ValueView::BigInt(bi) => (1, bi.to_string()),
+        crate::vm::value::ValueView::Float(f) => (2, f.to_string()),
+        crate::vm::value::ValueView::Bool(b) => (3, b.to_string()),
+        _ => (4, v.type_name().to_string()),
     }
 }
 
@@ -1172,19 +1179,19 @@ nan_val: .nan
 forced_str: !!str 123
 "#;
         let val = decode_single(doc, true).unwrap();
-        let Value::Table(t) = val else {
+        let Some(t) = val.as_table() else {
             panic!("expected table");
         };
         let tbl = t.borrow();
         assert!(json::is_null(&tbl.get_str("null_val")));
         assert!(json::is_null(&tbl.get_str("empty_val")));
-        assert_eq!(tbl.get_str("bool_true"), Value::Bool(true));
-        assert_eq!(tbl.get_str("bool_false"), Value::Bool(false));
+        assert_eq!(tbl.get_str("bool_true"), Value::TRUE);
+        assert_eq!(tbl.get_str("bool_false"), Value::FALSE);
         assert_eq!(tbl.get_str("norway"), Value::str("NO"));
         assert_eq!(tbl.get_str("yes_str"), Value::str("yes"));
-        assert_eq!(tbl.get_str("int_dec"), Value::Int(42));
-        assert_eq!(tbl.get_str("int_hex"), Value::Int(255));
-        assert_eq!(tbl.get_str("int_oct"), Value::Int(493));
+        assert_eq!(tbl.get_str("int_dec"), Value::int(42));
+        assert_eq!(tbl.get_str("int_hex"), Value::int(255));
+        assert_eq!(tbl.get_str("int_oct"), Value::int(493));
         assert!(parse_core_int("0x-1A").is_none());
         assert!(parse_core_int("0o+7").is_none());
         assert!(!is_safe_plain_string("<<"));
@@ -1195,9 +1202,18 @@ forced_str: !!str 123
             Value::from_bigint("123456789012345678901234567890".parse().unwrap())
         );
         assert_eq!(tbl.get_str("forced_str"), Value::str("123"));
-        assert!(matches!(tbl.get_str("pos_inf"), Value::Float(f) if f.is_infinite() && f > 0.0));
-        assert!(matches!(tbl.get_str("neg_inf"), Value::Float(f) if f.is_infinite() && f < 0.0));
-        assert!(matches!(tbl.get_str("nan_val"), Value::Float(f) if f.is_nan()));
+        assert!(matches!(
+            tbl.get_str("pos_inf").as_float(),
+            Some(f) if f.is_infinite() && f > 0.0
+        ));
+        assert!(matches!(
+            tbl.get_str("neg_inf").as_float(),
+            Some(f) if f.is_infinite() && f < 0.0
+        ));
+        assert!(matches!(
+            tbl.get_str("nan_val").as_float(),
+            Some(f) if f.is_nan()
+        ));
     }
 
     #[test]
@@ -1243,14 +1259,15 @@ service:
   port: 6432
 "#;
         let val = decode_single(doc, false).unwrap();
-        let Value::Table(root) = val else {
+        let Some(root) = val.as_table() else {
             panic!("expected table");
         };
-        let Value::Table(svc) = root.borrow().get_str("service") else {
+        let svc_val = root.borrow().get_str("service");
+        let Some(svc) = svc_val.as_table() else {
             panic!("expected service table");
         };
+        assert_eq!(svc.borrow().get_str("port"), Value::int(6432));
         assert_eq!(svc.borrow().get_str("host"), Value::str("localhost"));
-        assert_eq!(svc.borrow().get_str("port"), Value::Int(6432));
 
         let dup = "a: 1\na: 2\n";
         assert!(decode_single(dup, false).unwrap_err().contains("duplicate"));
@@ -1261,7 +1278,7 @@ service:
         let stream = "---\na: 1\n---\nb: 2\n";
         assert!(decode_single(stream, false).is_err());
         let all = decode_all(stream, false).unwrap();
-        let Value::Table(arr) = all else {
+        let Some(arr) = all.as_table() else {
             panic!("expected array");
         };
         assert_eq!(arr.borrow().array.len(), 2);

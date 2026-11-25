@@ -6,7 +6,7 @@ use std::rc::Rc;
 use crate::bytecode::instruction::MULTRET;
 use crate::vm::frame::CallFrame;
 use crate::vm::machine::{CoroutineState, VM};
-use crate::vm::value::{Value, VmTable};
+use crate::vm::value::{Value, ValueView, VmTable};
 
 pub fn create_coroutine_lib() -> Value {
     let t = Rc::new(RefCell::new(VmTable::new()));
@@ -37,13 +37,13 @@ pub fn create_coroutine_lib() -> Value {
     b.set_str("close", crate::native!("coroutine.close", coroutine_close));
     b.frozen = true;
 
-    Value::Table(t.clone())
+    drop(b);
+    Value::table(t)
 }
 
 pub(crate) fn coroutine_create(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let func = match args.first() {
-        Some(f @ (Value::Closure(_) | Value::Native(_))) => f.clone(),
-        _ => return Err("bad argument #1 to 'coroutine.create' (function expected)".to_string()),
+    let Some(func) = args.first().filter(|f| f.is_callable()).cloned() else {
+        return Err("bad argument #1 to 'coroutine.create' (function expected)".to_string());
     };
     Ok(vec![new_coroutine(vm, func)])
 }
@@ -87,14 +87,14 @@ pub(crate) fn new_coroutine(vm: &mut VM, func: Value) -> Value {
         vm.prune_co_states();
     }
     handle.borrow_mut().co_state = Some(state_rc);
-    Value::Table(handle)
+    Value::table(handle)
 }
 
 /// The id of the live coroutine whose handle is `val`. Finished coroutines
 /// are dropped from `vm.co_states`, so they, like tables that merely look
 /// like a handle, give `None`.
 fn live_coroutine(vm: &VM, val: Option<&Value>, func: &str) -> Result<Option<usize>, String> {
-    let Some(Value::Table(t)) = val else {
+    let Some(t) = val.and_then(|v| v.as_table()) else {
         return Err(format!("bad argument #1 to '{}' (thread expected)", func));
     };
     let id = t.borrow().get_str("_id").as_usize().unwrap_or(0);
@@ -102,7 +102,7 @@ fn live_coroutine(vm: &VM, val: Option<&Value>, func: &str) -> Result<Option<usi
         co.borrow()
             .handle
             .upgrade()
-            .is_some_and(|h| Rc::ptr_eq(&h, t))
+            .is_some_and(|h| std::ptr::eq(Rc::as_ptr(&h), t.as_ptr()))
     });
     Ok(is_handle.then_some(id))
 }
@@ -171,7 +171,7 @@ pub(crate) fn resume_with_error(
 fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let Some(co_id) = live_coroutine(vm, args.first(), "coroutine.resume")? else {
         return Ok(vec![
-            Value::Bool(false),
+            Value::FALSE,
             Value::str("cannot resume dead coroutine"),
         ]);
     };
@@ -181,7 +181,7 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let current_status = co_rc.borrow().status.clone();
     if current_status != "suspended" {
         return Ok(vec![
-            Value::Bool(false),
+            Value::FALSE,
             Value::string(format!("cannot resume {} coroutine", current_status)),
         ]);
     }
@@ -229,11 +229,12 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         vm.error_trace = Some(vm.capture_trace());
     } else if is_initial {
         let func = co_rc.borrow().func.clone();
-        match func {
-            Value::Closure(c) => {
+        match func.view() {
+            ValueView::Closure(c) => {
+                let c = c.to_rc();
                 let base = 0;
                 let needed = base + c.proto.max_registers as usize + resume_args.len() + 1;
-                vm.stack.resize(needed, Value::Nil);
+                vm.stack.resize(needed, Value::NIL);
                 for (i, arg) in resume_args.iter().enumerate() {
                     vm.stack[base + i] = arg.clone();
                 }
@@ -245,7 +246,7 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 };
                 vm.frames.push(CallFrame::with_varargs(c, base, varargs));
             }
-            Value::Native(def) => {
+            ValueView::Native(def) => {
                 let res = (def.func)(vm, resume_args);
                 co_rc.borrow_mut().status = "dead".to_string();
                 vm.co_states.remove(&co_id);
@@ -258,11 +259,11 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 vm.error_trace = None;
                 return match res {
                     Ok(vals) => {
-                        let mut out = vec![Value::Bool(true)];
+                        let mut out = vec![Value::TRUE];
                         out.extend(vals);
                         Ok(out)
                     }
-                    Err(e) => Ok(vec![Value::Bool(false), Value::string(e)]),
+                    Err(e) => Ok(vec![Value::FALSE, Value::string(e)]),
                 };
             }
             _ => {
@@ -289,10 +290,10 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         };
         let base = vm.frames.last().map(|f| f.base).unwrap_or(0);
         for i in 0..count {
-            let val = resume_args.get(i).cloned().unwrap_or(Value::Nil);
+            let val = resume_args.get(i).cloned().unwrap_or(Value::NIL);
             let slot = base + callee as usize + i;
             if slot >= vm.stack.len() {
-                vm.stack.resize(slot + 1, Value::Nil);
+                vm.stack.resize(slot + 1, Value::NIL);
             }
             vm.stack[slot] = val;
         }
@@ -324,7 +325,7 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             vm.unpark_upvalues(caller_open_upvalues);
             restore_caller();
 
-            let mut out = vec![Value::Bool(true)];
+            let mut out = vec![Value::TRUE];
             out.extend(yielded);
             Ok(out)
         }
@@ -345,7 +346,7 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             vm.unpark_upvalues(caller_open_upvalues);
             restore_caller();
 
-            let mut out = vec![Value::Bool(true)];
+            let mut out = vec![Value::TRUE];
             out.extend(returned);
             Ok(out)
         }
@@ -366,7 +367,7 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             }
             vm.error_trace = None;
 
-            Ok(vec![Value::Bool(false), Value::string(err)])
+            Ok(vec![Value::FALSE, Value::string(err)])
         }
     }
 }
@@ -405,8 +406,8 @@ fn coroutine_running(vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String>
         .and_then(|co_id| vm.co_state(co_id))
         .and_then(|co| co.borrow().handle.upgrade());
     match handle {
-        Some(h) => Ok(vec![Value::Table(h), Value::Bool(false)]),
-        None => Ok(vec![Value::Nil, Value::Bool(true)]),
+        Some(h) => Ok(vec![Value::table(h), Value::FALSE]),
+        None => Ok(vec![Value::NIL, Value::TRUE]),
     }
 }
 
@@ -414,18 +415,17 @@ fn wrapped_coroutine_call(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Str
     if args.is_empty() {
         return Err("coroutine wrapper called without self".to_string());
     }
-    let wrap_tbl = match &args[0] {
-        Value::Table(t) => t.clone(),
-        _ => return Err("coroutine wrapper called on non-table".to_string()),
+    let Some(wrap_tbl) = args[0].as_table() else {
+        return Err("coroutine wrapper called on non-table".to_string());
     };
     let co_table = wrap_tbl.borrow().get_str("_co");
-    if matches!(co_table, Value::Nil) {
+    if co_table.is_nil() {
         return Err("invalid coroutine wrapper".to_string());
     }
     let mut resume_args = vec![co_table];
     resume_args.extend_from_slice(&args[1..]);
     let res = coroutine_resume(vm, &resume_args)?;
-    if let Some(Value::Bool(true)) = res.first() {
+    if res.first().and_then(|v| v.as_bool()) == Some(true) {
         Ok(res[1..].to_vec())
     } else {
         let err_msg = res
@@ -454,13 +454,13 @@ fn coroutine_wrap(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     );
     wrapper_table.borrow_mut().metatable = Some(mt);
 
-    Ok(vec![Value::Table(wrapper_table)])
+    Ok(vec![Value::table(wrapper_table)])
 }
 
 /// Whether `coroutine.yield` would succeed here: inside a coroutine and not
 /// under a native function that called back into Neyuki.
 fn coroutine_isyieldable(vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
-    Ok(vec![Value::Bool(
+    Ok(vec![Value::bool(
         vm.current_co.is_some() && vm.native_calls <= vm.yield_floor,
     )])
 }
@@ -469,13 +469,13 @@ fn coroutine_isyieldable(vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, Str
 /// its stack. Returns true, or false and a message for one still running.
 pub(crate) fn coroutine_close(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let Some(co_id) = live_coroutine(vm, args.first(), "coroutine.close")? else {
-        return Ok(vec![Value::Bool(true)]);
+        return Ok(vec![Value::TRUE]);
     };
     let co = vm.co_state(co_id).expect("live_coroutine found its state");
     let status = co.borrow().status.clone();
     if status != "suspended" {
         return Ok(vec![
-            Value::Bool(false),
+            Value::FALSE,
             Value::string(format!("cannot close a {} coroutine", status)),
         ]);
     }
@@ -486,5 +486,5 @@ pub(crate) fn coroutine_close(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>,
     state.open_upvalues = Vec::new();
     drop(state);
     vm.co_states.remove(&co_id);
-    Ok(vec![Value::Bool(true)])
+    Ok(vec![Value::TRUE])
 }

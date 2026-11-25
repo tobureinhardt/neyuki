@@ -35,6 +35,20 @@ pub fn analyze_with_spans(
     analyzer.diagnostics
 }
 
+/// Like `analyze_with_spans`, also passing statement/declaration attributes.
+pub fn analyze_with_spans_and_attrs(
+    statements: &[Stmt],
+    source: &str,
+    spans: &crate::ast::span::SpanPool,
+    attributes: &crate::ast::attr::AttributePool,
+) -> Vec<Diagnostic> {
+    let mut analyzer = SemanticAnalyzer::new(source)
+        .with_spans(spans)
+        .with_attributes(attributes);
+    analyzer.analyze_program(statements);
+    analyzer.diagnostics
+}
+
 /// The names the program uses without anything declaring them.
 pub fn undeclared_names(
     statements: &[Stmt],

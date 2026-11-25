@@ -1,10 +1,65 @@
 //! HIR structural normalization and `-O1` desugaring passes.
 
 use crate::ast::literal::Literal;
+use crate::ast::op::{BinOp, UnOp};
 use crate::compiler::OptLevel;
 use crate::compiler::hir::nodes::{
     HirExpr, HirExprKind, HirLValue, HirModule, HirStmt, HirStmtKind,
 };
+
+fn block_has_loop_ctrl(stmts: &[HirStmt]) -> bool {
+    stmts.iter().any(|stmt| match &stmt.kind {
+        HirStmtKind::Break | HirStmtKind::Continue => true,
+        HirStmtKind::Block(body) => block_has_loop_ctrl(body),
+        HirStmtKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            block_has_loop_ctrl(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|else_b| block_has_loop_ctrl(else_b))
+        }
+        _ => false,
+    })
+}
+
+/// Only a string literal is statically a string: a concatenation can return
+/// any value through `__concat`, so `"" .. (t .. u)` must keep its outer
+/// concat.
+fn is_static_string(expr: &HirExpr) -> bool {
+    matches!(expr.kind, HirExprKind::Literal(Literal::String(_)))
+}
+
+/// Takes an operand out of `and`/`or`/`??` for the folded expression. A
+/// binary operand is cut to one value, so a call or `...` is wrapped in
+/// `Paren` to keep that truncation once the operator is gone.
+fn take_single_value(expr: &mut HirExpr) -> HirExprKind {
+    let kind = std::mem::replace(&mut expr.kind, HirExprKind::Literal(Literal::Nil));
+    match kind {
+        HirExprKind::Call { .. } | HirExprKind::MethodCall { .. } | HirExprKind::Vararg => {
+            HirExprKind::Paren(Box::new(HirExpr {
+                hir_id: expr.hir_id,
+                source_id: expr.source_id,
+                kind,
+            }))
+        }
+        other => other,
+    }
+}
+
+fn is_known_boolean(expr: &HirExpr) -> bool {
+    match &expr.kind {
+        HirExprKind::Literal(Literal::Bool(_)) => true,
+        HirExprKind::Unary { op: UnOp::Not, .. } => true,
+        HirExprKind::Binary { op, .. } => matches!(
+            op,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        ),
+        _ => false,
+    }
+}
 
 fn block_has_label(stmts: &[HirStmt]) -> bool {
     stmts.iter().any(stmt_has_label)
@@ -61,12 +116,111 @@ fn optimize_expr(expr: &mut HirExpr, opt_level: OptLevel) {
         HirExprKind::Function { body, .. } => {
             optimize_block(body, opt_level);
         }
-        HirExprKind::Unary { expr: inner, .. } | HirExprKind::Paren(inner) => {
-            optimize_expr(inner, opt_level)
+        HirExprKind::Paren(inner) => optimize_expr(inner, opt_level),
+        HirExprKind::Unary { op, expr: inner } => {
+            optimize_expr(inner, opt_level);
+            if opt_level != OptLevel::O1 {
+                return;
+            }
+            let op_val = *op;
+            match op_val {
+                UnOp::Not => {
+                    if let HirExprKind::Literal(lit) = &inner.kind {
+                        expr.kind = HirExprKind::Literal(Literal::Bool(!lit.is_truthy()));
+                    } else if let HirExprKind::Unary {
+                        op: UnOp::Not,
+                        expr: double_inner,
+                    } = &mut inner.kind
+                        && is_known_boolean(double_inner)
+                    {
+                        let replacement = std::mem::replace(
+                            &mut double_inner.kind,
+                            HirExprKind::Literal(Literal::Nil),
+                        );
+                        expr.kind = replacement;
+                    }
+                }
+                UnOp::Len => {
+                    if let HirExprKind::Literal(Literal::String(s)) = &inner.kind {
+                        expr.kind = HirExprKind::Literal(Literal::Int(s.len().into()));
+                    }
+                }
+                UnOp::Neg => match &inner.kind {
+                    HirExprKind::Literal(Literal::Int(i)) => {
+                        expr.kind = HirExprKind::Literal(Literal::Int(-i.clone()));
+                    }
+                    HirExprKind::Literal(Literal::Float(f)) => {
+                        expr.kind = HirExprKind::Literal(Literal::Float(-*f));
+                    }
+                    _ => {}
+                },
+                UnOp::BitNot => {
+                    if let HirExprKind::Literal(Literal::Int(i)) = &inner.kind {
+                        expr.kind = HirExprKind::Literal(Literal::Int(!i.clone()));
+                    }
+                }
+            }
         }
-        HirExprKind::Binary { left, right, .. } => {
+        HirExprKind::Binary { left, op, right } => {
             optimize_expr(left, opt_level);
             optimize_expr(right, opt_level);
+            if opt_level != OptLevel::O1 {
+                return;
+            }
+            match *op {
+                BinOp::And => {
+                    if let HirExprKind::Literal(lit) = &left.kind {
+                        if !lit.is_truthy() {
+                            expr.kind = HirExprKind::Literal(lit.clone());
+                        } else {
+                            expr.kind = take_single_value(right);
+                        }
+                    }
+                }
+                BinOp::Or => {
+                    if let HirExprKind::Literal(lit) = &left.kind {
+                        if lit.is_truthy() {
+                            expr.kind = HirExprKind::Literal(lit.clone());
+                        } else {
+                            expr.kind = take_single_value(right);
+                        }
+                    }
+                }
+                BinOp::Coalesce => {
+                    if let HirExprKind::Literal(lit) = &left.kind {
+                        if matches!(lit, Literal::Nil) {
+                            expr.kind = take_single_value(right);
+                        } else {
+                            expr.kind = HirExprKind::Literal(lit.clone());
+                        }
+                    }
+                }
+                BinOp::Concat => {
+                    if let (
+                        HirExprKind::Literal(Literal::String(a)),
+                        HirExprKind::Literal(Literal::String(b)),
+                    ) = (&left.kind, &right.kind)
+                    {
+                        let mut joined = String::with_capacity(a.len() + b.len());
+                        joined.push_str(a);
+                        joined.push_str(b);
+                        expr.kind = HirExprKind::Literal(Literal::String(joined));
+                    } else if matches!(&left.kind, HirExprKind::Literal(Literal::String(s)) if s.is_empty())
+                        && is_static_string(right)
+                    {
+                        let rhs =
+                            std::mem::replace(&mut right.kind, HirExprKind::Literal(Literal::Nil));
+                        expr.kind = rhs;
+                    } else if matches!(&right.kind, HirExprKind::Literal(Literal::String(s)) if s.is_empty())
+                        && is_static_string(left)
+                    {
+                        let lhs =
+                            std::mem::replace(&mut left.kind, HirExprKind::Literal(Literal::Nil));
+                        expr.kind = lhs;
+                    }
+                }
+                _ => {}
+            }
         }
         HirExprKind::Table(entries) => {
             for entry in entries {
@@ -136,8 +290,20 @@ fn optimize_block(stmts: &mut Vec<HirStmt>, opt_level: OptLevel) {
                 }
             }
             HirStmtKind::Increment { target, .. } => optimize_lvalue(target, opt_level),
-            HirStmtKind::Function { body, .. } | HirStmtKind::Block(body) => {
+            HirStmtKind::Function { body, .. } => {
                 optimize_block(body, opt_level);
+            }
+            HirStmtKind::Block(body) => {
+                optimize_block(body, opt_level);
+                if opt_level == OptLevel::O1 {
+                    if body.is_empty() {
+                        continue;
+                    }
+                    if body.len() == 1 && matches!(body[0].kind, HirStmtKind::Block(_)) {
+                        let inner = body.remove(0);
+                        stmt.kind = inner.kind;
+                    }
+                }
             }
             HirStmtKind::If {
                 condition,
@@ -200,6 +366,17 @@ fn optimize_block(stmts: &mut Vec<HirStmt>, opt_level: OptLevel) {
             HirStmtKind::Repeat { body, condition } => {
                 optimize_block(body, opt_level);
                 optimize_expr(condition, opt_level);
+                if opt_level == OptLevel::O1
+                    && eval_static_truthy(condition) == Some(true)
+                    && !block_has_label(body)
+                    && !block_has_loop_ctrl(body)
+                {
+                    let inner = std::mem::take(body);
+                    if inner.is_empty() {
+                        continue;
+                    }
+                    stmt.kind = HirStmtKind::Block(inner);
+                }
             }
             HirStmtKind::Return(vals) => {
                 for v in vals {
