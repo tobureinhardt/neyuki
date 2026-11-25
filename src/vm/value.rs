@@ -1464,7 +1464,7 @@ impl Upvalue {
         f(unsafe { &*self.closed.get() })
     }
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(neyuki_threaded)]
     #[inline(always)]
     pub(crate) fn closed_ptr(&self) -> *mut Value {
         self.closed.get()

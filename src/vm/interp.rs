@@ -115,7 +115,7 @@ impl VM {
         if self.frames.len() <= target_depth {
             return Ok(Some(Value::NIL));
         }
-        #[cfg(not(debug_assertions))]
+        #[cfg(neyuki_threaded)]
         if !TRAP {
             return crate::vm::threaded::run_fast_threaded(self, target_depth);
         }

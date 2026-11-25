@@ -170,3 +170,7 @@ Running with `--sandbox` denies host capabilities by default; individual `--allo
 ## Platform notes
 
 The runtime is a single executable with nothing else to install, apart from OpenSSL (`libssl`) on Linux, and it runs headless. TLS for `@neyuki/http` and `@neyuki/net` uses the operating system's own library (SChannel, Secure Transport or OpenSSL).
+
+Neyuki builds for 64-bit targets only. A value is one NaN-boxed 64-bit word with heap pointers in its low 48 bits, so 32-bit targets (`wasm32`, `i686`, `armv7`) and Android on aarch64, whose heap pointers carry a tag in the top byte, fail to compile with an error saying so.
+
+The `threaded` Cargo feature (`cargo build --release --features threaded`) switches the bytecode interpreter to one where every opcode handler tail-calls the next. Rust does not guarantee those tail calls, so the feature only takes effect in optimized builds (`opt-level` 2 or 3) without debug assertions on x86_64 and aarch64, where they compile to jumps; any other build keeps the loop interpreter. The release binaries are built with it. With a hook or the debugger active, the loop interpreter runs either way.

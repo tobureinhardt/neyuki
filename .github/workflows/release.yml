@@ -40,7 +40,9 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        # All targets here are 64-bit x86/ARM, where the threaded
+        # interpreter is enabled (see build.rs).
+        run: cargo build --release --features threaded --target ${{ matrix.target }}
       - name: Package
         shell: bash
         run: |

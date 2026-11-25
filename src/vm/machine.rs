@@ -158,19 +158,19 @@ pub struct VM {
     pub limits: ExecutionLimits,
     /// Capability-based sandbox permissions.
     pub permissions: Permissions,
-    #[cfg(not(debug_assertions))]
+    #[cfg(neyuki_threaded)]
     pub(crate) cur_consts: *const Value,
-    #[cfg(not(debug_assertions))]
+    #[cfg(neyuki_threaded)]
     pub(crate) cur_exec: *const crate::bytecode::exec::ExecProgram,
-    #[cfg(not(debug_assertions))]
+    #[cfg(neyuki_threaded)]
     pub(crate) cur_closure: *const VmClosure,
-    #[cfg(not(debug_assertions))]
+    #[cfg(neyuki_threaded)]
     pub(crate) cur_upvals: *const Rc<crate::vm::value::Upvalue>,
-    #[cfg(not(debug_assertions))]
+    #[cfg(neyuki_threaded)]
     pub(crate) run_target_depth: usize,
-    #[cfg(not(debug_assertions))]
+    #[cfg(neyuki_threaded)]
     pub(crate) run_result: Option<Value>,
-    #[cfg(not(debug_assertions))]
+    #[cfg(neyuki_threaded)]
     pub(crate) run_err: Option<String>,
 }
 
@@ -357,19 +357,19 @@ impl VM {
             tasks: Default::default(),
             limits: ExecutionLimits::new(),
             permissions: Permissions::allow_all(),
-            #[cfg(not(debug_assertions))]
+            #[cfg(neyuki_threaded)]
             cur_consts: std::ptr::null(),
-            #[cfg(not(debug_assertions))]
+            #[cfg(neyuki_threaded)]
             cur_exec: std::ptr::null(),
-            #[cfg(not(debug_assertions))]
+            #[cfg(neyuki_threaded)]
             cur_closure: std::ptr::null(),
-            #[cfg(not(debug_assertions))]
+            #[cfg(neyuki_threaded)]
             cur_upvals: std::ptr::null(),
-            #[cfg(not(debug_assertions))]
+            #[cfg(neyuki_threaded)]
             run_target_depth: 0,
-            #[cfg(not(debug_assertions))]
+            #[cfg(neyuki_threaded)]
             run_result: None,
-            #[cfg(not(debug_assertions))]
+            #[cfg(neyuki_threaded)]
             run_err: None,
         }
     }

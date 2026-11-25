@@ -57,6 +57,50 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+  # The threaded interpreter only compiles in optimized builds, so the debug
+  # test job never runs it. Its handlers chain through tail calls that Rust
+  # does not guarantee; a loop of 1e8 iterations overflows the native stack
+  # if any dispatch path stops being a jump.
+  release-threaded:
+    name: Release threaded interpreter
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Clippy (threaded)
+        run: cargo clippy --release --features threaded -- -D warnings
+      - name: Build
+        run: cargo build --release --features threaded
+      - name: Run tests
+        run: cargo test --release --features threaded
+      - name: Long loops
+        shell: bash
+        run: |
+          cat > long_loops.nyk <<'NYK'
+          for i = 1, 1e8 do end
+          local n = 0
+          for i = 1, 20000000 do n = n + i % 7 end
+          local function f(x) return x + 1 end
+          local c = 0
+          for i = 1, 5000000 do c = f(c) end
+          local t = {}
+          for i = 1, 5000000 do t[i % 64 + 1] = i end
+          local u = 0
+          local function bump() u = u + 1 end
+          for i = 1, 5000000 do bump() end
+          print(n, c, u)
+          NYK
+          ./target/release/neyuki long_loops.nyk
+
   fuzz:
     name: Fuzz (time-boxed)
     runs-on: ubuntu-latest
