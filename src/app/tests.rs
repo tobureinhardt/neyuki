@@ -606,3 +606,224 @@ fn test_build_bundles_only_the_runtimes_native_libraries() {
     assert_eq!(bundled(unknown), targets);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A project with a registry dependency, installed in `neyuki_packages`.
+fn project_with_dependency(dir: &Path) -> PathBuf {
+    let project = dir.join("project");
+    let package = project.join("neyuki_packages/acme/greet");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::create_dir_all(project.join("lib")).unwrap();
+    std::fs::write(
+        project.join("neyuki.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nentry = \"main.nyk\"\n\n\
+         [dependencies]\n\"@acme/greet\" = \"^1.0.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("main.nyk"),
+        "print(require(\"@pkg/acme/greet\").hi(require(\"lib/util\")))\n",
+    )
+    .unwrap();
+    std::fs::write(project.join("lib/util.nyk"), "return \"world\"\n").unwrap();
+    std::fs::write(
+        package.join("neyuki.toml"),
+        "[package]\nname = \"@acme/greet\"\nversion = \"1.2.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("init.nyk"),
+        "return { hi = function(n) return \"hi \" .. n end }\n",
+    )
+    .unwrap();
+    project
+}
+
+#[test]
+fn test_build_without_runtime() {
+    let dir = scratch_dir("no_runtime");
+    let project = project_with_dependency(&dir);
+    let options = BuildOptions {
+        project: Some(project.clone()),
+        // The extension is dropped: the launchers are `demo` and `demo.cmd`.
+        out: Some(dir.join("dist/demo.nykpak")),
+        no_runtime: true,
+        ..Default::default()
+    };
+    let report = build(&options).unwrap();
+    assert_eq!(report.platform, Platform::None);
+    assert_eq!(report.output, dir.join("dist/demo.nykpak"));
+    assert_eq!(
+        report.launchers,
+        vec![dir.join("dist/demo"), dir.join("dist/demo.cmd")]
+    );
+    assert_eq!(report.packages, vec!["@acme/greet@^1.0.0"]);
+    assert_eq!(report.files, 2, "main.nyk and lib/util.nyk");
+
+    let bundle = Bundle::from_payload_file(&report.output).unwrap();
+    assert_eq!(bundle.meta("runtime"), Some(super::EXTERNAL_RUNTIME));
+    assert_eq!(bundle.meta("packages"), Some("@acme/greet@^1.0.0"));
+    assert_eq!(bundle.meta("neyuki"), Some(env!("CARGO_PKG_VERSION")));
+    assert!(bundle.read("lib/util.nyk").is_some());
+    assert!(
+        bundle.paths().all(|p| !p.starts_with("neyuki_packages/")),
+        "registry packages stay out of the bundle"
+    );
+
+    let sh = std::fs::read_to_string(dir.join("dist/demo")).unwrap();
+    assert!(sh.starts_with("#!/bin/sh\n"));
+    assert!(sh.contains("exec neyuki run -- \"$dir/demo.nykpak\" \"$@\""));
+    let cmd = std::fs::read_to_string(dir.join("dist/demo.cmd")).unwrap();
+    assert!(cmd.contains("neyuki run -- \"%~dp0demo.nykpak\" %*\r\n"));
+
+    let conflict = build(&BuildOptions {
+        runtime: Some(std::env::current_exe().unwrap()),
+        ..options.clone()
+    });
+    assert!(conflict.unwrap_err().contains("--no-runtime"));
+    let bad_name = build(&BuildOptions {
+        out: Some(dir.join("dist/my app$")),
+        ..options.clone()
+    });
+    assert!(bad_name.unwrap_err().contains("may only use"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The shell launcher hands the bundle and arguments to the `neyuki` on
+/// `PATH`, or says how to get one.
+#[cfg(unix)]
+#[test]
+fn test_shell_launcher() {
+    use std::process::Command;
+    let dir = scratch_dir("launcher");
+    let launcher = dir.join("app/demo");
+    std::fs::create_dir_all(dir.join("app")).unwrap();
+    std::fs::write(&launcher, super::build::sh_launcher("demo", "demo.nykpak")).unwrap();
+
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let missing = Command::new("/bin/sh")
+        .arg(&launcher)
+        .env("PATH", &empty)
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("demo needs Neyuki"), "{}", stderr);
+    assert!(stderr.contains("#install"), "{}", stderr);
+
+    // A stand-in `neyuki` that prints what it was given.
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("neyuki"), "#!/bin/sh\nprintf '%s|' \"$@\"\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin.join("neyuki"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    std::fs::write(dir.join("app/demo.nykpak"), b"").unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let found = Command::new("/bin/sh")
+        .arg(&launcher)
+        .args(["a b", "-c"])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(found.status.success());
+    let stdout = String::from_utf8_lossy(&found.stdout);
+    let args: Vec<&str> = stdout.split('|').collect();
+    assert_eq!(args.len(), 6, "{}", stdout);
+    assert_eq!((args[0], args[1]), ("run", "--"));
+    assert_eq!(&args[3..], ["a b", "-c", ""]);
+    // `pwd` may print the directory through a symlink (macOS's temp
+    // directory is under `/var`, a link to `/private/var`).
+    assert_eq!(
+        std::fs::canonicalize(args[2]).unwrap(),
+        std::fs::canonicalize(dir.join("app/demo.nykpak")).unwrap(),
+        "{}",
+        stdout
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_requirements_of_a_bundle_without_runtime() {
+    let dir = scratch_dir("requirements");
+    let global = dir.join("global");
+    let version = |v: &str| v.parse::<crate::pkg::Version>().unwrap();
+    let mut meta = meta();
+    meta.insert("neyuki".to_string(), "1.4.0".to_string());
+    meta.insert(
+        "packages".to_string(),
+        "@acme/greet@^1.0.0\n@acme/zip@>=2.0.0".to_string(),
+    );
+    let bundle = Bundle::from_payload(pack(&meta, &sample_files()).unwrap()).unwrap();
+
+    let err = super::check_requirements(&bundle, &version("1.3.9"), Some(&global)).unwrap_err();
+    assert!(err.contains("needs Neyuki 1.4.0 or newer"), "{}", err);
+    assert!(
+        err.contains("@acme/greet ^1.0.0 (not installed)"),
+        "{}",
+        err
+    );
+    assert!(
+        err.contains("neyuki pkg install -g \"@acme/greet@^1.0.0\" \"@acme/zip@>=2.0.0\""),
+        "{}",
+        err
+    );
+
+    let install = |name: &str, v: &str| {
+        let pkg = global.join("acme").join(name);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("neyuki.toml"),
+            format!(
+                "[package]\nname = \"@acme/{}\"\nversion = \"{}\"\n",
+                name, v
+            ),
+        )
+        .unwrap();
+    };
+    install("greet", "1.2.0");
+    install("zip", "1.9.0");
+    let err = super::check_requirements(&bundle, &version("1.4.0"), Some(&global)).unwrap_err();
+    assert!(!err.contains("needs Neyuki"), "{}", err);
+    assert!(!err.contains("@acme/greet"), "{}", err);
+    assert!(
+        err.contains("@acme/zip >=2.0.0 (1.9.0 is installed)"),
+        "{}",
+        err
+    );
+
+    install("zip", "2.1.0");
+    super::check_requirements(&bundle, &version("1.5.0"), Some(&global)).unwrap();
+    // Without a global packages directory, every package is missing.
+    assert!(super::check_requirements(&bundle, &version("1.5.0"), None).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `neyuki run app.nykpak` installs the bundle and runs its entry.
+#[test]
+fn test_run_payload_file() {
+    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = scratch_dir("run_payload");
+    let files = vec![
+        (
+            "main.nyk".to_string(),
+            b"local app = os.app()\nassert(app.bundled and app.name == \"Test App\")\n\
+              assert(require(\"lib/util\") == 7)\n"
+                .to_vec(),
+        ),
+        ("lib/util.nyk".to_string(), b"return 7\n".to_vec()),
+    ];
+    let payload = dir.join("app.nykpak");
+    std::fs::write(&payload, pack(&meta(), &files).unwrap()).unwrap();
+    let result = super::run_payload_file(
+        &payload,
+        crate::compiler::Options::RUN,
+        crate::vm::ExecutionLimits::default(),
+        crate::vm::Permissions::default(),
+    );
+    super::install(None);
+    result.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

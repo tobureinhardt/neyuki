@@ -7,6 +7,11 @@
 //! relative path up in the bundle first and fall back to the real
 //! filesystem, so the same script works from its project directory under
 //! `neyuki run` and from the built executable.
+//!
+//! An app built with `--no-runtime` is only the bundle, a `.nykpak` file
+//! that `neyuki run` (or `neyuki app.nykpak`) runs. Before it starts,
+//! `check_requirements` makes sure this Neyuki is new enough and that the
+//! packages the app was built against are installed globally.
 
 pub mod build;
 pub mod bundle;
@@ -26,6 +31,100 @@ static INSTALLED: RwLock<Option<Arc<Bundle>>> = RwLock::new(None);
 /// The executable there is an unmodified runtime, which keeps its code
 /// signature intact.
 pub const MACOS_PAYLOAD: &str = "app.nykpak";
+
+/// The `runtime` metadata of a bundle built with `--no-runtime`.
+pub const EXTERNAL_RUNTIME: &str = "external";
+
+/// The command that installs `specs` (`@user/name@req`) globally. Each spec
+/// is quoted, as `^` means something to `cmd`.
+pub fn install_command(specs: &[String]) -> String {
+    let quoted: Vec<String> = specs.iter().map(|spec| format!("\"{}\"", spec)).collect();
+    format!("neyuki pkg install -g {}", quoted.join(" "))
+}
+
+/// Checks that a bundle can run here: that `running` is at least the Neyuki
+/// version it was built with, and that each package in its `packages`
+/// metadata (one `@user/name@req` per line) is installed in `global` (the
+/// global packages directory, `None` when there is none) at a matching
+/// version. The error says what to install.
+pub fn check_requirements(
+    bundle: &Bundle,
+    running: &crate::pkg::Version,
+    global: Option<&Path>,
+) -> Result<(), String> {
+    use crate::pkg::{PackageManifest, Version};
+
+    let app = bundle.meta("name").unwrap_or("this app");
+    let mut problems = Vec::new();
+    if let Some(built) = bundle
+        .meta("neyuki")
+        .and_then(|v| v.parse::<Version>().ok())
+        && *running < built
+    {
+        problems.push(format!(
+            "{} needs Neyuki {} or newer, but this is Neyuki {}; update Neyuki \
+             (https://github.com/neyuki-lang/neyuki#install).",
+            app, built, running
+        ));
+    }
+
+    let mut missing = Vec::new();
+    let mut lines = Vec::new();
+    for spec in bundle.meta("packages").unwrap_or_default().lines() {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        let (name, req) = crate::pkg::resolver::parse_spec(spec)
+            .map_err(|err| format!("the app bundle lists a bad package: {}", err))?;
+        let installed = global
+            .map(|root| name.dir_in(root).join(crate::pkg::paths::MANIFEST))
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| PackageManifest::parse(&text).ok())
+            .map(|manifest| manifest.version);
+        let req_text = req.as_ref().map_or("*".to_string(), ToString::to_string);
+        let state = match (&installed, &req) {
+            (None, _) => "not installed".to_string(),
+            (Some(version), Some(req)) if !req.matches(version) => {
+                format!("{} is installed", version)
+            }
+            _ => continue,
+        };
+        lines.push(format!("  {} {} ({})", name, req_text, state));
+        missing.push(spec.to_string());
+    }
+    if !missing.is_empty() {
+        problems.push(format!(
+            "{} needs these packages installed globally:\n{}\nInstall them with:\n  {}",
+            app,
+            lines.join("\n"),
+            install_command(&missing)
+        ));
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("\n"))
+    }
+}
+
+/// Runs a `.nykpak` bundle on this runtime after `check_requirements`.
+pub fn run_payload_file(
+    path: &Path,
+    options: crate::compiler::Options,
+    limits: crate::vm::ExecutionLimits,
+    permissions: crate::vm::Permissions,
+) -> Result<(), String> {
+    let bundle =
+        Bundle::from_payload_file(path).map_err(|err| format!("{}: {}", path.display(), err))?;
+    let running: crate::pkg::Version = env!("CARGO_PKG_VERSION")
+        .parse()
+        .map_err(|err| format!("bad Neyuki version: {}", err))?;
+    let global = crate::pkg::paths::global_packages_dir().ok();
+    check_requirements(&bundle, &running, global.as_deref())?;
+    install(Some(bundle));
+    run_installed_with(options, limits, permissions)
+}
 
 /// Makes `bundle` the virtual filesystem for the rest of the process (or
 /// removes it with `None`).
@@ -91,6 +190,19 @@ pub fn find_own_bundle() -> Result<Option<Bundle>, String> {
 
 /// Runs the installed bundle's entry script.
 pub fn run_installed() -> Result<(), String> {
+    run_installed_with(
+        crate::compiler::Options::RUN,
+        crate::vm::ExecutionLimits::default(),
+        crate::vm::Permissions::default(),
+    )
+}
+
+/// `run_installed` with the options, limits and permissions of `neyuki run`.
+fn run_installed_with(
+    options: crate::compiler::Options,
+    limits: crate::vm::ExecutionLimits,
+    permissions: crate::vm::Permissions,
+) -> Result<(), String> {
     let bundle = installed().ok_or_else(|| "no app bundle is installed".to_string())?;
     let entry = bundle
         .meta("entry")
@@ -105,7 +217,7 @@ pub fn run_installed() -> Result<(), String> {
             )
         })?
         .map_err(|err| format!("cannot read {}: {}", entry, err))?;
-    crate::vm::run_bytes(&entry, bytes, crate::compiler::Options::RUN)
+    crate::vm::run_bytes_with_config(&entry, bytes, options, limits, permissions)
 }
 
 /// Shows an error that ended an app. Apps built without a console on
