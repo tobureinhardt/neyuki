@@ -521,3 +521,88 @@ fn test_unpack_extracts_files_and_decompiles_bytecode() {
     assert!(super::unpack::open(&not_app).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A package with a library for every target: a build keeps only the ones
+/// its runtime loads.
+#[test]
+fn test_build_bundles_only_the_runtimes_native_libraries() {
+    let dir = scratch_dir("native_targets");
+    let project = dir.join("project");
+    let package = project.join("neyuki_packages/acme/zip");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(project.join("main.nyk"), "print(1)\n").unwrap();
+    let current = crate::pkg::native::current_target();
+    let mut targets = vec![
+        "aarch64-linux-gnu".to_string(),
+        "aarch64-linux-musl".to_string(),
+        "x86_64-windows".to_string(),
+        "aarch64-macos".to_string(),
+    ];
+    if !targets.contains(&current) {
+        targets.push(current.clone());
+    }
+    let mut manifest =
+        String::from("[package]\nname = \"zip\"\nversion = \"1.0.0\"\n\n[native]\nabi = 2\n");
+    for target in &targets {
+        manifest.push_str(&format!("{0} = \"native/{0}/lib\"\n", target));
+        std::fs::create_dir_all(package.join("native").join(target)).unwrap();
+        std::fs::write(package.join("native").join(target).join("lib"), target).unwrap();
+    }
+    std::fs::write(package.join("neyuki.toml"), manifest).unwrap();
+
+    // Each build gets its own output: on macOS the first one is a `.app`
+    // directory, which a later single-file build could not overwrite.
+    let bundled = |runtime: PathBuf| -> Vec<String> {
+        let stem = runtime.file_stem().unwrap().to_string_lossy().into_owned();
+        let out = dir.join(format!("out-{}{}", stem, std::env::consts::EXE_SUFFIX));
+        let report = build(&BuildOptions {
+            project: Some(project.clone()),
+            out: Some(out),
+            runtime: Some(runtime),
+            ..Default::default()
+        })
+        .unwrap();
+        let bundle = match report.platform {
+            Platform::MacOs => Bundle::from_payload_file(
+                &report
+                    .output
+                    .join("Contents/Resources")
+                    .join(super::MACOS_PAYLOAD),
+            )
+            .unwrap(),
+            _ => Bundle::from_executable(&report.output).unwrap().unwrap(),
+        };
+        targets
+            .iter()
+            .filter(|t| {
+                bundle
+                    .read(&format!("neyuki_packages/acme/zip/native/{}/lib", t))
+                    .is_some()
+            })
+            .cloned()
+            .collect()
+    };
+
+    // The test executable is a runtime for the running target.
+    assert_eq!(bundled(std::env::current_exe().unwrap()), vec![current]);
+
+    // A static aarch64 Linux runtime may be glibc (found through the
+    // `-gnu` key) or musl.
+    let mut elf = vec![0u8; 64];
+    elf[..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2;
+    elf[5] = 1;
+    elf[18..20].copy_from_slice(&0xb7u16.to_le_bytes());
+    let elf_runtime = dir.join("runtime-aarch64");
+    std::fs::write(&elf_runtime, &elf).unwrap();
+    assert_eq!(
+        bundled(elf_runtime),
+        vec!["aarch64-linux-gnu", "aarch64-linux-musl"]
+    );
+
+    // A runtime this build cannot read keeps every library.
+    let unknown = dir.join("runtime-unknown");
+    std::fs::write(&unknown, b"#!/bin/sh\n").unwrap();
+    assert_eq!(bundled(unknown), targets);
+    let _ = std::fs::remove_dir_all(&dir);
+}

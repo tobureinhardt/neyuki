@@ -30,7 +30,7 @@ print(`total: {total}`)
 - **Tests built in.** `@neyuki/test` gives `describe`/`it`, hooks, expectations that show a diff, snapshots and a summary line; `neyuki test` runs them.
 - **Batteries for daily work.** Files and paths, JSON, TOML, YAML and CSV, dates, running programs, structured logging, HTTP client and server, and hashing and encryption.
 - **Official packages for the rest.** Libraries a project may not need install on demand, such as `neyuki pkg add @nyk/html` for HTML. `@nyk/markdown`, `@nyk/sql` (PostgreSQL, MySQL and SQLite), `@nyk/ui` (windows with 2D drawing and animation), `@nyk/gpu` (GPU rendering on them), `@nyk/webview` (web pages in a window), `@nyk/hid` (keyboard and mouse automation) and `@nyk/audio` (sound) work the same way. See [the library reference](docs/reference/README.md#official-packages).
-- **One executable.** No runtime to install; on Linux, TLS uses the system's OpenSSL, and nothing else is linked. Packages with native code ship a prebuilt library for every platform, and `neyuki build` bundles them into the app. Scripts can also be compiled to verified bytecode.
+- **One executable.** No runtime to install; on Linux, TLS uses the system's OpenSSL, and nothing else is linked. Packages with native code ship a prebuilt library for every platform, and `neyuki build` bundles the one the app's platform needs. Scripts can also be compiled to verified bytecode.
 
 ## Install
 

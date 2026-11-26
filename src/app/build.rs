@@ -216,7 +216,29 @@ pub fn build(options: &BuildOptions) -> Result<BuildReport, String> {
         .or_else(|| app.icon.as_ref().map(|icon| project.root.join(icon)));
 
     check_entry(&project)?;
-    let files = collect_files(&project, &options.assets, options.out.as_deref())?;
+
+    let runtime_path = match &options.runtime {
+        Some(path) => path.clone(),
+        None => std::env::current_exe()
+            .map_err(|err| format!("cannot find the Neyuki runtime: {}", err))?,
+    };
+    let mut runtime = fs::read(&runtime_path)
+        .map_err(|err| format!("cannot read runtime {}: {}", runtime_path.display(), err))?;
+    runtime.truncate(bundle::strip_trailer(&runtime));
+    let platform = Platform::detect(&runtime);
+    // The running executable is the runtime unless --runtime names another,
+    // whose header says what it is.
+    let targets = match &options.runtime {
+        None => Some(vec![crate::pkg::native::current_target()]),
+        Some(_) => super::target::runtime_targets(&runtime),
+    };
+
+    let files = collect_files(
+        &project,
+        &options.assets,
+        options.out.as_deref(),
+        targets.as_deref(),
+    )?;
 
     let mut meta = BTreeMap::new();
     meta.insert("name".to_string(), name.clone());
@@ -233,15 +255,6 @@ pub fn build(options: &BuildOptions) -> Result<BuildReport, String> {
     }
     let payload = bundle::pack(&meta, &contents)?;
 
-    let runtime_path = match &options.runtime {
-        Some(path) => path.clone(),
-        None => std::env::current_exe()
-            .map_err(|err| format!("cannot find the Neyuki runtime: {}", err))?,
-    };
-    let mut runtime = fs::read(&runtime_path)
-        .map_err(|err| format!("cannot read runtime {}: {}", runtime_path.display(), err))?;
-    runtime.truncate(bundle::strip_trailer(&runtime));
-    let platform = Platform::detect(&runtime);
     let icon = match &icon_path {
         Some(path) => Some(
             fs::read(path)
@@ -319,13 +332,15 @@ fn check_entry(project: &Project) -> Result<(), String> {
 }
 
 /// Bundle path → file on disk: every `.nyk` and `.nykb` file in the project
-/// (so `require` finds local modules), the manifests and native libraries of
-/// installed registry packages, plus the assets. Hidden entries,
-/// `target`, `dist` and the output itself are skipped.
+/// (so `require` finds local modules), the manifests of installed registry
+/// packages and the native libraries the runtime loads (see
+/// `add_native_libraries`), plus the assets. Hidden entries, `target`,
+/// `dist` and the output itself are skipped.
 fn collect_files(
     project: &Project,
     extra_assets: &[String],
     out: Option<&Path>,
+    targets: Option<&[String]>,
 ) -> Result<BTreeMap<String, PathBuf>, String> {
     let root = &project.root;
     let skip = out.and_then(|out| fs::canonicalize(out).ok());
@@ -339,7 +354,7 @@ fn collect_files(
         let package_manifest =
             bundle_path.starts_with("neyuki_packages/") && bundle_path.ends_with("/neyuki.toml");
         if package_manifest {
-            add_native_libraries(&bundle_path, &disk_path, &mut files);
+            add_native_libraries(&bundle_path, &disk_path, targets, &mut files);
         }
         if bundle_path.ends_with(".nyk") || bundle_path.ends_with(".nykb") || package_manifest {
             files.insert(bundle_path, disk_path);
@@ -377,12 +392,15 @@ fn collect_files(
     Ok(files)
 }
 
-/// Bundles the native libraries a package's `[native]` section lists, for
-/// every target: the runtime the app is built on may be for another
-/// platform, and the app picks its own target's library when it runs.
+/// Bundles the native libraries from a package's `[native]` section that
+/// the runtime loads: for each of `targets`, the one library it would pick.
+/// Libraries for other platforms would only make the app bigger. With no
+/// `targets` (a runtime whose header is not recognized) every library goes
+/// in, and the app picks its own when it runs.
 fn add_native_libraries(
     manifest_bundle_path: &str,
     manifest_disk_path: &Path,
+    targets: Option<&[String]>,
     files: &mut BTreeMap<String, PathBuf>,
 ) {
     let Some(native) = fs::read_to_string(manifest_disk_path)
@@ -398,7 +416,14 @@ fn add_native_libraries(
     ) else {
         return;
     };
-    for library in native.targets.values() {
+    let libraries: Vec<&str> = match targets {
+        Some(targets) => targets
+            .iter()
+            .filter_map(|target| native.library_for(target))
+            .collect(),
+        None => native.targets.values().map(String::as_str).collect(),
+    };
+    for library in libraries {
         let disk = crate::pkg::native::library_in(disk_dir, library);
         if disk.is_file() {
             files.insert(format!("{}/{}", bundle_dir, library), disk);

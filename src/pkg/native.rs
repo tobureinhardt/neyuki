@@ -47,13 +47,12 @@ pub fn current_target() -> String {
     }
 }
 
-/// Keys accepted for the running target, preferred first. glibc Linux also
-/// answers to `<arch>-linux-gnu`.
-fn target_keys() -> Vec<String> {
-    let main = current_target();
-    let mut keys = vec![main.clone()];
-    if cfg!(all(target_os = "linux", not(target_env = "musl"))) {
-        keys.push(format!("{}-gnu", main));
+/// Keys a runtime for `target` accepts, preferred first. glibc Linux
+/// (`<arch>-linux`) also answers to `<arch>-linux-gnu`.
+fn keys_for(target: &str) -> Vec<String> {
+    let mut keys = vec![target.to_string()];
+    if target.ends_with("-linux") {
+        keys.push(format!("{}-gnu", target));
     }
     keys
 }
@@ -97,6 +96,15 @@ impl NativeManifest {
         out.push('\n');
     }
 
+    /// The library a runtime for `target` (as `current_target` names it)
+    /// loads, if the package ships one.
+    pub fn library_for(&self, target: &str) -> Option<&str> {
+        keys_for(target)
+            .iter()
+            .find_map(|key| self.targets.get(key))
+            .map(String::as_str)
+    }
+
     /// The library path for the running target, or an error that names the
     /// targets the package does ship.
     pub fn library_for_current_target(&self, package: &str) -> Result<&str, String> {
@@ -107,23 +115,19 @@ impl NativeManifest {
                 package, self.abi, NEYUKI_EXT_ABI_VERSION
             ));
         }
-        target_keys()
-            .iter()
-            .find_map(|key| self.targets.get(key))
-            .map(String::as_str)
-            .ok_or_else(|| {
-                let shipped: Vec<&str> = self.targets.keys().map(String::as_str).collect();
-                format!(
-                    "{} has no native library for {} (it ships: {})",
-                    package,
-                    current_target(),
-                    if shipped.is_empty() {
-                        "none".to_string()
-                    } else {
-                        shipped.join(", ")
-                    }
-                )
-            })
+        self.library_for(&current_target()).ok_or_else(|| {
+            let shipped: Vec<&str> = self.targets.keys().map(String::as_str).collect();
+            format!(
+                "{} has no native library for {} (it ships: {})",
+                package,
+                current_target(),
+                if shipped.is_empty() {
+                    "none".to_string()
+                } else {
+                    shipped.join(", ")
+                }
+            )
+        })
     }
 
     /// A problem `neyuki pkg install` should warn about, if any.
@@ -217,6 +221,21 @@ mod tests {
             m.library_for_current_target("@a/b").unwrap(),
             "native/lib.so"
         );
+    }
+
+    #[test]
+    fn picks_a_library_for_any_target() {
+        let m = manifest(&[
+            ("x86_64-linux-gnu", "native/gnu.so"),
+            ("x86_64-linux-musl", "native/musl.so"),
+            ("aarch64-linux", "native/arm.so"),
+            ("aarch64-linux-gnu", "native/arm-gnu.so"),
+        ]);
+        assert_eq!(m.library_for("x86_64-linux"), Some("native/gnu.so"));
+        assert_eq!(m.library_for("x86_64-linux-musl"), Some("native/musl.so"));
+        assert_eq!(m.library_for("aarch64-linux"), Some("native/arm.so"));
+        assert_eq!(m.library_for("aarch64-linux-musl"), None);
+        assert_eq!(m.library_for("x86_64-windows"), None);
     }
 
     #[test]
