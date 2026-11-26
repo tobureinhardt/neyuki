@@ -709,6 +709,7 @@ fn test_shell_launcher() {
     assert_eq!(missing.status.code(), Some(127));
     let stderr = String::from_utf8_lossy(&missing.stderr);
     assert!(stderr.contains("demo needs Neyuki"), "{}", stderr);
+    assert!(stderr.contains(super::build::INSTALL_SH), "{}", stderr);
     assert!(stderr.contains("#install"), "{}", stderr);
 
     // A stand-in `neyuki` that prints what it was given.
@@ -742,6 +743,150 @@ fn test_shell_launcher() {
         "{}",
         stdout
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Windows launcher prints the PowerShell install command when there is
+/// no `neyuki`. It is inside quotes, where `cmd` leaves `|` alone.
+#[test]
+fn test_cmd_launcher_shows_the_install_command() {
+    let launcher = super::build::cmd_launcher("demo", "demo.nykpak");
+    let line = format!("  echo   {} 1>&2\r\n", super::build::INSTALL_PS1);
+    assert!(launcher.contains(&line), "{}", launcher);
+    assert!(super::build::INSTALL_PS1.contains("\"irm https://neyuki.cc/install.ps1 | iex\""));
+}
+
+/// `install/install.sh` (served as https://neyuki.cc/install.sh) against a
+/// stand-in `curl` that serves a fake release from a directory, so the
+/// test needs no network.
+#[cfg(unix)]
+#[test]
+fn test_install_script() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", arch @ ("x86_64" | "aarch64")) => format!("{}-unknown-linux-gnu", arch),
+        ("macos", arch @ ("x86_64" | "aarch64")) => format!("{}-apple-darwin", arch),
+        _ => return,
+    };
+    let executable = |path: &Path, text: &str| {
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let dir = scratch_dir("install_script");
+    let release = dir.join("release");
+    let name = format!("neyuki-v9.9.9-{}", target);
+    std::fs::create_dir_all(release.join(&name)).unwrap();
+    executable(
+        &release.join(&name).join("neyuki"),
+        "#!/bin/sh\necho neyuki 9.9.9\n",
+    );
+    let archive = format!("{}.tar.gz", name);
+    let tar = Command::new("tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg(&name)
+        .current_dir(&release)
+        .status()
+        .unwrap();
+    assert!(tar.success());
+    let digest = Sha256::digest(std::fs::read(release.join(&archive)).unwrap());
+    let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+    let sums = format!("{}  {}\n", hex, archive);
+    std::fs::write(release.join("SHA256SUMS"), &sums).unwrap();
+    std::fs::write(
+        release.join("latest"),
+        "{\"url\": \"x\", \"tag_name\": \"v9.9.9\"}",
+    )
+    .unwrap();
+
+    let stubs = dir.join("stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    executable(
+        &stubs.join("curl"),
+        "#!/bin/sh\n\
+         out=; url=\n\
+         while [ $# -gt 0 ]; do\n\
+         \x20 case \"$1\" in -o) out=$2; shift 2 ;; https://*) url=$1; shift ;; *) shift ;; esac\n\
+         done\n\
+         echo \"$url\" >>\"$RELEASE/log\"\n\
+         [ -f \"$RELEASE/${url##*/}\" ] || exit 22\n\
+         cp \"$RELEASE/${url##*/}\" \"$out\"\n",
+    );
+
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let run = |args: &[&str]| {
+        Command::new("/bin/sh")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install/install.sh"))
+            .args(args)
+            .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
+            .env("HOME", &home)
+            .env("SHELL", "/bin/bash")
+            .env("RELEASE", &release)
+            .env_remove("NEYUKI_HOME")
+            .env_remove("NEYUKI_VERSION")
+            .env_remove("NEYUKI_NO_MODIFY_PATH")
+            .output()
+            .unwrap()
+    };
+
+    // The latest release, looked up through the API.
+    let first = run(&[]);
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(first.status.success(), "{}{}", stdout, stderr);
+    let bin = home.join(".neyuki/bin");
+    assert!(stdout.contains("Installed neyuki 9.9.9"), "{}", stdout);
+    let installed = Command::new(bin.join("neyuki")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&installed.stdout), "neyuki 9.9.9\n");
+    let log = std::fs::read_to_string(release.join("log")).unwrap();
+    assert!(
+        log.contains("https://api.github.com/repos/neyuki-lang/neyuki/releases/latest"),
+        "{}",
+        log
+    );
+    assert!(
+        log.contains(&format!(
+            "https://github.com/neyuki-lang/neyuki/releases/download/v9.9.9/{}",
+            archive
+        )),
+        "{}",
+        log
+    );
+    let export = format!("export PATH=\"{}:$PATH\"", bin.display());
+    let bashrc = std::fs::read_to_string(home.join(".bashrc")).unwrap();
+    assert_eq!(bashrc.matches(&export).count(), 1, "{}", bashrc);
+
+    // A given version, without the API; PATH is set up only once.
+    let _ = std::fs::remove_file(release.join("log"));
+    let again = run(&["--version", "9.9.9"]);
+    assert!(again.status.success());
+    let log = std::fs::read_to_string(release.join("log")).unwrap();
+    assert!(!log.contains("api.github.com"), "{}", log);
+    let bashrc = std::fs::read_to_string(home.join(".bashrc")).unwrap();
+    assert_eq!(bashrc.matches(&export).count(), 1, "{}", bashrc);
+
+    // A download that does not match SHA256SUMS is not installed.
+    std::fs::remove_file(bin.join("neyuki")).unwrap();
+    std::fs::write(
+        release.join("SHA256SUMS"),
+        sums.replace(&hex, &"0".repeat(64)),
+    )
+    .unwrap();
+    let corrupt = run(&["--version", "v9.9.9", "--no-modify-path"]);
+    assert!(!corrupt.status.success());
+    let stderr = String::from_utf8_lossy(&corrupt.stderr);
+    assert!(stderr.contains("checksum mismatch"), "{}", stderr);
+    assert!(!bin.join("neyuki").exists());
+
+    // Releases from before SHA256SUMS still install.
+    std::fs::remove_file(release.join("SHA256SUMS")).unwrap();
+    let unchecked = run(&["--version", "v9.9.9", "--no-modify-path"]);
+    assert!(unchecked.status.success());
+    assert!(bin.join("neyuki").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

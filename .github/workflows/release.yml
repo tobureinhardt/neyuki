@@ -75,6 +75,10 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      # The install scripts (install/) check downloads against this.
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum neyuki-* > SHA256SUMS
       # Publish the draft by hand after review. Don't pre-create the release
       # in the UI: the action appends generated notes to an existing release,
       # duplicating them.

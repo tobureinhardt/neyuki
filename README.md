@@ -34,7 +34,21 @@ print(`total: {total}`)
 
 ## Install
 
-With a recent stable Rust and a C compiler (on Linux also `pkg-config` and the OpenSSL headers; see [CONTRIBUTING.md](CONTRIBUTING.md#building) for each OS):
+On Linux and macOS:
+
+```bash
+curl -fsSL https://neyuki.cc/install.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://neyuki.cc/install.ps1 | iex"
+```
+
+Both download the latest [release](https://github.com/neyuki-lang/neyuki/releases) for your platform, check it against the release's `SHA256SUMS` (releases after v0.12.0), put `neyuki` in `~/.neyuki/bin` (`%USERPROFILE%\.neyuki\bin`; `$NEYUKI_HOME/bin` when that is set) and add that directory to your `PATH`. Run the command again to upgrade. To pick a release, pass `sh -s -- --version v0.12.0` to the shell script or set `NEYUKI_VERSION` for either; `--no-modify-path` (or `NEYUKI_NO_MODIFY_PATH=1`) leaves your `PATH` alone. The scripts are [`install/`](install) in this repository.
+
+To build it yourself instead, with a recent stable Rust and a C compiler (on Linux also `pkg-config` and the OpenSSL headers; see [CONTRIBUTING.md](CONTRIBUTING.md#building) for each OS):
 
 ```bash
 cargo install neyuki

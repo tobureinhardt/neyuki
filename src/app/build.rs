@@ -472,6 +472,13 @@ fn build_without_runtime(
 /// Where to point people who have no Neyuki yet.
 const INSTALL_HELP: &str = "https://github.com/neyuki-lang/neyuki#install";
 
+/// The command that installs Neyuki on Linux and macOS (`install/install.sh`).
+pub const INSTALL_SH: &str = "curl -fsSL https://neyuki.cc/install.sh | sh";
+
+/// The command that installs Neyuki on Windows (`install/install.ps1`).
+pub const INSTALL_PS1: &str =
+    "powershell -ExecutionPolicy Bypass -c \"irm https://neyuki.cc/install.ps1 | iex\"";
+
 /// A POSIX shell launcher that runs `payload` (next to it) on the `neyuki`
 /// on `PATH`, or says how to get one. `app` and `payload` come from `slug`
 /// and need no quoting.
@@ -481,18 +488,24 @@ pub fn sh_launcher(app: &str, payload: &str) -> String {
          # Runs {app} on an installed Neyuki (built with `neyuki build --no-runtime`).\n\
          if ! command -v neyuki >/dev/null 2>&1; then\n\
          \x20 echo \"{app} needs Neyuki, which is not installed or not on your PATH.\" >&2\n\
-         \x20 echo \"Install it ({help}), then run {app} again.\" >&2\n\
+         \x20 echo \"Install it with:\" >&2\n\
+         \x20 echo \"\" >&2\n\
+         \x20 echo \"  {command}\" >&2\n\
+         \x20 echo \"\" >&2\n\
+         \x20 echo \"then run {app} again. Other ways to install: {help}\" >&2\n\
          \x20 exit 127\n\
          fi\n\
          dir=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd) || exit 1\n\
          exec neyuki run -- \"$dir/{payload}\" \"$@\"\n",
         app = app,
         payload = payload,
+        command = INSTALL_SH,
         help = INSTALL_HELP,
     )
 }
 
-/// The Windows `cmd` launcher, like `sh_launcher`.
+/// The Windows `cmd` launcher, like `sh_launcher`. The install command is
+/// quoted, so its `|` needs no escaping.
 pub fn cmd_launcher(app: &str, payload: &str) -> String {
     format!(
         "@echo off\r\n\
@@ -500,13 +513,18 @@ pub fn cmd_launcher(app: &str, payload: &str) -> String {
          where neyuki >nul 2>nul\r\n\
          if errorlevel 1 (\r\n\
          \x20 echo {app} needs Neyuki, which is not installed or not on your PATH. 1>&2\r\n\
-         \x20 echo Install it from {help}, then run {app} again. 1>&2\r\n\
+         \x20 echo Install it with: 1>&2\r\n\
+         \x20 echo. 1>&2\r\n\
+         \x20 echo   {command} 1>&2\r\n\
+         \x20 echo. 1>&2\r\n\
+         \x20 echo then run {app} again. Other ways to install: {help} 1>&2\r\n\
          \x20 exit /b 9009\r\n\
          )\r\n\
          neyuki run -- \"%~dp0{payload}\" %*\r\n\
          exit /b %errorlevel%\r\n",
         app = app,
         payload = payload,
+        command = INSTALL_PS1,
         help = INSTALL_HELP,
     )
 }
