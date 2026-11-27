@@ -1,10 +1,10 @@
 [package]
 name = "neyuki"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 description = "A small Lua-like scripting language implemented in Rust"
 readme = "README.md"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/neyuki-lang/neyuki"
 homepage = "https://neyuki.cc/"
 
@@ -26,6 +26,10 @@ path = "src/main.rs"
 [features]
 default = []
 mimalloc = ["dep:mimalloc"]
+# Threaded tail-call interpreter. Only takes effect in optimized builds
+# without debug assertions on x86_64/aarch64 Linux and macOS (see build.rs);
+# elsewhere the loop interpreter runs.
+threaded = []
 
 [dependencies]
 num-bigint = "0.4"

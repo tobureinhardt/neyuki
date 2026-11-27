@@ -56,7 +56,7 @@ print("hello, " .. name)
 
 ## os.app(): table
 
-Describes the app that is running. In an executable built with `neyuki build` it returns `{ bundled = true, name, version, identifier }`, taken from the `[package]` and `[app]` sections of `neyuki.toml` (`identifier` is present only when the manifest sets it). Under `neyuki run` it returns `{ bundled = false }`. The table is frozen.
+Describes the app that is running. In an app built with `neyuki build` (also a `.nykpak` from `--no-runtime`) it returns `{ bundled = true, name, version, identifier }`, taken from the `[package]` and `[app]` sections of `neyuki.toml` (`identifier` is present only when the manifest sets it). Under `neyuki run` it returns `{ bundled = false }`. The table is frozen.
 
 ```lua
 local app = os.app()

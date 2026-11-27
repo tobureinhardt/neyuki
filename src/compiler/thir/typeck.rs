@@ -179,11 +179,30 @@ pub(crate) fn infer_binary_type(op: BinOp, left: &ThirExpr, right: &ThirExpr) ->
     }
 }
 
+/// False only for types whose every value is truthy. A type variable,
+/// custom name or generic can stand for `nil` or `boolean`, so it may be falsy.
 fn can_be_falsy(ty: &NeyukiType) -> bool {
     match ty {
-        NeyukiType::Nil | NeyukiType::Boolean | NeyukiType::Any | NeyukiType::Optional(_) => true,
+        NeyukiType::Never
+        | NeyukiType::Int
+        | NeyukiType::Float
+        | NeyukiType::Number
+        | NeyukiType::String
+        | NeyukiType::Table
+        | NeyukiType::Array(_)
+        | NeyukiType::Record(_)
+        | NeyukiType::TableMap { .. }
+        | NeyukiType::Buffer
+        | NeyukiType::Thread
+        | NeyukiType::Function { .. } => false,
         NeyukiType::Union(parts) => parts.iter().any(can_be_falsy),
-        _ => false,
+        NeyukiType::Any
+        | NeyukiType::Nil
+        | NeyukiType::Boolean
+        | NeyukiType::Optional(_)
+        | NeyukiType::Custom(_)
+        | NeyukiType::TypeVar(_)
+        | NeyukiType::Generic { .. } => true,
     }
 }
 
@@ -449,4 +468,25 @@ fn collect_return_type(
 
 pub(crate) fn is_module_import_member(expr: &ThirExprKind) -> bool {
     matches!(expr, ThirExprKind::Variable { binding: None, .. })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_types_may_be_falsy() {
+        assert!(can_be_falsy(&NeyukiType::TypeVar("T".into())));
+        assert!(can_be_falsy(&NeyukiType::Custom("Maybe".into())));
+        assert!(can_be_falsy(&NeyukiType::Generic {
+            params: vec!["T".into()],
+            inner: Box::new(NeyukiType::TypeVar("T".into())),
+        }));
+        assert!(!can_be_falsy(&NeyukiType::Int));
+        assert!(!can_be_falsy(&NeyukiType::String));
+        assert!(can_be_falsy(&NeyukiType::Union(vec![
+            NeyukiType::Int,
+            NeyukiType::TypeVar("T".into()),
+        ])));
+    }
 }

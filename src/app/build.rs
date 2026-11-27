@@ -5,6 +5,12 @@
 //! rest: a Windows runtime gets the app's icon, version resource and the GUI
 //! subsystem; a macOS runtime goes into a `.app` bundle with the payload as
 //! a separate file; any other runtime is written as a single executable.
+//!
+//! With `--no-runtime` the output is the bundle alone (`<name>.nykpak`) and
+//! two launchers next to it, a shell script and a `.cmd` file, which run it
+//! on the `neyuki` found on `PATH`. Registry packages are left out too: the
+//! app loads them from the global packages, and the installed runtime says
+//! which ones to install when they are missing (see `app::check_requirements`).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -29,7 +35,10 @@ Options:
   --asset <path>        Bundle a file or directory too (repeatable)
   --console             Keep the console window on Windows
   --runtime <file>      Build on this Neyuki executable instead of the
-                        running one, e.g. to build for another OS";
+                        running one, e.g. to build for another OS
+  --no-runtime          Leave out the runtime and the registry packages:
+                        write <name>.nykpak and launchers that run it on an
+                        installed Neyuki with globally installed packages";
 
 /// What to build. Relative paths are taken from the working directory,
 /// except `assets`, which are inside the project like their bundle paths.
@@ -43,6 +52,8 @@ pub struct BuildOptions {
     pub assets: Vec<String>,
     pub console: bool,
     pub runtime: Option<PathBuf>,
+    /// Write the bundle and launchers instead of an executable.
+    pub no_runtime: bool,
 }
 
 /// The kinds of runtime executable `neyuki build` knows how to package.
@@ -52,6 +63,8 @@ pub enum Platform {
     MacOs,
     /// ELF and anything else: the bundle is appended and nothing else changes.
     Other,
+    /// No runtime (`--no-runtime`): a `.nykpak` and its launchers.
+    None,
 }
 
 impl Platform {
@@ -77,6 +90,11 @@ pub struct BuildReport {
     pub bytes: u64,
     /// Whether a Windows build keeps its console window.
     pub console: bool,
+    /// The launchers of a `--no-runtime` build.
+    pub launchers: Vec<PathBuf>,
+    /// The global packages a `--no-runtime` build needs, as
+    /// `neyuki pkg install -g` specs (`@user/name@req`).
+    pub packages: Vec<String>,
 }
 
 pub fn run_cli(args: &[String]) -> Result<(), String> {
@@ -100,6 +118,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
             "--asset" => options.assets.push(value(arg)?),
             "--console" => options.console = true,
             "--runtime" => options.runtime = Some(value(arg)?.into()),
+            "--no-runtime" => options.no_runtime = true,
             flag if flag.starts_with('-') => {
                 return Err(format!("unknown option '{}'\n\n{}", flag, USAGE));
             }
@@ -113,6 +132,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         Platform::Windows => "Windows app",
         Platform::MacOs => "macOS app bundle",
         Platform::Other => "executable",
+        Platform::None => "app without a runtime",
     };
     println!(
         "built {} ({}, {} bundled files, {:.1} MiB)",
@@ -121,6 +141,22 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
         report.files,
         report.bytes as f64 / (1024.0 * 1024.0)
     );
+    if report.platform == Platform::None {
+        let launchers: Vec<String> = report
+            .launchers
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        println!("launchers: {}", launchers.join(", "));
+        println!(
+            "It runs on an installed Neyuki {} or newer.",
+            env!("CARGO_PKG_VERSION")
+        );
+        if !report.packages.is_empty() {
+            println!("Users also need its packages installed globally:");
+            println!("  {}", super::install_command(&report.packages));
+        }
+    }
     Ok(())
 }
 
@@ -216,22 +252,19 @@ pub fn build(options: &BuildOptions) -> Result<BuildReport, String> {
         .or_else(|| app.icon.as_ref().map(|icon| project.root.join(icon)));
 
     check_entry(&project)?;
-    let files = collect_files(&project, &options.assets, options.out.as_deref())?;
 
-    let mut meta = BTreeMap::new();
-    meta.insert("name".to_string(), name.clone());
-    meta.insert("version".to_string(), version.to_string());
-    meta.insert("identifier".to_string(), identifier.clone());
-    meta.insert("entry".to_string(), project.entry.clone());
-    meta.insert("console".to_string(), console.to_string());
-    meta.insert("neyuki".to_string(), env!("CARGO_PKG_VERSION").to_string());
-    let mut contents = Vec::with_capacity(files.len());
-    for (bundle_path, disk_path) in &files {
-        let data = fs::read(disk_path)
-            .map_err(|err| format!("cannot read {}: {}", disk_path.display(), err))?;
-        contents.push((bundle_path.clone(), data));
+    if options.no_runtime {
+        if options.runtime.is_some() {
+            return Err("--runtime and --no-runtime cannot be used together".to_string());
+        }
+        let mut meta = app_meta(&name, &version, &identifier, &project.entry, console);
+        meta.insert("runtime".to_string(), super::EXTERNAL_RUNTIME.to_string());
+        let packages = package_specs(&project.manifest);
+        if !packages.is_empty() {
+            meta.insert("packages".to_string(), packages.join("\n"));
+        }
+        return build_without_runtime(&project, options, &name, meta, packages);
     }
-    let payload = bundle::pack(&meta, &contents)?;
 
     let runtime_path = match &options.runtime {
         Some(path) => path.clone(),
@@ -242,6 +275,23 @@ pub fn build(options: &BuildOptions) -> Result<BuildReport, String> {
         .map_err(|err| format!("cannot read runtime {}: {}", runtime_path.display(), err))?;
     runtime.truncate(bundle::strip_trailer(&runtime));
     let platform = Platform::detect(&runtime);
+    // The running executable is the runtime unless --runtime names another,
+    // whose header says what it is.
+    let targets = match &options.runtime {
+        None => Some(vec![crate::pkg::native::current_target()]),
+        Some(_) => super::target::runtime_targets(&runtime),
+    };
+
+    let files = collect_files(
+        &project,
+        &options.assets,
+        options.out.as_deref(),
+        Packages::Bundle(targets.as_deref()),
+    )?;
+
+    let meta = app_meta(&name, &version, &identifier, &project.entry, console);
+    let payload = pack_files(&meta, &files)?;
+
     let icon = match &icon_path {
         Some(path) => Some(
             fs::read(path)
@@ -287,6 +337,8 @@ pub fn build(options: &BuildOptions) -> Result<BuildReport, String> {
             write_macos_bundle(&out, &runtime, &payload, &info)?;
             out
         }
+        // `Platform::detect` never returns it; `--no-runtime` returned above.
+        Platform::None => return Err("the runtime is not an executable".to_string()),
     };
     let bytes = match platform {
         Platform::MacOs => (runtime.len() + payload.len()) as u64,
@@ -298,7 +350,183 @@ pub fn build(options: &BuildOptions) -> Result<BuildReport, String> {
         files: files.len(),
         bytes,
         console,
+        launchers: Vec::new(),
+        packages: Vec::new(),
     })
+}
+
+/// The bundle metadata every build writes.
+fn app_meta(
+    name: &str,
+    version: &Version,
+    identifier: &str,
+    entry: &str,
+    console: bool,
+) -> BTreeMap<String, String> {
+    let mut meta = BTreeMap::new();
+    meta.insert("name".to_string(), name.to_string());
+    meta.insert("version".to_string(), version.to_string());
+    meta.insert("identifier".to_string(), identifier.to_string());
+    meta.insert("entry".to_string(), entry.to_string());
+    meta.insert("console".to_string(), console.to_string());
+    meta.insert("neyuki".to_string(), env!("CARGO_PKG_VERSION").to_string());
+    meta
+}
+
+/// Reads `files` from disk and packs them with `meta`.
+fn pack_files(
+    meta: &BTreeMap<String, String>,
+    files: &BTreeMap<String, PathBuf>,
+) -> Result<Vec<u8>, String> {
+    let mut contents = Vec::with_capacity(files.len());
+    for (bundle_path, disk_path) in files {
+        let data = fs::read(disk_path)
+            .map_err(|err| format!("cannot read {}: {}", disk_path.display(), err))?;
+        contents.push((bundle_path.clone(), data));
+    }
+    bundle::pack(meta, &contents)
+}
+
+/// The project's `[dependencies]` as `@user/name@req` specs, which is what
+/// `neyuki pkg install -g` takes.
+fn package_specs(manifest: &PackageManifest) -> Vec<String> {
+    manifest
+        .dependencies
+        .iter()
+        .map(|(name, req)| format!("{}@{}", name, req))
+        .collect()
+}
+
+/// Writes `<out>.nykpak` and the launchers `<out>` and `<out>.cmd`. `out`
+/// defaults to `dist/<slug>`; a `.nykpak` extension on it is dropped.
+fn build_without_runtime(
+    project: &Project,
+    options: &BuildOptions,
+    name: &str,
+    meta: BTreeMap<String, String>,
+    packages: Vec<String>,
+) -> Result<BuildReport, String> {
+    let base = match &options.out {
+        Some(out) if out.extension().is_some_and(|ext| ext == "nykpak") => out.with_extension(""),
+        Some(out) => out.clone(),
+        None => Path::new("dist").join(slug(name)),
+    };
+    let stem = base
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| format!("invalid output path {}", base.display()))?
+        .to_string();
+    // The launchers name the file in shell and `cmd` syntax, so keep to
+    // characters neither treats specially.
+    if !stem
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+    {
+        return Err(format!(
+            "the output name '{}' may only use letters, digits, '-', '_', '.' and '+' \
+             with --no-runtime",
+            stem
+        ));
+    }
+    let payload_path = base.with_file_name(format!("{}.nykpak", stem));
+    let sh_path = base.clone();
+    let cmd_path = base.with_file_name(format!("{}.cmd", stem));
+
+    let mut files = collect_files(
+        project,
+        &options.assets,
+        Some(&payload_path),
+        Packages::Skip,
+    )?;
+    // The launchers may sit inside the project when `-o` points there.
+    for launcher in [&sh_path, &cmd_path] {
+        if let Ok(skip) = fs::canonicalize(launcher) {
+            files.retain(|_, disk| fs::canonicalize(disk).ok().as_ref() != Some(&skip));
+        }
+    }
+    let payload = pack_files(&meta, &files)?;
+    let payload_name = format!("{}.nykpak", stem);
+
+    if let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("cannot create {}: {}", parent.display(), err))?;
+    }
+    fs::write(&payload_path, &payload)
+        .map_err(|err| format!("cannot write {}: {}", payload_path.display(), err))?;
+    write_executable(&sh_path, &[sh_launcher(&stem, &payload_name).as_bytes()])?;
+    fs::write(&cmd_path, cmd_launcher(&stem, &payload_name))
+        .map_err(|err| format!("cannot write {}: {}", cmd_path.display(), err))?;
+
+    Ok(BuildReport {
+        output: payload_path,
+        platform: Platform::None,
+        files: files.len(),
+        bytes: payload.len() as u64,
+        console: false,
+        launchers: vec![sh_path, cmd_path],
+        packages,
+    })
+}
+
+/// Where to point people who have no Neyuki yet.
+const INSTALL_HELP: &str = "https://github.com/neyuki-lang/neyuki#install";
+
+/// The command that installs Neyuki on Linux and macOS (`install/install.sh`).
+pub const INSTALL_SH: &str = "curl -fsSL https://neyuki.cc/install.sh | sh";
+
+/// The command that installs Neyuki on Windows (`install/install.ps1`).
+pub const INSTALL_PS1: &str =
+    "powershell -ExecutionPolicy Bypass -c \"irm https://neyuki.cc/install.ps1 | iex\"";
+
+/// A POSIX shell launcher that runs `payload` (next to it) on the `neyuki`
+/// on `PATH`, or says how to get one. `app` and `payload` come from `slug`
+/// and need no quoting.
+pub fn sh_launcher(app: &str, payload: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # Runs {app} on an installed Neyuki (built with `neyuki build --no-runtime`).\n\
+         if ! command -v neyuki >/dev/null 2>&1; then\n\
+         \x20 echo \"{app} needs Neyuki, which is not installed or not on your PATH.\" >&2\n\
+         \x20 echo \"Install it with:\" >&2\n\
+         \x20 echo \"\" >&2\n\
+         \x20 echo \"  {command}\" >&2\n\
+         \x20 echo \"\" >&2\n\
+         \x20 echo \"then run {app} again. Other ways to install: {help}\" >&2\n\
+         \x20 exit 127\n\
+         fi\n\
+         dir=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd) || exit 1\n\
+         exec neyuki run -- \"$dir/{payload}\" \"$@\"\n",
+        app = app,
+        payload = payload,
+        command = INSTALL_SH,
+        help = INSTALL_HELP,
+    )
+}
+
+/// The Windows `cmd` launcher, like `sh_launcher`. The install command is
+/// quoted, so its `|` needs no escaping.
+pub fn cmd_launcher(app: &str, payload: &str) -> String {
+    format!(
+        "@echo off\r\n\
+         rem Runs {app} on an installed Neyuki (built with `neyuki build --no-runtime`).\r\n\
+         where neyuki >nul 2>nul\r\n\
+         if errorlevel 1 (\r\n\
+         \x20 echo {app} needs Neyuki, which is not installed or not on your PATH. 1>&2\r\n\
+         \x20 echo Install it with: 1>&2\r\n\
+         \x20 echo. 1>&2\r\n\
+         \x20 echo   {command} 1>&2\r\n\
+         \x20 echo. 1>&2\r\n\
+         \x20 echo then run {app} again. Other ways to install: {help} 1>&2\r\n\
+         \x20 exit /b 9009\r\n\
+         )\r\n\
+         neyuki run -- \"%~dp0{payload}\" %*\r\n\
+         exit /b %errorlevel%\r\n",
+        app = app,
+        payload = payload,
+        command = INSTALL_PS1,
+        help = INSTALL_HELP,
+    )
 }
 
 /// Compiles the entry so a syntax or type error fails the build rather than
@@ -319,13 +547,16 @@ fn check_entry(project: &Project) -> Result<(), String> {
 }
 
 /// Bundle path → file on disk: every `.nyk` and `.nykb` file in the project
-/// (so `require` finds local modules), the manifests and native libraries of
-/// installed registry packages, plus the assets. Hidden entries,
-/// `target`, `dist` and the output itself are skipped.
+/// (so `require` finds local modules), the manifests of installed registry
+/// packages and the native libraries the runtime loads (see
+/// `add_native_libraries`), plus the assets. Hidden entries, `target`,
+/// `dist` and the output itself are skipped, and with `Packages::Skip`
+/// everything under `neyuki_packages/` too.
 fn collect_files(
     project: &Project,
     extra_assets: &[String],
     out: Option<&Path>,
+    packages: Packages,
 ) -> Result<BTreeMap<String, PathBuf>, String> {
     let root = &project.root;
     let skip = out.and_then(|out| fs::canonicalize(out).ok());
@@ -334,12 +565,17 @@ fn collect_files(
     let mut scripts = Vec::new();
     walk(root, root, &mut scripts, true)?;
     for (bundle_path, disk_path) in scripts {
+        let in_packages = bundle_path.starts_with("neyuki_packages/");
+        let targets = match packages {
+            Packages::Skip if in_packages => continue,
+            Packages::Skip => None,
+            Packages::Bundle(targets) => targets,
+        };
         // A registry package's neyuki.toml names its entry file, which
         // `require("@pkg/user/name")` reads inside the app too.
-        let package_manifest =
-            bundle_path.starts_with("neyuki_packages/") && bundle_path.ends_with("/neyuki.toml");
+        let package_manifest = in_packages && bundle_path.ends_with("/neyuki.toml");
         if package_manifest {
-            add_native_libraries(&bundle_path, &disk_path, &mut files);
+            add_native_libraries(&bundle_path, &disk_path, targets, &mut files);
         }
         if bundle_path.ends_with(".nyk") || bundle_path.ends_with(".nykb") || package_manifest {
             files.insert(bundle_path, disk_path);
@@ -377,12 +613,25 @@ fn collect_files(
     Ok(files)
 }
 
-/// Bundles the native libraries a package's `[native]` section lists, for
-/// every target: the runtime the app is built on may be for another
-/// platform, and the app picks its own target's library when it runs.
+/// Whether `collect_files` bundles the installed registry packages.
+#[derive(Clone, Copy)]
+enum Packages<'a> {
+    /// Bundle them, with the native libraries for these targets (all
+    /// libraries when `None`; see `add_native_libraries`).
+    Bundle(Option<&'a [String]>),
+    /// Leave them out: the app loads them from the global packages.
+    Skip,
+}
+
+/// Bundles the native libraries from a package's `[native]` section that
+/// the runtime loads: for each of `targets`, the one library it would pick.
+/// Libraries for other platforms would only make the app bigger. With no
+/// `targets` (a runtime whose header is not recognized) every library goes
+/// in, and the app picks its own when it runs.
 fn add_native_libraries(
     manifest_bundle_path: &str,
     manifest_disk_path: &Path,
+    targets: Option<&[String]>,
     files: &mut BTreeMap<String, PathBuf>,
 ) {
     let Some(native) = fs::read_to_string(manifest_disk_path)
@@ -398,7 +647,14 @@ fn add_native_libraries(
     ) else {
         return;
     };
-    for library in native.targets.values() {
+    let libraries: Vec<&str> = match targets {
+        Some(targets) => targets
+            .iter()
+            .filter_map(|target| native.library_for(target))
+            .collect(),
+        None => native.targets.values().map(String::as_str).collect(),
+    };
+    for library in libraries {
         let disk = crate::pkg::native::library_in(disk_dir, library);
         if disk.is_file() {
             files.insert(format!("{}/{}", bundle_dir, library), disk);

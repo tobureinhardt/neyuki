@@ -5,6 +5,7 @@ use num_integer::Integer as _;
 use num_traits::{FromPrimitive, ToPrimitive, Zero};
 use std::collections::HashSet;
 
+use crate::ast::NodeId;
 use crate::ast::literal::Literal;
 use crate::ast::op::{BinOp, UnOp};
 use crate::ast::pattern::AssignTarget;
@@ -26,8 +27,11 @@ impl PartialEq for FoldVal {
             (FoldVal::Bool(a), FoldVal::Bool(b)) => a == b,
             (FoldVal::Int(a), FoldVal::Int(b)) => a == b,
             (FoldVal::Float(a), FoldVal::Float(b)) => a == b,
-            (FoldVal::Int(a), FoldVal::Float(b)) => a.to_f64().is_some_and(|v| v == *b),
-            (FoldVal::Float(a), FoldVal::Int(b)) => b.to_f64().is_some_and(|v| *a == v),
+            // Exact, like the VM: converting the integer to `f64` rounds
+            // above 2^53, so the float is converted to an integer instead.
+            (FoldVal::Int(a), FoldVal::Float(b)) | (FoldVal::Float(b), FoldVal::Int(a)) => {
+                b.fract() == 0.0 && BigInt::from_f64(*b).is_some_and(|v| v == *a)
+            }
             (FoldVal::Str(a), FoldVal::Str(b)) => a == b,
             _ => false,
         }
@@ -456,6 +460,23 @@ fn fold_assign_target_scoped(target: AssignTarget, shadowed: &HashSet<String>) -
     }
 }
 
+// The operand of a folded `and`/`or`/`??` stands in for the whole binary
+// expression, which yields one value: a call or `...` keeps that truncation
+// in a `Paren` that takes over the binary node's id.
+fn single_value(expr: Expr, id: NodeId) -> Expr {
+    if matches!(
+        expr,
+        Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Vararg { .. }
+    ) {
+        Expr::Paren {
+            expr: Box::new(expr),
+            id,
+        }
+    } else {
+        expr
+    }
+}
+
 // Recursively optimize an AST expression by folding constants with shadow tracking
 fn fold_expr_scoped(expr: Expr, shadowed: &HashSet<String>) -> Expr {
     match expr {
@@ -532,14 +553,14 @@ fn fold_expr_scoped(expr: Expr, shadowed: &HashSet<String>) -> Expr {
                     if !c.is_truthy() {
                         return folded_left;
                     }
-                    return fold_expr_scoped(*right, shadowed);
+                    return single_value(fold_expr_scoped(*right, shadowed), id);
                 }
             } else if op == BinOp::Or {
                 if let Some(c) = FoldVal::from_expr(&folded_left) {
                     if c.is_truthy() {
                         return folded_left;
                     }
-                    return fold_expr_scoped(*right, shadowed);
+                    return single_value(fold_expr_scoped(*right, shadowed), id);
                 }
             } else if op == BinOp::Coalesce
                 && let Some(c) = FoldVal::from_expr(&folded_left)
@@ -547,7 +568,7 @@ fn fold_expr_scoped(expr: Expr, shadowed: &HashSet<String>) -> Expr {
                 if c != FoldVal::Nil {
                     return folded_left;
                 }
-                return fold_expr_scoped(*right, shadowed);
+                return single_value(fold_expr_scoped(*right, shadowed), id);
             }
 
             let folded_right = fold_expr_scoped(*right, shadowed);
@@ -920,6 +941,17 @@ pub fn fold_program(mut stmts: Vec<Stmt>) -> Vec<Stmt> {
 mod tests {
     use super::*;
     use crate::parser::Parser;
+
+    #[test]
+    fn int_float_equality_folds_exactly() {
+        let big = |s: &str| FoldVal::Int(s.parse::<BigInt>().unwrap());
+        assert_ne!(big("9007199254740993"), FoldVal::Float(9007199254740992.0));
+        assert_ne!(big("9223372036854775807"), FoldVal::Float(2f64.powi(63)));
+        assert_eq!(big("9007199254740992"), FoldVal::Float(9007199254740992.0));
+        assert_eq!(FoldVal::Float(2f64.powi(63)), big("9223372036854775808"));
+        assert_ne!(big("1"), FoldVal::Float(1.5));
+        assert_ne!(big("0"), FoldVal::Float(f64::NAN));
+    }
 
     #[test]
     fn test_fold_arithmetic() {

@@ -521,3 +521,454 @@ fn test_unpack_extracts_files_and_decompiles_bytecode() {
     assert!(super::unpack::open(&not_app).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A package with a library for every target: a build keeps only the ones
+/// its runtime loads.
+#[test]
+fn test_build_bundles_only_the_runtimes_native_libraries() {
+    let dir = scratch_dir("native_targets");
+    let project = dir.join("project");
+    let package = project.join("neyuki_packages/acme/zip");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(project.join("main.nyk"), "print(1)\n").unwrap();
+    let current = crate::pkg::native::current_target();
+    let mut targets = vec![
+        "aarch64-linux-gnu".to_string(),
+        "aarch64-linux-musl".to_string(),
+        "x86_64-windows".to_string(),
+        "aarch64-macos".to_string(),
+    ];
+    if !targets.contains(&current) {
+        targets.push(current.clone());
+    }
+    let mut manifest =
+        String::from("[package]\nname = \"zip\"\nversion = \"1.0.0\"\n\n[native]\nabi = 2\n");
+    for target in &targets {
+        manifest.push_str(&format!("{0} = \"native/{0}/lib\"\n", target));
+        std::fs::create_dir_all(package.join("native").join(target)).unwrap();
+        std::fs::write(package.join("native").join(target).join("lib"), target).unwrap();
+    }
+    std::fs::write(package.join("neyuki.toml"), manifest).unwrap();
+
+    // Each build gets its own output: on macOS the first one is a `.app`
+    // directory, which a later single-file build could not overwrite.
+    let bundled = |runtime: PathBuf| -> Vec<String> {
+        let stem = runtime.file_stem().unwrap().to_string_lossy().into_owned();
+        let out = dir.join(format!("out-{}{}", stem, std::env::consts::EXE_SUFFIX));
+        let report = build(&BuildOptions {
+            project: Some(project.clone()),
+            out: Some(out),
+            runtime: Some(runtime),
+            ..Default::default()
+        })
+        .unwrap();
+        let bundle = match report.platform {
+            Platform::MacOs => Bundle::from_payload_file(
+                &report
+                    .output
+                    .join("Contents/Resources")
+                    .join(super::MACOS_PAYLOAD),
+            )
+            .unwrap(),
+            _ => Bundle::from_executable(&report.output).unwrap().unwrap(),
+        };
+        targets
+            .iter()
+            .filter(|t| {
+                bundle
+                    .read(&format!("neyuki_packages/acme/zip/native/{}/lib", t))
+                    .is_some()
+            })
+            .cloned()
+            .collect()
+    };
+
+    // The test executable is a runtime for the running target.
+    assert_eq!(bundled(std::env::current_exe().unwrap()), vec![current]);
+
+    // A static aarch64 Linux runtime may be glibc (found through the
+    // `-gnu` key) or musl.
+    let mut elf = vec![0u8; 64];
+    elf[..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2;
+    elf[5] = 1;
+    elf[18..20].copy_from_slice(&0xb7u16.to_le_bytes());
+    let elf_runtime = dir.join("runtime-aarch64");
+    std::fs::write(&elf_runtime, &elf).unwrap();
+    assert_eq!(
+        bundled(elf_runtime),
+        vec!["aarch64-linux-gnu", "aarch64-linux-musl"]
+    );
+
+    // A runtime this build cannot read keeps every library.
+    let unknown = dir.join("runtime-unknown");
+    std::fs::write(&unknown, b"#!/bin/sh\n").unwrap();
+    assert_eq!(bundled(unknown), targets);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A project with a registry dependency, installed in `neyuki_packages`.
+fn project_with_dependency(dir: &Path) -> PathBuf {
+    let project = dir.join("project");
+    let package = project.join("neyuki_packages/acme/greet");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::create_dir_all(project.join("lib")).unwrap();
+    std::fs::write(
+        project.join("neyuki.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nentry = \"main.nyk\"\n\n\
+         [dependencies]\n\"@acme/greet\" = \"^1.0.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("main.nyk"),
+        "print(require(\"@pkg/acme/greet\").hi(require(\"lib/util\")))\n",
+    )
+    .unwrap();
+    std::fs::write(project.join("lib/util.nyk"), "return \"world\"\n").unwrap();
+    std::fs::write(
+        package.join("neyuki.toml"),
+        "[package]\nname = \"@acme/greet\"\nversion = \"1.2.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("init.nyk"),
+        "return { hi = function(n) return \"hi \" .. n end }\n",
+    )
+    .unwrap();
+    project
+}
+
+#[test]
+fn test_build_without_runtime() {
+    let dir = scratch_dir("no_runtime");
+    let project = project_with_dependency(&dir);
+    let options = BuildOptions {
+        project: Some(project.clone()),
+        // The extension is dropped: the launchers are `demo` and `demo.cmd`.
+        out: Some(dir.join("dist/demo.nykpak")),
+        no_runtime: true,
+        ..Default::default()
+    };
+    let report = build(&options).unwrap();
+    assert_eq!(report.platform, Platform::None);
+    assert_eq!(report.output, dir.join("dist/demo.nykpak"));
+    assert_eq!(
+        report.launchers,
+        vec![dir.join("dist/demo"), dir.join("dist/demo.cmd")]
+    );
+    assert_eq!(report.packages, vec!["@acme/greet@^1.0.0"]);
+    assert_eq!(report.files, 2, "main.nyk and lib/util.nyk");
+
+    let bundle = Bundle::from_payload_file(&report.output).unwrap();
+    assert_eq!(bundle.meta("runtime"), Some(super::EXTERNAL_RUNTIME));
+    assert_eq!(bundle.meta("packages"), Some("@acme/greet@^1.0.0"));
+    assert_eq!(bundle.meta("neyuki"), Some(env!("CARGO_PKG_VERSION")));
+    assert!(bundle.read("lib/util.nyk").is_some());
+    assert!(
+        bundle.paths().all(|p| !p.starts_with("neyuki_packages/")),
+        "registry packages stay out of the bundle"
+    );
+
+    let sh = std::fs::read_to_string(dir.join("dist/demo")).unwrap();
+    assert!(sh.starts_with("#!/bin/sh\n"));
+    assert!(sh.contains("exec neyuki run -- \"$dir/demo.nykpak\" \"$@\""));
+    let cmd = std::fs::read_to_string(dir.join("dist/demo.cmd")).unwrap();
+    assert!(cmd.contains("neyuki run -- \"%~dp0demo.nykpak\" %*\r\n"));
+
+    let conflict = build(&BuildOptions {
+        runtime: Some(std::env::current_exe().unwrap()),
+        ..options.clone()
+    });
+    assert!(conflict.unwrap_err().contains("--no-runtime"));
+    let bad_name = build(&BuildOptions {
+        out: Some(dir.join("dist/my app$")),
+        ..options.clone()
+    });
+    assert!(bad_name.unwrap_err().contains("may only use"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The shell launcher hands the bundle and arguments to the `neyuki` on
+/// `PATH`, or says how to get one.
+#[cfg(unix)]
+#[test]
+fn test_shell_launcher() {
+    use std::process::Command;
+    let dir = scratch_dir("launcher");
+    let launcher = dir.join("app/demo");
+    std::fs::create_dir_all(dir.join("app")).unwrap();
+    std::fs::write(&launcher, super::build::sh_launcher("demo", "demo.nykpak")).unwrap();
+
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let missing = Command::new("/bin/sh")
+        .arg(&launcher)
+        .env("PATH", &empty)
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("demo needs Neyuki"), "{}", stderr);
+    assert!(stderr.contains(super::build::INSTALL_SH), "{}", stderr);
+    assert!(stderr.contains("#install"), "{}", stderr);
+
+    // A stand-in `neyuki` that prints what it was given.
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("neyuki"), "#!/bin/sh\nprintf '%s|' \"$@\"\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin.join("neyuki"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    std::fs::write(dir.join("app/demo.nykpak"), b"").unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let found = Command::new("/bin/sh")
+        .arg(&launcher)
+        .args(["a b", "-c"])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(found.status.success());
+    let stdout = String::from_utf8_lossy(&found.stdout);
+    let args: Vec<&str> = stdout.split('|').collect();
+    assert_eq!(args.len(), 6, "{}", stdout);
+    assert_eq!((args[0], args[1]), ("run", "--"));
+    assert_eq!(&args[3..], ["a b", "-c", ""]);
+    // `pwd` may print the directory through a symlink (macOS's temp
+    // directory is under `/var`, a link to `/private/var`).
+    assert_eq!(
+        std::fs::canonicalize(args[2]).unwrap(),
+        std::fs::canonicalize(dir.join("app/demo.nykpak")).unwrap(),
+        "{}",
+        stdout
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Windows launcher prints the PowerShell install command when there is
+/// no `neyuki`. It is inside quotes, where `cmd` leaves `|` alone.
+#[test]
+fn test_cmd_launcher_shows_the_install_command() {
+    let launcher = super::build::cmd_launcher("demo", "demo.nykpak");
+    let line = format!("  echo   {} 1>&2\r\n", super::build::INSTALL_PS1);
+    assert!(launcher.contains(&line), "{}", launcher);
+    assert!(super::build::INSTALL_PS1.contains("\"irm https://neyuki.cc/install.ps1 | iex\""));
+}
+
+/// `install/install.sh` (served as https://neyuki.cc/install.sh) against a
+/// stand-in `curl` that serves a fake release from a directory, so the
+/// test needs no network.
+#[cfg(unix)]
+#[test]
+fn test_install_script() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", arch @ ("x86_64" | "aarch64")) => format!("{}-unknown-linux-gnu", arch),
+        ("macos", arch @ ("x86_64" | "aarch64")) => format!("{}-apple-darwin", arch),
+        _ => return,
+    };
+    let executable = |path: &Path, text: &str| {
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let dir = scratch_dir("install_script");
+    let release = dir.join("release");
+    let name = format!("neyuki-v9.9.9-{}", target);
+    std::fs::create_dir_all(release.join(&name)).unwrap();
+    executable(
+        &release.join(&name).join("neyuki"),
+        "#!/bin/sh\necho neyuki 9.9.9\n",
+    );
+    let archive = format!("{}.tar.gz", name);
+    let tar = Command::new("tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg(&name)
+        .current_dir(&release)
+        .status()
+        .unwrap();
+    assert!(tar.success());
+    let digest = Sha256::digest(std::fs::read(release.join(&archive)).unwrap());
+    let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+    let sums = format!("{}  {}\n", hex, archive);
+    std::fs::write(release.join("SHA256SUMS"), &sums).unwrap();
+    std::fs::write(
+        release.join("latest"),
+        "{\"url\": \"x\", \"tag_name\": \"v9.9.9\"}",
+    )
+    .unwrap();
+
+    let stubs = dir.join("stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    executable(
+        &stubs.join("curl"),
+        "#!/bin/sh\n\
+         out=; url=\n\
+         while [ $# -gt 0 ]; do\n\
+         \x20 case \"$1\" in -o) out=$2; shift 2 ;; https://*) url=$1; shift ;; *) shift ;; esac\n\
+         done\n\
+         echo \"$url\" >>\"$RELEASE/log\"\n\
+         [ -f \"$RELEASE/${url##*/}\" ] || exit 22\n\
+         cp \"$RELEASE/${url##*/}\" \"$out\"\n",
+    );
+
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let run = |args: &[&str]| {
+        Command::new("/bin/sh")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install/install.sh"))
+            .args(args)
+            .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
+            .env("HOME", &home)
+            .env("SHELL", "/bin/bash")
+            .env("RELEASE", &release)
+            .env_remove("NEYUKI_HOME")
+            .env_remove("NEYUKI_VERSION")
+            .env_remove("NEYUKI_NO_MODIFY_PATH")
+            .output()
+            .unwrap()
+    };
+
+    // The latest release, looked up through the API.
+    let first = run(&[]);
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(first.status.success(), "{}{}", stdout, stderr);
+    let bin = home.join(".neyuki/bin");
+    assert!(stdout.contains("Installed neyuki 9.9.9"), "{}", stdout);
+    let installed = Command::new(bin.join("neyuki")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&installed.stdout), "neyuki 9.9.9\n");
+    let log = std::fs::read_to_string(release.join("log")).unwrap();
+    assert!(
+        log.contains("https://api.github.com/repos/neyuki-lang/neyuki/releases/latest"),
+        "{}",
+        log
+    );
+    assert!(
+        log.contains(&format!(
+            "https://github.com/neyuki-lang/neyuki/releases/download/v9.9.9/{}",
+            archive
+        )),
+        "{}",
+        log
+    );
+    let export = format!("export PATH=\"{}:$PATH\"", bin.display());
+    let bashrc = std::fs::read_to_string(home.join(".bashrc")).unwrap();
+    assert_eq!(bashrc.matches(&export).count(), 1, "{}", bashrc);
+
+    // A given version, without the API; PATH is set up only once.
+    let _ = std::fs::remove_file(release.join("log"));
+    let again = run(&["--version", "9.9.9"]);
+    assert!(again.status.success());
+    let log = std::fs::read_to_string(release.join("log")).unwrap();
+    assert!(!log.contains("api.github.com"), "{}", log);
+    let bashrc = std::fs::read_to_string(home.join(".bashrc")).unwrap();
+    assert_eq!(bashrc.matches(&export).count(), 1, "{}", bashrc);
+
+    // A download that does not match SHA256SUMS is not installed.
+    std::fs::remove_file(bin.join("neyuki")).unwrap();
+    std::fs::write(
+        release.join("SHA256SUMS"),
+        sums.replace(&hex, &"0".repeat(64)),
+    )
+    .unwrap();
+    let corrupt = run(&["--version", "v9.9.9", "--no-modify-path"]);
+    assert!(!corrupt.status.success());
+    let stderr = String::from_utf8_lossy(&corrupt.stderr);
+    assert!(stderr.contains("checksum mismatch"), "{}", stderr);
+    assert!(!bin.join("neyuki").exists());
+
+    // Releases from before SHA256SUMS still install.
+    std::fs::remove_file(release.join("SHA256SUMS")).unwrap();
+    let unchecked = run(&["--version", "v9.9.9", "--no-modify-path"]);
+    assert!(unchecked.status.success());
+    assert!(bin.join("neyuki").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_requirements_of_a_bundle_without_runtime() {
+    let dir = scratch_dir("requirements");
+    let global = dir.join("global");
+    let version = |v: &str| v.parse::<crate::pkg::Version>().unwrap();
+    let mut meta = meta();
+    meta.insert("neyuki".to_string(), "1.4.0".to_string());
+    meta.insert(
+        "packages".to_string(),
+        "@acme/greet@^1.0.0\n@acme/zip@>=2.0.0".to_string(),
+    );
+    let bundle = Bundle::from_payload(pack(&meta, &sample_files()).unwrap()).unwrap();
+
+    let err = super::check_requirements(&bundle, &version("1.3.9"), Some(&global)).unwrap_err();
+    assert!(err.contains("needs Neyuki 1.4.0 or newer"), "{}", err);
+    assert!(
+        err.contains("@acme/greet ^1.0.0 (not installed)"),
+        "{}",
+        err
+    );
+    assert!(
+        err.contains("neyuki pkg install -g \"@acme/greet@^1.0.0\" \"@acme/zip@>=2.0.0\""),
+        "{}",
+        err
+    );
+
+    let install = |name: &str, v: &str| {
+        let pkg = global.join("acme").join(name);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("neyuki.toml"),
+            format!(
+                "[package]\nname = \"@acme/{}\"\nversion = \"{}\"\n",
+                name, v
+            ),
+        )
+        .unwrap();
+    };
+    install("greet", "1.2.0");
+    install("zip", "1.9.0");
+    let err = super::check_requirements(&bundle, &version("1.4.0"), Some(&global)).unwrap_err();
+    assert!(!err.contains("needs Neyuki"), "{}", err);
+    assert!(!err.contains("@acme/greet"), "{}", err);
+    assert!(
+        err.contains("@acme/zip >=2.0.0 (1.9.0 is installed)"),
+        "{}",
+        err
+    );
+
+    install("zip", "2.1.0");
+    super::check_requirements(&bundle, &version("1.5.0"), Some(&global)).unwrap();
+    // Without a global packages directory, every package is missing.
+    assert!(super::check_requirements(&bundle, &version("1.5.0"), None).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `neyuki run app.nykpak` installs the bundle and runs its entry.
+#[test]
+fn test_run_payload_file() {
+    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = scratch_dir("run_payload");
+    let files = vec![
+        (
+            "main.nyk".to_string(),
+            b"local app = os.app()\nassert(app.bundled and app.name == \"Test App\")\n\
+              assert(require(\"lib/util\") == 7)\n"
+                .to_vec(),
+        ),
+        ("lib/util.nyk".to_string(), b"return 7\n".to_vec()),
+    ];
+    let payload = dir.join("app.nykpak");
+    std::fs::write(&payload, pack(&meta(), &files).unwrap()).unwrap();
+    let result = super::run_payload_file(
+        &payload,
+        crate::compiler::Options::RUN,
+        crate::vm::ExecutionLimits::default(),
+        crate::vm::Permissions::default(),
+    );
+    super::install(None);
+    result.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

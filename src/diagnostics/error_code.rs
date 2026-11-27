@@ -31,6 +31,8 @@ pub enum ErrorCode {
     W0004, // Unreachable code
     W0005, // Redundant expression or statement
     W0006, // Byte escape above ASCII in a string literal
+    W0007, // Invalid attribute arguments
+    W0008, // Use of a deprecated symbol
 }
 
 impl ErrorCode {
@@ -56,6 +58,8 @@ impl ErrorCode {
             ErrorCode::W0004 => "W0004",
             ErrorCode::W0005 => "W0005",
             ErrorCode::W0006 => "W0006",
+            ErrorCode::W0007 => "W0007",
+            ErrorCode::W0008 => "W0008",
         }
     }
 
@@ -81,6 +85,8 @@ impl ErrorCode {
             ErrorCode::W0004 => "unreachable code",
             ErrorCode::W0005 => "redundant operation",
             ErrorCode::W0006 => "byte escape above ASCII is a code point",
+            ErrorCode::W0007 => "invalid attribute",
+            ErrorCode::W0008 => "use of deprecated symbol",
         }
     }
 }

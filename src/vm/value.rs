@@ -21,7 +21,7 @@
 //! callers.
 
 use num_bigint::BigInt;
-use num_traits::ToPrimitive;
+use num_traits::{FromPrimitive, ToPrimitive};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -35,6 +35,25 @@ use crate::vm::buffer::VmBuffer;
 use crate::vm::hash::FxHashMap;
 use crate::vm::table::TableKey;
 
+// A `Value` is a NaN-boxed `u64` whose heap pointers live in the low 48 bits,
+// so only 64-bit targets are supported; 32-bit targets (wasm32, i686, armv7)
+// are rejected here instead of failing in the layout assertions below.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!(
+    "Neyuki needs a 64-bit target: its NaN-boxed `Value` stores pointers in a 48-bit payload. \
+     32-bit targets (wasm32, i686, armv7) are not supported."
+);
+// Android on aarch64 hands out heap pointers with a tag in the top byte
+// (Scudo's 0xb4 TBI tag, or per-allocation MTE tags), which neither fits the
+// 48-bit payload nor can be restored after stripping. Other 64-bit targets
+// keep user-space addresses below 2^47 (on Linux with 5-level paging or
+// 52-bit VA too, since the kernel only maps higher when `mmap` is given a
+// hint above that line), so `pack_ptr` and friends only assert it.
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+compile_error!(
+    "Neyuki does not support Android on aarch64: tagged heap pointers do not fit the \
+     48-bit NaN-box payload of `Value`."
+);
 const _: () = assert!(std::mem::size_of::<usize>() == 8);
 const _: () = assert!(std::mem::align_of::<i64>() >= 2);
 const _: () = assert!(std::mem::align_of::<BigInt>() >= 2);
@@ -1806,15 +1825,33 @@ impl Value {
             (ValueView::BigInt(a), ValueView::BigInt(b)) => a == b,
             (ValueView::Int(_), ValueView::BigInt(_))
             | (ValueView::BigInt(_), ValueView::Int(_)) => false,
-            (ValueView::Int(a), ValueView::Float(b)) => (a as f64) == b,
-            (ValueView::Float(a), ValueView::Int(b)) => a == (b as f64),
-            (ValueView::BigInt(a), ValueView::Float(b)) => a.to_f64().is_some_and(|v| v == b),
-            (ValueView::Float(a), ValueView::BigInt(b)) => b.to_f64().is_some_and(|v| a == v),
+            (ValueView::Int(a), ValueView::Float(b)) | (ValueView::Float(b), ValueView::Int(a)) => {
+                int_eq_float(a, b)
+            }
+            (ValueView::BigInt(a), ValueView::Float(b))
+            | (ValueView::Float(b), ValueView::BigInt(a)) => bigint_eq_float(a, b),
             (ValueView::String(a), ValueView::String(b)) => a == b,
             (ValueView::Native(a), ValueView::Native(b)) => std::ptr::eq(a, b) || a.name == b.name,
             _ => false,
         }
     }
+}
+
+/// Exact integer/float equality. Converting the integer to `f64` rounds
+/// above 2^53, which would make `9007199254740993 == 9007199254740992.0`.
+#[inline]
+fn int_eq_float(i: i64, f: f64) -> bool {
+    // 2^63 itself is out of range: `as i64` would saturate it to `i64::MAX`.
+    f.fract() == 0.0
+        && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f)
+        && f as i64 == i
+}
+
+/// Exact big integer/float equality; a finite integral float converts to a
+/// `BigInt` without loss.
+#[inline]
+fn bigint_eq_float(b: &BigInt, f: f64) -> bool {
+    f.fract() == 0.0 && BigInt::from_f64(f).is_some_and(|v| &v == b)
 }
 
 pub struct VmTable {
@@ -2089,7 +2126,7 @@ impl Upvalue {
         f(unsafe { &*self.closed.get() })
     }
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(neyuki_threaded)]
     #[inline(always)]
     pub(crate) fn closed_ptr(&self) -> *mut Value {
         self.closed.get()

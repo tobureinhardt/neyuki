@@ -10,7 +10,9 @@ use crate::bytecode::instruction::MULTRET;
 use crate::vm::frame::CallFrame;
 use crate::vm::machine::{HookEvent, RUNNING_FRAME, VM};
 use crate::vm::ops;
-use crate::vm::value::{TAG_RC_START, Upvalue, Value, ValueView, VmTable};
+use crate::vm::value::{
+    INLINE_INT_MAX, INLINE_INT_MIN, TAG_RC_START, Upvalue, Value, ValueView, VmTable,
+};
 
 /// A register of the running frame. The interpreter loop only calls this
 /// with indices below `base + max_registers` of a verified prototype, and
@@ -113,7 +115,7 @@ impl VM {
         if self.frames.len() <= target_depth {
             return Ok(Some(Value::NIL));
         }
-        #[cfg(not(debug_assertions))]
+        #[cfg(neyuki_threaded)]
         if !TRAP {
             return crate::vm::threaded::run_fast_threaded(self, target_depth);
         }
@@ -533,7 +535,10 @@ impl VM {
                         {
                             let tbl = t.borrow();
                             let idx = i as usize - 1;
-                            if idx < tbl.array.len() {
+                            // A nil hole falls through so `__index` runs.
+                            if idx < tbl.array.len()
+                                && (!tbl.array[idx].is_nil() || tbl.metatable.is_none())
+                            {
                                 let val = tbl.array[idx].clone();
                                 if !(val.is_look() && tbl.metatable.is_some()) {
                                     drop(tbl);
@@ -548,7 +553,9 @@ impl VM {
                             } else {
                                 tbl.fields.get(s.as_str())
                             };
-                            if let Some(v) = found {
+                            if let Some(v) = found
+                                && (!v.is_nil() || tbl.metatable.is_none())
+                            {
                                 let val = v.clone();
                                 if !(val.is_look() && tbl.metatable.is_some()) {
                                     drop(tbl);
@@ -592,6 +599,7 @@ impl VM {
                                 s.as_ptr(),
                                 s.vm_str(),
                             )
+                            && (!v.is_nil() || tbl.metatable.is_none())
                         {
                             let val = v.clone();
                             if !(val.is_look() && tbl.metatable.is_some()) {
@@ -603,6 +611,7 @@ impl VM {
                         if let Some(slot_idx) =
                             tbl.fields.find_index_by_vmstr(s.as_ptr(), s.vm_str())
                             && let Some(v) = tbl.fields.get_slot(slot_idx)
+                            && (!v.is_nil() || tbl.metatable.is_none())
                         {
                             let val = v.clone();
                             if !(val.is_look() && tbl.metatable.is_some()) {
@@ -2126,7 +2135,10 @@ impl VM {
                             } else {
                                 0
                             };
-                            if (0..=i64::MAX as i128).contains(&iters)
+                            // `ForLoopCount*` only accept inline ints, so
+                            // both the index and the count must fit in one.
+                            if (INLINE_INT_MIN..=INLINE_INT_MAX).contains(&diff)
+                                && (0..=INLINE_INT_MAX as i128).contains(&iters)
                                 && let Some(
                                     ExecInst::ForLoop { base: fb, jump: fj }
                                     | ExecInst::ForLoopInt { base: fb, jump: fj }

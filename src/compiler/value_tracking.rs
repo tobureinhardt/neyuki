@@ -251,7 +251,12 @@ pub fn eval_binop(op: IrBinaryOp, lhs: &TrackedValue, rhs: &TrackedValue) -> Tra
         | IrBinaryOp::Le
         | IrBinaryOp::Gt
         | IrBinaryOp::Ge => TrackedValue::KnownType(NeyukiType::Boolean),
-        IrBinaryOp::Concat => TrackedValue::KnownType(NeyukiType::String),
+        // Strings and numbers concatenate to a string; anything else goes
+        // through `__concat`, which can return any value.
+        IrBinaryOp::Concat if concats_natively(lhs) && concats_natively(rhs) => {
+            TrackedValue::KnownType(NeyukiType::String)
+        }
+        IrBinaryOp::Concat => TrackedValue::Bottom,
         IrBinaryOp::BitAnd
         | IrBinaryOp::BitOr
         | IrBinaryOp::BitXor
@@ -293,6 +298,22 @@ pub fn eval_unop(op: IrUnaryOp, src: &TrackedValue) -> TrackedValue {
             }
         }
         IrUnaryOp::Len | IrUnaryOp::BitNot => TrackedValue::KnownType(NeyukiType::Int),
+    }
+}
+
+/// Whether `..` on this operand is the built-in string/number concatenation.
+fn concats_natively(v: &TrackedValue) -> bool {
+    match v {
+        TrackedValue::Const(c) => matches!(
+            c,
+            IrConstant::String(_) | IrConstant::Int(_) | IrConstant::Float(_)
+        ),
+        TrackedValue::Range { .. } => true,
+        TrackedValue::KnownType(ty) => matches!(
+            ty,
+            NeyukiType::String | NeyukiType::Int | NeyukiType::Float | NeyukiType::Number
+        ),
+        TrackedValue::Top | TrackedValue::NonNil | TrackedValue::Bottom => false,
     }
 }
 
@@ -699,6 +720,29 @@ mod tests {
 
         let v4 = TrackedValue::Const(IrConstant::Int(BigInt::from(25)));
         assert_eq!(joined.join(&v4), TrackedValue::Range { min: 10, max: 25 });
+    }
+
+    #[test]
+    fn concat_is_a_string_only_for_strings_and_numbers() {
+        let s = TrackedValue::KnownType(NeyukiType::String);
+        let n = TrackedValue::Range { min: 1, max: 2 };
+        assert_eq!(
+            eval_binop(IrBinaryOp::Concat, &s, &n),
+            TrackedValue::KnownType(NeyukiType::String)
+        );
+        // `__concat` can return anything for any other operand.
+        assert_eq!(
+            eval_binop(IrBinaryOp::Concat, &TrackedValue::Bottom, &s),
+            TrackedValue::Bottom
+        );
+        assert_eq!(
+            eval_binop(
+                IrBinaryOp::Concat,
+                &TrackedValue::KnownType(NeyukiType::Table),
+                &TrackedValue::KnownType(NeyukiType::Table)
+            ),
+            TrackedValue::Bottom
+        );
     }
 
     #[test]

@@ -1,4 +1,9 @@
-//! Release-only threaded tail-call bytecode interpreter (`TRAP == false`).
+//! Threaded tail-call bytecode interpreter (`TRAP == false`).
+//!
+//! Compiled only under `cfg(neyuki_threaded)`, which build.rs sets for the
+//! opt-in `threaded` feature in optimized 64-bit x86/ARM Linux and macOS
+//! builds without debug assertions. Rust does not guarantee tail calls; those are the builds where
+//! the handler-to-handler calls are known to become jumps.
 //!
 //! Each opcode handler takes six scalar/pointer arguments in registers:
 //! `(vm, regs, pc, consts, dtbl, raw)` where `regs = vm.stack.as_mut_ptr() + base`,
@@ -200,6 +205,27 @@ macro_rules! dispatch {
     }};
 }
 
+// What a slow path that does not dispatch hands back to its dispatcher: the
+// register window to continue with, or one of the two sentinels below.
+// Keeping the work in a separate non-inlined function means the dispatcher
+// has no locals at all, so nothing (no `Drop`, no escaped stack address)
+// stops its dispatch from being a tail call.
+const STEP_ERR: *mut Value = std::ptr::null_mut();
+const STEP_TRAP: *mut Value = std::ptr::without_provenance_mut(1);
+
+macro_rules! dispatch_step {
+    ($vm:expr, $step:expr, $pc:expr, $consts:expr, $dtbl:expr) => {{
+        let regs: *mut Value = $step;
+        if regs == STEP_ERR {
+            return STATUS_ERR;
+        }
+        if regs == STEP_TRAP {
+            return STATUS_OK;
+        }
+        unsafe { dispatch!($vm, regs, $pc, $consts, $dtbl) }
+    }};
+}
+
 #[inline(always)]
 unsafe fn ip_of(vm: &VM, pc: *const Cell<AlignedExec>) -> usize {
     unsafe { pc.offset_from((*vm.cur_exec).ops.as_ptr()) as usize }
@@ -215,38 +241,20 @@ const fn fits_inline_int(i: i64) -> bool {
     i >= INLINE_INT_MIN && i <= INLINE_INT_MAX
 }
 
+// The slow paths below overwrite a slot that may hold a heap value, which
+// must be dropped. They return instead of dispatching: a cold helper with
+// more than the six handler arguments cannot be sibling-called, so a handler
+// that ends in a call to one grows the native stack on every dispatch.
 #[cold]
 #[inline(never)]
-fn cold_write_int_dispatch(
-    vm: &mut VM,
-    regs: *mut Value,
-    pc: *const Cell<AlignedExec>,
-    consts: *const Value,
-    dtbl: DispatchTbl,
-    dst: u8,
-    val: i64,
-) -> u8 {
-    unsafe {
-        (*regs.add(dst as usize)).set_inplace(Value::int(val));
-        dispatch!(vm, regs, pc, consts, dtbl);
-    }
+unsafe fn cold_set_int(slot: *mut Value, val: i64) {
+    unsafe { (*slot).set_inplace(Value::int(val)) }
 }
 
 #[cold]
 #[inline(never)]
-fn cold_write_trivial_dispatch(
-    vm: &mut VM,
-    regs: *mut Value,
-    pc: *const Cell<AlignedExec>,
-    consts: *const Value,
-    dtbl: DispatchTbl,
-    dst: u8,
-    bits: u64,
-) -> u8 {
-    unsafe {
-        (*regs.add(dst as usize)).set_inplace(Value::from_trivial_bits(bits));
-        dispatch!(vm, regs, pc, consts, dtbl);
-    }
+unsafe fn cold_set_trivial(slot: *mut Value, bits: u64) {
+    unsafe { (*slot).set_inplace(Value::from_trivial_bits(bits)) }
 }
 
 macro_rules! write_int_dispatch {
@@ -257,31 +265,38 @@ macro_rules! write_int_dispatch {
             std::ptr::write(_slot, Value::int(_v));
             dispatch!($vm, $regs, $pc, $consts, $dtbl);
         }
-        return cold_write_int_dispatch($vm, $regs, $pc, $consts, $dtbl, $dst, _v);
+        cold_set_int($regs.add($dst as usize), _v);
+        dispatch!($vm, $regs, $pc, $consts, $dtbl);
     }};
 }
 
 macro_rules! write_float_dispatch {
     ($vm:expr, $regs:expr, $pc:expr, $consts:expr, $dtbl:expr, $dst:expr, $val:expr) => {{
         let _slot = $regs.add($dst as usize);
-        let _v = Value::float($val);
+        // Bits, not a `Value`: a live `Value` would be dropped after the
+        // dispatch and keep it from being a tail call.
+        let _bits = Value::float($val).bits();
         if (*_slot).is_trivial() {
-            std::ptr::write(_slot, _v);
+            std::ptr::write(_slot, Value::from_trivial_bits(_bits));
             dispatch!($vm, $regs, $pc, $consts, $dtbl);
         }
-        return cold_write_trivial_dispatch($vm, $regs, $pc, $consts, $dtbl, $dst, _v.bits());
+        cold_set_trivial(_slot, _bits);
+        dispatch!($vm, $regs, $pc, $consts, $dtbl);
     }};
 }
 
 macro_rules! write_bool_dispatch {
     ($vm:expr, $regs:expr, $pc:expr, $consts:expr, $dtbl:expr, $dst:expr, $val:expr) => {{
         let _slot = $regs.add($dst as usize);
-        let _v = Value::bool($val);
+        // Bits, not a `Value`: a live `Value` would be dropped after the
+        // dispatch and keep it from being a tail call.
+        let _bits = Value::bool($val).bits();
         if (*_slot).is_trivial() {
-            std::ptr::write(_slot, _v);
+            std::ptr::write(_slot, Value::from_trivial_bits(_bits));
             dispatch!($vm, $regs, $pc, $consts, $dtbl);
         }
-        return cold_write_trivial_dispatch($vm, $regs, $pc, $consts, $dtbl, $dst, _v.bits());
+        cold_set_trivial(_slot, _bits);
+        dispatch!($vm, $regs, $pc, $consts, $dtbl);
     }};
 }
 
@@ -542,7 +557,10 @@ fn op_load_nil(
             dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
-    cold_write_trivial_dispatch(vm, regs, pc, consts, dtbl, dst, Value::NIL.bits())
+    unsafe {
+        cold_set_trivial(regs.add(dst as usize), Value::NIL.bits());
+        dispatch!(vm, regs, pc, consts, dtbl);
+    }
 }
 
 fn op_load_bool(
@@ -792,9 +810,12 @@ fn cold_get_upval_dispatch(
     unsafe {
         let uv = &*vm.cur_upvals.add(upval_idx as usize);
         match uv.location.get() {
-            Some(idx) => {
+            Some(idx) if idx < vm.stack.len() => {
                 copy_slot(regs.add(dst as usize), vm.stack.as_ptr().add(idx));
             }
+            // An upvalue still open past the end of the stack reads as nil,
+            // matching the loop interpreter's `upvalue_get`.
+            Some(_) => set_slot_val(regs.add(dst as usize), Value::NIL),
             None => {
                 uv.with_closed(|v| copy_slot(regs.add(dst as usize), v));
             }
@@ -844,8 +865,9 @@ fn op_get_upval(
     unsafe {
         let uv = &*vm.cur_upvals.add(upval_idx as usize);
         let src_ptr: *const Value = match uv.location.get() {
-            Some(idx) => vm.stack.as_ptr().add(idx),
+            Some(idx) if idx < vm.stack.len() => vm.stack.as_ptr().add(idx),
             None => uv.closed_ptr() as *const Value,
+            _ => return cold_get_upval_dispatch(vm, regs, pc, consts, dtbl, raw),
         };
         let src_ref = &*src_ptr;
         let src_bits = src_ref.bits();
@@ -971,31 +993,33 @@ fn op_get_table(
                 {
                     if idx < tbl.array.len() {
                         let v_bits = tbl.array[idx].bits();
-                        if v_bits < TAG_RC_START {
+                        // A nil hole goes to the cold path so `__index` runs.
+                        if v_bits < TAG_RC_START
+                            && (v_bits != Value::NIL.bits() || tbl.metatable.is_none())
+                        {
                             drop(tbl);
                             let slot = regs.add(dst as usize);
                             if (*slot).is_trivial() {
                                 std::ptr::write(slot, Value::from_trivial_bits(v_bits));
                                 dispatch!(vm, regs, pc, consts, dtbl);
                             }
-                            return cold_write_trivial_dispatch(
-                                vm, regs, pc, consts, dtbl, dst, v_bits,
-                            );
+                            cold_set_trivial(slot, v_bits);
+                            dispatch!(vm, regs, pc, consts, dtbl);
                         }
                     }
                 } else if let Some(bt_ptr) = tbl_val.beat_table_ptr() {
                     let arr = (*bt_ptr).array_slice();
                     if idx < arr.len() {
                         let v_bits = arr[idx].bits();
-                        if v_bits < TAG_RC_START {
+                        let has_mt = (*bt_ptr).extra_ref().is_some_and(|e| e.metatable.is_some());
+                        if v_bits < TAG_RC_START && (v_bits != Value::NIL.bits() || !has_mt) {
                             let slot = regs.add(dst as usize);
                             if (*slot).is_trivial() {
                                 std::ptr::write(slot, Value::from_trivial_bits(v_bits));
                                 dispatch!(vm, regs, pc, consts, dtbl);
                             }
-                            return cold_write_trivial_dispatch(
-                                vm, regs, pc, consts, dtbl, dst, v_bits,
-                            );
+                            cold_set_trivial(slot, v_bits);
+                            dispatch!(vm, regs, pc, consts, dtbl);
                         }
                     }
                 }
@@ -1096,14 +1120,16 @@ fn op_get_table_k(
                         .get_slot_keyed_vmstr(ic.slot_idx as usize, s.as_ptr(), s.vm_str())
             {
                 let v_bits = v.bits();
-                if v_bits < TAG_RC_START {
+                if v_bits < TAG_RC_START && (v_bits != Value::NIL.bits() || tbl.metatable.is_none())
+                {
                     drop(tbl);
                     let slot = regs.add(dst as usize);
                     if (*slot).is_trivial() {
                         std::ptr::write(slot, Value::from_trivial_bits(v_bits));
                         dispatch!(vm, regs, pc, consts, dtbl);
                     }
-                    return cold_write_trivial_dispatch(vm, regs, pc, consts, dtbl, dst, v_bits);
+                    cold_set_trivial(regs.add(dst as usize), v_bits);
+                    dispatch!(vm, regs, pc, consts, dtbl);
                 }
             }
         }
@@ -1152,6 +1178,7 @@ fn cold_get_table_k_inner(
                 let exec = &*vm.cur_exec;
                 if let Some(slot_idx) = tbl.fields.find_index_by_vmstr(s.as_ptr(), s.vm_str())
                     && let Some(v) = tbl.fields.get_slot(slot_idx)
+                    && (!v.is_nil() || tbl.metatable.is_none())
                 {
                     let val = v.clone();
                     drop(tbl);
@@ -2556,28 +2583,6 @@ fn op_idiv_int_pow2(
 
 #[cold]
 #[inline(never)]
-fn cold_eval_pow2_inner(
-    vm: &mut VM,
-    regs: *mut Value,
-    dst: u8,
-    a: u8,
-    shift: u8,
-    op: fn(&Value, &Value) -> Result<Value, String>,
-) -> Result<*mut Value, String> {
-    let base = unsafe { base_of(vm, regs) };
-    let res = unsafe {
-        let ra = &*regs.add(a as usize);
-        op(ra, &Value::int(1i64 << shift))?
-    };
-    unsafe {
-        let new_regs = vm.stack.as_mut_ptr().add(base);
-        set_slot_val(new_regs.add(dst as usize), res);
-        Ok(new_regs)
-    }
-}
-
-#[cold]
-#[inline(never)]
 fn cold_eval_idiv_pow2(
     vm: &mut VM,
     regs: *mut Value,
@@ -2586,15 +2591,43 @@ fn cold_eval_idiv_pow2(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let ExecInst::IDivIntPow2 { dst, a, shift } = raw.0 else {
+    dispatch_step!(
+        vm,
+        cold_eval_idiv_pow2_slow(vm, regs, pc, raw),
+        pc,
+        consts,
+        dtbl
+    )
+}
+
+#[inline(never)]
+fn cold_eval_idiv_pow2_slow(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    raw: AlignedExec,
+) -> *mut Value {
+    let inst = raw.0;
+    let ExecInst::IDivIntPow2 { dst, a, shift } = inst else {
         unsafe { std::hint::unreachable_unchecked() }
     };
-    let new_regs = match cold_eval_pow2_inner(vm, regs, dst, a, shift, ops::eval_idiv) {
-        Ok(r) => r,
-        Err(e) => return fail_with(vm, pc, e),
-    };
+    let base = unsafe { base_of(vm, regs) };
     unsafe {
-        dispatch!(vm, new_regs, pc, consts, dtbl);
+        let ra = &*regs.add(a as usize);
+        // Bound first: a temporary in the scrutinee would be dropped after
+        // the dispatch in the arm, so the dispatch could not be a tail call.
+        let res = ops::eval_idiv(ra, &Value::int(1i64 << shift));
+        match res {
+            Ok(res) => {
+                let new_regs = vm.stack.as_mut_ptr().add(base);
+                set_slot_val(new_regs.add(dst as usize), res);
+                new_regs
+            }
+            Err(e) => {
+                fail_with(vm, pc, e);
+                STEP_ERR
+            }
+        }
     }
 }
 
@@ -2750,15 +2783,43 @@ fn cold_eval_mod_pow2(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let ExecInst::ModIntPow2 { dst, a, shift } = raw.0 else {
+    dispatch_step!(
+        vm,
+        cold_eval_mod_pow2_slow(vm, regs, pc, raw),
+        pc,
+        consts,
+        dtbl
+    )
+}
+
+#[inline(never)]
+fn cold_eval_mod_pow2_slow(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    raw: AlignedExec,
+) -> *mut Value {
+    let inst = raw.0;
+    let ExecInst::ModIntPow2 { dst, a, shift } = inst else {
         unsafe { std::hint::unreachable_unchecked() }
     };
-    let new_regs = match cold_eval_pow2_inner(vm, regs, dst, a, shift, ops::eval_mod) {
-        Ok(r) => r,
-        Err(e) => return fail_with(vm, pc, e),
-    };
+    let base = unsafe { base_of(vm, regs) };
     unsafe {
-        dispatch!(vm, new_regs, pc, consts, dtbl);
+        let ra = &*regs.add(a as usize);
+        // Bound first: a temporary in the scrutinee would be dropped after
+        // the dispatch in the arm, so the dispatch could not be a tail call.
+        let res = ops::eval_mod(ra, &Value::int(1i64 << shift));
+        match res {
+            Ok(res) => {
+                let new_regs = vm.stack.as_mut_ptr().add(base);
+                set_slot_val(new_regs.add(dst as usize), res);
+                new_regs
+            }
+            Err(e) => {
+                fail_with(vm, pc, e);
+                STEP_ERR
+            }
+        }
     }
 }
 
@@ -3587,43 +3648,7 @@ fn op_unm(
             dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
-    cold_unm(vm, regs, pc, consts, dtbl, dst, src)
-}
-
-#[cold]
-#[inline(never)]
-fn cold_unm_inner(
-    vm: &mut VM,
-    regs: *mut Value,
-    pc: *const Cell<AlignedExec>,
-    dst: u8,
-    src: u8,
-) -> Result<Option<*mut Value>, String> {
-    let base = unsafe { base_of(vm, regs) };
-    unsafe {
-        let v = &*regs.add(src as usize);
-        if v.is_table() {
-            if let Some(mm) = vm.get_unop_metamethod(v, "__unm") {
-                let v = v.clone();
-                sync_frame_pc(vm, pc);
-                let res = vm.call_function(mm, &[v])?;
-                if vm.trap {
-                    sync_frame_pc(vm, pc);
-                    vm.run_result = None;
-                    return Ok(None);
-                }
-                let new_regs = vm.stack.as_mut_ptr().add(base);
-                set_slot_val(
-                    new_regs.add(dst as usize),
-                    res.into_iter().next().unwrap_or(Value::NIL),
-                );
-                return Ok(Some(new_regs));
-            }
-            return Err("unary minus expects a number".to_string());
-        }
-        ops::eval_unm_into(&mut vm.stack, base + dst as usize, base + src as usize)?;
-        Ok(Some(vm.stack.as_mut_ptr().add(base)))
-    }
+    cold_unm(vm, regs, pc, consts, dtbl, raw)
 }
 
 #[cold]
@@ -3634,16 +3659,58 @@ fn cold_unm(
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
     dtbl: DispatchTbl,
-    dst: u8,
-    src: u8,
+    raw: AlignedExec,
 ) -> u8 {
-    let new_regs = match cold_unm_inner(vm, regs, pc, dst, src) {
-        Ok(Some(r)) => r,
-        Ok(None) => return STATUS_OK,
-        Err(e) => return fail_with(vm, pc, e),
+    dispatch_step!(vm, cold_unm_slow(vm, regs, pc, raw), pc, consts, dtbl)
+}
+
+#[inline(never)]
+fn cold_unm_slow(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    raw: AlignedExec,
+) -> *mut Value {
+    let ExecInst::Unm { dst, src } = raw.0 else {
+        unsafe { std::hint::unreachable_unchecked() }
     };
+    let base = unsafe { base_of(vm, regs) };
     unsafe {
-        dispatch!(vm, new_regs, pc, consts, dtbl);
+        let v = &*regs.add(src as usize);
+        if v.is_table() {
+            if let Some(mm) = vm.get_unop_metamethod(v, "__unm") {
+                let v = v.clone();
+                sync_frame_pc(vm, pc);
+                let called = vm.call_function(mm, &[v]);
+                match called {
+                    Ok(res) => {
+                        if vm.trap {
+                            sync_frame_pc(vm, pc);
+                            vm.run_result = None;
+                            return STEP_TRAP;
+                        }
+                        let new_regs = vm.stack.as_mut_ptr().add(base);
+                        set_slot_val(
+                            new_regs.add(dst as usize),
+                            res.into_iter().next().unwrap_or(Value::NIL),
+                        );
+                        return new_regs;
+                    }
+                    Err(e) => {
+                        fail_with(vm, pc, e);
+                        return STEP_ERR;
+                    }
+                }
+            }
+            fail_msg(vm, pc, "unary minus expects a number");
+            return STEP_ERR;
+        }
+        if let Err(e) = ops::eval_unm_into(&mut vm.stack, base + dst as usize, base + src as usize)
+        {
+            fail_with(vm, pc, e);
+            return STEP_ERR;
+        }
+        vm.stack.as_mut_ptr().add(base)
     }
 }
 
@@ -3707,49 +3774,7 @@ fn op_len(
             dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
-    cold_len(vm, regs, pc, consts, dtbl, dst, src)
-}
-
-#[cold]
-#[inline(never)]
-fn cold_len_inner(
-    vm: &mut VM,
-    regs: *mut Value,
-    pc: *const Cell<AlignedExec>,
-    dst: u8,
-    src: u8,
-) -> Result<Option<*mut Value>, String> {
-    let base = unsafe { base_of(vm, regs) };
-    unsafe {
-        let v = &*regs.add(src as usize);
-        let len = match v.view() {
-            ValueView::String(s) => s.len(),
-            ValueView::Table(t) => {
-                if let Some(mm) = vm.get_unop_metamethod(v, "__len") {
-                    let v = v.clone();
-                    sync_frame_pc(vm, pc);
-                    let res = vm.call_function(mm, &[v])?;
-                    if vm.trap {
-                        sync_frame_pc(vm, pc);
-                        vm.run_result = None;
-                        return Ok(None);
-                    }
-                    let new_regs = vm.stack.as_mut_ptr().add(base);
-                    set_slot_val(
-                        new_regs.add(dst as usize),
-                        res.into_iter().next().unwrap_or(Value::NIL),
-                    );
-                    return Ok(Some(new_regs));
-                }
-                t.borrow().array_len()
-            }
-            ValueView::Buffer(b) => b.borrow().len(),
-            _ => return Err("len expects string, table or buffer".to_string()),
-        };
-        let new_regs = vm.stack.as_mut_ptr().add(base);
-        set_slot_val(new_regs.add(dst as usize), Value::from_usize(len));
-        Ok(Some(new_regs))
-    }
+    cold_len(vm, regs, pc, consts, dtbl, raw)
 }
 
 #[cold]
@@ -3760,16 +3785,62 @@ fn cold_len(
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
     dtbl: DispatchTbl,
-    dst: u8,
-    src: u8,
+    raw: AlignedExec,
 ) -> u8 {
-    let new_regs = match cold_len_inner(vm, regs, pc, dst, src) {
-        Ok(Some(r)) => r,
-        Ok(None) => return STATUS_OK,
-        Err(e) => return fail_with(vm, pc, e),
+    dispatch_step!(vm, cold_len_slow(vm, regs, pc, raw), pc, consts, dtbl)
+}
+
+#[inline(never)]
+fn cold_len_slow(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    raw: AlignedExec,
+) -> *mut Value {
+    let ExecInst::Len { dst, src } = raw.0 else {
+        unsafe { std::hint::unreachable_unchecked() }
     };
+    let base = unsafe { base_of(vm, regs) };
     unsafe {
-        dispatch!(vm, new_regs, pc, consts, dtbl);
+        let v = &*regs.add(src as usize);
+        let len = match v.view() {
+            ValueView::String(s) => s.len(),
+            ValueView::Table(t) => {
+                if let Some(mm) = vm.get_unop_metamethod(v, "__len") {
+                    let v = v.clone();
+                    sync_frame_pc(vm, pc);
+                    let called = vm.call_function(mm, &[v]);
+                    match called {
+                        Ok(res) => {
+                            if vm.trap {
+                                sync_frame_pc(vm, pc);
+                                vm.run_result = None;
+                                return STEP_TRAP;
+                            }
+                            let new_regs = vm.stack.as_mut_ptr().add(base);
+                            set_slot_val(
+                                new_regs.add(dst as usize),
+                                res.into_iter().next().unwrap_or(Value::NIL),
+                            );
+                            return new_regs;
+                        }
+                        Err(e) => {
+                            fail_with(vm, pc, e);
+                            return STEP_ERR;
+                        }
+                    }
+                }
+                t.borrow().array_len()
+            }
+            ValueView::Buffer(b) => b.borrow().len(),
+            _ => {
+                fail_msg(vm, pc, "len expects string, table or buffer");
+                return STEP_ERR;
+            }
+        };
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        set_slot_val(new_regs.add(dst as usize), Value::from_usize(len));
+        new_regs
     }
 }
 
@@ -3792,7 +3863,7 @@ fn op_bit_not(
             dispatch!(vm, regs, pc, consts, dtbl);
         }
     }
-    cold_bit_not(vm, regs, pc, consts, dtbl, dst, src)
+    cold_bit_not(vm, regs, pc, consts, dtbl, raw)
 }
 
 #[cold]
@@ -3803,12 +3874,15 @@ fn cold_bit_not(
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
     dtbl: DispatchTbl,
-    dst: u8,
-    src: u8,
+    raw: AlignedExec,
 ) -> u8 {
+    let ExecInst::BitNot { dst, src } = raw.0 else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
     let base = unsafe { base_of(vm, regs) };
     unsafe {
-        match ops::eval_bitnot(&*regs.add(src as usize)) {
+        let res = ops::eval_bitnot(&*regs.add(src as usize));
+        match res {
             Ok(res) => {
                 let new_regs = vm.stack.as_mut_ptr().add(base);
                 set_slot_val(new_regs.add(dst as usize), res);
@@ -5352,7 +5426,7 @@ fn op_for_prep(
             }
         }
     }
-    cold_for_prep(vm, regs, pc, consts, dtbl, b, jump)
+    cold_for_prep(vm, regs, pc, consts, dtbl, raw)
 }
 
 fn op_for_loop_count(
@@ -5389,7 +5463,7 @@ fn op_for_loop_count(
         }
         (&*pc.sub(1)).set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
     }
-    cold_for_loop(vm, regs, pc, consts, dtbl, b, jump)
+    cold_for_loop(vm, regs, pc, consts, dtbl, raw)
 }
 
 fn op_for_loop_count1(
@@ -5423,9 +5497,13 @@ fn op_for_loop_count1(
         }
         (&*pc.sub(1)).set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
     }
-    cold_for_loop(vm, regs, pc, consts, dtbl, b, jump)
+    cold_for_loop(vm, regs, pc, consts, dtbl, raw)
 }
 
+// Slow numeric-for paths are split in two: the work happens in a helper
+// that returns the next pc (null after an error), and a six-argument
+// dispatcher with no live locals tail-calls the next handler. A `Value` or
+// `Result` alive across the dispatch would turn it into a real call.
 #[cold]
 #[inline(never)]
 fn cold_for_prep(
@@ -5434,9 +5512,26 @@ fn cold_for_prep(
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
     dtbl: DispatchTbl,
+    raw: AlignedExec,
+) -> u8 {
+    let ExecInst::ForPrep { base: b, jump } = raw.0 else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
+    let next_pc = for_prep_slow(vm, regs, pc, b, jump);
+    if next_pc.is_null() {
+        return STATUS_ERR;
+    }
+    unsafe { dispatch!(vm, regs, next_pc, consts, dtbl) }
+}
+
+#[inline(never)]
+fn for_prep_slow(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
     b: u8,
     jump: i16,
-) -> u8 {
+) -> *const Cell<AlignedExec> {
     unsafe {
         let target_pc = pc.offset(jump as isize);
         if let ExecInst::ForLoopCount { base: fb, jump: fj }
@@ -5447,18 +5542,28 @@ fn cold_for_prep(
         let init = &*regs.add(b as usize);
         let step = &*regs.add(b as usize + 2);
         match step.view() {
-            ValueView::Int(0) => return fail_msg(vm, pc, "numeric for step cannot be zero"),
+            ValueView::Int(0) => {
+                fail_msg(vm, pc, "numeric for step cannot be zero");
+                return std::ptr::null();
+            }
             ValueView::Float(0.0) => {
-                return fail_msg(vm, pc, "numeric for step cannot be zero");
+                {
+                    fail_msg(vm, pc, "numeric for step cannot be zero");
+                    return std::ptr::null();
+                };
             }
             _ => {}
         }
-        let init_minus_step = match ops::eval_sub(init, step) {
-            Ok(v) => v,
-            Err(e) => return fail_with(vm, pc, e),
-        };
-        set_slot_val(regs.add(b as usize), init_minus_step);
-        dispatch!(vm, regs, target_pc, consts, dtbl);
+        match ops::eval_sub(init, step) {
+            Ok(init_minus_step) => {
+                set_slot_val(regs.add(b as usize), init_minus_step);
+                target_pc
+            }
+            Err(e) => {
+                fail_with(vm, pc, e);
+                std::ptr::null()
+            }
+        }
     }
 }
 
@@ -5495,7 +5600,7 @@ fn op_for_loop_int(
         }
         (&*pc.sub(1)).set(AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }));
     }
-    cold_for_loop(vm, regs, pc, consts, dtbl, b, jump)
+    cold_for_loop(vm, regs, pc, consts, dtbl, raw)
 }
 
 fn op_for_loop(
@@ -5531,7 +5636,7 @@ fn op_for_loop(
             }
         }
     }
-    cold_for_loop(vm, regs, pc, consts, dtbl, b, jump)
+    cold_for_loop(vm, regs, pc, consts, dtbl, raw)
 }
 
 fn op_for_prep_beat(
@@ -5568,7 +5673,14 @@ fn op_for_prep_beat(
             dispatch!(vm, regs, target_pc, consts, dtbl);
         }
     }
-    cold_for_prep(vm, regs, pc, consts, dtbl, b, jump)
+    cold_for_prep(
+        vm,
+        regs,
+        pc,
+        consts,
+        dtbl,
+        AlignedExec(ExecInst::ForPrep { base: b, jump }),
+    )
 }
 
 fn op_for_loop_beat(
@@ -5611,7 +5723,7 @@ fn op_for_loop_beat(
             dispatch!(vm, new_regs, next_pc, consts, dtbl);
         }
     }
-    cold_for_loop_inner(vm, regs, pc, consts, dtbl, raw)
+    cold_for_loop_beat(vm, regs, pc, consts, dtbl, raw)
 }
 
 fn op_for_loop_generic(
@@ -5622,7 +5734,50 @@ fn op_for_loop_generic(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    cold_for_loop_inner(vm, regs, pc, consts, dtbl, raw)
+    cold_for_loop(vm, regs, pc, consts, dtbl, raw)
+}
+
+#[cold]
+#[inline(never)]
+fn cold_for_loop_beat(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    dtbl: DispatchTbl,
+    raw: AlignedExec,
+) -> u8 {
+    let ExecInst::ForLoopBeat {
+        base: b,
+        jump,
+        site,
+    } = raw.0
+    else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
+    let (new_regs, next_pc) = for_loop_beat_slow(vm, regs, pc, b, jump, site);
+    if next_pc.is_null() {
+        return STATUS_ERR;
+    }
+    unsafe { dispatch!(vm, new_regs, next_pc, consts, dtbl) }
+}
+
+#[inline(never)]
+fn for_loop_beat_slow(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    b: u8,
+    jump: i16,
+    site: u16,
+) -> (*mut Value, *const Cell<AlignedExec>) {
+    let next_pc = for_loop_slow(vm, regs, pc, b, jump);
+    if next_pc.is_null() {
+        return (STEP_ERR, std::ptr::null());
+    }
+    let again = next_pc != pc;
+    let new_regs = beat_safepoint_dispatch(vm, pc, site, again);
+    (new_regs, next_pc)
 }
 
 #[cold]
@@ -5633,83 +5788,31 @@ fn cold_for_loop(
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
     dtbl: DispatchTbl,
-    b: u8,
-    jump: i16,
-) -> u8 {
-    cold_for_loop_inner(
-        vm,
-        regs,
-        pc,
-        consts,
-        dtbl,
-        AlignedExec(ExecInst::ForLoopGeneric { base: b, jump }),
-    )
-}
-
-#[cold]
-#[inline(never)]
-fn cold_for_loop_step(
-    vm: &mut VM,
-    regs: *mut Value,
-    pc: *const Cell<AlignedExec>,
-    b: u8,
-    site_opt: Option<u16>,
-) -> Result<(bool, *mut Value), String> {
-    unsafe {
-        let idx = &*regs.add(b as usize);
-        let limit = &*regs.add(b as usize + 1);
-        let step = &*regs.add(b as usize + 2);
-        match step.view() {
-            ValueView::Int(0) => return Err("numeric for step cannot be zero".to_string()),
-            ValueView::Float(0.0) => return Err("numeric for step cannot be zero".to_string()),
-            _ => {}
-        }
-        let is_positive = match step.view() {
-            ValueView::Int(i) => i >= 0,
-            ValueView::BigInt(i) => num_traits::Signed::is_positive(i),
-            ValueView::Float(f) => f >= 0.0,
-            _ => true,
-        };
-        let next_idx = ops::eval_add(idx, step)?;
-        let loop_again = if is_positive {
-            ops::eval_le(&next_idx, limit)?
-        } else {
-            ops::eval_ge(&next_idx, limit)?
-        };
-        set_slot_val(regs.add(b as usize), next_idx.clone());
-        if loop_again {
-            set_slot_val(regs.add(b as usize + 3), next_idx);
-        } else {
-            drop(next_idx);
-        }
-        let new_regs = if let Some(site) = site_opt {
-            beat_safepoint_dispatch(vm, pc, site, loop_again)
-        } else {
-            regs
-        };
-        Ok((loop_again, new_regs))
-    }
-}
-
-#[cold]
-#[inline(never)]
-fn cold_for_loop_inner(
-    vm: &mut VM,
-    regs: *mut Value,
-    pc: *const Cell<AlignedExec>,
-    consts: *const Value,
-    dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let (b, jump, site_opt) = match raw.0 {
-        ExecInst::ForLoopBeat { base, jump, site } => (base, jump, Some(site)),
-        ExecInst::ForLoop { base, jump }
-        | ExecInst::ForLoopInt { base, jump }
-        | ExecInst::ForLoopCount { base, jump }
-        | ExecInst::ForLoopCount1 { base, jump }
-        | ExecInst::ForLoopGeneric { base, jump } => (base, jump, None),
-        _ => unsafe { std::hint::unreachable_unchecked() },
+    let (ExecInst::ForLoop { base: b, jump }
+    | ExecInst::ForLoopInt { base: b, jump }
+    | ExecInst::ForLoopCount { base: b, jump }
+    | ExecInst::ForLoopCount1 { base: b, jump }
+    | ExecInst::ForLoopGeneric { base: b, jump }) = raw.0
+    else {
+        unsafe { std::hint::unreachable_unchecked() }
     };
+    let next_pc = for_loop_slow(vm, regs, pc, b, jump);
+    if next_pc.is_null() {
+        return STATUS_ERR;
+    }
+    unsafe { dispatch!(vm, regs, next_pc, consts, dtbl) }
+}
+
+#[inline(never)]
+fn for_loop_slow(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    b: u8,
+    jump: i16,
+) -> *const Cell<AlignedExec> {
     unsafe {
         let idx = &*regs.add(b as usize);
         let limit = &*regs.add(b as usize + 1);
@@ -5721,25 +5824,53 @@ fn cold_for_loop_inner(
             write_int(regs.add(b as usize), next);
             if again {
                 write_int(regs.add(b as usize + 3), next);
+                return pc.offset(jump as isize);
             }
-            let new_regs = if let Some(site) = site_opt {
-                beat_safepoint_dispatch(vm, pc, site, again)
-            } else {
-                regs
-            };
-            let next_pc = if again { pc.offset(jump as isize) } else { pc };
-            dispatch!(vm, new_regs, next_pc, consts, dtbl);
+            return pc;
         }
-        let (loop_again, new_regs) = match cold_for_loop_step(vm, regs, pc, b, site_opt) {
-            Ok(v) => v,
-            Err(e) => return fail_with(vm, pc, e),
+        match step.view() {
+            ValueView::Int(0) => {
+                fail_msg(vm, pc, "numeric for step cannot be zero");
+                return std::ptr::null();
+            }
+            ValueView::Float(0.0) => {
+                fail_msg(vm, pc, "numeric for step cannot be zero");
+                return std::ptr::null();
+            }
+            _ => {}
+        }
+        let is_positive = match step.view() {
+            ValueView::Int(i) => i >= 0,
+            ValueView::BigInt(i) => num_traits::Signed::is_positive(i),
+            ValueView::Float(f) => f >= 0.0,
+            _ => true,
         };
-        let next_pc = if loop_again {
+        let next_idx = match ops::eval_add(idx, step) {
+            Ok(v) => v,
+            Err(e) => {
+                fail_with(vm, pc, e);
+                return std::ptr::null();
+            }
+        };
+        let loop_again = if is_positive {
+            ops::eval_le(&next_idx, limit)
+        } else {
+            ops::eval_ge(&next_idx, limit)
+        };
+        let loop_again = match loop_again {
+            Ok(b) => b,
+            Err(e) => {
+                fail_with(vm, pc, e);
+                return std::ptr::null();
+            }
+        };
+        set_slot_val(regs.add(b as usize), next_idx.clone());
+        if loop_again {
+            set_slot_val(regs.add(b as usize + 3), next_idx);
             pc.offset(jump as isize)
         } else {
             pc
-        };
-        dispatch!(vm, new_regs, next_pc, consts, dtbl);
+        }
     }
 }
 
@@ -6225,7 +6356,10 @@ fn op_tail_call(
             dispatch!(vm, new_regs, start_pc, consts, dtbl);
         }
     }
-    cold_tail_call_general(vm, pc, consts, dtbl, base, callee, argc)
+    // Six arguments, so this stays a tail call; `regs` is re-derived in
+    // case the self-tail-call attempt moved the stack.
+    let regs = unsafe { vm.stack.as_mut_ptr().add(base) };
+    cold_tail_call_general(vm, regs, pc, consts, dtbl, raw)
 }
 
 #[cold]
@@ -6358,13 +6492,16 @@ fn cold_tail_call_step(
 #[inline(never)]
 fn cold_tail_call_general(
     vm: &mut VM,
+    regs: *mut Value,
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
     dtbl: DispatchTbl,
-    base: usize,
-    callee: u8,
-    argc: u8,
+    raw: AlignedExec,
 ) -> u8 {
+    let ExecInst::TailCall { callee, argc } = raw.0 else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
+    let base = unsafe { base_of(vm, regs) };
     match cold_tail_call_step(vm, pc, consts, base, callee, argc) {
         Some((new_regs, new_pc, new_consts, check_trap)) => {
             if check_trap && vm.trap {

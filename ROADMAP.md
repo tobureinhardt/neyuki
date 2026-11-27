@@ -70,6 +70,7 @@ This document outlines the architectural milestones and engineering trajectory f
 
 ## Milestone: Desktop app platform
 - [x] `neyuki build`: package an entry script and an asset folder into a standalone executable with an embedded read-only file system.
+- [x] `neyuki build --no-runtime`: an app without the runtime and its registry packages, run by launchers on an installed Neyuki, which names the global packages to install.
 - [x] `[app]` manifest section: name, identifier, icon, publisher, copyright; no console window by default on Windows.
 - [x] `os.app()`: read the app's name, version and identifier at runtime.
 - [x] Per-user storage in `@neyuki/os`: `dataDir`, `configDir` and `cacheDir` following each platform's conventions, and `protect`/`unprotect` for secrets (DPAPI on Windows, an OS keychain key elsewhere).

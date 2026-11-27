@@ -15,7 +15,7 @@ pub mod old;
 pub mod ops;
 pub mod permissions;
 pub mod table;
-#[cfg(not(debug_assertions))]
+#[cfg(neyuki_threaded)]
 mod threaded;
 pub mod traceback;
 pub mod upvalue;

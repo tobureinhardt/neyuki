@@ -30,11 +30,25 @@ print(`total: {total}`)
 - **Tests built in.** `@neyuki/test` gives `describe`/`it`, hooks, expectations that show a diff, snapshots and a summary line; `neyuki test` runs them.
 - **Batteries for daily work.** Files and paths, JSON, TOML, YAML and CSV, dates, running programs, structured logging, HTTP client and server, and hashing and encryption.
 - **Official packages for the rest.** Libraries a project may not need install on demand, such as `neyuki pkg add @nyk/html` for HTML. `@nyk/markdown`, `@nyk/sql` (PostgreSQL, MySQL and SQLite), `@nyk/ui` (windows with 2D drawing and animation), `@nyk/gpu` (GPU rendering on them), `@nyk/webview` (web pages in a window), `@nyk/hid` (keyboard and mouse automation) and `@nyk/audio` (sound) work the same way. See [the library reference](docs/reference/README.md#official-packages).
-- **One executable.** No runtime to install; on Linux, TLS uses the system's OpenSSL, and nothing else is linked. Packages with native code ship a prebuilt library for every platform, and `neyuki build` bundles them into the app. Scripts can also be compiled to verified bytecode.
+- **One executable.** No runtime to install; on Linux, TLS uses the system's OpenSSL, and nothing else is linked. Packages with native code ship a prebuilt library for every platform, and `neyuki build` bundles the one the app's platform needs. Scripts can also be compiled to verified bytecode.
 
 ## Install
 
-With a recent stable Rust and a C compiler (on Linux also `pkg-config` and the OpenSSL headers; see [CONTRIBUTING.md](CONTRIBUTING.md#building) for each OS):
+On Linux and macOS:
+
+```bash
+curl -fsSL https://neyuki.cc/install.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://neyuki.cc/install.ps1 | iex"
+```
+
+Both download the latest [release](https://github.com/neyuki-lang/neyuki/releases) for your platform, check it against the release's `SHA256SUMS` (releases after v0.12.0), put `neyuki` in `~/.neyuki/bin` (`%USERPROFILE%\.neyuki\bin`; `$NEYUKI_HOME/bin` when that is set) and add that directory to your `PATH`. Run the command again to upgrade. To pick a release, pass `sh -s -- --version v0.12.0` to the shell script or set `NEYUKI_VERSION` for either; `--no-modify-path` (or `NEYUKI_NO_MODIFY_PATH=1`) leaves your `PATH` alone. The scripts are [`install/`](install) in this repository.
+
+To build it yourself instead, with a recent stable Rust and a C compiler (on Linux also `pkg-config` and the OpenSSL headers; see [CONTRIBUTING.md](CONTRIBUTING.md#building) for each OS):
 
 ```bash
 cargo install neyuki
@@ -102,4 +116,9 @@ Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). To report a s
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
