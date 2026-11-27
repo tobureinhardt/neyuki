@@ -87,7 +87,7 @@ fn float_arg(args: &[Value], index: usize, name: &str) -> Result<f64, String> {
 }
 
 pub(crate) fn new_buffer(vm: &mut VM, data: Vec<u8>) -> Result<Vec<Value>, String> {
-    if vm.gc.should_collect() || vm.gc.sweeping {
+    if vm.heap.old.should_collect() || vm.heap.old.has_pending_work() {
         vm.gc_auto_step()?;
     }
     Ok(vec![vm.alloc_buffer(VmBuffer::from_bytes(data))])

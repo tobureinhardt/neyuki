@@ -36,11 +36,11 @@ impl VM {
     fn instruction_hook(&mut self, ip: usize) -> Result<(), String> {
         if !self.in_eval {
             if let Some(limit) = self.limits.heap_limit_bytes
-                && self.gc.bytes_allocated > limit
+                && self.heap.old.bytes_allocated > limit
             {
                 self.gc_collect()?;
             }
-            self.limits.step(self.gc.bytes_allocated)?;
+            self.limits.step(self.heap.old.bytes_allocated)?;
         }
         if self.in_hook || self.in_eval {
             return Ok(());
@@ -480,9 +480,8 @@ impl VM {
                         throw!("global name must be string");
                     };
                     let mut val = reg!(src).clone();
-                    self.beat_escape_if_needed(&mut val);
-                    // Re-inserting an existing key would drop the old Rc for
-                    // an identical one; a lookup first avoids that churn.
+                    let prev = self.globals.get(name.as_str()).cloned();
+                    self.global_write_barrier(prev, &mut val);
                     if let Some(slot) = self.globals.get_mut(&*name) {
                         slot.set_inplace(val);
                     } else {
@@ -517,7 +516,7 @@ impl VM {
                     array_cap,
                     fields_cap,
                 } => {
-                    if self.gc.should_collect() || self.gc.sweeping {
+                    if self.heap.old.should_collect() {
                         self.gc_auto_step().inspect_err(|_| {
                             sync_ip!();
                         })?;
@@ -536,9 +535,11 @@ impl VM {
                             let idx = i as usize - 1;
                             if idx < tbl.array.len() {
                                 let val = tbl.array[idx].clone();
-                                drop(tbl);
-                                set!(dst, val);
-                                continue;
+                                if !(val.is_look() && tbl.metatable.is_some()) {
+                                    drop(tbl);
+                                    set!(dst, val);
+                                    continue;
+                                }
                             }
                         } else if let Some(s) = k.as_str_ref() {
                             let tbl = t.borrow();
@@ -549,9 +550,11 @@ impl VM {
                             };
                             if let Some(v) = found {
                                 let val = v.clone();
-                                drop(tbl);
-                                set!(dst, val);
-                                continue;
+                                if !(val.is_look() && tbl.metatable.is_some()) {
+                                    drop(tbl);
+                                    set!(dst, val);
+                                    continue;
+                                }
                             } else if tbl.metatable.is_none() {
                                 drop(tbl);
                                 set!(dst, Value::NIL);
@@ -591,26 +594,30 @@ impl VM {
                             )
                         {
                             let val = v.clone();
-                            drop(tbl);
-                            set!(dst, val);
-                            continue;
+                            if !(val.is_look() && tbl.metatable.is_some()) {
+                                drop(tbl);
+                                set!(dst, val);
+                                continue;
+                            }
                         }
                         if let Some(slot_idx) =
                             tbl.fields.find_index_by_vmstr(s.as_ptr(), s.vm_str())
                             && let Some(v) = tbl.fields.get_slot(slot_idx)
                         {
                             let val = v.clone();
-                            drop(tbl);
-                            exec.table_cache_set(
-                                site,
-                                TableCacheSlot {
-                                    table_ptr: ptr,
-                                    shape_version: shape,
-                                    slot_idx: slot_idx as u32,
-                                },
-                            );
-                            set!(dst, val);
-                            continue;
+                            if !(val.is_look() && tbl.metatable.is_some()) {
+                                drop(tbl);
+                                exec.table_cache_set(
+                                    site,
+                                    TableCacheSlot {
+                                        table_ptr: ptr,
+                                        shape_version: shape,
+                                        slot_idx: slot_idx as u32,
+                                    },
+                                );
+                                set!(dst, val);
+                                continue;
+                            }
                         } else if tbl.metatable.is_none() {
                             drop(tbl);
                             set!(dst, Value::NIL);
@@ -705,37 +712,36 @@ impl VM {
                         continue;
                     }
                     if let Some(t) = tbl_val.as_table()
+                        && v.is_trivial()
                         && !v.is_nil()
-                        && !v.is_beat()
                         && !k.is_beat()
                     {
                         if let Some(i) = k.as_int()
                             && i >= 1
                         {
                             let mut tbl = t.borrow_mut();
-                            if !tbl.frozen {
+                            if !tbl.frozen && tbl.metatable.is_none() {
                                 let idx = i as usize - 1;
-                                if idx < tbl.array.len() {
+                                if idx < tbl.array.len() && tbl.array[idx].is_trivial() {
                                     tbl.array[idx].assign_ref(v);
                                     continue;
-                                } else if idx == tbl.array.len()
-                                    && tbl.metatable.is_none()
-                                    && tbl.general.is_none()
-                                {
+                                } else if idx == tbl.array.len() && tbl.general.is_none() {
                                     tbl.array.push(v.clone());
                                     continue;
                                 }
                             }
                         } else if let Some(s) = k.as_str_ref() {
                             let mut tbl = t.borrow_mut();
-                            if !tbl.frozen {
-                                if tbl.metatable.is_none() {
-                                    tbl.fields.set_by_vmstr(s.as_ptr(), s.vm_str(), v);
-                                    continue;
-                                } else if let Some(slot) =
+                            if !tbl.frozen && tbl.metatable.is_none() {
+                                if let Some(slot) =
                                     tbl.fields.get_mut_by_vmstr(s.as_ptr(), s.vm_str())
                                 {
-                                    crate::vm::table::assign_value(slot, v);
+                                    if slot.is_trivial() {
+                                        crate::vm::table::assign_value(slot, v);
+                                        continue;
+                                    }
+                                } else {
+                                    tbl.fields.set_by_vmstr(s.as_ptr(), s.vm_str(), v);
                                     continue;
                                 }
                             }
@@ -764,12 +770,12 @@ impl VM {
                         continue;
                     }
                     if let (Some(t), Some(s)) = (tbl_val.as_table(), k.as_str_ref())
+                        && v.is_trivial()
                         && !v.is_nil()
-                        && !v.is_beat()
                     {
                         let ptr = t.as_ptr() as usize;
                         let mut tbl = t.borrow_mut();
-                        if !tbl.frozen {
+                        if !tbl.frozen && tbl.metatable.is_none() {
                             let shape = tbl.fields.shape_version();
                             if let Some(ic) = exec.table_cache_get(site)
                                 && ic.table_ptr == ptr
@@ -779,12 +785,14 @@ impl VM {
                                     s.as_ptr(),
                                     s.vm_str(),
                                 )
+                                && slot_v.is_trivial()
                             {
                                 slot_v.assign_ref(v);
                                 continue;
                             }
                             if let Some(slot_idx) =
                                 tbl.fields.find_index_by_vmstr(s.as_ptr(), s.vm_str())
+                                && tbl.fields.get_slot(slot_idx).is_some_and(Value::is_trivial)
                             {
                                 tbl.fields.set_slot(slot_idx, v.clone());
                                 drop(tbl);
@@ -797,7 +805,11 @@ impl VM {
                                     },
                                 );
                                 continue;
-                            } else if tbl.metatable.is_none() {
+                            } else if tbl
+                                .fields
+                                .find_index_by_vmstr(s.as_ptr(), s.vm_str())
+                                .is_none()
+                            {
                                 let slot_idx = tbl.fields.insert_cached(s.to_str_ref(), v.clone());
                                 let new_shape = tbl.fields.shape_version();
                                 drop(tbl);
@@ -2702,6 +2714,10 @@ impl VM {
                                 throw!("attempted to call non-function ({:?})", callee_val);
                             }
                         }
+                        ValueView::Look(_) => {
+                            let resolved = self.resolve_look_value(&reg!(callee));
+                            self.store_call_results(callee, MULTRET, vec![resolved]);
+                        }
                         _ => {
                             throw!("attempted to call non-function ({:?})", reg!(callee));
                         }
@@ -2868,6 +2884,10 @@ impl VM {
                             } else {
                                 throw!("attempted to call non-function ({:?})", callee_val);
                             }
+                        }
+                        ValueView::Look(_) => {
+                            let resolved = self.resolve_look_value(&reg!(callee));
+                            self.store_call_results(callee, retc, vec![resolved]);
                         }
                         _ => {
                             throw!("attempted to call non-function ({:?})", reg!(callee));

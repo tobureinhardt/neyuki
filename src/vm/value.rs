@@ -233,6 +233,11 @@ fn unpack_beat_ptr<T>(bits: u64) -> *mut T {
 }
 
 #[inline(always)]
+fn unpack_table_ptr(bits: u64) -> *const RefCell<VmTable> {
+    std::ptr::with_exposed_provenance((bits & (BEAT_PAYLOAD_MASK & !1)) as usize)
+}
+
+#[inline(always)]
 fn pack_bigint(rc: Rc<BigInt>) -> u64 {
     let ptr = Rc::into_raw(rc);
     let addr = ptr.expose_provenance() as u64;
@@ -716,6 +721,7 @@ pub enum ValueView<'a> {
     Table(BorrowedTable<'a>),
     Closure(BorrowedRc<'a, VmClosure>),
     Buffer(BorrowedRc<'a, RefCell<VmBuffer>>),
+    Look(crate::vm::old::SlotId),
 }
 
 /// Owned discriminated representation extracted without extra refcount bumps.
@@ -730,6 +736,7 @@ pub enum OwnedValue {
     Table(Rc<RefCell<VmTable>>),
     Closure(Rc<VmClosure>),
     Buffer(Rc<RefCell<VmBuffer>>),
+    Look(crate::vm::old::SlotId),
 }
 
 /// A compact 8-byte runtime value encoded via 64-bit NaN-boxing.
@@ -869,6 +876,46 @@ impl Value {
         Value(pack_ptr(Rc::into_raw(t), TAG_TABLE))
     }
 
+    /// Encodes a non-owning reference to an `OldArena`/`Job` table with zero
+    /// `Clone`/`Drop` RC traffic (distinguished by `BIT_BEAT | 1`).
+    #[inline(always)]
+    pub(crate) fn arena_table(ptr: *const RefCell<VmTable>) -> Value {
+        let addr = ptr.expose_provenance() as u64;
+        assert!(
+            addr <= BEAT_PAYLOAD_MASK && (addr & 1) == 0,
+            "arena table pointer {addr:#x} exceeds 47-bit payload or is unaligned"
+        );
+        Value(TAG_TABLE | BIT_BEAT | addr | 1)
+    }
+
+    /// Encodes a weak generational `(slot, epoch)` `look(x)` handle inside `TAG_CLOSURE | BIT_BEAT`.
+    /// Because `>= TAG_RC_START` with `BIT_BEAT` set, hot scalar table reads skip it
+    /// automatically while `Clone`/`Drop` still perform zero refcount traffic.
+    #[inline(always)]
+    pub(crate) const fn look(slot: u32, epoch: u16) -> Value {
+        debug_assert!(epoch != 0 && epoch <= crate::vm::old::MAX_LOOK_EPOCH);
+        Value(TAG_CLOSURE | BIT_BEAT | (((epoch as u64) & 0x7FFF) << 32) | (slot as u64))
+    }
+
+    #[inline(always)]
+    pub const fn is_look(&self) -> bool {
+        (self.0 & (TAG_MASK | BIT_BEAT)) == (TAG_CLOSURE | BIT_BEAT)
+    }
+
+    #[inline(always)]
+    pub fn look_slot_id(&self) -> Option<crate::vm::old::SlotId> {
+        if self.is_look() {
+            let epoch = ((self.0 >> 32) & 0x7FFF) as u16;
+            if epoch != 0 {
+                return Some(crate::vm::old::SlotId {
+                    slot: self.0 as u32,
+                    epoch,
+                });
+            }
+        }
+        None
+    }
+
     #[inline(always)]
     pub fn beat_table(ptr: *const crate::vm::beat::BeatTable) -> Value {
         Value(pack_beat_ptr(ptr, TAG_TABLE))
@@ -876,7 +923,7 @@ impl Value {
 
     #[inline(always)]
     pub const fn is_beat(&self) -> bool {
-        self.0 >= TAG_RC_START && (self.0 & BIT_BEAT) != 0
+        self.0 >= TAG_STRING && self.0 < TAG_CLOSURE && (self.0 & (BIT_BEAT | 1)) == BIT_BEAT
     }
 
     #[inline(always)]
@@ -886,12 +933,17 @@ impl Value {
 
     #[inline(always)]
     pub const fn is_beat_table(&self) -> bool {
-        (self.0 & (TAG_MASK | BIT_BEAT)) == (TAG_TABLE | BIT_BEAT)
+        (self.0 & (TAG_MASK | BIT_BEAT | 1)) == (TAG_TABLE | BIT_BEAT)
+    }
+
+    #[inline(always)]
+    pub const fn is_arena_table(&self) -> bool {
+        (self.0 & (TAG_MASK | BIT_BEAT | 1)) == (TAG_TABLE | BIT_BEAT | 1)
     }
 
     #[inline(always)]
     pub const fn is_old_table(&self) -> bool {
-        (self.0 & (TAG_MASK | BIT_BEAT)) == TAG_TABLE
+        (self.0 & TAG_MASK) == TAG_TABLE && (self.0 & (BIT_BEAT | 1)) != BIT_BEAT
     }
 
     #[inline(always)]
@@ -1219,11 +1271,11 @@ impl Value {
     #[inline(always)]
     pub fn as_table(&self) -> Option<BorrowedRc<'_, RefCell<VmTable>>> {
         if self.is_old_table() {
-            Some(unsafe { BorrowedRc::from_raw(unpack_ptr::<RefCell<VmTable>>(self.0)) })
+            Some(unsafe { BorrowedRc::from_raw(unpack_table_ptr(self.0)) })
         } else if self.is_beat_table() {
             let bt = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0) };
             if bt.forwarded != 0 {
-                Some(unsafe { BorrowedRc::from_raw(unpack_ptr::<RefCell<VmTable>>(bt.forwarded)) })
+                Some(unsafe { BorrowedRc::from_raw(unpack_table_ptr(bt.forwarded)) })
             } else {
                 None
             }
@@ -1235,11 +1287,11 @@ impl Value {
     #[inline(always)]
     pub fn table_ptr(&self) -> Option<*const RefCell<VmTable>> {
         if self.is_old_table() {
-            Some(unpack_ptr::<RefCell<VmTable>>(self.0))
+            Some(unpack_table_ptr(self.0))
         } else if self.is_beat_table() {
             let bt = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0) };
             if bt.forwarded != 0 {
-                Some(unpack_ptr::<RefCell<VmTable>>(bt.forwarded))
+                Some(unpack_table_ptr(bt.forwarded))
             } else {
                 None
             }
@@ -1265,12 +1317,12 @@ impl Value {
     #[inline(always)]
     pub fn table_borrow(&self) -> Option<TableBorrow<'_>> {
         if self.is_old_table() {
-            let tbl = unsafe { &*unpack_ptr::<RefCell<VmTable>>(self.0) };
+            let tbl = unsafe { &*unpack_table_ptr(self.0) };
             Some(TableBorrow::Old(tbl.borrow()))
         } else if self.is_beat_table() {
             let tbl = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0) };
             if tbl.forwarded != 0 {
-                let old_tbl = unsafe { &*unpack_ptr::<RefCell<VmTable>>(tbl.forwarded) };
+                let old_tbl = unsafe { &*unpack_table_ptr(tbl.forwarded) };
                 Some(TableBorrow::Old(old_tbl.borrow()))
             } else {
                 Some(TableBorrow::Beat(tbl))
@@ -1283,12 +1335,12 @@ impl Value {
     #[inline(always)]
     pub fn try_table_borrow(&self) -> Option<Result<TableBorrow<'_>, std::cell::BorrowError>> {
         if self.is_old_table() {
-            let tbl = unsafe { &*unpack_ptr::<RefCell<VmTable>>(self.0) };
+            let tbl = unsafe { &*unpack_table_ptr(self.0) };
             Some(tbl.try_borrow().map(TableBorrow::Old))
         } else if self.is_beat_table() {
             let tbl = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0) };
             if tbl.forwarded != 0 {
-                let old_tbl = unsafe { &*unpack_ptr::<RefCell<VmTable>>(tbl.forwarded) };
+                let old_tbl = unsafe { &*unpack_table_ptr(tbl.forwarded) };
                 Some(old_tbl.try_borrow().map(TableBorrow::Old))
             } else {
                 Some(Ok(TableBorrow::Beat(tbl)))
@@ -1305,7 +1357,7 @@ impl Value {
 
     #[inline(always)]
     pub const fn is_closure(&self) -> bool {
-        (self.0 & TAG_MASK) == TAG_CLOSURE
+        (self.0 & (TAG_MASK | BIT_BEAT)) == TAG_CLOSURE
     }
 
     #[inline(always)]
@@ -1361,8 +1413,7 @@ impl Value {
 
     #[inline(always)]
     pub const fn is_callable(&self) -> bool {
-        let hi = (self.0 >> 48) as u16;
-        hi == TAG_NATIVE_HI || hi == TAG_CLOSURE_HI
+        self.is_native() || self.is_closure()
     }
 
     /// Borrows this value as a pattern-matchable [`ValueView`] with zero refcount overhead.
@@ -1398,24 +1449,31 @@ impl Value {
                 }
             }
             TAG_TABLE_HI => {
-                if (bits & BIT_BEAT) != 0 {
+                if (bits & (BIT_BEAT | 1)) == BIT_BEAT {
                     let ptr = unpack_beat_ptr::<crate::vm::beat::BeatTable>(bits);
                     let fwd = unsafe { (*ptr).forwarded };
                     if fwd != 0 {
                         ValueView::Table(unsafe {
-                            BorrowedTable::from_old_raw(unpack_ptr::<RefCell<VmTable>>(fwd))
+                            BorrowedTable::from_old_raw(unpack_table_ptr(fwd))
                         })
                     } else {
                         ValueView::Table(unsafe { BorrowedTable::from_beat_raw(ptr) })
                     }
                 } else {
-                    ValueView::Table(unsafe {
-                        BorrowedTable::from_old_raw(unpack_ptr::<RefCell<VmTable>>(bits))
-                    })
+                    ValueView::Table(unsafe { BorrowedTable::from_old_raw(unpack_table_ptr(bits)) })
                 }
             }
             TAG_CLOSURE_HI => {
-                ValueView::Closure(unsafe { BorrowedRc::from_raw(unpack_ptr::<VmClosure>(bits)) })
+                if (bits & BIT_BEAT) != 0 {
+                    ValueView::Look(crate::vm::old::SlotId {
+                        slot: bits as u32,
+                        epoch: ((bits >> 32) & 0x7FFF) as u16,
+                    })
+                } else {
+                    ValueView::Closure(unsafe {
+                        BorrowedRc::from_raw(unpack_ptr::<VmClosure>(bits))
+                    })
+                }
             }
             TAG_BUFFER_HI => ValueView::Buffer(unsafe {
                 BorrowedRc::from_raw(unpack_ptr::<RefCell<VmBuffer>>(bits))
@@ -1456,14 +1514,27 @@ impl Value {
                     }
                 }
                 TAG_TABLE_HI => {
-                    if (bits & BIT_BEAT) != 0 {
+                    if (bits & (BIT_BEAT | 1)) == BIT_BEAT {
                         let bt = &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(bits);
                         OwnedValue::Table(Rc::new(RefCell::new(bt.to_vm_table_cloned())))
+                    } else if (bits & BIT_BEAT) != 0 {
+                        let ptr = unpack_table_ptr(bits);
+                        Rc::increment_strong_count(ptr);
+                        OwnedValue::Table(Rc::from_raw(ptr))
                     } else {
-                        OwnedValue::Table(Rc::from_raw(unpack_ptr(bits)))
+                        OwnedValue::Table(Rc::from_raw(unpack_table_ptr(bits)))
                     }
                 }
-                TAG_CLOSURE_HI => OwnedValue::Closure(Rc::from_raw(unpack_ptr(bits))),
+                TAG_CLOSURE_HI => {
+                    if (bits & BIT_BEAT) != 0 {
+                        OwnedValue::Look(crate::vm::old::SlotId {
+                            slot: bits as u32,
+                            epoch: ((bits >> 32) & 0x7FFF) as u16,
+                        })
+                    } else {
+                        OwnedValue::Closure(Rc::from_raw(unpack_ptr(bits)))
+                    }
+                }
                 TAG_BUFFER_HI => OwnedValue::Buffer(Rc::from_raw(unpack_ptr(bits))),
                 _ => {
                     if (bits & 1) == 0 {
@@ -1482,7 +1553,11 @@ impl Value {
         if self.is_old_table() {
             let bits = self.0;
             std::mem::forget(self);
-            Ok(unsafe { Rc::from_raw(unpack_ptr(bits)) })
+            let ptr = unpack_table_ptr(bits);
+            if (bits & BIT_BEAT) != 0 {
+                unsafe { Rc::increment_strong_count(ptr) };
+            }
+            Ok(unsafe { Rc::from_raw(ptr) })
         } else if self.is_beat_table() {
             let bt = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0) };
             let fwd = bt.forwarded;
@@ -1612,6 +1687,7 @@ impl Value {
             ValueView::Table(_) => "table",
             ValueView::Closure(_) | ValueView::Native(..) => "function",
             ValueView::Buffer(_) => "buffer",
+            ValueView::Look(_) => "look",
         }
     }
 
@@ -1626,6 +1702,7 @@ impl Value {
             ValueView::Table(_) => "table",
             ValueView::Closure(_) | ValueView::Native(..) => "function",
             ValueView::Buffer(_) => "buffer",
+            ValueView::Look(_) => "look",
         }
     }
 
@@ -1740,7 +1817,6 @@ impl Value {
     }
 }
 
-#[derive(Clone)]
 pub struct VmTable {
     pub array: Vec<Value>,
     pub fields: crate::vm::table::FieldMap,
@@ -1759,6 +1835,24 @@ pub struct VmTable {
     /// dropping the last handle frees a suspended coroutine immediately by
     /// plain refcounting. Cloning a handle shares the state.
     pub co_state: Option<Rc<RefCell<crate::vm::machine::CoroutineState>>>,
+    /// Packed `OldArena`/`Job` slot identity (`((gen as u64) << 32) | (slot as u64 + 1)`),
+    /// or `0` for Beat/static/untracked tables. Cleared to `0` on `Clone`.
+    pub(crate) arena_id: u64,
+}
+
+impl Clone for VmTable {
+    fn clone(&self) -> Self {
+        Self {
+            array: self.array.clone(),
+            fields: self.fields.clone(),
+            general: self.general.clone(),
+            array_peak: self.array_peak,
+            frozen: self.frozen,
+            metatable: self.metatable.clone(),
+            co_state: self.co_state.clone(),
+            arena_id: 0,
+        }
+    }
 }
 
 impl Default for VmTable {
@@ -1777,6 +1871,7 @@ impl VmTable {
             frozen: false,
             metatable: None,
             co_state: None,
+            arena_id: 0,
         }
     }
 
@@ -1793,6 +1888,7 @@ impl VmTable {
             frozen: false,
             metatable: None,
             co_state: None,
+            arena_id: 0,
         }
     }
 
@@ -2074,6 +2170,7 @@ impl fmt::Display for Value {
             ),
             ValueView::Native(def) => write!(f, "native function({})", def.name),
             ValueView::Buffer(b) => write!(f, "buffer({})", b.borrow().len()),
+            ValueView::Look(id) => write!(f, "look({}:{})", id.slot, id.epoch),
         }
     }
 }

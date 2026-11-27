@@ -688,6 +688,32 @@ fn op_get_global_dynamic(
 
 #[cold]
 #[inline(never)]
+fn cold_get_global_inner(
+    vm: &mut VM,
+    regs: *mut Value,
+    consts: *const Value,
+    raw: AlignedExec,
+) -> Result<(), &'static str> {
+    let (dst, name_k, site) = match raw.0 {
+        ExecInst::GetGlobal { dst, name_k, site } => (dst, name_k, Some(site)),
+        ExecInst::GetGlobalDynamic { dst, name_k } => (dst, name_k, None),
+        _ => unsafe { std::hint::unreachable_unchecked() },
+    };
+    unsafe {
+        let Some(name) = (&*consts.add(name_k as usize)).as_str_ref() else {
+            return Err("global name must be string");
+        };
+        let val = vm.globals.get(name.as_str()).cloned().unwrap_or(Value::NIL);
+        if let Some(site) = site {
+            (*vm.cur_exec).global_cache_set(site, vm.globals_epoch, val.clone());
+        }
+        set_slot_val(regs.add(dst as usize), val);
+    }
+    Ok(())
+}
+
+#[cold]
+#[inline(never)]
 fn cold_get_global(
     vm: &mut VM,
     regs: *mut Value,
@@ -696,23 +722,10 @@ fn cold_get_global(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let (dst, name_k, site) = match raw.0 {
-        ExecInst::GetGlobal { dst, name_k, site } => (dst, name_k, Some(site)),
-        ExecInst::GetGlobalDynamic { dst, name_k } => (dst, name_k, None),
-        _ => unsafe { std::hint::unreachable_unchecked() },
-    };
+    if let Err(msg) = cold_get_global_inner(vm, regs, consts, raw) {
+        return fail_msg(vm, pc, msg);
+    }
     unsafe {
-        let name = {
-            let Some(name) = (&*consts.add(name_k as usize)).as_str_ref() else {
-                return fail_msg(vm, pc, "global name must be string");
-            };
-            name.to_str_ref()
-        };
-        let val = vm.globals.get(&*name).cloned().unwrap_or(Value::NIL);
-        if let Some(site) = site {
-            (*vm.cur_exec).global_cache_set(site, vm.globals_epoch, val.clone());
-        }
-        set_slot_val(regs.add(dst as usize), val);
         dispatch!(vm, regs, pc, consts, dtbl);
     }
 }
@@ -750,7 +763,8 @@ fn set_global_inner(
             return false;
         };
         let mut val = (*regs.add(src as usize)).clone();
-        vm.beat_escape_if_needed(&mut val);
+        let prev = vm.globals.get(name.as_str()).cloned();
+        vm.global_write_barrier(prev, &mut val);
         if let Some(slot) = vm.globals.get_mut(name.as_str()) {
             *slot = val;
         } else {
@@ -805,9 +819,11 @@ fn cold_set_upval_dispatch(
     };
     unsafe {
         let base = base_of(vm, regs);
-        let uv = (&*vm.cur_upvals.add(upval_idx as usize)).clone();
-        let val = (*regs.add(src as usize)).clone();
-        vm.upvalue_set(&uv, val);
+        {
+            let uv = (&*vm.cur_upvals.add(upval_idx as usize)).clone();
+            let val = (*regs.add(src as usize)).clone();
+            vm.upvalue_set(&uv, val);
+        }
         regs = vm.stack.as_mut_ptr().add(base);
         dispatch!(vm, regs, pc, consts, dtbl);
     }
@@ -893,7 +909,7 @@ fn new_table_inner(
     array_cap: u8,
     fields_cap: u8,
 ) -> Result<*mut Value, String> {
-    if vm.gc.should_collect() || vm.gc.sweeping {
+    if vm.heap.old.should_collect() {
         vm.gc_auto_step()?;
     }
     let table_val = vm.alloc_beat_table_sized(array_cap, fields_cap);
@@ -946,26 +962,83 @@ fn op_get_table(
     unsafe {
         let tbl_val = &*regs.add(table as usize);
         let k = &*regs.add(key as usize);
-        if let (Some(t), Some(i)) = (tbl_val.as_table(), k.as_int())
-            && i >= 1
-            && let Ok(tbl) = t.try_borrow()
-        {
-            let idx = i as usize - 1;
-            if idx < tbl.array.len() {
-                let v_bits = tbl.array[idx].bits();
-                if v_bits < TAG_RC_START {
-                    drop(tbl);
-                    let slot = regs.add(dst as usize);
-                    if (*slot).is_trivial() {
-                        std::ptr::write(slot, Value::from_trivial_bits(v_bits));
-                        dispatch!(vm, regs, pc, consts, dtbl);
+        if k.is_inline_int() {
+            let i = k.as_inline_int_unchecked();
+            if i >= 1 {
+                let idx = i as usize - 1;
+                if let Some(t) = tbl_val.as_table()
+                    && let Ok(tbl) = t.try_borrow()
+                {
+                    if idx < tbl.array.len() {
+                        let v_bits = tbl.array[idx].bits();
+                        if v_bits < TAG_RC_START {
+                            drop(tbl);
+                            let slot = regs.add(dst as usize);
+                            if (*slot).is_trivial() {
+                                std::ptr::write(slot, Value::from_trivial_bits(v_bits));
+                                dispatch!(vm, regs, pc, consts, dtbl);
+                            }
+                            return cold_write_trivial_dispatch(
+                                vm, regs, pc, consts, dtbl, dst, v_bits,
+                            );
+                        }
                     }
-                    return cold_write_trivial_dispatch(vm, regs, pc, consts, dtbl, dst, v_bits);
+                } else if let Some(bt_ptr) = tbl_val.beat_table_ptr() {
+                    let arr = (*bt_ptr).array_slice();
+                    if idx < arr.len() {
+                        let v_bits = arr[idx].bits();
+                        if v_bits < TAG_RC_START {
+                            let slot = regs.add(dst as usize);
+                            if (*slot).is_trivial() {
+                                std::ptr::write(slot, Value::from_trivial_bits(v_bits));
+                                dispatch!(vm, regs, pc, consts, dtbl);
+                            }
+                            return cold_write_trivial_dispatch(
+                                vm, regs, pc, consts, dtbl, dst, v_bits,
+                            );
+                        }
+                    }
                 }
             }
         }
     }
     cold_get_table(vm, regs, pc, consts, dtbl, raw)
+}
+
+#[cold]
+#[inline(never)]
+fn cold_get_table_inner(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    raw: AlignedExec,
+) -> Result<Option<*mut Value>, String> {
+    let ExecInst::GetTable { dst, table, key } = raw.0 else {
+        unsafe { std::hint::unreachable_unchecked() }
+    };
+    let base = unsafe { base_of(vm, regs) };
+    let val = unsafe {
+        let tbl_val = &*regs.add(table as usize);
+        let k = &*regs.add(key as usize);
+        match VM::table_get_fast(tbl_val, k) {
+            Some(v) => v,
+            None => {
+                let (tbl, kv) = (tbl_val.clone(), k.clone());
+                sync_frame_pc(vm, pc);
+                vm.table_get(&tbl, &kv)?
+            }
+        }
+    };
+    if vm.trap {
+        sync_frame_pc(vm, pc);
+        vm.run_result = None;
+        return Ok(None);
+    }
+    unsafe {
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        set_slot_val(new_regs.add(dst as usize), val);
+        Ok(Some(new_regs))
+    }
 }
 
 #[cold]
@@ -978,37 +1051,13 @@ fn cold_get_table(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let inst = raw.0;
-    let ExecInst::GetTable { dst, table, key } = inst else {
-        unsafe { std::hint::unreachable_unchecked() }
+    let new_regs = match cold_get_table_inner(vm, regs, pc, raw) {
+        Ok(Some(r)) => r,
+        Ok(None) => return STATUS_OK,
+        Err(e) => return fail_with(vm, pc, e),
     };
-    let base = unsafe { base_of(vm, regs) };
-    let res = unsafe {
-        let tbl_val = &*regs.add(table as usize);
-        let k = &*regs.add(key as usize);
-        match VM::table_get_fast(tbl_val, k) {
-            Some(v) => Ok(v),
-            None => {
-                let (tbl, kv) = (tbl_val.clone(), k.clone());
-                sync_frame_pc(vm, pc);
-                vm.table_get(&tbl, &kv)
-            }
-        }
-    };
-    match res {
-        Ok(val) => {
-            if vm.trap {
-                sync_frame_pc(vm, pc);
-                vm.run_result = None;
-                return STATUS_OK;
-            }
-            unsafe {
-                let new_regs = vm.stack.as_mut_ptr().add(base);
-                set_slot_val(new_regs.add(dst as usize), val);
-                dispatch!(vm, new_regs, pc, consts, dtbl);
-            }
-        }
-        Err(e) => fail_with(vm, pc, e),
+    unsafe {
+        dispatch!(vm, new_regs, pc, consts, dtbl);
     }
 }
 
@@ -1075,14 +1124,13 @@ fn op_get_table_k_dyn(
 
 #[cold]
 #[inline(never)]
-fn cold_get_table_k(
+fn cold_get_table_k_inner(
     vm: &mut VM,
     regs: *mut Value,
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
-    dtbl: DispatchTbl,
     raw: AlignedExec,
-) -> u8 {
+) -> Result<Option<*mut Value>, String> {
     let (dst, table, key_k, site_opt) = match raw.0 {
         ExecInst::GetTableK {
             dst,
@@ -1116,43 +1164,58 @@ fn cold_get_table_k(
                         },
                     );
                     set_slot_val(regs.add(dst as usize), val);
-                    dispatch!(vm, regs, pc, consts, dtbl);
+                    return Ok(Some(regs));
                 } else if tbl.metatable.is_none() {
                     drop(tbl);
                     set_slot_val(regs.add(dst as usize), Value::NIL);
-                    dispatch!(vm, regs, pc, consts, dtbl);
+                    return Ok(Some(regs));
                 }
             }
         }
     }
     let base = unsafe { base_of(vm, regs) };
-    let res = unsafe {
+    let val = unsafe {
         let tbl_val = &*regs.add(table as usize);
         let k = &*consts.add(key_k as usize);
         match VM::table_get_fast(tbl_val, k) {
-            Some(v) => Ok(v),
+            Some(v) => v,
             None => {
                 let tbl = tbl_val.clone();
                 let kv = k.clone();
                 sync_frame_pc(vm, pc);
-                vm.table_get(&tbl, &kv)
+                vm.table_get(&tbl, &kv)?
             }
         }
     };
-    match res {
-        Ok(val) => {
-            if vm.trap {
-                sync_frame_pc(vm, pc);
-                vm.run_result = None;
-                return STATUS_OK;
-            }
-            unsafe {
-                let new_regs = vm.stack.as_mut_ptr().add(base);
-                set_slot_val(new_regs.add(dst as usize), val);
-                dispatch!(vm, new_regs, pc, consts, dtbl);
-            }
-        }
-        Err(e) => fail_with(vm, pc, e),
+    if vm.trap {
+        sync_frame_pc(vm, pc);
+        vm.run_result = None;
+        return Ok(None);
+    }
+    unsafe {
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        set_slot_val(new_regs.add(dst as usize), val);
+        Ok(Some(new_regs))
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cold_get_table_k(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    dtbl: DispatchTbl,
+    raw: AlignedExec,
+) -> u8 {
+    let new_regs = match cold_get_table_k_inner(vm, regs, pc, consts, raw) {
+        Ok(Some(r)) => r,
+        Ok(None) => return STATUS_OK,
+        Err(e) => return fail_with(vm, pc, e),
+    };
+    unsafe {
+        dispatch!(vm, new_regs, pc, consts, dtbl);
     }
 }
 
@@ -1177,33 +1240,34 @@ unsafe fn try_set_table_fast(
         }
         if let (Some(t), Some(i)) = (tbl_val.as_table(), k.as_int())
             && i >= 1
+            && v.is_trivial()
             && !v.is_nil()
-            && !v.is_beat()
         {
             let mut tbl = t.borrow_mut();
-            if !tbl.frozen {
+            if !tbl.frozen && tbl.metatable.is_none() {
                 let idx = i as usize - 1;
-                if idx < tbl.array.len() {
+                if idx < tbl.array.len() && tbl.array[idx].is_trivial() {
                     tbl.array[idx].assign_ref(v);
                     return Ok(true);
-                } else if idx == tbl.array.len() && tbl.metatable.is_none() && tbl.general.is_none()
-                {
+                } else if idx == tbl.array.len() && tbl.general.is_none() {
                     tbl.array.push(v.clone());
                     return Ok(true);
                 }
             }
         } else if let (Some(t), Some(s)) = (tbl_val.as_table(), k.as_str_ref())
+            && v.is_trivial()
             && !v.is_nil()
-            && !v.is_beat()
             && let Some((s_ptr, s_vms)) = s.as_old_vmstr()
         {
             let mut tbl = t.borrow_mut();
-            if !tbl.frozen {
-                if tbl.metatable.is_none() {
+            if !tbl.frozen && tbl.metatable.is_none() {
+                if let Some(slot) = tbl.fields.get_mut_by_vmstr(s_ptr, s_vms) {
+                    if slot.is_trivial() {
+                        slot.assign_ref(v);
+                        return Ok(true);
+                    }
+                } else {
                     tbl.fields.set_by_vmstr(s_ptr, s_vms, v);
-                    return Ok(true);
-                } else if let Some(slot) = tbl.fields.get_mut_by_vmstr(s_ptr, s_vms) {
-                    slot.assign_ref(v);
                     return Ok(true);
                 }
             }
@@ -1228,18 +1292,39 @@ fn op_set_table(
         let tbl_val = &*regs.add(table as usize);
         let k = &*regs.add(key as usize);
         let v = &*regs.add(val as usize);
-        if let (Some(t), Some(i)) = (tbl_val.as_table(), k.as_int())
-            && i >= 1
-            && !v.is_nil()
-            && v.is_trivial()
-            && let Ok(mut tbl) = t.try_borrow_mut()
-            && !tbl.frozen
-        {
-            let idx = i as usize - 1;
-            if idx < tbl.array.len() && tbl.array[idx].is_trivial() {
-                std::ptr::write(&mut tbl.array[idx], Value::from_trivial_bits(v.bits()));
-                drop(tbl);
-                dispatch!(vm, regs, pc, consts, dtbl);
+        if k.is_inline_int() && !v.is_nil() && v.is_trivial() {
+            let i = k.as_inline_int_unchecked();
+            if i >= 1 {
+                let idx = i as usize - 1;
+                if let Some(t) = tbl_val.as_table()
+                    && let Ok(mut tbl) = t.try_borrow_mut()
+                    && !tbl.frozen
+                    && idx < tbl.array.len()
+                    && tbl.array[idx].is_trivial()
+                {
+                    std::ptr::write(&mut tbl.array[idx], Value::from_trivial_bits(v.bits()));
+                    drop(tbl);
+                    dispatch!(vm, regs, pc, consts, dtbl);
+                } else if let Some(bt_ptr) = tbl_val.beat_table_ptr() {
+                    let bt = &mut *bt_ptr;
+                    if !bt.is_frozen() {
+                        if let Some(ext) = bt.extra_mut() {
+                            if idx < ext.array.len() && ext.array[idx].is_trivial() {
+                                std::ptr::write(
+                                    &mut ext.array[idx],
+                                    Value::from_trivial_bits(v.bits()),
+                                );
+                                dispatch!(vm, regs, pc, consts, dtbl);
+                            }
+                        } else if idx < bt.arr_len as usize {
+                            let slot = bt.arr_ptr.add(idx);
+                            if (*slot).is_trivial() {
+                                std::ptr::write(slot, Value::from_trivial_bits(v.bits()));
+                                dispatch!(vm, regs, pc, consts, dtbl);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1316,13 +1401,13 @@ unsafe fn try_set_table_k_fast(
             return Ok(true);
         }
         if let (Some(t), Some(s)) = (tbl_val.as_table(), k.as_str_ref())
+            && v.is_trivial()
             && !v.is_nil()
-            && !v.is_beat()
             && let Some((s_ptr, s_vms)) = s.as_old_vmstr()
         {
             let ptr = t.as_ptr() as usize;
             let mut tbl = t.borrow_mut();
-            if !tbl.frozen {
+            if !tbl.frozen && tbl.metatable.is_none() {
                 let shape = tbl.fields.shape_version();
                 let exec = &*vm.cur_exec;
                 if let Some(ic) = exec.table_cache_get(site)
@@ -1331,23 +1416,26 @@ unsafe fn try_set_table_k_fast(
                     && let Some(slot_v) =
                         tbl.fields
                             .get_slot_keyed_mut_vmstr(ic.slot_idx as usize, s_ptr, s_vms)
+                    && slot_v.is_trivial()
                 {
                     slot_v.assign_ref(v);
                     return Ok(true);
                 }
                 if let Some(slot_idx) = tbl.fields.find_index_by_vmstr(s_ptr, s_vms) {
-                    tbl.fields.set_slot(slot_idx, v.clone());
-                    drop(tbl);
-                    exec.table_cache_set(
-                        site,
-                        TableCacheSlot {
-                            table_ptr: ptr,
-                            shape_version: shape,
-                            slot_idx: slot_idx as u32,
-                        },
-                    );
-                    return Ok(true);
-                } else if tbl.metatable.is_none() {
+                    if tbl.fields.get_slot(slot_idx).is_some_and(Value::is_trivial) {
+                        tbl.fields.set_slot(slot_idx, v.clone());
+                        drop(tbl);
+                        exec.table_cache_set(
+                            site,
+                            TableCacheSlot {
+                                table_ptr: ptr,
+                                shape_version: shape,
+                                slot_idx: slot_idx as u32,
+                            },
+                        );
+                        return Ok(true);
+                    }
+                } else {
                     let slot_idx = tbl.fields.insert_cached(s.to_str_ref(), v.clone());
                     let new_shape = tbl.fields.shape_version();
                     drop(tbl);
@@ -1576,14 +1664,13 @@ fn op_get_import(
 
 #[cold]
 #[inline(never)]
-fn cold_get_import(
+fn cold_get_import_inner(
     vm: &mut VM,
     regs: *mut Value,
     pc: *const Cell<AlignedExec>,
     consts: *const Value,
-    dtbl: DispatchTbl,
     raw: AlignedExec,
-) -> u8 {
+) -> Result<Option<*mut Value>, String> {
     let ExecInst::GetImport {
         dst,
         mod_k,
@@ -1594,13 +1681,13 @@ fn cold_get_import(
         unsafe { std::hint::unreachable_unchecked() }
     };
     let base = unsafe { base_of(vm, regs) };
-    let res: Result<Value, String> = unsafe {
+    let value = unsafe {
         let (mname, fname) = match (
             (&*consts.add(mod_k as usize)).as_str_ref(),
             (&*consts.add(field_k as usize)).as_str_ref(),
         ) {
             (Some(m), Some(f)) => (m.to_str_ref(), f.to_str_ref()),
-            _ => return fail_msg(vm, pc, "import names must be strings"),
+            _ => return Err("import names must be strings".to_string()),
         };
         let module_val = vm.globals.get(&*mname).cloned().unwrap_or(Value::NIL);
         let fkey = Value::str_ref(fname);
@@ -1608,10 +1695,7 @@ fn cold_get_import(
             Some(v) => v,
             None => {
                 sync_frame_pc(vm, pc);
-                match vm.table_get(&module_val, &fkey) {
-                    Ok(v) => v,
-                    Err(e) => return fail_with(vm, pc, e),
-                }
+                vm.table_get(&module_val, &fkey)?
             }
         };
         if let Some(t) = module_val.as_table() {
@@ -1628,22 +1712,37 @@ fn cold_get_import(
                 );
             }
         }
-        Ok(value)
+        value
     };
-    match res {
-        Ok(value) => {
-            if vm.trap {
-                sync_frame_pc(vm, pc);
-                vm.run_result = None;
-                return STATUS_OK;
-            }
-            unsafe {
-                let new_regs = vm.stack.as_mut_ptr().add(base);
-                set_slot_val(new_regs.add(dst as usize), value);
-                dispatch!(vm, new_regs, pc, consts, dtbl);
-            }
-        }
-        Err(e) => fail_with(vm, pc, e),
+    if vm.trap {
+        sync_frame_pc(vm, pc);
+        vm.run_result = None;
+        return Ok(None);
+    }
+    unsafe {
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        set_slot_val(new_regs.add(dst as usize), value);
+        Ok(Some(new_regs))
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cold_get_import(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    dtbl: DispatchTbl,
+    raw: AlignedExec,
+) -> u8 {
+    let new_regs = match cold_get_import_inner(vm, regs, pc, consts, raw) {
+        Ok(Some(r)) => r,
+        Ok(None) => return STATUS_OK,
+        Err(e) => return fail_with(vm, pc, e),
+    };
+    unsafe {
+        dispatch!(vm, new_regs, pc, consts, dtbl);
     }
 }
 
@@ -2457,6 +2556,28 @@ fn op_idiv_int_pow2(
 
 #[cold]
 #[inline(never)]
+fn cold_eval_pow2_inner(
+    vm: &mut VM,
+    regs: *mut Value,
+    dst: u8,
+    a: u8,
+    shift: u8,
+    op: fn(&Value, &Value) -> Result<Value, String>,
+) -> Result<*mut Value, String> {
+    let base = unsafe { base_of(vm, regs) };
+    let res = unsafe {
+        let ra = &*regs.add(a as usize);
+        op(ra, &Value::int(1i64 << shift))?
+    };
+    unsafe {
+        let new_regs = vm.stack.as_mut_ptr().add(base);
+        set_slot_val(new_regs.add(dst as usize), res);
+        Ok(new_regs)
+    }
+}
+
+#[cold]
+#[inline(never)]
 fn cold_eval_idiv_pow2(
     vm: &mut VM,
     regs: *mut Value,
@@ -2465,21 +2586,15 @@ fn cold_eval_idiv_pow2(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let inst = raw.0;
-    let ExecInst::IDivIntPow2 { dst, a, shift } = inst else {
+    let ExecInst::IDivIntPow2 { dst, a, shift } = raw.0 else {
         unsafe { std::hint::unreachable_unchecked() }
     };
-    let base = unsafe { base_of(vm, regs) };
+    let new_regs = match cold_eval_pow2_inner(vm, regs, dst, a, shift, ops::eval_idiv) {
+        Ok(r) => r,
+        Err(e) => return fail_with(vm, pc, e),
+    };
     unsafe {
-        let ra = &*regs.add(a as usize);
-        match ops::eval_idiv(ra, &Value::int(1i64 << shift)) {
-            Ok(res) => {
-                let new_regs = vm.stack.as_mut_ptr().add(base);
-                set_slot_val(new_regs.add(dst as usize), res);
-                dispatch!(vm, new_regs, pc, consts, dtbl);
-            }
-            Err(e) => fail_with(vm, pc, e),
-        }
+        dispatch!(vm, new_regs, pc, consts, dtbl);
     }
 }
 
@@ -2635,21 +2750,15 @@ fn cold_eval_mod_pow2(
     dtbl: DispatchTbl,
     raw: AlignedExec,
 ) -> u8 {
-    let inst = raw.0;
-    let ExecInst::ModIntPow2 { dst, a, shift } = inst else {
+    let ExecInst::ModIntPow2 { dst, a, shift } = raw.0 else {
         unsafe { std::hint::unreachable_unchecked() }
     };
-    let base = unsafe { base_of(vm, regs) };
+    let new_regs = match cold_eval_pow2_inner(vm, regs, dst, a, shift, ops::eval_mod) {
+        Ok(r) => r,
+        Err(e) => return fail_with(vm, pc, e),
+    };
     unsafe {
-        let ra = &*regs.add(a as usize);
-        match ops::eval_mod(ra, &Value::int(1i64 << shift)) {
-            Ok(res) => {
-                let new_regs = vm.stack.as_mut_ptr().add(base);
-                set_slot_val(new_regs.add(dst as usize), res);
-                dispatch!(vm, new_regs, pc, consts, dtbl);
-            }
-            Err(e) => fail_with(vm, pc, e),
-        }
+        dispatch!(vm, new_regs, pc, consts, dtbl);
     }
 }
 
@@ -3483,6 +3592,42 @@ fn op_unm(
 
 #[cold]
 #[inline(never)]
+fn cold_unm_inner(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    dst: u8,
+    src: u8,
+) -> Result<Option<*mut Value>, String> {
+    let base = unsafe { base_of(vm, regs) };
+    unsafe {
+        let v = &*regs.add(src as usize);
+        if v.is_table() {
+            if let Some(mm) = vm.get_unop_metamethod(v, "__unm") {
+                let v = v.clone();
+                sync_frame_pc(vm, pc);
+                let res = vm.call_function(mm, &[v])?;
+                if vm.trap {
+                    sync_frame_pc(vm, pc);
+                    vm.run_result = None;
+                    return Ok(None);
+                }
+                let new_regs = vm.stack.as_mut_ptr().add(base);
+                set_slot_val(
+                    new_regs.add(dst as usize),
+                    res.into_iter().next().unwrap_or(Value::NIL),
+                );
+                return Ok(Some(new_regs));
+            }
+            return Err("unary minus expects a number".to_string());
+        }
+        ops::eval_unm_into(&mut vm.stack, base + dst as usize, base + src as usize)?;
+        Ok(Some(vm.stack.as_mut_ptr().add(base)))
+    }
+}
+
+#[cold]
+#[inline(never)]
 fn cold_unm(
     vm: &mut VM,
     regs: *mut Value,
@@ -3492,37 +3637,12 @@ fn cold_unm(
     dst: u8,
     src: u8,
 ) -> u8 {
-    let base = unsafe { base_of(vm, regs) };
+    let new_regs = match cold_unm_inner(vm, regs, pc, dst, src) {
+        Ok(Some(r)) => r,
+        Ok(None) => return STATUS_OK,
+        Err(e) => return fail_with(vm, pc, e),
+    };
     unsafe {
-        let v = &*regs.add(src as usize);
-        if v.is_table() {
-            if let Some(mm) = vm.get_unop_metamethod(v, "__unm") {
-                let v = v.clone();
-                sync_frame_pc(vm, pc);
-                match vm.call_function(mm, &[v]) {
-                    Ok(res) => {
-                        if vm.trap {
-                            sync_frame_pc(vm, pc);
-                            vm.run_result = None;
-                            return STATUS_OK;
-                        }
-                        let new_regs = vm.stack.as_mut_ptr().add(base);
-                        set_slot_val(
-                            new_regs.add(dst as usize),
-                            res.into_iter().next().unwrap_or(Value::NIL),
-                        );
-                        dispatch!(vm, new_regs, pc, consts, dtbl);
-                    }
-                    Err(e) => return fail_with(vm, pc, e),
-                }
-            }
-            return fail_msg(vm, pc, "unary minus expects a number");
-        }
-        if let Err(e) = ops::eval_unm_into(&mut vm.stack, base + dst as usize, base + src as usize)
-        {
-            return fail_with(vm, pc, e);
-        }
-        let new_regs = vm.stack.as_mut_ptr().add(base);
         dispatch!(vm, new_regs, pc, consts, dtbl);
     }
 }
@@ -3592,15 +3712,13 @@ fn op_len(
 
 #[cold]
 #[inline(never)]
-fn cold_len(
+fn cold_len_inner(
     vm: &mut VM,
     regs: *mut Value,
     pc: *const Cell<AlignedExec>,
-    consts: *const Value,
-    dtbl: DispatchTbl,
     dst: u8,
     src: u8,
-) -> u8 {
+) -> Result<Option<*mut Value>, String> {
     let base = unsafe { base_of(vm, regs) };
     unsafe {
         let v = &*regs.add(src as usize);
@@ -3610,30 +3728,47 @@ fn cold_len(
                 if let Some(mm) = vm.get_unop_metamethod(v, "__len") {
                     let v = v.clone();
                     sync_frame_pc(vm, pc);
-                    match vm.call_function(mm, &[v]) {
-                        Ok(res) => {
-                            if vm.trap {
-                                sync_frame_pc(vm, pc);
-                                vm.run_result = None;
-                                return STATUS_OK;
-                            }
-                            let new_regs = vm.stack.as_mut_ptr().add(base);
-                            set_slot_val(
-                                new_regs.add(dst as usize),
-                                res.into_iter().next().unwrap_or(Value::NIL),
-                            );
-                            dispatch!(vm, new_regs, pc, consts, dtbl);
-                        }
-                        Err(e) => return fail_with(vm, pc, e),
+                    let res = vm.call_function(mm, &[v])?;
+                    if vm.trap {
+                        sync_frame_pc(vm, pc);
+                        vm.run_result = None;
+                        return Ok(None);
                     }
+                    let new_regs = vm.stack.as_mut_ptr().add(base);
+                    set_slot_val(
+                        new_regs.add(dst as usize),
+                        res.into_iter().next().unwrap_or(Value::NIL),
+                    );
+                    return Ok(Some(new_regs));
                 }
                 t.borrow().array_len()
             }
             ValueView::Buffer(b) => b.borrow().len(),
-            _ => return fail_msg(vm, pc, "len expects string, table or buffer"),
+            _ => return Err("len expects string, table or buffer".to_string()),
         };
         let new_regs = vm.stack.as_mut_ptr().add(base);
         set_slot_val(new_regs.add(dst as usize), Value::from_usize(len));
+        Ok(Some(new_regs))
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn cold_len(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    consts: *const Value,
+    dtbl: DispatchTbl,
+    dst: u8,
+    src: u8,
+) -> u8 {
+    let new_regs = match cold_len_inner(vm, regs, pc, dst, src) {
+        Ok(Some(r)) => r,
+        Ok(None) => return STATUS_OK,
+        Err(e) => return fail_with(vm, pc, e),
+    };
+    unsafe {
         dispatch!(vm, new_regs, pc, consts, dtbl);
     }
 }
@@ -5513,6 +5648,51 @@ fn cold_for_loop(
 
 #[cold]
 #[inline(never)]
+fn cold_for_loop_step(
+    vm: &mut VM,
+    regs: *mut Value,
+    pc: *const Cell<AlignedExec>,
+    b: u8,
+    site_opt: Option<u16>,
+) -> Result<(bool, *mut Value), String> {
+    unsafe {
+        let idx = &*regs.add(b as usize);
+        let limit = &*regs.add(b as usize + 1);
+        let step = &*regs.add(b as usize + 2);
+        match step.view() {
+            ValueView::Int(0) => return Err("numeric for step cannot be zero".to_string()),
+            ValueView::Float(0.0) => return Err("numeric for step cannot be zero".to_string()),
+            _ => {}
+        }
+        let is_positive = match step.view() {
+            ValueView::Int(i) => i >= 0,
+            ValueView::BigInt(i) => num_traits::Signed::is_positive(i),
+            ValueView::Float(f) => f >= 0.0,
+            _ => true,
+        };
+        let next_idx = ops::eval_add(idx, step)?;
+        let loop_again = if is_positive {
+            ops::eval_le(&next_idx, limit)?
+        } else {
+            ops::eval_ge(&next_idx, limit)?
+        };
+        set_slot_val(regs.add(b as usize), next_idx.clone());
+        if loop_again {
+            set_slot_val(regs.add(b as usize + 3), next_idx);
+        } else {
+            drop(next_idx);
+        }
+        let new_regs = if let Some(site) = site_opt {
+            beat_safepoint_dispatch(vm, pc, site, loop_again)
+        } else {
+            regs
+        };
+        Ok((loop_again, new_regs))
+    }
+}
+
+#[cold]
+#[inline(never)]
 fn cold_for_loop_inner(
     vm: &mut VM,
     regs: *mut Value,
@@ -5550,40 +5730,9 @@ fn cold_for_loop_inner(
             let next_pc = if again { pc.offset(jump as isize) } else { pc };
             dispatch!(vm, new_regs, next_pc, consts, dtbl);
         }
-        match step.view() {
-            ValueView::Int(0) => return fail_msg(vm, pc, "numeric for step cannot be zero"),
-            ValueView::Float(0.0) => {
-                return fail_msg(vm, pc, "numeric for step cannot be zero");
-            }
-            _ => {}
-        }
-        let is_positive = match step.view() {
-            ValueView::Int(i) => i >= 0,
-            ValueView::BigInt(i) => num_traits::Signed::is_positive(i),
-            ValueView::Float(f) => f >= 0.0,
-            _ => true,
-        };
-        let next_idx = match ops::eval_add(idx, step) {
+        let (loop_again, new_regs) = match cold_for_loop_step(vm, regs, pc, b, site_opt) {
             Ok(v) => v,
             Err(e) => return fail_with(vm, pc, e),
-        };
-        let loop_again = if is_positive {
-            ops::eval_le(&next_idx, limit)
-        } else {
-            ops::eval_ge(&next_idx, limit)
-        };
-        let loop_again = match loop_again {
-            Ok(b) => b,
-            Err(e) => return fail_with(vm, pc, e),
-        };
-        set_slot_val(regs.add(b as usize), next_idx.clone());
-        if loop_again {
-            set_slot_val(regs.add(b as usize + 3), next_idx);
-        }
-        let new_regs = if let Some(site) = site_opt {
-            beat_safepoint_dispatch(vm, pc, site, loop_again)
-        } else {
-            regs
         };
         let next_pc = if loop_again {
             pc.offset(jump as isize)
@@ -5969,6 +6118,10 @@ fn call_non_closure_inner(
         } else {
             Err(format!("attempted to call non-function ({:?})", callee_val))
         }
+    } else if vm.stack[base + callee as usize].is_look() {
+        let resolved = vm.resolve_look_value(&vm.stack[base + callee as usize]);
+        vm.store_call_results(callee, retc, vec![resolved]);
+        Ok(())
     } else {
         Err(format!(
             "attempted to call non-function ({:?})",

@@ -195,6 +195,7 @@ impl VM {
                 }
                 Err("loop in __call chain".to_string())
             }
+            ValueView::Look(_) => Ok(vec![self.resolve_look_value(&func)]),
             _ => Err("attempt to call a non-function value".to_string()),
         }
     }

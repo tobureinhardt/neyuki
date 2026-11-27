@@ -3,6 +3,7 @@
 pub mod gc;
 pub mod global;
 pub mod iter;
+pub mod mem;
 pub mod meta;
 
 pub use gc::builtin_collectgarbage;
@@ -48,8 +49,11 @@ pub fn register_all(vm: &mut VM) {
         crate::vm::Value::str(concat!("Neyuki ", env!("CARGO_PKG_VERSION"))),
     );
 
-    // Garbage collector
+    // Garbage collector and memory regions
     vm.register_native(crate::native_def!("collectgarbage", builtin_collectgarbage));
+    vm.register_native(crate::native_def!("job", mem::builtin_job));
+    vm.register_native(crate::native_def!("share", mem::builtin_share));
+    vm.register_native(crate::native_def!("look", mem::builtin_look));
 
     // Metatable and raw functions
     vm.register_native(crate::native_def!("setmetatable", builtin_setmetatable));

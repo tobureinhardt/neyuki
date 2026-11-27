@@ -463,6 +463,28 @@ impl BeatArena {
         BeatMark::new(self.cur_chunk, self.cur_off)
     }
 
+    /// Returns true when `ptr` points inside the currently live (non-rewound)
+    /// bump byte range `[0..cur_off)` of an active Beat chunk.
+    #[inline]
+    pub fn is_live_ptr(&self, ptr: *const u8) -> bool {
+        let addr = ptr as usize;
+        for c in 0..=self.cur_chunk.min(self.chunks.len().saturating_sub(1)) {
+            if c >= self.chunks.len() {
+                break;
+            }
+            let base = self.chunks[c].data.as_ptr() as usize;
+            let limit = if c == self.cur_chunk {
+                self.cur_off
+            } else {
+                self.chunks[c].data.len()
+            };
+            if addr >= base && addr < base + limit {
+                return true;
+            }
+        }
+        false
+    }
+
     #[inline(always)]
     pub fn needs_spill(&self) -> bool {
         self.active_bytes >= BEAT_SOFT_CAP_BYTES

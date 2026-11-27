@@ -1,0 +1,178 @@
+-- Memory Follows Work Stage 3 end-to-end tests:
+-- `job(fn)`, `share(x)`, `look(x)`, `UniqueOwner` subtree reclamation,
+-- stack-alias safety, reverse `__gc` order, and coroutine `Job` teardown.
+
+-- 1. `look(x)` weak generational handles (`w()`, `w.k`, slot reuse, nil/frozen).
+do
+    local w_dead
+    local w_frozen
+    do
+        local function make_dead()
+            local t = { name = "ephemeral", nested = { v = 42 } }
+            return look(t)
+        end
+        local ok, w = pcall(make_dead)
+        assert(ok and type(w) == "look" and typeof(w) == "look")
+        w_dead = w
+
+        local f = table.freeze({ a = 99 })
+        w_frozen = look(f)
+        assert(w_frozen.a == 99)
+    end
+    collectgarbage("collect")
+    assert(w_dead() == nil, "dead look() target must return nil after collection")
+    assert(w_dead.name == nil, "indexing dead look() handle must return nil")
+
+    -- Reallocate many tables to trigger slot reuse; stale `look` handle must stay nil.
+    local live_holder = {}
+    for i = 1, 200 do
+        live_holder[i] = { reused = i }
+    end
+    assert(w_dead() == nil, "stale look() epoch must stay nil after slot reuse")
+
+    -- Live look handle tracks mutations and dereferences back to exact table.
+    local target = { x = 10 }
+    local w_live = look(target)
+    assert(w_live() == target)
+    assert(w_live.x == 10)
+    target.x = 77
+    assert(w_live().x == 77)
+    assert(w_live.x == 77)
+    assert(rawequal(w_live, look(target)))
+end
+
+-- 2. Stack-alias safety under `UniqueOwner` overwrite:
+-- `local tmp = a.x; a.x = nil; b.x = tmp` must never drop `tmp`.
+do
+    local a = { x = { payload = "alive" } }
+    local b = {}
+    local w = look(a.x)
+    local tmp = a.x
+    a.x = nil
+    for i = 1, 50 do
+        local scratch = { i }
+    end
+    b.x = tmp
+    tmp = nil
+    collectgarbage("collect")
+    assert(b.x.payload == "alive")
+    assert(w() == b.x)
+end
+
+-- 3. `job(fn)` region isolation, reverse `__gc` finalizers, escaping values & closures.
+do
+    local fin_log = {}
+    local escaped_table, escaped_fn, w_local_cycle
+
+    local function run_job(mult)
+        -- Reverse `__gc` check for job-local objects:
+        local mk = function(label)
+            local obj = { label = label }
+            return setmetatable(obj, {
+                __gc = function(o)
+                    fin_log[#fin_log + 1] = o.label
+                end,
+            })
+        end
+        local _first = mk("first")
+        local _second = mk("second")
+
+        -- Job-local cycle must die when job finishes without touching stack/Old cycle GC:
+        local c1, c2 = {}, {}
+        c1.peer = c2
+        c2.peer = c1
+        w_local_cycle = look(c1)
+
+        -- Nested job escaping into outer job:
+        local inner_res = job(function(k)
+            local inner_only = { k * 2 }
+            local sub = { val = inner_only[1] + 5 }
+            return { sub = sub }
+        end, mult)
+
+        -- Closure capturing job-local table escaping out of job:
+        local captured = { count = inner_res.sub.val }
+        local reader = function(delta)
+            captured.count += delta
+            return captured.count
+        end
+
+        local ret_tbl = { wrapped = inner_res, tag = "from_job" }
+        return ret_tbl, reader
+    end
+
+    escaped_table, escaped_fn = job(run_job, 10)
+    assert(#fin_log == 2, "job exit must run local __gc finalizers")
+    assert(fin_log[1] == "second" and fin_log[2] == "first", "job __gc must run newest-first")
+    assert(w_local_cycle() == nil, "job-local cycle must reclaim on job exit")
+    assert(escaped_table.tag == "from_job")
+    assert(escaped_table.wrapped.sub.val == 25)
+    assert(escaped_fn(5) == 30)
+    assert(escaped_fn(2) == 32)
+end
+
+-- 4. `share(x)` explicit promotion and mixed Shared/UniqueOwner cycles.
+do
+    local w_shared
+    local function make_mixed()
+        local a = share({ name = "shared_root" })
+        local b = { back = a } -- UniqueOwner pointing back to Shared `a`
+        a.child = b
+        w_shared = look(a)
+        -- Return `1` (`a` & `b` die after frame exit).
+        return 1
+    end
+    assert(pcall(make_mixed))
+    collectgarbage("collect")
+    collectgarbage("collect")
+    assert(w_shared() == nil, "mixed Shared<->UniqueOwner cycle must collect cleanly")
+
+    -- Scalars and strings pass cleanly through share().
+    assert(share(42) == 42)
+    assert(share("ok") == "ok")
+    assert(share(nil) == nil)
+end
+
+-- 5. Coroutine `Job` cleanup on natural completion and error exit.
+do
+    local co_fin = {}
+    local w_co_dead
+    local co = coroutine.create(function()
+        local cyc1, cyc2 = {}, {}
+        cyc1.other = cyc2
+        cyc2.other = cyc1
+        w_co_dead = look(cyc1)
+        setmetatable({}, { __gc = function() co_fin[#co_fin + 1] = "done" end })
+        coroutine.yield({ msg = "yielded_ok" })
+        return { msg = "returned_ok" }
+    end)
+    local ok1, v1 = coroutine.resume(co)
+    assert(ok1 and v1.msg == "yielded_ok")
+    assert(w_co_dead() ~= nil, "coroutine job data must stay alive across yield")
+    local ok2, v2 = coroutine.resume(co)
+    assert(ok2 and v2.msg == "returned_ok")
+    assert(v1.msg == "yielded_ok")
+    assert(w_co_dead() == nil, "coroutine local cycle must free when coroutine exits")
+    assert(#co_fin == 1 and co_fin[1] == "done")
+end
+
+-- 6. Transitive root-pinning through nested BeatTables when an Old edge releases.
+do
+    local nodes, roots = {}, {}
+    for i = 1, 16 do
+        nodes[#nodes + 1] = { id = i }
+        if i == 1 then
+            roots[#roots + 1] = { nodes[1], nodes[1].id }
+        elseif i == 4 then
+            nodes[2].e = nodes[1]
+        elseif i == 8 then
+            nodes[1] = nil
+        elseif i == 12 then
+            nodes[2].e = nodes[4]
+        end
+    end
+    collectgarbage("collect")
+    assert(roots[1][1].id == 1, "nested BeatTable pin must preserve promoted Old child")
+end
+
+print("[pass] Stage 3 memory tiers (job, share, look, UniqueOwner, coroutines)")

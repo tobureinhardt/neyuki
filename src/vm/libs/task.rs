@@ -109,6 +109,40 @@ pub struct Scheduler {
     failed: usize,
 }
 
+impl Scheduler {
+    /// Visits all coroutine handles and queued wake values held by the scheduler.
+    pub(crate) fn visit_roots(&self, mut f: impl FnMut(&Value)) {
+        for (h, args) in &self.deferred {
+            f(h);
+            for a in args {
+                f(a);
+            }
+        }
+        for (h, w) in self.sleeping.values() {
+            f(h);
+            if let Wake::Args(args) = w {
+                for a in args {
+                    f(a);
+                }
+            }
+        }
+        for (h, w) in &self.ready {
+            f(h);
+            if let Wake::Args(args) = w {
+                for a in args {
+                    f(a);
+                }
+            }
+        }
+        for (h, _) in &self.pollers {
+            f(h);
+        }
+        for h in self.waiting.values() {
+            f(h);
+        }
+    }
+}
+
 impl Default for Scheduler {
     fn default() -> Self {
         let (sender, completions) = mpsc::channel();

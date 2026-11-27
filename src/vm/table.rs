@@ -18,6 +18,7 @@ pub enum TableKey {
     Closure(*const VmClosure),
     Native(*const NativeDef),
     Buffer(*const RefCell<VmBuffer>),
+    Look(crate::vm::old::SlotId),
 }
 
 impl PartialEq for TableKey {
@@ -32,6 +33,7 @@ impl PartialEq for TableKey {
             (TableKey::Closure(a), TableKey::Closure(b)) => std::ptr::eq(*a, *b),
             (TableKey::Native(a), TableKey::Native(b)) => std::ptr::eq(*a, *b),
             (TableKey::Buffer(a), TableKey::Buffer(b)) => std::ptr::eq(*a, *b),
+            (TableKey::Look(a), TableKey::Look(b)) => a == b,
             _ => false,
         }
     }
@@ -52,6 +54,7 @@ impl Hash for TableKey {
             TableKey::Closure(p) => p.hash(state),
             TableKey::Native(p) => p.hash(state),
             TableKey::Buffer(p) => p.hash(state),
+            TableKey::Look(id) => id.hash(state),
         }
     }
 }
@@ -94,6 +97,7 @@ impl TableKey {
             ValueView::Closure(c) => Ok(TableKey::Closure(c.as_ptr())),
             ValueView::Native(def) => Ok(TableKey::Native(def as *const _)),
             ValueView::Buffer(b) => Ok(TableKey::Buffer(b.as_ptr())),
+            ValueView::Look(id) => Ok(TableKey::Look(id)),
         }
     }
 }
@@ -658,6 +662,21 @@ impl FieldMap {
     #[inline(always)]
     pub fn shape_version(&self) -> u32 {
         self.shape_version as u32
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        match &self.inner {
+            FieldStorage::Small(entries) => entries.capacity(),
+            FieldStorage::Hash(map) => map.entries.len(),
+        }
+    }
+
+    #[inline]
+    pub fn reserve_at_least(&mut self, cap: usize) {
+        if cap > self.capacity() {
+            *self = Self::with_capacity(cap);
+        }
     }
 
     #[inline(always)]

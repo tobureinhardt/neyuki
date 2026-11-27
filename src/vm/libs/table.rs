@@ -103,13 +103,13 @@ fn table_insert(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let Some(t) = tbl_val.as_table() else {
         return Err("t must be a table".to_string());
     };
+    let tbl_copy = tbl_val.clone();
     let mut val = match args.len() {
         0 | 1 => return Err("insert expects a value".to_string()),
         2 => args[1].clone(),
         _ => args[2].clone(),
     };
-    vm.beat_escape_if_needed(&mut val);
-    vm.gc.write_barrier(tbl_val, &val);
+    vm.container_write_barrier(&tbl_copy, None, &mut val);
     let mut tbl = t.borrow_mut();
     match args.len() {
         2 => {

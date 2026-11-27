@@ -12,14 +12,33 @@ pub static NEXT: &NativeDef = &NativeDef {
 
 /// `next(t, key?)`: the entry after `key` (the first one when `key` is nil),
 /// or nil at the end. The order is the one `for k, v in t` uses.
-pub fn builtin_next(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let Some(t) = args.first().and_then(|v| v.table_borrow()) else {
+pub fn builtin_next(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+    let Some(tbl_val) = args.first().filter(|v| v.is_table()) else {
         return Err("next expects a table".to_string());
     };
-    let key = args.get(1).cloned().unwrap_or(Value::NIL);
-    match t.next_entry(&key)? {
-        Some((k, v)) => Ok(vec![k, v]),
-        None => Ok(vec![Value::NIL]),
+    let mut key = args.get(1).cloned().unwrap_or(Value::NIL);
+    let is_weak_v = tbl_val
+        .as_table()
+        .is_some_and(|t| crate::vm::old::table_is_weak_v(&t.borrow()));
+    loop {
+        let next = tbl_val
+            .table_borrow()
+            .expect("verified table")
+            .next_entry(&key)?;
+        match next {
+            Some((k, v)) => {
+                if is_weak_v && v.is_look() {
+                    let resolved = vm.resolve_look_value(&v);
+                    if resolved.is_nil() {
+                        key = k;
+                        continue;
+                    }
+                    return Ok(vec![k, resolved]);
+                }
+                return Ok(vec![k, v]);
+            }
+            None => return Ok(vec![Value::NIL]),
+        }
     }
 }
 

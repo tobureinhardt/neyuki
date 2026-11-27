@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use crate::bytecode::instruction::MULTRET;
 use crate::vm::frame::CallFrame;
-use crate::vm::machine::{CoroutineState, VM};
+use crate::vm::machine::{CoroutineState, SuspendedCaller, VM};
 use crate::vm::value::{Value, ValueView, VmTable};
 
 pub fn create_coroutine_lib() -> Value {
@@ -56,34 +56,33 @@ pub(crate) fn new_coroutine(vm: &mut VM, func: Value) -> Value {
     handle.set_str("__type", Value::str("thread"));
     handle.set_str("_id", Value::from_usize(id));
     handle.frozen = true;
-    let handle = Rc::new(RefCell::new(handle));
+    let (_handle_id, handle_rc) = vm.heap.old.insert_table(handle, 0);
 
+    let job_id = vm.heap.jobs.create_job();
     let state = CoroutineState {
         stack: Vec::new(),
         frames: Vec::new(),
         status: "suspended".to_string(),
         func,
-        handle: Rc::downgrade(&handle),
+        handle: Rc::downgrade(&handle_rc),
         yield_callee: 0,
         yield_retc: 0,
         yield_values: Vec::new(),
         open_upvalues: Vec::new(),
         resume_error: None,
+        job_id,
     };
     let state_rc = Rc::new(RefCell::new(state));
     // The map holds only a WEAK reference: the handle owns the state
     // strongly, so an abandoned suspended coroutine dies with its handle
-    // instead of leaking its whole stack/frames in this map. The state only
-    // points back at the handle weakly, so the two do not form a cycle.
+    // instead of leaking its whole stack/frames in this map.
     vm.co_states.insert(id, Rc::downgrade(&state_rc));
-    // Dead-weak pruning is amortized: full collections prune, and creation
-    // prunes once the map doubles past the last prune, so a loop that never
-    // collects still cannot pile dead entries unboundedly.
+    vm.co_jobs.insert(id, job_id);
     if vm.co_states.len() > vm.co_states_pruned_at.saturating_mul(2).saturating_add(64) {
         vm.prune_co_states();
     }
-    handle.borrow_mut().co_state = Some(state_rc);
-    Value::table(handle)
+    handle_rc.borrow_mut().co_state = Some(state_rc);
+    Value::arena_table(Rc::as_ptr(&handle_rc))
 }
 
 /// The id of the live coroutine whose handle is `val`. Finished coroutines
@@ -193,6 +192,11 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let caller_open_upvalues = vm.park_upvalues();
     let caller_stack = std::mem::take(&mut vm.stack);
     let caller_frames = std::mem::take(&mut vm.frames);
+    vm.suspended_callers.push(SuspendedCaller {
+        stack: caller_stack,
+        frames: caller_frames,
+        open_upvalues: caller_open_upvalues,
+    });
     let caller_co = vm.current_co;
     // A coroutine that resumes another is "normal" until it gets control back.
     let caller_state = caller_co.and_then(|id| vm.co_state(id));
@@ -204,6 +208,12 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             caller.borrow_mut().status = "running".to_string();
         }
     };
+
+    let caller_job = vm.heap.jobs.current_job_id();
+    let co_job = co_rc.borrow().job_id;
+    if co_job != 0 {
+        vm.heap.jobs.push_active(co_job);
+    }
 
     let is_initial = co_rc.borrow().frames.is_empty();
     {
@@ -250,16 +260,33 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             }
             ValueView::Native(def) => {
                 let res = (def.func)(vm, resume_args);
+                let mut res = res;
+                if let Ok(ref mut vals) = res
+                    && co_job != 0
+                {
+                    for v in vals.iter_mut() {
+                        vm.escape_value_to_job(v, co_job, caller_job);
+                    }
+                }
                 vm.beat_flush_to_floor(beat_floor, false);
                 vm.beat_loops = caller_beat_loops;
                 vm.beat_exit_nested();
+                vm.close_upvalues(0);
+                if co_job != 0 {
+                    vm.heap.jobs.pop_active();
+                    let _ = vm.teardown_job_and_finalize(co_job);
+                }
                 co_rc.borrow_mut().status = "dead".to_string();
                 vm.co_states.remove(&co_id);
-                vm.close_upvalues(0);
-                vm.stack = caller_stack;
-                vm.frames = caller_frames;
+                vm.co_jobs.remove(&co_id);
+                let caller = vm
+                    .suspended_callers
+                    .pop()
+                    .expect("balanced suspended caller");
+                vm.stack = caller.stack;
+                vm.frames = caller.frames;
                 vm.current_co = caller_co;
-                vm.unpark_upvalues(caller_open_upvalues);
+                vm.unpark_upvalues(caller.open_upvalues);
                 restore_caller();
                 vm.error_trace = None;
                 return match res {
@@ -276,10 +303,21 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 vm.beat_loops = caller_beat_loops;
                 vm.beat_exit_nested();
                 vm.close_upvalues(0);
-                vm.stack = caller_stack;
-                vm.frames = caller_frames;
+                if co_job != 0 {
+                    vm.heap.jobs.pop_active();
+                    let _ = vm.teardown_job_and_finalize(co_job);
+                }
+                co_rc.borrow_mut().status = "dead".to_string();
+                vm.co_states.remove(&co_id);
+                vm.co_jobs.remove(&co_id);
+                let caller = vm
+                    .suspended_callers
+                    .pop()
+                    .expect("balanced suspended caller");
+                vm.stack = caller.stack;
+                vm.frames = caller.frames;
                 vm.current_co = caller_co;
-                vm.unpark_upvalues(caller_open_upvalues);
+                vm.unpark_upvalues(caller.open_upvalues);
                 restore_caller();
                 return Err("coroutine function is not callable".to_string());
             }
@@ -322,12 +360,17 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 let mut cs = co_rc.borrow_mut();
                 std::mem::take(&mut cs.yield_values)
             };
-            for y in &mut yielded {
-                vm.beat_escape_if_needed(y);
-            }
+            // Flush coroutine Beat into `co_job` first, then promote yielded
+            // values out to `caller_job`.
             vm.beat_flush_to_floor(beat_floor, true);
             vm.beat_loops = caller_beat_loops;
             vm.beat_exit_nested();
+            if co_job != 0 {
+                vm.heap.jobs.pop_active();
+            }
+            for y in &mut yielded {
+                vm.escape_value_to_job(y, co_job, caller_job);
+            }
             let parked = vm.park_upvalues();
             let mut cs = co_rc.borrow_mut();
             cs.stack = std::mem::take(&mut vm.stack);
@@ -336,10 +379,14 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             cs.status = "suspended".to_string();
             drop(cs);
 
-            vm.stack = caller_stack;
-            vm.frames = caller_frames;
+            let caller = vm
+                .suspended_callers
+                .pop()
+                .expect("balanced suspended caller");
+            vm.stack = caller.stack;
+            vm.frames = caller.frames;
             vm.current_co = caller_co;
-            vm.unpark_upvalues(caller_open_upvalues);
+            vm.unpark_upvalues(caller.open_upvalues);
             restore_caller();
 
             let mut out = vec![Value::TRUE];
@@ -356,19 +403,33 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                     vm.beat_promote_if_after(r, beat_floor);
                 }
             }
+            if co_job != 0 {
+                for r in &mut returned {
+                    vm.escape_value_to_job(r, co_job, caller_job);
+                }
+            }
             vm.beat_flush_to_floor(beat_floor, false);
             vm.beat_loops = caller_beat_loops;
             vm.beat_exit_nested();
             vm.close_upvalues(0);
+            if co_job != 0 {
+                vm.heap.jobs.pop_active();
+                let _ = vm.teardown_job_and_finalize(co_job);
+            }
             let mut cs = co_rc.borrow_mut();
             cs.status = "dead".to_string();
             drop(cs);
             vm.co_states.remove(&co_id);
+            vm.co_jobs.remove(&co_id);
 
-            vm.stack = caller_stack;
-            vm.frames = caller_frames;
+            let caller = vm
+                .suspended_callers
+                .pop()
+                .expect("balanced suspended caller");
+            vm.stack = caller.stack;
+            vm.frames = caller.frames;
             vm.current_co = caller_co;
-            vm.unpark_upvalues(caller_open_upvalues);
+            vm.unpark_upvalues(caller.open_upvalues);
             restore_caller();
 
             let mut out = vec![Value::TRUE];
@@ -380,15 +441,24 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             vm.beat_loops = caller_beat_loops;
             vm.beat_exit_nested();
             vm.close_upvalues(0);
+            if co_job != 0 {
+                vm.heap.jobs.pop_active();
+                let _ = vm.teardown_job_and_finalize(co_job);
+            }
             let mut cs = co_rc.borrow_mut();
             cs.status = "dead".to_string();
             drop(cs);
             vm.co_states.remove(&co_id);
+            vm.co_jobs.remove(&co_id);
 
-            vm.stack = caller_stack;
-            vm.frames = caller_frames;
+            let caller = vm
+                .suspended_callers
+                .pop()
+                .expect("balanced suspended caller");
+            vm.stack = caller.stack;
+            vm.frames = caller.frames;
             vm.current_co = caller_co;
-            vm.unpark_upvalues(caller_open_upvalues);
+            vm.unpark_upvalues(caller.open_upvalues);
             restore_caller();
             if vm.limits.is_tripped() {
                 return Err(err);
@@ -434,7 +504,14 @@ fn coroutine_running(vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String>
         .and_then(|co_id| vm.co_state(co_id))
         .and_then(|co| co.borrow().handle.upgrade());
     match handle {
-        Some(h) => Ok(vec![Value::table(h), Value::FALSE]),
+        Some(h) => {
+            let v = if h.borrow().arena_id != 0 {
+                Value::arena_table(Rc::as_ptr(&h))
+            } else {
+                Value::table(h)
+            };
+            Ok(vec![v, Value::FALSE])
+        }
         None => Ok(vec![Value::NIL, Value::TRUE]),
     }
 }

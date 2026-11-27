@@ -5,7 +5,6 @@ use std::rc::{Rc, Weak};
 use crate::bytecode::proto::Proto;
 use crate::dap::DapSession;
 use crate::vm::frame::CallFrame;
-use crate::vm::gc::GcTracker;
 use crate::vm::hash::{FxHashMap, new_map, with_capacity};
 use crate::vm::libs::{
     create_bit_lib, create_buffer_lib, create_coroutine_lib, create_debug_lib, create_json_lib,
@@ -42,6 +41,8 @@ pub struct CoroutineState {
     /// error where the coroutine is suspended instead of returning values
     /// there.
     pub resume_error: Option<String>,
+    /// Private `Job` region id (`0` until first resumed).
+    pub job_id: u32,
 }
 
 /// A `debug.sethook` hook. `None` means no hook is set, in which case event
@@ -80,19 +81,30 @@ impl HookEvent {
     }
 }
 
+pub struct SuspendedCaller {
+    pub stack: Vec<Value>,
+    pub frames: Vec<CallFrame>,
+    pub open_upvalues: Vec<ParkedUpvalue>,
+}
+
 pub struct VM {
     pub stack: Vec<Value>,
     pub frames: Vec<CallFrame>,
+    /// Caller execution states put aside while a resumed coroutine runs,
+    /// so cycle/pending collection still sees parked caller stacks & upvalues.
+    pub(crate) suspended_callers: Vec<SuspendedCaller>,
     pub globals: FxHashMap<StrRef, Value>,
     /// Bumped on every global write: `GetImport` slots resolved under an
     /// older epoch re-resolve instead of trusting a stale value.
     pub globals_epoch: u64,
-    pub gc: GcTracker,
     pub heap: crate::vm::heap::VmHeap,
     /// Coroutine states by id, held weakly: each handle table's `co_state`
     /// field owns its state, so dropping the last handle frees a suspended
-    /// coroutine by refcounting.
+    /// coroutine cleanly.
     pub co_states: HashMap<usize, Weak<RefCell<CoroutineState>>>,
+    /// Tracks each coroutine's `Job` region id so abandoned suspended
+    /// coroutines tear down their `Job` heap cleanly on prune.
+    pub(crate) co_jobs: HashMap<usize, u32>,
     /// Map length at the last dead-weak prune: pruning runs when the map
     /// doubles past this, keeping cleanup amortized O(1) per coroutine.
     pub(crate) co_states_pruned_at: usize,
@@ -331,11 +343,12 @@ impl VM {
         Self {
             stack: Vec::new(),
             frames: Vec::new(),
+            suspended_callers: Vec::new(),
             globals: new_map(),
             globals_epoch: 0,
-            gc: GcTracker::new(),
             heap: crate::vm::heap::VmHeap::new(),
             co_states: HashMap::new(),
+            co_jobs: HashMap::new(),
             co_states_pruned_at: 0,
             next_co_id: 1,
             current_co: None,
@@ -449,7 +462,8 @@ impl VM {
     }
 
     pub fn set_global(&mut self, name: &str, mut value: Value) {
-        self.beat_escape_if_needed(&mut value);
+        let prev = self.globals.get(name).cloned();
+        self.global_write_barrier(prev, &mut value);
         self.globals.insert(StrRef::from(name), value);
         self.globals_epoch = self.globals_epoch.wrapping_add(1);
     }
@@ -465,6 +479,7 @@ impl VM {
         });
         self.stack.clear();
         self.frames.clear();
+        self.suspended_callers.clear();
         self.open_upvalues.clear();
         self.beat_loops.clear();
         // A chunk that panicked (the REPL keeps its VM across chunks) can
@@ -487,6 +502,7 @@ impl VM {
             Ok(mut val) => {
                 self.beat_escape_if_needed(&mut val);
                 self.beat_flush_to_floor(crate::vm::beat::BeatMark::ZERO, true);
+                self.detach_return_value(&mut val);
                 Ok(val)
             }
             Err(err) => {
@@ -560,103 +576,69 @@ impl VM {
     }
 
     pub(crate) fn prune_co_states(&mut self) {
-        self.co_states.retain(|_, weak| weak.upgrade().is_some());
+        let mut dead_jobs = Vec::new();
+        self.co_states.retain(|id, weak| {
+            let alive = weak.upgrade().is_some();
+            if !alive && let Some(jid) = self.co_jobs.remove(id) {
+                dead_jobs.push(jid);
+            }
+            alive
+        });
+        for jid in dead_jobs {
+            if jid != 0 {
+                let _ = self.teardown_job_and_finalize(jid);
+            }
+        }
         self.co_states_pruned_at = self.co_states.len();
     }
 
+    /// Full collection with finalizers: flushes `Beat`, `pending_free` Old subtrees,
+    /// local Bacon-Rajan cycle collection on `purple_buffer` + `suspect_roots`,
+    /// weak-value pruning, and dead coroutine teardown.
     pub(crate) fn gc_collect(&mut self) -> Result<(), String> {
         let floor = self.heap.beat.floor;
         self.beat_flush_to_floor(floor, false);
-        while !self.gc.sweep_slice(usize::MAX) {}
-        while !self.gc.sweep_slice(usize::MAX) {}
-        let crate::vm::gc::SweepPlan {
-            queue,
-            internal,
-            plain,
-            dropped,
-        } = self.gc.collect_plan(&self.stack, &self.globals);
-        let (settled_cleared, settled_freed, first_err) = self.settle_queue(&queue, &internal);
-        self.gc
-            .sweep_finish(plain, dropped, settled_cleared, settled_freed);
-        // Dead coroutine weaks need no GC decision (liveness follows the
-        // handle's refcount, visible or not); drop them here every cycle.
+
+        let pins = self.collect_root_pins();
+        let plan = self.heap.old.collect_cycles(&pins);
+        let first_err = self.run_old_reclaim_plan(plan);
+        // Second pass settles any children released by finalized destructors
+        // and any abandoned coroutine handles/jobs.
+        let pins2 = self.collect_root_pins();
+        let plan2 = self.heap.old.flush_pending(&pins2, true);
+        let err2 = self.run_old_reclaim_plan(plan2);
         self.prune_co_states();
-        if let Some(e) = first_err {
+        let pins3 = self.collect_root_pins();
+        let _ = self.heap.old.flush_pending(&pins3, true);
+        self.heap.old.update_threshold();
+
+        if let Some(e) = first_err.or(err2) {
             return Err(e);
         }
         Ok(())
     }
 
-    /// Runs one finalizer queue, settling each table afterwards. Shared by
-    /// the draining and bounded-stepping drivers so both observe identical
-    /// order and resurrection rules.
-    fn settle_queue(
-        &mut self,
-        queue: &[(Rc<RefCell<VmTable>>, Value)],
-        internal: &crate::vm::hash::FxHashMap<*const RefCell<VmTable>, usize>,
-    ) -> (Vec<*const RefCell<VmTable>>, usize, Option<String>) {
-        let mut settled_cleared = Vec::new();
-        let mut settled_freed = 0;
-        let mut first_err: Option<String> = None;
-        for (rc, handler) in queue {
-            let arg = Value::table(rc.clone());
-            let res = self.call_function(handler.clone(), std::slice::from_ref(&arg));
-            let (cleared, freed) = self.gc.settle_table(rc, res.is_ok(), internal);
-            if let Some(ptr) = cleared {
-                settled_cleared.push(ptr);
-            }
-            settled_freed += freed;
-            if let Err(e) = res {
-                first_err.get_or_insert(e);
-            }
-        }
-        (settled_cleared, settled_freed, first_err)
-    }
-
-    /// Allocation-triggered collection step: advances an in-progress sweep
-    /// by one bounded slice, or starts a new cycle (plan, settle, begin)
-    /// when over threshold and takes its first slice. Bounds pause times;
-    /// explicit collections still drain fully. Slice size is fixed; pacing
-    /// itself comes from the allocation threshold.
+    /// Bounded collection step triggered when allocations cross `threshold`.
     pub(crate) fn gc_auto_step(&mut self) -> Result<(), String> {
-        const SLICE_BUDGET: usize = 256;
-        if self.gc.sweeping {
-            self.gc.sweep_slice(SLICE_BUDGET);
-            return Ok(());
+        if !self.heap.old.pending_free.is_empty()
+            && let Some(e) = self.flush_pending_old(false)
+        {
+            return Err(e);
         }
-        if !self.gc.should_collect() {
+        if !self.heap.old.should_collect() {
             if let Some(limit) = self.limits.heap_limit_bytes
-                && self.gc.bytes_allocated > limit
+                && self.heap.old.bytes_allocated > limit
             {
                 self.gc_collect()?;
-                self.limits.check_heap(self.gc.bytes_allocated)?;
+                self.limits.check_heap(self.heap.old.bytes_allocated)?;
             }
             return Ok(());
         }
-        // Reap dead acyclic tables from the nursery and promote survivors into
-        // `tables` (safe even when `__gc` or weak tables exist, since pinned
-        // and referenced entries keep `strong_count > 0`). Skip the full cycle
-        // collector only while total occupancy stays comfortably below the
-        // threshold and consecutive nursery-only reaps remain bounded.
-        let dropped = self.gc.reap_young();
-        if dropped > 0
-            && self.gc.bytes_allocated <= self.gc.threshold * 3 / 4
-            && self.gc.nursery_reaps_since_cycle < 12
-        {
-            self.gc.nursery_reaps_since_cycle += 1;
-            self.gc.last_freed = dropped;
-            return Ok(());
-        }
-        let crate::vm::gc::SweepPlan {
-            queue,
-            internal,
-            plain,
-            dropped,
-        } = self.gc.collect_plan(&self.stack, &self.globals);
-        let (settled_cleared, settled_freed, first_err) = self.settle_queue(&queue, &internal);
-        self.gc
-            .sweep_begin(plain, dropped, settled_cleared, settled_freed);
-        self.gc.sweep_slice(SLICE_BUDGET);
+        let pins = self.collect_root_pins();
+        let plan = self.heap.old.collect_cycles(&pins);
+        let first_err = self.run_old_reclaim_plan(plan);
+        self.prune_co_states();
+        self.heap.old.update_threshold();
         if let Some(e) = first_err {
             return Err(e);
         }

@@ -33,7 +33,11 @@ impl VM {
                 .pop()
                 .expect("the loop condition saw an open upvalue");
             let mut val = self.stack.get(idx).cloned().unwrap_or(Value::NIL);
-            self.beat_escape_if_needed(&mut val);
+            let cur_job = self.heap.jobs.current_job_id();
+            self.escape_value_to_job(&mut val, cur_job, 0);
+            if let Some(cid) = crate::vm::old::OldArena::slot_of_value(&val) {
+                self.heap.old.record_upvalue_edge(&uv, cid);
+            }
             uv.close(val);
         }
     }
@@ -45,7 +49,11 @@ impl VM {
         if self.open_upvalues.get(pos).is_some_and(|(i, _)| *i == idx) {
             let (_, uv) = self.open_upvalues.remove(pos);
             let mut val = self.stack.get(idx).cloned().unwrap_or(Value::NIL);
-            self.beat_escape_if_needed(&mut val);
+            let cur_job = self.heap.jobs.current_job_id();
+            self.escape_value_to_job(&mut val, cur_job, 0);
+            if let Some(cid) = crate::vm::old::OldArena::slot_of_value(&val) {
+                self.heap.old.record_upvalue_edge(&uv, cid);
+            }
             uv.close(val);
         }
     }
@@ -100,7 +108,7 @@ impl VM {
     }
 
     #[inline]
-    pub fn upvalue_set(&mut self, uv: &Upvalue, mut val: Value) {
+    pub fn upvalue_set(&mut self, uv: &Rc<Upvalue>, mut val: Value) {
         match uv.location.get() {
             Some(idx) => {
                 let cur_base = self.frames.last().map(|f| f.base).unwrap_or(0);
@@ -110,7 +118,17 @@ impl VM {
                 self.set_reg_grow(idx, val);
             }
             None => {
-                self.beat_escape_if_needed(&mut val);
+                let prev = uv.get_closed();
+                let cur_job = self.heap.jobs.current_job_id();
+                self.escape_value_to_job(&mut val, cur_job, 0);
+                if let Some(old_cid) = crate::vm::old::OldArena::slot_of_value(&prev)
+                    && self.heap.old.job_of(old_cid) == Some(0)
+                {
+                    self.heap.old.on_old_release(old_cid);
+                }
+                if let Some(new_cid) = crate::vm::old::OldArena::slot_of_value(&val) {
+                    self.heap.old.record_upvalue_edge(uv, new_cid);
+                }
                 uv.set_closed(val);
             }
         }

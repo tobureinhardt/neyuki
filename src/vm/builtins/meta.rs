@@ -51,13 +51,16 @@ pub fn builtin_getmetatable(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, 
     }
 }
 
-pub fn builtin_rawget(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let Some(t) = args.first().and_then(|v| v.table_borrow()) else {
+pub fn builtin_rawget(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
+    let Some(tbl_val) = args.first().filter(|v| v.is_table()) else {
         return Err("rawget expects a table".to_string());
     };
     let nil = Value::NIL;
     let key = args.get(1).unwrap_or(&nil);
-    Ok(vec![t.raw_get(key)])
+    let raw = tbl_val
+        .table_borrow()
+        .map_or(Value::NIL, |t| t.raw_get(key));
+    Ok(vec![vm.unwrap_weak_read_val(tbl_val, raw)])
 }
 
 pub fn builtin_rawset(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -90,6 +93,7 @@ pub fn builtin_rawequal(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Stri
         (ValueView::Buffer(x), ValueView::Buffer(y)) => BorrowedRc::ptr_eq(x, y),
         (ValueView::Closure(x), ValueView::Closure(y)) => BorrowedRc::ptr_eq(x, y),
         (ValueView::Native(na), ValueView::Native(nb)) => na.name == nb.name,
+        (ValueView::Look(a), ValueView::Look(b)) => a == b,
         _ => false,
     };
     Ok(vec![Value::bool(eq)])

@@ -504,7 +504,8 @@ fn builtin_alloc(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     if let Some(limit) = vm.limits.heap_limit_bytes {
         let ffi_used = FFI_ALLOCATED_BYTES.with(|b| b.get());
         if vm
-            .gc
+            .heap
+            .old
             .bytes_allocated
             .saturating_add(ffi_used)
             .saturating_add(len)

@@ -83,36 +83,35 @@ impl VM {
         } else {
             tbl.raw_get(key)
         };
-        if found.is_nil() && tbl.metatable.is_some() {
+        if (found.is_nil() || found.is_look()) && tbl.metatable.is_some() {
             return None;
         }
         Some(found)
     }
 
-    /// Raw store into an existing array slot or field, or an append, on a
-    /// table that nothing can intercept. Returns false to defer to the slow
-    /// path, which also handles nil (removal), Beat escapes, and reports errors.
+    /// Raw store into a scalar-only array slot or field on a table without a
+    /// metatable. Anything involving non-trivial/table/closure values, weak
+    /// metatables, or replacing a non-trivial existing value returns false to run barriers.
     #[inline]
     pub(crate) fn table_set_fast(table: &Value, key: &Value, val: &Value) -> bool {
         let Some(t) = table.as_table() else {
             return false;
         };
-        if val.is_nil() || key.is_beat() || val.is_beat() {
+        if !val.is_trivial() || val.is_nil() || key.is_beat() {
             return false;
         }
         let mut tbl = t.borrow_mut();
-        if tbl.frozen {
+        if tbl.frozen || tbl.metatable.is_some() {
             return false;
         }
         if key.is_inline_int() {
             let i = key.as_inline_int_unchecked();
             if i >= 1 {
                 let idx = i as usize - 1;
-                if idx < tbl.array.len() {
+                if idx < tbl.array.len() && tbl.array[idx].is_trivial() {
                     tbl.array[idx].assign_ref(val);
                     return true;
-                } else if idx == tbl.array.len() && tbl.metatable.is_none() && tbl.general.is_none()
-                {
+                } else if idx == tbl.array.len() && tbl.general.is_none() {
                     tbl.array.push(val.clone());
                     return true;
                 }
@@ -122,13 +121,15 @@ impl VM {
         if let Some(k) = key.as_str_ref()
             && let Some((k_ptr, k_vms)) = k.as_old_vmstr()
         {
-            if tbl.metatable.is_none() {
-                tbl.fields.set_by_vmstr(k_ptr, k_vms, val);
-                return true;
-            } else if let Some(slot) = tbl.fields.get_mut_by_vmstr(k_ptr, k_vms) {
-                slot.assign_ref(val);
-                return true;
+            if let Some(slot) = tbl.fields.get_mut_by_vmstr(k_ptr, k_vms) {
+                if slot.is_trivial() {
+                    slot.assign_ref(val);
+                    return true;
+                }
+                return false;
             }
+            tbl.fields.set_by_vmstr(k_ptr, k_vms, val);
+            return true;
         }
         false
     }
@@ -147,13 +148,26 @@ impl VM {
             return Err("loop in gettable / __index chain".to_string());
         }
         match table.view() {
+            ValueView::Look(_) => {
+                let target = self.resolve_look_value(table);
+                if target.is_nil() {
+                    Ok(Value::NIL)
+                } else {
+                    self.table_get_depth(&target, key, depth + 1)
+                }
+            }
             ValueView::Table(t) => {
                 if let Some(b) = key.as_bigint()
                     && num_traits::Signed::is_positive(b)
                 {
                     return Err("table index too large".to_string());
                 }
-                let val = t.borrow().raw_get(key);
+                let raw = t.borrow().raw_get(key);
+                let val = if raw.is_look() {
+                    self.unwrap_weak_read_val(table, raw)
+                } else {
+                    raw
+                };
                 if !val.is_nil() {
                     return Ok(val);
                 }

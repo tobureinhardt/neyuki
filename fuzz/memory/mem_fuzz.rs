@@ -2,13 +2,11 @@
 
 // Buffers, allocation limits and reference cycles.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use crate::vm::buffer::VmBuffer;
-use crate::vm::gc::GcTracker;
+use crate::vm::hash::FxHashSet;
 use crate::vm::machine::VM;
-use crate::vm::value::{Value, VmTable};
+use crate::vm::old::OldArena;
+use crate::vm::value::Value;
 
 pub fn fuzz_buffer_integer_overflow() {
     let mut buf = VmBuffer::new(64);
@@ -42,45 +40,44 @@ pub fn fuzz_buffer_copy_boundaries() {
 
 pub fn fuzz_gc_cyclic_stress() {
     // Stress test: allocate 100 clusters of 5-node mutually cyclic tables
-    let mut gc = GcTracker::new();
-    let mut root_refs = Vec::new();
+    let mut old = OldArena::new();
+    let mut pins = FxHashSet::default();
 
     for cluster in 0..100 {
-        let t1 = Rc::new(RefCell::new(VmTable::new()));
-        let t2 = Rc::new(RefCell::new(VmTable::new()));
-        let t3 = Rc::new(RefCell::new(VmTable::new()));
-        let t4 = Rc::new(RefCell::new(VmTable::new()));
-        let t5 = Rc::new(RefCell::new(VmTable::new()));
-
-        gc.register_table(&t1);
-        gc.register_table(&t2);
-        gc.register_table(&t3);
-        gc.register_table(&t4);
-        gc.register_table(&t5);
+        let (id1, t1) = old.alloc_with_capacity(0, 1, 0);
+        let (id2, t2) = old.alloc_with_capacity(0, 1, 0);
+        let (id3, t3) = old.alloc_with_capacity(0, 1, 0);
+        let (id4, t4) = old.alloc_with_capacity(0, 1, 0);
+        let (id5, t5) = old.alloc_with_capacity(0, 1, 0);
 
         // Cyclic ring: t1 -> t2 -> t3 -> t4 -> t5 -> t1
         t1.borrow_mut().set_str("next", Value::table(t2.clone()));
+        old.on_old_store(Some(id1), id2);
         t2.borrow_mut().set_str("next", Value::table(t3.clone()));
+        old.on_old_store(Some(id2), id3);
         t3.borrow_mut().set_str("next", Value::table(t4.clone()));
+        old.on_old_store(Some(id3), id4);
         t4.borrow_mut().set_str("next", Value::table(t5.clone()));
+        old.on_old_store(Some(id4), id5);
         t5.borrow_mut().set_str("next", Value::table(t1.clone()));
+        old.on_old_store(Some(id5), id1);
 
         if cluster % 10 == 0 {
             // Keep 1 out of 10 clusters alive in roots
-            root_refs.push(Value::table(t1));
+            pins.insert(id1.slot);
         }
     }
 
-    let empty_globals = crate::vm::hash::new_map();
-    let plan = gc.collect_plan(&root_refs, &empty_globals);
-    assert!(plan.queue.is_empty(), "cyclic stress uses no finalizers");
-    let crate::vm::gc::SweepPlan { plain, dropped, .. } = plan;
-    gc.sweep_finish(plain, dropped, Vec::new(), 0);
-    let freed = gc.last_freed;
+    let plan = old.collect_cycles(&pins);
     assert!(
-        freed > 0,
-        "GC sweep must break unreachable cyclic table clusters"
+        plan.finalizers.is_empty(),
+        "cyclic stress uses no finalizers"
     );
+    assert!(
+        plan.bytes_freed > 0,
+        "OldArena cycle collector must break unreachable cyclic table clusters"
+    );
+    assert_eq!(old.live_count(), 50);
 }
 
 pub fn fuzz_vm_recursion_protection() {

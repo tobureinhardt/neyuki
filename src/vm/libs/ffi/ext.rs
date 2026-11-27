@@ -350,6 +350,17 @@ impl Drop for FrameGuard {
             };
             (handles, keep, scratch, unload)
         });
+        let vm_ptr = STATE.with(|s| s.borrow().frames.last().map(|f| f.vm));
+        if let Some(ptr) = vm_ptr
+            && !ptr.is_null()
+        {
+            let vm_ref = unsafe { &mut *ptr };
+            for (_, v) in &handles {
+                if let Some(cid) = crate::vm::old::OldArena::slot_of_value(v) {
+                    vm_ref.heap.old.release_ext_pin(cid);
+                }
+            }
+        }
         drop((handles, keep, scratch));
         // Only now is no extension code left on the stack.
         drop(unload);
@@ -397,6 +408,14 @@ impl ExtState {
 
     fn new_handle(&mut self, mut value: Value) -> NeyukiExtValue {
         self.promote_if_beat(&mut value);
+        if let Ok(vm) = self.vm() {
+            let vm_ref = unsafe { &mut *vm.as_ptr() };
+            let cur_job = vm_ref.heap.jobs.current_job_id();
+            vm_ref.escape_value_to_job(&mut value, cur_job, 0);
+            if let Some(cid) = crate::vm::old::OldArena::slot_of_value(&value) {
+                vm_ref.heap.old.add_ext_pin(cid);
+            }
+        }
         let serial = self.serial();
         let index = self.handles.len() as i64;
         self.handles.push((serial, value));
@@ -769,7 +788,15 @@ unsafe extern "C" fn api_retain(handle: NeyukiExtValue) -> NeyukiExtValue {
         if handle.tag != EXT_TAG_HANDLE {
             return Err("retain expects a handle".to_string());
         }
-        let v = s.lookup(handle.i)?;
+        let mut v = s.lookup(handle.i)?;
+        if let Ok(vm) = s.vm() {
+            let vm_ref = unsafe { &mut *vm.as_ptr() };
+            let cur_job = vm_ref.heap.jobs.current_job_id();
+            vm_ref.escape_value_to_job(&mut v, cur_job, 0);
+            if let Some(cid) = crate::vm::old::OldArena::slot_of_value(&v) {
+                vm_ref.heap.old.add_ext_pin(cid);
+            }
+        }
         s.next_persistent += 1;
         let id = PERSISTENT_BIT | s.next_persistent;
         s.persistent.insert(id, v);
@@ -783,7 +810,18 @@ unsafe extern "C" fn api_release(handle: NeyukiExtValue) {
     }
     // Released from any context (an extension's own destructor included);
     // the value is dropped after STATE is no longer borrowed.
-    let removed = STATE.with(|s| s.borrow_mut().persistent.remove(&handle.i));
+    let (removed, vm_ptr) = STATE.with(|s| {
+        let mut st = s.borrow_mut();
+        let vm_ptr = st.frames.last().map(|f| f.vm);
+        (st.persistent.remove(&handle.i), vm_ptr)
+    });
+    if let Some(ref v) = removed
+        && let Some(ptr) = vm_ptr
+        && !ptr.is_null()
+        && let Some(cid) = crate::vm::old::OldArena::slot_of_value(v)
+    {
+        unsafe { (*ptr).heap.old.release_ext_pin(cid) };
+    }
     drop(removed);
 }
 
