@@ -37,7 +37,8 @@ const USAGE: &str = "Usage: neyuki <command> [arguments]
 
 Commands:
   run [options] <file> [args...]
-                          Run a .nyk script or .nykb bytecode file
+                          Run a .nyk script, .nykb bytecode file or an app
+                          built with `build --no-runtime` (.nykpak)
     --sandbox             Deny all host capabilities unless allowed
     --allow-all, -A       Allow all host capabilities (default without --sandbox)
     --allow-read[=PATHS]  Allow filesystem read access
@@ -59,7 +60,8 @@ Commands:
                           Compile to .nykb bytecode
   emit-llvm [-O0|-O1] <file> [out.ll]
                           Emit LLVM IR (.ll) from MIR
-  build [project]         Build a standalone app executable
+  build [project]         Build a standalone app executable (--no-runtime:
+                          an app that runs on an installed Neyuki)
   unpack <app> [-o dir]   Extract a built app's scripts and assets
   test [filter|path...]   Run .nyk test scripts (default: tests/)
   repl                    Start an interactive session
@@ -102,6 +104,7 @@ fn run_cli() {
     // `neyuki script.nyk ...` or `neyuki --sandbox script.nyk ...` runs the script.
     if args[1].ends_with(".nyk")
         || args[1].ends_with(".nykb")
+        || args[1].ends_with(".nykpak")
         || args[1] == "--sandbox"
         || args[1] == "-A"
         || args[1] == "-O0"
@@ -249,12 +252,23 @@ fn run_cli() {
         };
         vm::libs::os::set_script_args(parsed.script_args);
         let compile_opts = compiler::Options::RUN.with_opt_level(parsed.opt_level);
-        if let Err(err) = vm::run_file_with_config(
-            &parsed.path,
-            compile_opts,
-            parsed.limits,
-            parsed.permissions,
-        ) {
+        // An app built with `neyuki build --no-runtime`.
+        let result = if parsed.path.ends_with(".nykpak") {
+            app::run_payload_file(
+                std::path::Path::new(&parsed.path),
+                compile_opts,
+                parsed.limits,
+                parsed.permissions,
+            )
+        } else {
+            vm::run_file_with_config(
+                &parsed.path,
+                compile_opts,
+                parsed.limits,
+                parsed.permissions,
+            )
+        };
+        if let Err(err) = result {
             if err.starts_with("error[") || err.starts_with("runtime error") {
                 eprint!("{}", err);
                 if !err.ends_with('\n') {
