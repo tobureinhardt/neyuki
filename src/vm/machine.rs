@@ -133,6 +133,8 @@ pub struct VM {
     /// sorted by register index. Nearly always empty or very short, which is
     /// why a plain vector beats a map here.
     pub open_upvalues: Vec<ParkedUpvalue>,
+    /// Active Beat loop safepoint stack for current execution chain.
+    pub(crate) beat_loops: Vec<crate::vm::beat::ActiveBeatLoop>,
     /// One past the last value produced by the most recent MULTRET `Call`,
     /// `Vararg` or returning frame. Only meaningful for the instruction that
     /// immediately consumes it.
@@ -349,6 +351,7 @@ impl VM {
             dap: None,
             in_eval: false,
             open_upvalues: Vec::new(),
+            beat_loops: Vec::new(),
             top: 0,
             modules: HashMap::new(),
             script_dir: None,
@@ -445,7 +448,8 @@ impl VM {
         self.frames.len() + self.frames_below
     }
 
-    pub fn set_global(&mut self, name: &str, value: Value) {
+    pub fn set_global(&mut self, name: &str, mut value: Value) {
+        self.beat_escape_if_needed(&mut value);
         self.globals.insert(StrRef::from(name), value);
         self.globals_epoch = self.globals_epoch.wrapping_add(1);
     }
@@ -462,6 +466,7 @@ impl VM {
         self.stack.clear();
         self.frames.clear();
         self.open_upvalues.clear();
+        self.beat_loops.clear();
         // A chunk that panicked (the REPL keeps its VM across chunks) can
         // leave these mid-call; a new top-level run starts outside any.
         self.native_calls = 0;
@@ -476,7 +481,19 @@ impl VM {
         self.stack.resize(max_reg + 1, Value::NIL);
 
         self.frames.push(CallFrame::new(closure, 0));
-        self.catch_panics(|vm| vm.run())
+        let res = self.catch_panics(|vm| vm.run());
+        self.beat_loops.clear();
+        match res {
+            Ok(mut val) => {
+                self.beat_escape_if_needed(&mut val);
+                self.beat_flush_to_floor(crate::vm::beat::BeatMark::ZERO, true);
+                Ok(val)
+            }
+            Err(err) => {
+                self.beat_flush_to_floor(crate::vm::beat::BeatMark::ZERO, true);
+                Err(err)
+            }
+        }
     }
 
     /// Runs a whole program: the main chunk, then every task it left
@@ -548,6 +565,8 @@ impl VM {
     }
 
     pub(crate) fn gc_collect(&mut self) -> Result<(), String> {
+        let floor = self.heap.beat.floor;
+        self.beat_flush_to_floor(floor, false);
         while !self.gc.sweep_slice(usize::MAX) {}
         while !self.gc.sweep_slice(usize::MAX) {}
         let crate::vm::gc::SweepPlan {

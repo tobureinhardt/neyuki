@@ -217,6 +217,18 @@ impl GcTracker {
         self.pinned.remove(&Rc::as_ptr(rc));
     }
 
+    /// Marks a Beat-promoted table whose `__gc` just ran during Beat teardown
+    /// as finalized and unpinned so a subsequent Old GC cycle will never invoke
+    /// its finalizer twice (even if resurrected).
+    pub fn mark_already_finalized(&mut self, rc: &Rc<RefCell<VmTable>>) {
+        let ptr = Rc::as_ptr(rc);
+        self.pinned.remove(&ptr);
+        self.reap_young();
+        if let Some((_, header)) = self.tables.get_mut(&ptr) {
+            header.finalized = true;
+        }
+    }
+
     pub fn register_table(&mut self, rc: &Rc<RefCell<VmTable>>) {
         let size = 64 + rc.borrow().array.capacity() * std::mem::size_of::<Value>();
         self.register_table_sized(rc, size);

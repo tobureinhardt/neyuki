@@ -308,8 +308,8 @@ fn json_decode(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         }
         None => return Err("text must be provided".to_string()),
     };
-    let keep_null = match args.get(1).and_then(Value::as_table) {
-        Some(opts) => opts.borrow().get_str("keepNull").is_truthy(),
+    let keep_null = match args.get(1).and_then(Value::table_borrow) {
+        Some(opts) => opts.get_str("keepNull").is_truthy(),
         _ => false,
     };
     Ok(vec![decode_with(Some(vm), text, keep_null)?])

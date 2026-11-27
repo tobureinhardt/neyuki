@@ -410,6 +410,7 @@ impl VM {
                     self.fire_hook(HookEvent::Return)?;
                 }
                 let frame = self.frames.pop().expect(RUNNING_FRAME);
+                self.beat_unwind_frames(self.frames.len() + 1);
                 self.close_upvalues_if_needed(frame.base);
                 if self.frames.len() == target_depth {
                     self.returned.clear();
@@ -478,7 +479,8 @@ impl VM {
                     let Some(name) = consts[name_k as usize].as_str_ref() else {
                         throw!("global name must be string");
                     };
-                    let val = reg!(src).clone();
+                    let mut val = reg!(src).clone();
+                    self.beat_escape_if_needed(&mut val);
                     // Re-inserting an existing key would drop the old Rc for
                     // an identical one; a lookup first avoids that churn.
                     if let Some(slot) = self.globals.get_mut(&*name) {
@@ -520,7 +522,7 @@ impl VM {
                             sync_ip!();
                         })?;
                     }
-                    let table_val = self.alloc_table_sized(array_cap, fields_cap);
+                    let table_val = self.alloc_beat_table_sized(array_cap, fields_cap);
                     set!(dst, table_val);
                 }
                 ExecInst::GetTable { dst, table, key } => {
@@ -540,7 +542,12 @@ impl VM {
                             }
                         } else if let Some(s) = k.as_str_ref() {
                             let tbl = t.borrow();
-                            if let Some(v) = tbl.fields.get_by_vmstr(s.as_ptr(), s.vm_str()) {
+                            let found = if let Some((s_ptr, s_vms)) = s.as_old_vmstr() {
+                                tbl.fields.get_by_vmstr(s_ptr, s_vms)
+                            } else {
+                                tbl.fields.get(s.as_str())
+                            };
+                            if let Some(v) = found {
                                 let val = v.clone();
                                 drop(tbl);
                                 set!(dst, val);
@@ -689,8 +696,18 @@ impl VM {
                     let tbl_val = &reg!(table);
                     let k = &reg!(key);
                     let v = &reg!(val);
+                    if let Some(bt_ptr) = tbl_val.beat_table_ptr()
+                        && unsafe { (*bt_ptr).extra.is_null() }
+                        && !k.is_bigint()
+                    {
+                        let (kv, vv) = (k.clone(), v.clone());
+                        attempt!(unsafe { self.heap.beat.table_raw_set(bt_ptr, kv, vv) });
+                        continue;
+                    }
                     if let Some(t) = tbl_val.as_table()
                         && !v.is_nil()
+                        && !v.is_beat()
+                        && !k.is_beat()
                     {
                         if let Some(i) = k.as_int()
                             && i >= 1
@@ -739,8 +756,16 @@ impl VM {
                     let tbl_val = &reg!(table);
                     let k = &consts[key_k as usize];
                     let v = &reg!(val);
+                    if let Some(bt_ptr) = tbl_val.beat_table_ptr()
+                        && unsafe { (*bt_ptr).extra.is_null() }
+                    {
+                        let (kv, vv) = (k.clone(), v.clone());
+                        attempt!(unsafe { self.heap.beat.table_raw_set(bt_ptr, kv, vv) });
+                        continue;
+                    }
                     if let (Some(t), Some(s)) = (tbl_val.as_table(), k.as_str_ref())
                         && !v.is_nil()
+                        && !v.is_beat()
                     {
                         let ptr = t.as_ptr() as usize;
                         let mut tbl = t.borrow_mut();
@@ -806,45 +831,34 @@ impl VM {
                 }
                 ExecInst::AppendArray { table, src } => {
                     let val = reg!(src).clone();
-                    if let Some(t) = reg!(table).as_table() {
-                        t.borrow_mut().array.push(val);
-                    } else {
-                        throw!("cannot append to non-table");
-                    }
+                    attempt!(self.beat_append_array(base + table as usize, val));
                 }
                 ExecInst::SetList {
                     table,
                     base: list,
                     count,
                 } => {
-                    let start = base + list as usize;
-                    let end = if count == MULTRET {
-                        self.top.max(start)
-                    } else {
-                        start + count as usize
-                    };
-                    let end = end.min(self.stack.len());
-                    if let Some(t) = reg!(table).as_table() {
-                        let t = t.to_rc();
-                        let mut tbl = t.borrow_mut();
-                        tbl.array.reserve(end.saturating_sub(start));
-                        tbl.array.extend(self.stack[start..end].iter().cloned());
-                    } else {
-                        throw!("cannot SetList to non-table");
-                    }
+                    attempt!(self.beat_set_list(base, table, list, count));
                 }
                 ExecInst::TForCall { base: b, retc } => {
                     sync_ip!();
                     self.tfor_call(base, b, retc)?;
                 }
-                ExecInst::TForLoop { base: b, jump }
-                | ExecInst::TForLoopBeat { base: b, jump, .. } => {
+                ExecInst::TForLoop { base: b, jump } => {
                     let first_var = reg!(b + 3).clone();
                     if first_var.is_nil() {
-                        // Exit loop: jump forward past the back-jump
                         jump!(jump);
                     } else {
-                        // Update ctrl to first result, continue
+                        set!(b + 2, first_var);
+                    }
+                }
+                ExecInst::TForLoopBeat { base: b, jump, .. } => {
+                    let first_var = reg!(b + 3).clone();
+                    if first_var.is_nil() {
+                        let target_ip = (ip as isize + jump as isize) as usize;
+                        self.beat_pop_exited_loops(self.frames.len(), target_ip);
+                        jump!(jump);
+                    } else {
                         set!(b + 2, first_var);
                     }
                 }
@@ -1543,10 +1557,7 @@ impl VM {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
                     let res = if let (Some(x), Some(y)) = (ra.as_str(), rb.as_str()) {
-                        let mut s = String::with_capacity(x.len() + y.len());
-                        s.push_str(x);
-                        s.push_str(y);
-                        Value::string(s)
+                        self.heap.alloc_beat_concat(x, y)
                     } else if ra.is_table() || rb.is_table() {
                         if let Some(mm) = self.get_binop_metamethod(ra, rb, "__concat") {
                             let (va, vb) = (ra.clone(), rb.clone());
@@ -2032,13 +2043,30 @@ impl VM {
                         jump!(jump_if_false);
                     }
                 }
-                ExecInst::Jump { offset } | ExecInst::JumpBeat { offset, .. } => {
+                ExecInst::Jump { offset } => {
                     if !TRAP && offset < 0 {
                         attempt!(self.limits.check_interrupt());
                     }
                     jump!(offset);
                 }
-                ExecInst::ForPrepBeat { base: b, jump, .. } => {
+                ExecInst::JumpBeat { offset, site } => {
+                    if offset < 0 {
+                        if !TRAP {
+                            attempt!(self.limits.check_interrupt());
+                        }
+                        if let Some(sf) = exec.safepoint(site).copied() {
+                            let max_r = current_closure.proto.max_registers as usize;
+                            sync_ip!();
+                            self.beat_safepoint_step(sf, base, max_r, cur_ip, site, true);
+                        }
+                    }
+                    jump!(offset);
+                }
+                ExecInst::ForPrepBeat {
+                    base: b,
+                    jump,
+                    site,
+                } => {
                     let step = &reg!(b + 2);
                     match step.view() {
                         ValueView::Int(0) => throw!("numeric for step cannot be zero"),
@@ -2046,18 +2074,20 @@ impl VM {
                         _ => {}
                     }
                     let init = &reg!(b);
-                    if init.is_inline_int()
+                    let init_minus_step = if init.is_inline_int()
                         && step.is_inline_int()
                         && let Some(diff) = init
                             .as_inline_int_unchecked()
                             .checked_sub(step.as_inline_int_unchecked())
                     {
-                        set!(b, Value::int(diff));
-                        jump!(jump);
-                        continue;
-                    }
-                    let init_minus_step = attempt!(ops::eval_sub(init, step));
+                        Value::int(diff)
+                    } else {
+                        attempt!(ops::eval_sub(init, step))
+                    };
                     set!(b, init_minus_step);
+                    if let Some(sf) = exec.safepoint(site) {
+                        self.beat_enter_for_prep(cur_ip, sf.loop_end, site);
+                    }
                     jump!(jump);
                 }
                 ExecInst::ForPrep { base: b, jump } => {
@@ -2268,8 +2298,7 @@ impl VM {
                         jump!(jump);
                     }
                 }
-                ExecInst::ForLoopGeneric { base: b, jump }
-                | ExecInst::ForLoopBeat { base: b, jump, .. } => {
+                ExecInst::ForLoopGeneric { base: b, jump } => {
                     let idx = &reg!(b);
                     let limit = &reg!(b + 1);
                     let step = &reg!(b + 2);
@@ -2309,6 +2338,66 @@ impl VM {
                     set!(b, next_idx.clone());
                     if loop_again {
                         set!(b + 3, next_idx);
+                        jump!(jump);
+                    }
+                }
+                ExecInst::ForLoopBeat {
+                    base: b,
+                    jump,
+                    site,
+                } => {
+                    let idx = &reg!(b);
+                    let limit = &reg!(b + 1);
+                    let step = &reg!(b + 2);
+                    let (next_idx, loop_again) =
+                        if idx.is_inline_int() && limit.is_inline_int() && step.is_inline_int() {
+                            let i = idx.as_inline_int_unchecked();
+                            let lim = limit.as_inline_int_unchecked();
+                            let st = step.as_inline_int_unchecked();
+                            if let Some(next) = i.checked_add(st) {
+                                let again = if st >= 0 { next <= lim } else { next >= lim };
+                                (Value::int(next), again)
+                            } else {
+                                let next = attempt!(ops::eval_add(idx, step));
+                                let again = if st >= 0 {
+                                    attempt!(ops::eval_le(&next, limit))
+                                } else {
+                                    attempt!(ops::eval_ge(&next, limit))
+                                };
+                                (next, again)
+                            }
+                        } else {
+                            match step.view() {
+                                ValueView::Int(0) => throw!("numeric for step cannot be zero"),
+                                ValueView::Float(0.0) => {
+                                    throw!("numeric for step cannot be zero")
+                                }
+                                _ => {}
+                            }
+                            let is_positive = match step.view() {
+                                ValueView::Int(i) => i >= 0,
+                                ValueView::BigInt(i) => num_traits::Signed::is_positive(i),
+                                ValueView::Float(f) => f >= 0.0,
+                                _ => true,
+                            };
+                            let next = attempt!(ops::eval_add(idx, step));
+                            let again = if is_positive {
+                                attempt!(ops::eval_le(&next, limit))
+                            } else {
+                                attempt!(ops::eval_ge(&next, limit))
+                            };
+                            (next, again)
+                        };
+                    set!(b, next_idx.clone());
+                    if loop_again {
+                        set!(b + 3, next_idx);
+                    }
+                    if let Some(sf) = exec.safepoint(site).copied() {
+                        let max_r = current_closure.proto.max_registers as usize;
+                        sync_ip!();
+                        self.beat_safepoint_step(sf, base, max_r, cur_ip, site, loop_again);
+                    }
+                    if loop_again {
                         jump!(jump);
                     }
                 }
@@ -2360,6 +2449,7 @@ impl VM {
                             if !TRAP {
                                 attempt!(self.limits.check_interrupt());
                             }
+                            self.beat_unwind_frames(self.frames.len());
                             self.close_upvalues_if_needed(base);
                             let needed = base + max_registers;
                             if needed >= self.stack.len() {
@@ -2395,6 +2485,7 @@ impl VM {
                         } else {
                             Some(callee_closure)
                         };
+                        self.beat_unwind_frames(self.frames.len());
                         self.close_upvalues_if_needed(base);
                         let caller_dest = base - 1;
                         let callee_abs = base + callee as usize;
@@ -2789,6 +2880,7 @@ impl VM {
                         self.fire_hook(HookEvent::Return)?;
                     }
                     let frame = self.frames.pop().expect(RUNNING_FRAME);
+                    self.beat_unwind_frames(self.frames.len() + 1);
                     if !self.open_upvalues.is_empty() {
                         self.close_upvalues(frame.base);
                     }

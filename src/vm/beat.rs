@@ -95,6 +95,15 @@ impl BeatTable {
     }
 
     #[inline(always)]
+    pub fn array_len(&self) -> usize {
+        if let Some(ext) = self.extra_ref() {
+            ext.array.len()
+        } else {
+            self.arr_len as usize
+        }
+    }
+
+    #[inline(always)]
     pub fn fields_slice(&self) -> &[BeatField] {
         if self.fld_len == 0 {
             &[]
@@ -328,6 +337,17 @@ impl BeatTable {
     }
 }
 
+/// Active Beat loop safepoint tracked on `VM` for O(1) iteration resets and
+/// nested loop / `break` unwinding.
+#[derive(Clone, Copy, Debug)]
+pub struct ActiveBeatLoop {
+    pub frame_depth: usize,
+    pub site: u16,
+    pub loop_end: usize,
+    pub mark: BeatMark,
+    pub prev_rewind: BeatMark,
+}
+
 /// Nested Beat frame pushed across `call_function` callbacks (`pcall`,
 /// `table.sort`, metamethods) so objects allocated at outer depths remain
 /// stationary while inner loops rewind.
@@ -399,11 +419,14 @@ pub struct BeatArena {
     pub depth: u16,
     pub floor: BeatMark,
     pub rewind_mark: BeatMark,
+    pub barrier_outer_min: BeatMark,
+    pub barrier_inner_max: BeatMark,
     frames: Vec<BeatFrame>,
     pub rem_set: Vec<BeatRemTarget>,
     pub extras: Vec<(BeatMark, NonNull<BeatExtra>)>,
     pub old_ref_holders: Vec<(BeatMark, *mut BeatTable)>,
     pub finalizers: Vec<(BeatMark, *mut BeatTable)>,
+    pub promoted_refs: Vec<(BeatMark, Value)>,
     pub active_bytes: usize,
 }
 
@@ -422,11 +445,14 @@ impl BeatArena {
             depth: 1,
             floor: BeatMark::ZERO,
             rewind_mark: BeatMark::ZERO,
+            barrier_outer_min: BeatMark(u64::MAX),
+            barrier_inner_max: BeatMark::ZERO,
             frames: Vec::with_capacity(16),
             rem_set: Vec::new(),
             extras: Vec::new(),
             old_ref_holders: Vec::new(),
             finalizers: Vec::new(),
+            promoted_refs: Vec::new(),
             active_bytes: 0,
         }
     }
@@ -442,6 +468,29 @@ impl BeatArena {
         self.active_bytes >= BEAT_SOFT_CAP_BYTES
     }
 
+    /// Recomputes `(barrier_outer_min, barrier_inner_max)` from active nested
+    /// floors and the outermost active loop safepoint mark (if any).
+    #[inline(always)]
+    pub fn sync_barrier_bounds(&mut self, oldest_loop_mark: Option<BeatMark>) {
+        let nested_min = if self.depth > 1 {
+            self.frames.get(1).map_or(self.floor, |f| f.floor)
+        } else {
+            BeatMark(u64::MAX)
+        };
+        let loop_min = oldest_loop_mark
+            .or_else(|| (self.rewind_mark > BeatMark::ZERO).then_some(self.rewind_mark));
+        let outer_min = match loop_min {
+            Some(m) => m.min(nested_min),
+            None => nested_min,
+        };
+        self.barrier_outer_min = outer_min;
+        self.barrier_inner_max = if outer_min == BeatMark(u64::MAX) {
+            BeatMark::ZERO
+        } else {
+            self.rewind_mark.max(self.floor)
+        };
+    }
+
     #[inline(always)]
     pub fn enter_nested(&mut self) -> BeatMark {
         let prev_floor = self.floor;
@@ -454,6 +503,7 @@ impl BeatArena {
         self.floor = cur;
         self.rewind_mark = cur;
         self.depth = self.depth.saturating_add(1);
+        self.sync_barrier_bounds(None);
         cur
     }
 
@@ -463,6 +513,7 @@ impl BeatArena {
             self.floor = prev.floor;
             self.rewind_mark = prev.rewind_mark;
             self.depth = prev.depth;
+            self.sync_barrier_bounds(None);
         }
     }
 
@@ -527,6 +578,33 @@ impl BeatArena {
             );
             let dst = hdr.add(1) as *mut u8;
             std::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
+        }
+        hdr
+    }
+
+    /// Concatenates two strings directly into a Beat bump [`BeatString`] with
+    /// zero intermediate `String` heap allocation.
+    pub fn alloc_string_concat(&mut self, a: &str, b: &str) -> *mut BeatString {
+        let alloc_mark = self.cursor();
+        let len = a.len() + b.len();
+        let total = std::mem::size_of::<BeatString>() + len;
+        let raw = self.alloc_raw(total, std::mem::align_of::<BeatString>());
+        let hdr = raw as *mut BeatString;
+        unsafe {
+            let dst = hdr.add(1) as *mut u8;
+            std::ptr::copy_nonoverlapping(a.as_ptr(), dst, a.len());
+            std::ptr::copy_nonoverlapping(b.as_ptr(), dst.add(a.len()), b.len());
+            let bytes = std::slice::from_raw_parts(dst, len);
+            let hash = fx_hash_bytes(bytes);
+            std::ptr::write(
+                hdr,
+                BeatString {
+                    len: len as u32,
+                    hash,
+                    alloc_mark,
+                    forwarded: 0,
+                },
+            );
         }
         hdr
     }
@@ -601,6 +679,58 @@ impl BeatArena {
         }
     }
 
+    #[inline(always)]
+    unsafe fn record_beat_write(
+        &mut self,
+        tbl_ptr: *mut BeatTable,
+        key: Option<&Value>,
+        val: &Value,
+    ) {
+        let tbl = unsafe { &mut *tbl_ptr };
+        let key_old =
+            key.is_some_and(|k| k.bits() >= crate::vm::value::TAG_RC_START && !k.is_beat());
+        let val_old = val.bits() >= crate::vm::value::TAG_RC_START && !val.is_beat();
+        if key_old || val_old {
+            unsafe { self.mark_old_ref_holder(tbl_ptr) };
+        }
+        if tbl.alloc_mark < self.barrier_inner_max && !tbl.in_rem_set {
+            let outer_min = self.barrier_outer_min;
+            let tbl_mark = tbl.alloc_mark;
+            let young_key = key
+                .and_then(Value::beat_alloc_mark)
+                .is_some_and(|m| m > tbl_mark && m >= outer_min);
+            let young_val = val
+                .beat_alloc_mark()
+                .is_some_and(|m| m > tbl_mark && m >= outer_min);
+            if young_key || young_val {
+                tbl.in_rem_set = true;
+                self.rem_set
+                    .push(BeatRemTarget::OuterBeatTable { table: tbl_ptr });
+            }
+        }
+    }
+
+    /// Inserts `val` at 0-based `idx` in `tbl_ptr`'s array part (spilling to `BeatExtra`),
+    /// firing Old-ref and Beat escape barriers.
+    ///
+    /// # Safety
+    ///
+    /// `tbl_ptr` must point to a valid, live `BeatTable` allocated from `self`.
+    pub unsafe fn table_insert_at(
+        &mut self,
+        tbl_ptr: *mut BeatTable,
+        idx: usize,
+        val: Value,
+    ) -> Result<(), String> {
+        let tbl = unsafe { &mut *tbl_ptr };
+        if tbl.is_frozen() {
+            return Err("attempted to mutate a frozen table".to_string());
+        }
+        unsafe { self.record_beat_write(tbl_ptr, None, &val) };
+        self.ensure_extra(tbl).array.insert(idx, val);
+        Ok(())
+    }
+
     /// Raw set on a `BeatTable`, upgrading slices in Beat or spilling to `BeatExtra`
     /// if capacities or key kinds exceed inline bump storage.
     ///
@@ -617,20 +747,7 @@ impl BeatArena {
         if tbl.is_frozen() {
             return Err("attempted to mutate a frozen table".to_string());
         }
-        let key_old = key.bits() >= crate::vm::value::TAG_RC_START && !key.is_beat();
-        let val_old = val.bits() >= crate::vm::value::TAG_RC_START && !val.is_beat();
-        if key_old || val_old {
-            unsafe { self.mark_old_ref_holder(tbl_ptr) };
-        }
-        if tbl.alloc_mark < self.rewind_mark && !tbl.in_rem_set {
-            let young_key = key.beat_alloc_mark().is_some_and(|m| m >= self.rewind_mark);
-            let young_val = val.beat_alloc_mark().is_some_and(|m| m >= self.rewind_mark);
-            if young_key || young_val {
-                tbl.in_rem_set = true;
-                self.rem_set
-                    .push(BeatRemTarget::OuterBeatTable { table: tbl_ptr });
-            }
-        }
+        unsafe { self.record_beat_write(tbl_ptr, Some(&key), &val) };
 
         if !tbl.extra.is_null() {
             return unsafe { (*tbl.extra).table.raw_set(key, val) };
@@ -727,6 +844,38 @@ impl BeatArena {
         self.ensure_extra(tbl).raw_set(key, val)
     }
 
+    /// Appends `val` sequentially to `tbl_ptr`'s array part (preserving `nil` holes
+    /// in table constructors), firing Old-ref and Beat escape barriers.
+    ///
+    /// # Safety
+    ///
+    /// `tbl_ptr` must point to a valid, live `BeatTable` allocated from `self`.
+    pub unsafe fn table_push_array(
+        &mut self,
+        tbl_ptr: *mut BeatTable,
+        val: Value,
+    ) -> Result<(), String> {
+        let tbl = unsafe { &mut *tbl_ptr };
+        if tbl.is_frozen() {
+            return Err("attempted to mutate a frozen table".to_string());
+        }
+        unsafe { self.record_beat_write(tbl_ptr, None, &val) };
+        if !tbl.extra.is_null() {
+            unsafe { (*tbl.extra).table.array.push(val) };
+            return Ok(());
+        }
+        let len = tbl.arr_len as usize;
+        if len < tbl.arr_cap as usize {
+            unsafe {
+                std::ptr::write(tbl.arr_ptr.add(len), val);
+            }
+            tbl.arr_len += 1;
+            return Ok(());
+        }
+        self.ensure_extra(tbl).array.push(val);
+        Ok(())
+    }
+
     /// Rewinds bump cursor and frees any `BeatExtra` / `old_ref_holders`
     /// belonging to Beat allocations at or above `mark` (respecting `self.floor`).
     /// Outer Beat tables modified inside inner loops retain their resources.
@@ -760,6 +909,9 @@ impl BeatArena {
         }
         if !self.finalizers.is_empty() {
             self.finalizers.retain(|&(m, _)| m < target);
+        }
+        if !self.promoted_refs.is_empty() {
+            self.promoted_refs.retain(|&(m, _)| m < target);
         }
         self.cur_chunk = target.chunk_idx();
         self.cur_off = target.offset();

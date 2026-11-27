@@ -25,7 +25,7 @@ fn os_clock(_vm: &mut VM, _args: &[Value]) -> Result<Vec<Value>, String> {
 /// optionally `hour` (default 12), `min` and `sec`) the same way, with
 /// out-of-range fields carried over as in Lua (month 13 is next January).
 fn os_time(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let Some(fields) = args.first().and_then(Value::as_table) else {
+    let Some(fields) = args.first().and_then(Value::table_borrow) else {
         if let Some(other) = args.first().filter(|v| !v.is_nil()) {
             return Err(format!("t must be a table, got {}", other.type_name()));
         }
@@ -34,7 +34,6 @@ fn os_time(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             .unwrap_or_default();
         return Ok(vec![Value::from_bigint(BigInt::from(now.as_secs()))]);
     };
-    let fields = fields.borrow();
     let field = |name: &str, default: Option<i64>| -> Result<i64, String> {
         let v = fields.get_str(name);
         match v.view() {

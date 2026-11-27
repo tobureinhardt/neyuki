@@ -933,14 +933,33 @@ impl Value {
         Value(bits)
     }
 
-    /// Returns the Beat allocation cursor for a Beat-resident value (`BeatTable`
-    /// or `BeatString`), or `None` for scalars and Old values.
+    /// Returns the raw Beat allocation cursor for a Beat-resident value (`BeatTable`
+    /// or `BeatString`), even after forwarding, or `None` for scalars and Old values.
     #[inline(always)]
     pub fn beat_alloc_mark(&self) -> Option<crate::vm::beat::BeatMark> {
-        if let Some(bt) = self.beat_table_ptr() {
+        if let Some(bt) = self.raw_beat_table_ptr() {
             Some(unsafe { (*bt).alloc_mark })
         } else {
-            self.beat_str_ptr().map(|bs| unsafe { (*bs).alloc_mark })
+            self.raw_beat_str_ptr()
+                .map(|bs| unsafe { (*bs).alloc_mark })
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn raw_beat_str_ptr(&self) -> Option<*mut crate::vm::beat::BeatString> {
+        if self.is_beat_string() {
+            Some(unpack_beat_ptr::<crate::vm::beat::BeatString>(self.0))
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn raw_beat_table_ptr(&self) -> Option<*mut crate::vm::beat::BeatTable> {
+        if self.is_beat_table() {
+            Some(unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0))
+        } else {
+            None
         }
     }
 
@@ -1153,11 +1172,13 @@ impl Value {
     pub fn as_str_ref(&self) -> Option<BorrowedStr<'_>> {
         if self.is_string() {
             if (self.0 & BIT_BEAT) != 0 {
-                Some(unsafe {
-                    BorrowedStr::from_beat_raw(unpack_beat_ptr::<crate::vm::beat::BeatString>(
-                        self.0,
-                    ))
-                })
+                let ptr = unpack_beat_ptr::<crate::vm::beat::BeatString>(self.0);
+                let fwd = unsafe { (*ptr).forwarded };
+                if fwd != 0 {
+                    Some(unsafe { BorrowedStr::from_raw(unpack_ptr::<VmString>(fwd)) })
+                } else {
+                    Some(unsafe { BorrowedStr::from_beat_raw(ptr) })
+                }
             } else {
                 Some(unsafe { BorrowedStr::from_raw(unpack_ptr::<VmString>(self.0)) })
             }
@@ -1179,7 +1200,12 @@ impl Value {
     #[inline(always)]
     pub fn beat_str_ptr(&self) -> Option<*mut crate::vm::beat::BeatString> {
         if self.is_beat_string() {
-            Some(unpack_beat_ptr::<crate::vm::beat::BeatString>(self.0))
+            let ptr = unpack_beat_ptr::<crate::vm::beat::BeatString>(self.0);
+            if unsafe { (*ptr).forwarded } == 0 {
+                Some(ptr)
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -1194,6 +1220,13 @@ impl Value {
     pub fn as_table(&self) -> Option<BorrowedRc<'_, RefCell<VmTable>>> {
         if self.is_old_table() {
             Some(unsafe { BorrowedRc::from_raw(unpack_ptr::<RefCell<VmTable>>(self.0)) })
+        } else if self.is_beat_table() {
+            let bt = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0) };
+            if bt.forwarded != 0 {
+                Some(unsafe { BorrowedRc::from_raw(unpack_ptr::<RefCell<VmTable>>(bt.forwarded)) })
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -1203,6 +1236,13 @@ impl Value {
     pub fn table_ptr(&self) -> Option<*const RefCell<VmTable>> {
         if self.is_old_table() {
             Some(unpack_ptr::<RefCell<VmTable>>(self.0))
+        } else if self.is_beat_table() {
+            let bt = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0) };
+            if bt.forwarded != 0 {
+                Some(unpack_ptr::<RefCell<VmTable>>(bt.forwarded))
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -1211,7 +1251,12 @@ impl Value {
     #[inline(always)]
     pub fn beat_table_ptr(&self) -> Option<*mut crate::vm::beat::BeatTable> {
         if self.is_beat_table() {
-            Some(unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0))
+            let ptr = unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0);
+            if unsafe { (*ptr).forwarded } == 0 {
+                Some(ptr)
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -1224,7 +1269,12 @@ impl Value {
             Some(TableBorrow::Old(tbl.borrow()))
         } else if self.is_beat_table() {
             let tbl = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0) };
-            Some(TableBorrow::Beat(tbl))
+            if tbl.forwarded != 0 {
+                let old_tbl = unsafe { &*unpack_ptr::<RefCell<VmTable>>(tbl.forwarded) };
+                Some(TableBorrow::Old(old_tbl.borrow()))
+            } else {
+                Some(TableBorrow::Beat(tbl))
+            }
         } else {
             None
         }
@@ -1237,7 +1287,12 @@ impl Value {
             Some(tbl.try_borrow().map(TableBorrow::Old))
         } else if self.is_beat_table() {
             let tbl = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0) };
-            Some(Ok(TableBorrow::Beat(tbl)))
+            if tbl.forwarded != 0 {
+                let old_tbl = unsafe { &*unpack_ptr::<RefCell<VmTable>>(tbl.forwarded) };
+                Some(old_tbl.try_borrow().map(TableBorrow::Old))
+            } else {
+                Some(Ok(TableBorrow::Beat(tbl)))
+            }
         } else {
             None
         }
@@ -1327,11 +1382,15 @@ impl Value {
             TAG_NATIVE_HI => ValueView::Native(unsafe { &*unpack_ptr::<NativeDef>(bits) }),
             TAG_STRING_HI => {
                 if (bits & BIT_BEAT) != 0 {
-                    ValueView::String(unsafe {
-                        BorrowedStr::from_beat_raw(unpack_beat_ptr::<crate::vm::beat::BeatString>(
-                            bits,
-                        ))
-                    })
+                    let ptr = unpack_beat_ptr::<crate::vm::beat::BeatString>(bits);
+                    let fwd = unsafe { (*ptr).forwarded };
+                    if fwd != 0 {
+                        ValueView::String(unsafe {
+                            BorrowedStr::from_raw(unpack_ptr::<VmString>(fwd))
+                        })
+                    } else {
+                        ValueView::String(unsafe { BorrowedStr::from_beat_raw(ptr) })
+                    }
                 } else {
                     ValueView::String(unsafe {
                         BorrowedStr::from_raw(unpack_ptr::<VmString>(bits))
@@ -1340,11 +1399,15 @@ impl Value {
             }
             TAG_TABLE_HI => {
                 if (bits & BIT_BEAT) != 0 {
-                    ValueView::Table(unsafe {
-                        BorrowedTable::from_beat_raw(unpack_beat_ptr::<crate::vm::beat::BeatTable>(
-                            bits,
-                        ))
-                    })
+                    let ptr = unpack_beat_ptr::<crate::vm::beat::BeatTable>(bits);
+                    let fwd = unsafe { (*ptr).forwarded };
+                    if fwd != 0 {
+                        ValueView::Table(unsafe {
+                            BorrowedTable::from_old_raw(unpack_ptr::<RefCell<VmTable>>(fwd))
+                        })
+                    } else {
+                        ValueView::Table(unsafe { BorrowedTable::from_beat_raw(ptr) })
+                    }
                 } else {
                     ValueView::Table(unsafe {
                         BorrowedTable::from_old_raw(unpack_ptr::<RefCell<VmTable>>(bits))
@@ -1422,9 +1485,15 @@ impl Value {
             Ok(unsafe { Rc::from_raw(unpack_ptr(bits)) })
         } else if self.is_beat_table() {
             let bt = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatTable>(self.0) };
-            let vm_tbl = bt.to_vm_table_cloned();
-            std::mem::forget(self);
-            Ok(Rc::new(RefCell::new(vm_tbl)))
+            let fwd = bt.forwarded;
+            if fwd != 0 {
+                std::mem::forget(self);
+                Ok(unsafe { Value::clone_from_bits(fwd).into_table().unwrap() })
+            } else {
+                let vm_tbl = bt.to_vm_table_cloned();
+                std::mem::forget(self);
+                Ok(Rc::new(RefCell::new(vm_tbl)))
+            }
         } else {
             Err(self)
         }
@@ -1435,9 +1504,15 @@ impl Value {
         if self.is_string() {
             if (self.0 & BIT_BEAT) != 0 {
                 let s = unsafe { &*unpack_beat_ptr::<crate::vm::beat::BeatString>(self.0) };
-                let owned = StrRef::from(s.as_str());
-                std::mem::forget(self);
-                Ok(owned)
+                if s.forwarded != 0 {
+                    let fwd = s.forwarded;
+                    std::mem::forget(self);
+                    unsafe { Value::clone_from_bits(fwd) }.into_str_ref()
+                } else {
+                    let owned = StrRef::from(s.as_str());
+                    std::mem::forget(self);
+                    Ok(owned)
+                }
             } else {
                 let bits = self.0;
                 std::mem::forget(self);
@@ -1643,6 +1718,9 @@ impl Value {
     #[inline(never)]
     fn eq_slow(&self, other: &Self) -> bool {
         if self.is_table() || other.is_table() {
+            if let (Some(a), Some(b)) = (self.table_ptr(), other.table_ptr()) {
+                return std::ptr::eq(a, b);
+            }
             return false;
         }
         match (self.view(), other.view()) {

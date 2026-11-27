@@ -90,8 +90,11 @@ pub(crate) fn new_coroutine(vm: &mut VM, func: Value) -> Value {
 /// are dropped from `vm.co_states`, so they, like tables that merely look
 /// like a handle, give `None`.
 fn live_coroutine(vm: &VM, val: Option<&Value>, func: &str) -> Result<Option<usize>, String> {
-    let Some(t) = val.and_then(|v| v.as_table()) else {
+    let Some(v) = val.filter(|v| v.is_table()) else {
         return Err(format!("bad argument #1 to '{}' (thread expected)", func));
+    };
+    let Some(t) = v.as_table() else {
+        return Ok(None);
     };
     let id = t.borrow().get_str("_id").as_usize().unwrap_or(0);
     let is_handle = vm.co_state(id).is_some_and(|co| {
@@ -185,6 +188,8 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     // The caller's open upvalues are parked while its stack is put aside, so
     // closures that captured its locals keep working from inside the coroutine.
     let beat_floor = vm.beat_enter_nested();
+    let caller_beat_loops = std::mem::take(&mut vm.beat_loops);
+    vm.heap.beat.sync_barrier_bounds(None);
     let caller_open_upvalues = vm.park_upvalues();
     let caller_stack = std::mem::take(&mut vm.stack);
     let caller_frames = std::mem::take(&mut vm.frames);
@@ -246,6 +251,7 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             ValueView::Native(def) => {
                 let res = (def.func)(vm, resume_args);
                 vm.beat_flush_to_floor(beat_floor, false);
+                vm.beat_loops = caller_beat_loops;
                 vm.beat_exit_nested();
                 co_rc.borrow_mut().status = "dead".to_string();
                 vm.co_states.remove(&co_id);
@@ -267,6 +273,7 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             }
             _ => {
                 vm.beat_flush_to_floor(beat_floor, false);
+                vm.beat_loops = caller_beat_loops;
                 vm.beat_exit_nested();
                 vm.close_upvalues(0);
                 vm.stack = caller_stack;
@@ -319,6 +326,7 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                 vm.beat_escape_if_needed(y);
             }
             vm.beat_flush_to_floor(beat_floor, true);
+            vm.beat_loops = caller_beat_loops;
             vm.beat_exit_nested();
             let parked = vm.park_upvalues();
             let mut cs = co_rc.borrow_mut();
@@ -339,13 +347,18 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
             Ok(out)
         }
         Ok(mut first) => {
-            vm.beat_flush_to_floor(beat_floor, false);
-            vm.beat_exit_nested();
             let mut returned = vm.take_returned();
             if returned.is_empty() {
                 vm.beat_promote_if_after(&mut first, beat_floor);
                 returned.push(first);
+            } else {
+                for r in &mut returned {
+                    vm.beat_promote_if_after(r, beat_floor);
+                }
             }
+            vm.beat_flush_to_floor(beat_floor, false);
+            vm.beat_loops = caller_beat_loops;
+            vm.beat_exit_nested();
             vm.close_upvalues(0);
             let mut cs = co_rc.borrow_mut();
             cs.status = "dead".to_string();
@@ -364,6 +377,7 @@ fn resume(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         }
         Err(err) => {
             vm.beat_flush_to_floor(beat_floor, false);
+            vm.beat_loops = caller_beat_loops;
             vm.beat_exit_nested();
             vm.close_upvalues(0);
             let mut cs = co_rc.borrow_mut();

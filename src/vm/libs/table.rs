@@ -77,13 +77,13 @@ fn table_insert(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
         match args.len() {
             0 | 1 => return Err("insert expects a value".to_string()),
             2 => {
-                let len = unsafe { &*bt_ptr }.array_slice().len();
+                let len = unsafe { &*bt_ptr }.array_len();
                 vm.table_raw_set(tbl_val, Value::from_usize(len + 1), args[1].clone())?;
                 return Ok(Vec::new());
             }
             _ => {
                 let pos = int_arg(args, 1, "pos")?;
-                let len = unsafe { &*bt_ptr }.array_slice().len() as i64;
+                let len = unsafe { &*bt_ptr }.array_len() as i64;
                 if pos < 1 || pos > len + 1 {
                     return Err(format!(
                         "position {} is out of bounds (1 to {})",
@@ -91,8 +91,11 @@ fn table_insert(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
                         len + 1
                     ));
                 }
-                let ext = vm.heap.beat.ensure_extra(unsafe { &mut *bt_ptr });
-                ext.array.insert((pos - 1) as usize, args[2].clone());
+                unsafe {
+                    vm.heap
+                        .beat
+                        .table_insert_at(bt_ptr, (pos - 1) as usize, args[2].clone())?;
+                }
                 return Ok(Vec::new());
             }
         }
@@ -135,7 +138,7 @@ fn table_remove(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let _ = writable(args, "t")?;
     let tbl_val = &args[0];
     if let Some(bt_ptr) = tbl_val.beat_table_ptr() {
-        let len = unsafe { &*bt_ptr }.array_slice().len() as i64;
+        let len = unsafe { &*bt_ptr }.array_len() as i64;
         let pos = opt_int_arg(args, 1, "pos", len)?;
         if len == 0 && (pos == 0 || pos == len) {
             return Ok(vec![Value::NIL]);

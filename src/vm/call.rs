@@ -32,13 +32,20 @@ impl VM {
         if needed >= self.stack.len() {
             self.stack.resize(needed + 1, Value::NIL);
         }
+        let beat_floor = self.beat_enter_nested();
         self.frames.push(CallFrame::new(closure, base));
-        let result = self.run_to_depth(depth);
+        let mut result = self.run_to_depth(depth);
+        self.beat_unwind_frames(depth + 1);
         self.frames.truncate(depth);
         // Upvalues captured by the module's closures live on in the closures
         // themselves; closing them here just moves the values across.
         self.close_upvalues(prev_stack_len);
         self.stack.truncate(prev_stack_len);
+        if let Ok(ref mut val) = result {
+            self.beat_escape_if_needed(val);
+        }
+        self.beat_flush_to_floor(beat_floor, false);
+        self.beat_exit_nested();
         result
     }
 
@@ -118,6 +125,7 @@ impl VM {
                     .push(CallFrame::with_varargs(c.clone(), base, varargs));
                 if let Err(err) = self.fire_hook(HookEvent::Call) {
                     if !self.is_yielding {
+                        self.beat_unwind_frames(depth + 1);
                         self.frames.truncate(depth);
                         self.close_upvalues(prev_stack_len);
                         self.stack.truncate(prev_stack_len);
@@ -128,6 +136,7 @@ impl VM {
                     crate::dap::check_break(self, c.proto.name.as_deref().unwrap_or("<anonymous>"))
                 {
                     if !self.is_yielding {
+                        self.beat_unwind_frames(depth + 1);
                         self.frames.truncate(depth);
                         self.close_upvalues(prev_stack_len);
                         self.stack.truncate(prev_stack_len);
@@ -155,6 +164,7 @@ impl VM {
                     }
                     Err(err) => {
                         if !self.is_yielding {
+                            self.beat_unwind_frames(depth + 1);
                             self.frames.truncate(depth);
                             self.close_upvalues(prev_stack_len);
                             self.stack.truncate(prev_stack_len);

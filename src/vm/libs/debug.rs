@@ -310,15 +310,14 @@ fn debug_upvalueid(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 
 /// `debug.getmetatable(t)`, ignoring a `__metatable` field.
 fn debug_getmetatable(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    Ok(vec![match args.first().and_then(Value::as_table) {
-        Some(t) => t
-            .borrow()
-            .metatable
-            .clone()
-            .map(Value::table)
-            .unwrap_or(Value::NIL),
-        _ => Value::NIL,
-    }])
+    let mt = match args.first().and_then(Value::table_borrow) {
+        Some(crate::vm::value::TableBorrow::Old(old)) => old.metatable.clone(),
+        Some(crate::vm::value::TableBorrow::Beat(bt)) => {
+            bt.extra_ref().and_then(|e| e.metatable.clone())
+        }
+        None => None,
+    };
+    Ok(vec![mt.map(Value::table).unwrap_or(Value::NIL)])
 }
 
 /// `debug.setmetatable(t, mt)`, ignoring a `__metatable` field.

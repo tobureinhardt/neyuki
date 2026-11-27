@@ -12,6 +12,7 @@ use crate::vm::hash::{FxHashMap, new_map};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoopSafepoint {
     pub loop_start: usize,
+    pub loop_end: usize,
     pub live_mask: [u64; 4],
 }
 
@@ -440,6 +441,7 @@ pub fn analyze_loop_safepoints(
             back_ip,
             LoopSafepoint {
                 loop_start: target_ip,
+                loop_end: back_ip,
                 live_mask: mask.0,
             },
         );
